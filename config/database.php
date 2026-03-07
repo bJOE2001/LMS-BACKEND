@@ -118,8 +118,8 @@ return [
         | HRIS Server — pmis2003 (employee records via vwActive view)
         |----------------------------------------------------------------------
         */
-        'hr_sqlsrv' => [
-            'driver' => 'sqlsrv',
+        'hr' => [
+            'driver' => env('HR_DB_CONNECTION', 'sqlsrv'),
             'host' => env('HR_DB_HOST', 'localhost'),
             'port' => env('HR_DB_PORT', '1433'),
             'database' => env('HR_DB_DATABASE', 'pmis2003'),
@@ -132,11 +132,23 @@ return [
 
         /*
         |----------------------------------------------------------------------
-        | Bioattendance Server — BIOASD (department heads via libOffice)
+        | Bioattendance Server - BIOASD
         |----------------------------------------------------------------------
         */
+        'bio' => [
+            'driver' => env('BIO_DB_CONNECTION', 'sqlsrv'),
+            'host' => env('BIO_DB_HOST', 'localhost'),
+            'port' => env('BIO_DB_PORT', '1433'),
+            'database' => env('BIO_DB_DATABASE', 'BIOASD'),
+            'username' => env('BIO_DB_USERNAME', ''),
+            'password' => env('BIO_DB_PASSWORD', ''),
+            'charset' => 'utf8',
+            'prefix' => '',
+            'prefix_indexes' => true,
+        ],
+
         'bio_sqlsrv' => [
-            'driver' => 'sqlsrv',
+            'driver' => env('BIO_DB_CONNECTION', 'sqlsrv'),
             'host' => env('BIO_DB_HOST', 'localhost'),
             'port' => env('BIO_DB_PORT', '1433'),
             'database' => env('BIO_DB_DATABASE', 'BIOASD'),
@@ -215,3 +227,4 @@ return [
     ],
 
 ];
+

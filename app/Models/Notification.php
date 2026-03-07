@@ -11,6 +11,8 @@ use Illuminate\Database\Eloquent\Relations\MorphTo;
  */
 class Notification extends Model
 {
+    protected $table = 'tblNotifications';
+
     protected $fillable = [
         'notifiable_type',
         'notifiable_id',
@@ -32,6 +34,8 @@ class Notification extends Model
 
     public const TYPE_LEAVE_APPROVED = 'leave_approved';
     public const TYPE_LEAVE_REJECTED = 'leave_rejected';
+    public const TYPE_LEAVE_CANCELLED = 'leave_cancelled';
+    public const TYPE_LEAVE_EDIT_REQUEST = 'leave_edit_requested';
     public const TYPE_LEAVE_REQUEST = 'leave_request';
     public const TYPE_LEAVE_PENDING = 'leave_pending';
     public const TYPE_REMINDER = 'reminder';

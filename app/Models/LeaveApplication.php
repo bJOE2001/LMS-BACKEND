@@ -13,11 +13,13 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
  */
 class LeaveApplication extends Model
 {
-    protected $table = 'leave_applications';
+    protected $table = 'tblLeaveApplications';
 
+    // This system uses ERMS ControlNo as the authoritative employee identifier.
+    // Employee master records are stored and managed in LMS tblEmployees.
     protected $fillable = [
         'applicant_admin_id',
-        'employee_id',
+        'erms_control_no',
         'leave_type_id',
         'start_date',
         'end_date',
@@ -29,16 +31,24 @@ class LeaveApplication extends Model
         'admin_approved_at',
         'hr_approved_at',
         'remarks',
+        'selected_dates',
+        'commutation',
+        'is_monetization',
+        'equivalent_amount',
     ];
 
     protected function casts(): array
     {
         return [
+            'erms_control_no' => 'integer',
             'start_date' => 'date',
             'end_date' => 'date',
             'total_days' => 'decimal:2',
             'admin_approved_at' => 'datetime',
             'hr_approved_at' => 'datetime',
+            'selected_dates' => 'array',
+            'is_monetization' => 'boolean',
+            'equivalent_amount' => 'decimal:2',
         ];
     }
 
@@ -50,11 +60,6 @@ class LeaveApplication extends Model
     public const STATUS_REJECTED = 'REJECTED';
 
     // ─── Relationships ───────────────────────────────────────────────
-
-    public function employee(): BelongsTo
-    {
-        return $this->belongsTo(Employee::class);
-    }
 
     public function leaveType(): BelongsTo
     {
@@ -69,5 +74,10 @@ class LeaveApplication extends Model
     public function applicantAdmin(): BelongsTo
     {
         return $this->belongsTo(DepartmentAdmin::class, 'applicant_admin_id');
+    }
+
+    public function employee(): BelongsTo
+    {
+        return $this->belongsTo(Employee::class, 'erms_control_no', 'control_no');
     }
 }

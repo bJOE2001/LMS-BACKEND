@@ -12,7 +12,11 @@ class ResetPasswordNotification extends BaseResetPassword
      */
     protected function resetUrl(mixed $notifiable): string
     {
-        $frontendUrl = rtrim(config('app.frontend_url', 'http://localhost:9000'), '/');
+        $frontendUrl = rtrim((string) config('app.frontend_url'), '/');
+        if ($frontendUrl === '') {
+            throw new \RuntimeException('FRONTEND_URL is not configured.');
+        }
+
         $query = http_build_query([
             'token' => $this->token,
             'email' => $notifiable->getEmailForPasswordReset(),

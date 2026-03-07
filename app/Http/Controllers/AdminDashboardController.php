@@ -5,11 +5,16 @@ namespace App\Http\Controllers;
 use App\Models\AdminLeaveBalance;
 use App\Models\DepartmentAdmin;
 use App\Models\Employee;
+use App\Models\HRAccount;
 use App\Models\LeaveApplication;
+use App\Models\LeaveApplicationLog;
 use App\Models\LeaveBalance;
 use App\Models\LeaveType;
+use App\Models\Notification;
+
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -19,6 +24,10 @@ use Illuminate\Support\Facades\Log;
  */
 class AdminDashboardController extends Controller
 {
+    public function __construct()
+    {
+    }
+
     /**
      * Dashboard data: pending count, approved today, total approved, all department applications.
      */
@@ -29,37 +38,67 @@ class AdminDashboardController extends Controller
             return response()->json(['message' => 'Only department admins can access this endpoint.'], 403);
         }
 
-        $applications = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin'])
-            ->where(function ($query) use ($admin) {
-                // Include employee leaves for this department
-                $query->whereHas('employee', fn($q) => $q->where('department_id', $admin->department_id))
+        $admin->loadMissing('department');
+        $deptName = $admin->department?->name;
+
+        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin', 'employee', 'logs'])
+            ->where(function ($query) use ($deptName, $admin) {
+                // Include employee leaves for this department (matched by office)
+                $query->whereIn('erms_control_no', function ($q) use ($deptName) {
+                    $q->select('control_no')->from('tblEmployees')->where('office', $deptName);
+                })
                     // OR admin self-apply leaves for this department
                     ->orWhereHas('applicantAdmin', fn($q) => $q->where('department_id', $admin->department_id));
             })
             ->orderByDesc('created_at')
             ->get();
 
-        $pending = $applications->where('status', LeaveApplication::STATUS_PENDING_ADMIN)->count();
+        $pendingApps = $applications->where('status', LeaveApplication::STATUS_PENDING_ADMIN);
+        $pending = $pendingApps->count();
 
-        $approvedToday = $applications->filter(function ($app) {
-            return $app->status === LeaveApplication::STATUS_PENDING_HR
-                || $app->status === LeaveApplication::STATUS_APPROVED
-                ? ($app->admin_approved_at && $app->admin_approved_at->isToday())
-                : false;
-        })->count();
+        $approvedTodayApps = $applications->filter(function (LeaveApplication $app): bool {
+            return in_array($app->status, [
+                LeaveApplication::STATUS_PENDING_HR,
+                LeaveApplication::STATUS_APPROVED,
+            ], true) && (bool) $app->admin_approved_at?->isToday();
+        });
+        $approvedToday = $approvedTodayApps->count();
 
-        $totalApproved = $applications->whereIn('status', [
+        $totalApprovedApps = $applications->whereIn('status', [
             LeaveApplication::STATUS_PENDING_HR,
             LeaveApplication::STATUS_APPROVED,
-        ])->count();
+        ]);
+        $totalApproved = $totalApprovedApps->count();
 
-        $formatted = $applications->map(fn($app) => $this->formatApplication($app));
+        $employeesByControlNo = Employee::query()
+            ->when($deptName, fn($query) => $query->where('office', $deptName))
+            ->get(['control_no', 'status', 'surname', 'firstname', 'middlename', 'office', 'designation', 'rate_mon'])
+            ->mapWithKeys(fn(Employee $employee) => [
+                $this->normalizeControlNo($employee->control_no) => $employee,
+            ])
+            ->all();
+
+        $employeeStatusByControlNo = collect($employeesByControlNo)
+            ->map(fn(Employee $employee) => $employee->status)
+            ->all();
+
+        $actorDirectory = $this->buildActorDirectory($applications, $employeesByControlNo);
+        $formatted = $applications->map(
+            fn($app) => $this->formatApplication($app, $employeesByControlNo, $actorDirectory)
+        );
+        $kpiBreakdown = [
+            'pending' => $this->buildEmploymentStatusBreakdown($pendingApps, $employeeStatusByControlNo),
+            'approved_today' => $this->buildEmploymentStatusBreakdown($approvedTodayApps, $employeeStatusByControlNo),
+            'total_approved' => $this->buildEmploymentStatusBreakdown($totalApprovedApps, $employeeStatusByControlNo),
+            'total' => $this->buildEmploymentStatusBreakdown($applications, $employeeStatusByControlNo),
+        ];
 
         return response()->json([
             'pending_count' => $pending,
             'approved_today' => $approvedToday,
             'total_approved' => $totalApproved,
             'total_count' => $applications->count(),
+            'kpi_breakdown' => $kpiBreakdown,
             'applications' => $formatted,
         ]);
     }
@@ -225,6 +264,69 @@ class AdminDashboardController extends Controller
     }
 
     /**
+     * GET /admin/self-leave-balance/{leaveTypeId}
+     * Return the admin's own balance for a specific leave type.
+     * Used by the monetization form.
+     */
+    public function selfLeaveBalance(Request $request, int $leaveTypeId): JsonResponse
+    {
+        $admin = $request->user();
+        if (!$admin instanceof DepartmentAdmin) {
+            return response()->json(['message' => 'Only department admins can access this endpoint.'], 403);
+        }
+
+        $leaveType = LeaveType::find($leaveTypeId);
+        if (!$leaveType) {
+            return response()->json(['message' => 'Leave type not found.'], 404);
+        }
+
+        $balance = AdminLeaveBalance::where('admin_id', $admin->id)
+            ->where('leave_type_id', $leaveTypeId)
+            ->where('year', now()->year)
+            ->first();
+
+        return response()->json([
+            'leave_type_id' => $leaveType->id,
+            'leave_type_name' => $leaveType->name,
+            'balance' => $balance ? (float) $balance->balance : 0,
+        ]);
+    }
+
+    /**
+     * GET /admin/employee-leave-balance/{employeeId}/{leaveTypeId}
+     * Return a department employee's balance for a specific leave type.
+     * Used by the admin on-behalf monetization form.
+     */
+    public function employeeLeaveBalance(Request $request, string $employeeId, int $leaveTypeId): JsonResponse
+    {
+        $admin = $request->user();
+        if (!$admin instanceof DepartmentAdmin) {
+            return response()->json(['message' => 'Only department admins can access this endpoint.'], 403);
+        }
+
+        $admin->loadMissing('department');
+        $employee = Employee::find($employeeId);
+        if (!$employee || $employee->office !== $admin->department?->name) {
+            return response()->json(['message' => 'Employee not found in your department.'], 404);
+        }
+
+        $leaveType = LeaveType::find($leaveTypeId);
+        if (!$leaveType) {
+            return response()->json(['message' => 'Leave type not found.'], 404);
+        }
+
+        $balance = LeaveBalance::where('employee_id', $employeeId)
+            ->where('leave_type_id', $leaveTypeId)
+            ->first();
+
+        return response()->json([
+            'leave_type_id' => $leaveType->id,
+            'leave_type_name' => $leaveType->name,
+            'balance' => $balance ? (float) $balance->balance : 0,
+        ]);
+    }
+
+    /**
      * Store a leave application for the admin themselves.
      */
     public function storeSelfLeave(Request $request): JsonResponse
@@ -238,15 +340,42 @@ class AdminDashboardController extends Controller
             return response()->json(['message' => 'Please initialize your leave balances first.'], 422);
         }
 
-        $request->validate([
-            'leave_type_id' => 'required|exists:leave_types,id',
+        // Detect monetization request
+        $isMonetization = (bool) $request->input('is_monetization', false);
+
+        if ($isMonetization) {
+            return $this->storeSelfMonetization($request, $admin);
+        }
+
+        $validated = $request->validate([
+            'leave_type_id' => 'required|exists:tblLeaveTypes,id',
             'start_date' => 'required|date',
             'end_date' => 'required|date|after_or_equal:start_date',
             'total_days' => 'required|numeric|min:0.5',
             'reason' => 'required|string',
+            'selected_dates' => ['nullable', 'array'],
+            'selected_dates.*' => ['date'],
         ]);
 
-        $leaveType = LeaveType::find($request->leave_type_id);
+        $leaveType = LeaveType::find($validated['leave_type_id']);
+
+        if (!$leaveType) {
+            return response()->json([
+                'message' => 'Selected leave type is not available.',
+                'errors' => [
+                    'leave_type_id' => ['Selected leave type is not available.'],
+                ],
+            ], 422);
+        }
+
+        if ($leaveType->max_days && (float) $validated['total_days'] > (float) $leaveType->max_days) {
+            return response()->json([
+                'message' => "This leave type is limited to {$leaveType->max_days} days per application.",
+                'errors' => [
+                    'total_days' => ["Maximum of {$leaveType->max_days} days allowed for {$leaveType->name}."],
+                ],
+            ], 422);
+        }
 
         // Check balance if credit-based
         if ($leaveType->is_credit_based) {
@@ -255,34 +384,261 @@ class AdminDashboardController extends Controller
                 ->where('year', now()->year)
                 ->first();
 
-            if (!$balance || $balance->balance < $request->total_days) {
-                return response()->json(['message' => 'Insufficient leave balance.'], 422);
+            if (!$balance) {
+                return response()->json([
+                    'message' => "{$leaveType->name} is not available for this account.",
+                    'errors' => [
+                        'leave_type_id' => ["{$leaveType->name} is not available for this account."],
+                    ],
+                ], 422);
+            }
+
+            $currentBalance = (float) $balance->balance;
+
+            if ($currentBalance < (float) $validated['total_days']) {
+                $fmtAvail = self::formatDays($currentBalance);
+                return response()->json([
+                    'message' => "Insufficient leave balance. Available: {$fmtAvail}.",
+                    'errors' => [
+                        'total_days' => ["Insufficient leave balance. Available: {$fmtAvail}."]
+                    ],
+                ], 422);
             }
         }
 
-        // Create the application
-        $application = LeaveApplication::create([
-            'applicant_admin_id' => $admin->id,
-            'employee_id' => null, // Not an employee
-            'leave_type_id' => $leaveType->id,
-            'start_date' => $request->start_date,
-            'end_date' => $request->end_date,
-            'total_days' => $request->total_days,
-            'reason' => $request->reason,
-            'status' => LeaveApplication::STATUS_PENDING_HR, // Admins go straight to HR review
-            'admin_id' => $admin->id, // Self-approved at department level
-            'admin_approved_at' => now(),
-        ]);
+        // 3. Create the application
+        $application = DB::transaction(function () use ($validated, $admin, $leaveType) {
+            $app = LeaveApplication::create([
+                'applicant_admin_id' => $admin->id,
+                'erms_control_no' => null,
+                'leave_type_id' => $leaveType->id,
+                'start_date' => $validated['start_date'],
+                'end_date' => $validated['end_date'],
+                'total_days' => $validated['total_days'],
+                'reason' => $validated['reason'],
+                'selected_dates' => $validated['selected_dates'] ?? null,
+                'status' => LeaveApplication::STATUS_PENDING_HR,
+                'admin_id' => $admin->id,
+                'admin_approved_at' => now(),
+            ]);
+
+            LeaveApplicationLog::create([
+                'leave_application_id' => $app->id,
+                'action' => LeaveApplicationLog::ACTION_SUBMITTED,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_ADMIN,
+                'performed_by_id' => $admin->id,
+                'created_at' => now(),
+            ]);
+
+            LeaveApplicationLog::create([
+                'leave_application_id' => $app->id,
+                'action' => LeaveApplicationLog::ACTION_ADMIN_APPROVED,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_ADMIN,
+                'performed_by_id' => $admin->id,
+                'remarks' => 'Personal application (Form No. 6). Auto-approved at department level.',
+                'created_at' => now(),
+            ]);
+
+            return $app;
+        });
+
+        // 4. Notify all HR accounts
+        $hrAccounts = HRAccount::all();
+        foreach ($hrAccounts as $hrAccount) {
+            Notification::send(
+                $hrAccount,
+                Notification::TYPE_LEAVE_REQUEST,
+                'New Personal Leave Application',
+                "{$admin->full_name} submitted a personal {$leaveType->name} leave application (" . self::formatDays($application->total_days) . ").",
+                $application->id
+            );
+        }
 
         return response()->json([
             'message' => 'Leave application submitted successfully.',
-            'application' => $this->formatApplication($application),
+            'application' => $this->formatApplication($application->fresh(['leaveType', 'applicantAdmin'])),
         ]);
+    }
+
+    /**
+     * Handle admin personal monetization submission.
+     */
+    private function storeSelfMonetization(Request $request, DepartmentAdmin $admin): JsonResponse
+    {
+        $validated = $request->validate([
+            'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
+            'total_days' => ['required', 'numeric', 'min:1', 'max:999'],
+            'reason' => ['nullable', 'string', 'max:2000'],
+            'salary' => ['nullable', 'numeric', 'min:0'],
+        ]);
+
+        $leaveType = LeaveType::find($validated['leave_type_id']);
+        if (!$leaveType || !in_array($leaveType->name, ['Vacation Leave', 'Sick Leave'], true)) {
+            return response()->json([
+                'message' => 'Monetization is only allowed for Vacation Leave or Sick Leave.',
+                'errors' => ['leave_type_id' => ['Monetization is only allowed for Vacation Leave or Sick Leave.']],
+            ], 422);
+        }
+
+        $balance = AdminLeaveBalance::where('admin_id', $admin->id)
+            ->where('leave_type_id', $validated['leave_type_id'])
+            ->where('year', now()->year)
+            ->first();
+
+        $currentBalance = $balance ? (float) $balance->balance : 0;
+
+        if ($currentBalance < 10) {
+            return response()->json([
+                'message' => 'Minimum of 10 leave credits required for monetization.',
+                'errors' => ['total_days' => ['Minimum of 10 leave credits required for monetization. Current balance: ' . self::formatDays($currentBalance) . '.']],
+            ], 422);
+        }
+
+        $requestedDays = (float) $validated['total_days'];
+        if ($requestedDays > $currentBalance) {
+            return response()->json([
+                'message' => 'Requested monetization days exceed available leave credits.',
+                'errors' => ['total_days' => ["Requested monetization days ({$requestedDays}) exceed available balance (" . self::formatDays($currentBalance) . ")."]],
+            ], 422);
+        }
+
+        $equivalentAmount = null;
+        $salary = $request->input('salary');
+        if ($salary && is_numeric($salary) && (float) $salary > 0) {
+            $dailyRate = (float) $salary / 22;
+            $equivalentAmount = round($requestedDays * $dailyRate, 2);
+        }
+
+        $application = DB::transaction(function () use ($validated, $admin, $equivalentAmount) {
+            $app = LeaveApplication::create([
+                'applicant_admin_id' => $admin->id,
+                'erms_control_no' => null,
+                'leave_type_id' => $validated['leave_type_id'],
+                'start_date' => null,
+                'end_date' => null,
+                'total_days' => $validated['total_days'],
+                'reason' => $validated['reason'] ?? null,
+                'status' => LeaveApplication::STATUS_PENDING_HR,
+                'admin_id' => $admin->id,
+                'admin_approved_at' => now(),
+                'is_monetization' => true,
+                'equivalent_amount' => $equivalentAmount,
+            ]);
+
+            LeaveApplicationLog::create([
+                'leave_application_id' => $app->id,
+                'action' => LeaveApplicationLog::ACTION_SUBMITTED,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_ADMIN,
+                'performed_by_id' => $admin->id,
+                'created_at' => now(),
+            ]);
+
+            LeaveApplicationLog::create([
+                'leave_application_id' => $app->id,
+                'action' => LeaveApplicationLog::ACTION_ADMIN_APPROVED,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_ADMIN,
+                'performed_by_id' => $admin->id,
+                'remarks' => 'Personal monetization request. Auto-approved at department level.',
+                'created_at' => now(),
+            ]);
+
+            return $app;
+        });
+
+        $application->load('leaveType');
+        $hrAccounts = HRAccount::all();
+        foreach ($hrAccounts as $hrAccount) {
+            Notification::send(
+                $hrAccount,
+                Notification::TYPE_LEAVE_REQUEST,
+                'Monetization Request',
+                "{$admin->full_name} submitted a personal monetization request for {$application->leaveType->name} (" . self::formatDays($application->total_days) . ").",
+                $application->id
+            );
+        }
+
+        return response()->json([
+            'message' => 'Monetization request submitted successfully.',
+            'application' => $this->formatApplication($application->fresh(['leaveType', 'applicantAdmin'])),
+            'equivalent_amount' => $equivalentAmount,
+        ], 201);
+    }
+
+    /**
+     * Format total days for display.
+     */
+    private static function formatDays($days): string
+    {
+        $num = (float) $days;
+        $display = ($num == (int) $num) ? (int) $num : $num;
+        return $display . ' ' . ($num == 1 ? 'day' : 'days');
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────
 
-    private function formatApplication(LeaveApplication $app): array
+    private function emptyEmploymentBreakdown(): array
+    {
+        return [
+            'elective' => 0,
+            'co_terminous' => 0,
+            'regular' => 0,
+            'casual' => 0,
+        ];
+    }
+
+    private function buildEmploymentStatusBreakdown(Collection $applications, array $employeeStatusByControlNo): array
+    {
+        $breakdown = $this->emptyEmploymentBreakdown();
+
+        foreach ($applications as $application) {
+            if (!$application instanceof LeaveApplication) {
+                continue;
+            }
+
+            $bucket = $this->employmentStatusToBucket($application, $employeeStatusByControlNo);
+            if ($bucket !== null) {
+                $breakdown[$bucket]++;
+            }
+        }
+
+        return $breakdown;
+    }
+
+    private function employmentStatusToBucket(LeaveApplication $application, array $employeeStatusByControlNo): ?string
+    {
+        $employeeStatus = $application->employee?->status;
+
+        if ($employeeStatus === null) {
+            $rawControlNo = $application->getRawOriginal('erms_control_no') ?: $application->erms_control_no;
+            $normalizedControlNo = $this->normalizeControlNo($rawControlNo);
+            $employeeStatus = $employeeStatusByControlNo[$normalizedControlNo] ?? null;
+        }
+
+        $rawStatus = strtoupper(trim((string) ($employeeStatus ?? '')));
+        if ($rawStatus === '') {
+            return null;
+        }
+
+        return match ($rawStatus) {
+            'ELECTIVE' => 'elective',
+            'CO-TERMINOUS', 'CO TERMINOUS', 'COTERMINOUS' => 'co_terminous',
+            'REGULAR' => 'regular',
+            'CASUAL' => 'casual',
+            default => null,
+        };
+    }
+
+    private function normalizeControlNo(mixed $controlNo): string
+    {
+        $normalized = ltrim(trim((string) ($controlNo ?? '')), '0');
+        return $normalized === '' ? '0' : $normalized;
+    }
+
+    private function formatApplication(
+        LeaveApplication $app,
+        array $employeesByControlNo = [],
+        array $actorDirectory = []
+    ): array
     {
         $statusMap = [
             LeaveApplication::STATUS_PENDING_ADMIN => 'Pending Admin',
@@ -291,33 +647,341 @@ class AdminDashboardController extends Controller
             LeaveApplication::STATUS_REJECTED => 'Rejected',
         ];
 
+        $employee = $app->employee;
+        if (!$employee) {
+            $rawControlNo = $app->getRawOriginal('erms_control_no') ?: $app->erms_control_no;
+            $employee = $employeesByControlNo[$this->normalizeControlNo($rawControlNo)] ?? null;
+        }
+
         // Determine employee name & office (could be admin self-apply)
-        $employeeName = $app->employee ? $app->employee->full_name : ($app->applicantAdmin ? $app->applicantAdmin->full_name : 'Unknown');
-        $office = $app->employee?->department?->name ?? ($app->applicantAdmin?->department?->name ?? '');
+        $employeeFullName = $employee ? $this->formatEmployeeFullName($employee) : '';
+        $employeeName = $employeeFullName !== ''
+            ? $employeeFullName
+            : ($app->applicantAdmin ? $app->applicantAdmin->full_name : 'Unknown');
+        $office = $employee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
+
+        $position = $employee?->designation ?? '';
+        $salary = $employee && $employee->rate_mon != null
+            ? (float) $employee->rate_mon
+            : null;
+
+        $surname = $employee?->surname ?? '';
+        $firstname = $employee?->firstname ?? '';
+        $middlename = $employee?->middlename ?? '';
+        $logs = $app->relationLoaded('logs')
+            ? $app->logs->sortByDesc(fn(LeaveApplicationLog $log) => $log->created_at?->timestamp ?? 0)->values()
+            : collect();
+
+        $submittedLog = $logs->first(
+            fn(LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_SUBMITTED
+        );
+        $adminApprovedLog = $logs->first(
+            fn(LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_ADMIN_APPROVED
+        );
+        $hrApprovedLog = $logs->first(
+            fn(LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_APPROVED
+        );
+        $adminRejectedLog = $logs->first(
+            fn(LeaveApplicationLog $log) =>
+            $log->action === LeaveApplicationLog::ACTION_ADMIN_REJECTED
+            && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_ADMIN
+        );
+        $hrRejectedLog = $logs->first(
+            fn(LeaveApplicationLog $log) =>
+            $log->action === LeaveApplicationLog::ACTION_HR_REJECTED
+            && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
+        $cancelledLog = $logs->first(
+            fn(LeaveApplicationLog $log) =>
+            $this->isCancelledRemark($log->remarks)
+            || (
+                $log->action === LeaveApplicationLog::ACTION_ADMIN_REJECTED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_EMPLOYEE
+            )
+        );
+
+        $filedBy = $this->resolvePerformerName($submittedLog, $actorDirectory, $employeeName) ?? $employeeName;
+        $adminActionBy = ($app->admin_id && isset($actorDirectory['admin'][(int) $app->admin_id]))
+            ? $actorDirectory['admin'][(int) $app->admin_id]
+            : $this->resolvePerformerName($adminApprovedLog ?? $adminRejectedLog, $actorDirectory, $employeeName);
+        $hrActionBy = ($app->hr_id && isset($actorDirectory['hr'][(int) $app->hr_id]))
+            ? $actorDirectory['hr'][(int) $app->hr_id]
+            : $this->resolvePerformerName($hrApprovedLog ?? $hrRejectedLog, $actorDirectory, $employeeName);
+
+        $isCancelled = $this->isCancelledRemark($app->remarks);
+        $cancelledBy = $cancelledLog
+            ? ($this->resolvePerformerName($cancelledLog, $actorDirectory, $employeeName) ?? $employeeName)
+            : ($isCancelled ? $employeeName : null);
+
+        $disapprovedBy = null;
+        if ($app->status === LeaveApplication::STATUS_REJECTED) {
+            if ($cancelledBy) {
+                $disapprovedBy = $cancelledBy;
+            } elseif ($hrRejectedLog || $app->hr_id) {
+                $disapprovedBy = $this->resolvePerformerName($hrRejectedLog, $actorDirectory, $employeeName)
+                    ?? $hrActionBy;
+            } elseif ($adminRejectedLog || $app->admin_id) {
+                $disapprovedBy = $this->resolvePerformerName($adminRejectedLog, $actorDirectory, $employeeName)
+                    ?? $adminActionBy;
+            }
+        }
+
+        $adminActionAt = $adminApprovedLog?->created_at
+            ?? $adminRejectedLog?->created_at
+            ?? $app->admin_approved_at;
+        $hrActionAt = $hrApprovedLog?->created_at
+            ?? $hrRejectedLog?->created_at
+            ?? $app->hr_approved_at;
+        $cancelledAt = $cancelledLog?->created_at;
+
+        $disapprovedAt = null;
+        if ($app->status === LeaveApplication::STATUS_REJECTED) {
+            if ($cancelledAt) {
+                $disapprovedAt = $cancelledAt;
+            } elseif ($hrRejectedLog?->created_at) {
+                $disapprovedAt = $hrRejectedLog->created_at;
+            } elseif ($adminRejectedLog?->created_at) {
+                $disapprovedAt = $adminRejectedLog->created_at;
+            }
+        }
+
+        $processedBy = null;
+        $reviewedAt = null;
+
+        if ($isCancelled) {
+            $processedBy = $cancelledBy;
+            $reviewedAt = $cancelledAt;
+        } elseif ($app->status === LeaveApplication::STATUS_PENDING_HR) {
+            $processedBy = $adminActionBy;
+            $reviewedAt = $adminActionAt;
+        } elseif ($app->status === LeaveApplication::STATUS_APPROVED) {
+            $processedBy = $hrActionBy ?? $adminActionBy;
+            $reviewedAt = $hrActionAt ?? $adminActionAt;
+        } elseif ($app->status === LeaveApplication::STATUS_REJECTED) {
+            $processedBy = $disapprovedBy;
+            $reviewedAt = $disapprovedAt ?? $hrActionAt ?? $adminActionAt;
+        }
 
         return [
             'id' => $app->id,
-            'employee_id' => $app->employee_id,
+            'employee_id' => $app->erms_control_no,
             'employeeName' => $employeeName,
-            'employeeId' => $app->employee_id,
             'office' => $office,
+            'position' => $position,
+            'salary' => $salary,
+            'surname' => $surname,
+            'firstname' => $firstname,
+            'middlename' => $middlename,
             'leaveType' => $app->leaveType?->name ?? 'Unknown',
-            'startDate' => $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : '',
-            'endDate' => $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : '',
+            'startDate' => $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : null,
+            'endDate' => $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : null,
             'days' => (float) $app->total_days,
             'reason' => $app->reason,
             'status' => $statusMap[$app->status] ?? $app->status,
             'rawStatus' => $app->status,
             'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
             'remarks' => $app->remarks,
+            'selected_dates' => $app->selected_dates,
+            'commutation' => $app->commutation ?? 'Not Requested',
+            'is_monetization' => (bool) $app->is_monetization,
+            'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
+            'admin_id' => $app->admin_id,
+            'hr_id' => $app->hr_id,
+            'filedBy' => $filedBy,
+            'adminActionBy' => $adminActionBy,
+            'hrActionBy' => $hrActionBy,
+            'disapprovedBy' => $disapprovedBy,
+            'cancelledBy' => $cancelledBy,
+            'processedBy' => $processedBy,
+            'reviewedAt' => $reviewedAt?->toIso8601String(),
+            'adminActionAt' => $adminActionAt?->toIso8601String(),
+            'hrActionAt' => $hrActionAt?->toIso8601String(),
+            'disapprovedAt' => $disapprovedAt?->toIso8601String(),
+            'cancelledAt' => $cancelledAt?->toIso8601String(),
             'leaveBalance' => $this->getBalanceForApp($app),
+            'certificationLeaveCredits' => $this->getCertificationLeaveCredits($app),
+        ];
+    }
+
+    private function formatEmployeeFullName(Employee $employee): string
+    {
+        return trim(implode(' ', array_filter([
+            trim((string) ($employee->firstname ?? '')),
+            trim((string) ($employee->middlename ?? '')),
+            trim((string) ($employee->surname ?? '')),
+        ], fn(string $part) => $part !== '')));
+    }
+
+    private function buildActorDirectory(Collection $applications, array $employeesByControlNo): array
+    {
+        $adminIds = [];
+        $hrIds = [];
+
+        foreach ($applications as $application) {
+            if (!$application instanceof LeaveApplication) {
+                continue;
+            }
+
+            if ($application->admin_id) {
+                $adminIds[] = (int) $application->admin_id;
+            }
+
+            if ($application->hr_id) {
+                $hrIds[] = (int) $application->hr_id;
+            }
+
+            if (!$application->relationLoaded('logs')) {
+                continue;
+            }
+
+            foreach ($application->logs as $log) {
+                if (!$log instanceof LeaveApplicationLog || !$log->performed_by_id) {
+                    continue;
+                }
+
+                $performerType = strtoupper((string) $log->performed_by_type);
+                if ($performerType === LeaveApplicationLog::PERFORMER_ADMIN) {
+                    $adminIds[] = (int) $log->performed_by_id;
+                } elseif ($performerType === LeaveApplicationLog::PERFORMER_HR) {
+                    $hrIds[] = (int) $log->performed_by_id;
+                }
+            }
+        }
+
+        $adminIds = array_values(array_unique(array_filter($adminIds)));
+        $hrIds = array_values(array_unique(array_filter($hrIds)));
+
+        $adminNamesById = DepartmentAdmin::query()
+            ->whereIn('id', $adminIds)
+            ->pluck('full_name', 'id')
+            ->map(fn($name) => trim((string) $name))
+            ->all();
+
+        $hrNamesById = HRAccount::query()
+            ->whereIn('id', $hrIds)
+            ->pluck('full_name', 'id')
+            ->map(fn($name) => trim((string) $name))
+            ->all();
+
+        $employeeNamesByControlNo = collect($employeesByControlNo)
+            ->mapWithKeys(function (Employee $employee, string $normalizedControlNo) {
+                $name = $this->formatEmployeeFullName($employee);
+                return [$normalizedControlNo => $name !== '' ? $name : null];
+            })
+            ->all();
+
+        return [
+            'admin' => $adminNamesById,
+            'hr' => $hrNamesById,
+            'employee' => $employeeNamesByControlNo,
+        ];
+    }
+
+    private function resolvePerformerName(
+        ?LeaveApplicationLog $log,
+        array $actorDirectory,
+        string $fallbackEmployeeName = ''
+    ): ?string
+    {
+        if (!$log) {
+            return null;
+        }
+
+        $performerType = strtoupper((string) $log->performed_by_type);
+        $performerId = (int) $log->performed_by_id;
+        if ($performerId <= 0) {
+            return null;
+        }
+
+        if ($performerType === LeaveApplicationLog::PERFORMER_ADMIN) {
+            return $actorDirectory['admin'][$performerId] ?? null;
+        }
+
+        if ($performerType === LeaveApplicationLog::PERFORMER_HR) {
+            return $actorDirectory['hr'][$performerId] ?? null;
+        }
+
+        if ($performerType === LeaveApplicationLog::PERFORMER_EMPLOYEE) {
+            $controlNo = $this->normalizeControlNo($performerId);
+            return $actorDirectory['employee'][$controlNo] ?? ($fallbackEmployeeName !== '' ? $fallbackEmployeeName : null);
+        }
+
+        return null;
+    }
+
+    private function isCancelledRemark(mixed $remarks): bool
+    {
+        return (bool) preg_match('/^cancelled\b/i', trim((string) ($remarks ?? '')));
+    }
+
+    /**
+     * Return Vacation and Sick leave credits for 7.A CERTIFICATION OF LEAVE CREDITS.
+     * Keys: vacation, sick. Each has total_earned, less_this_application, balance (numbers).
+     */
+    private function getCertificationLeaveCredits(LeaveApplication $app): array
+    {
+        $vacationType = LeaveType::where('name', 'Vacation Leave')->first();
+        $sickType = LeaveType::where('name', 'Sick Leave')->first();
+        $vacId = $vacationType?->id;
+        $sickId = $sickType?->id;
+        $year = now()->year;
+
+        $vacBalance = 0.0;
+        $sickBalance = 0.0;
+
+        if ($app->erms_control_no) {
+            if ($vacId) {
+                $b = LeaveBalance::where('employee_id', $app->erms_control_no)
+                    ->where('leave_type_id', $vacId)
+                    ->first();
+                $vacBalance = $b ? (float) $b->balance : 0.0;
+            }
+            if ($sickId) {
+                $b = LeaveBalance::where('employee_id', $app->erms_control_no)
+                    ->where('leave_type_id', $sickId)
+                    ->first();
+                $sickBalance = $b ? (float) $b->balance : 0.0;
+            }
+        } elseif ($app->applicant_admin_id) {
+            if ($vacId) {
+                $b = AdminLeaveBalance::where('admin_id', $app->applicant_admin_id)
+                    ->where('leave_type_id', $vacId)
+                    ->where('year', $year)
+                    ->first();
+                $vacBalance = $b ? (float) $b->balance : 0.0;
+            }
+            if ($sickId) {
+                $b = AdminLeaveBalance::where('admin_id', $app->applicant_admin_id)
+                    ->where('leave_type_id', $sickId)
+                    ->where('year', $year)
+                    ->first();
+                $sickBalance = $b ? (float) $b->balance : 0.0;
+            }
+        }
+
+        $days = (float) $app->total_days;
+        $vacLess = ($app->leave_type_id == $vacId) ? $days : 0.0;
+        $sickLess = ($app->leave_type_id == $sickId) ? $days : 0.0;
+
+        return [
+            'vacation' => [
+                'total_earned' => $vacBalance,
+                'less_this_application' => $vacLess,
+                'balance' => $vacBalance - $vacLess,
+            ],
+            'sick' => [
+                'total_earned' => $sickBalance,
+                'less_this_application' => $sickLess,
+                'balance' => $sickBalance - $sickLess,
+            ],
+            'as_of_date' => $app->created_at?->format('F j, Y') ?? now()->format('F j, Y'),
         ];
     }
 
     private function getBalanceForApp(LeaveApplication $app): ?float
     {
-        if ($app->employee_id) {
-            $balance = LeaveBalance::where('employee_id', $app->employee_id)
+        if ($app->erms_control_no) {
+            $balance = LeaveBalance::where('employee_id', $app->erms_control_no)
                 ->where('leave_type_id', $app->leave_type_id)
                 ->first();
             return $balance ? (float) $balance->balance : null;

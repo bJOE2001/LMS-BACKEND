@@ -3,7 +3,6 @@
 namespace App\Http\Requests\Auth;
 
 use App\Models\DepartmentAdmin;
-use App\Models\EmployeeAccount;
 use App\Models\HRAccount;
 use Illuminate\Auth\Events\Lockout;
 use Illuminate\Foundation\Http\FormRequest;
@@ -56,13 +55,6 @@ class LoginRequest extends FormRequest
         }
 
         $account = DepartmentAdmin::where('username', $username)->first();
-        if ($account && Hash::check($password, $account->getAuthPassword())) {
-            Auth::guard('web')->setUser($account);
-            RateLimiter::clear($this->throttleKey());
-            return;
-        }
-
-        $account = EmployeeAccount::where('username', $username)->first();
         if ($account && Hash::check($password, $account->getAuthPassword())) {
             Auth::guard('web')->setUser($account);
             RateLimiter::clear($this->throttleKey());

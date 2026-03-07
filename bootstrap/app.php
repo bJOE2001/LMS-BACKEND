@@ -12,7 +12,12 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware): void {
-        //
+        $middleware->throttleApi();
+
+        $middleware->alias([
+            'hr' => \App\Http\Middleware\EnsureHR::class,
+            'erms.auth' => \App\Http\Middleware\VerifyERMSApiKey::class,
+        ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         //

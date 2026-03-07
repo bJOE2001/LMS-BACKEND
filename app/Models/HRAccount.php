@@ -14,7 +14,7 @@ class HRAccount extends Model implements AuthenticatableContract
 {
     use HasApiTokens;
 
-    protected $table = 'hr_accounts';
+    protected $table = 'tblHRAccounts';
 
     protected $fillable = [
         'full_name',

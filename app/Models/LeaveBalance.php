@@ -11,7 +11,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  */
 class LeaveBalance extends Model
 {
-    protected $table = 'leave_balances';
+    protected $table = 'tblLeaveBalances';
 
     protected $fillable = [
         'employee_id',

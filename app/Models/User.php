@@ -20,7 +20,6 @@ class User extends Authenticatable
      * Valid department-level roles.
      */
     public const ROLE_ADMIN = 'ADMIN';
-    public const ROLE_HEAD  = 'HEAD';
 
     /**
      * The attributes that are mass assignable.
@@ -77,14 +76,6 @@ class User extends Authenticatable
     public function isDepartmentAdmin(): bool
     {
         return $this->role === self::ROLE_ADMIN;
-    }
-
-    /**
-     * Check if the user is a department head.
-     */
-    public function isDepartmentHead(): bool
-    {
-        return $this->role === self::ROLE_HEAD;
     }
 
     /**

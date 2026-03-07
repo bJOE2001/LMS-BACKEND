@@ -5,7 +5,6 @@ namespace App\Http\Controllers\Auth;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Auth\LoginRequest;
 use App\Models\DepartmentAdmin;
-use App\Models\EmployeeAccount;
 use App\Models\HRAccount;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -15,8 +14,6 @@ class AuthController extends Controller
 {
     private const DASHBOARD_HR = '/hr/dashboard';
     private const DASHBOARD_DEPARTMENT_ADMIN = '/admin/dashboard';
-    private const DASHBOARD_EMPLOYEE = '/employee/dashboard';
-    private const CHANGE_PASSWORD_EMPLOYEE = '/employee/change-password';
 
     /**
      * Handle a login request — authenticate via hr_accounts or department_admins, issue Sanctum token.
@@ -26,10 +23,14 @@ class AuthController extends Controller
         $request->authenticate();
 
         $account = $request->user();
+        $tokenExpirationMinutes = (int) config('sanctum.expiration', 120);
+        $tokenExpiresAt = $tokenExpirationMinutes > 0
+            ? now()->addMinutes($tokenExpirationMinutes)
+            : null;
 
-        $token = DB::transaction(function () use ($account) {
+        $token = DB::transaction(function () use ($account, $tokenExpiresAt) {
             $account->tokens()->delete();
-            return $account->createToken('auth-token')->plainTextToken;
+            return $account->createToken('auth-token', ['*'], $tokenExpiresAt)->plainTextToken;
         });
 
         [$userPayload, $dashboardRoute] = $this->formatAccount($account);
@@ -40,11 +41,6 @@ class AuthController extends Controller
             'dashboard_route' => $dashboardRoute,
             'token' => $token,
         ];
-
-        if ($account instanceof EmployeeAccount && $account->must_change_password) {
-            $response['must_change_password'] = true;
-            $response['redirect_to'] = self::CHANGE_PASSWORD_EMPLOYEE;
-        }
 
         return response()->json($response);
     }
@@ -76,10 +72,10 @@ class AuthController extends Controller
     }
 
     /**
-     * @param HRAccount|DepartmentAdmin|EmployeeAccount $account
+     * @param HRAccount|DepartmentAdmin $account
      * @return array{0: array, 1: string}
      */
-    private function formatAccount(HRAccount|DepartmentAdmin|EmployeeAccount $account): array
+    private function formatAccount(HRAccount|DepartmentAdmin $account): array
     {
         if ($account instanceof HRAccount) {
             return [
@@ -90,33 +86,6 @@ class AuthController extends Controller
                     'role' => 'hr',
                 ],
                 self::DASHBOARD_HR,
-            ];
-        }
-
-        if ($account instanceof EmployeeAccount) {
-            $account->loadMissing(['employee', 'employee.department']);
-            $emp = $account->employee;
-            $name = $emp
-                ? trim($emp->first_name . ' ' . $emp->last_name)
-                : $account->username;
-            $department = $emp && $emp->department ? ['id' => $emp->department->id, 'name' => $emp->department->name] : null;
-
-            return [
-                [
-                    'id' => $account->id,
-                    'employee_id' => $account->employee_id,
-                    'name' => $name,
-                    'first_name' => $emp?->first_name,
-                    'last_name' => $emp?->last_name,
-                    'username' => $account->username,
-                    'role' => 'employee',
-                    'must_change_password' => $account->must_change_password,
-                    'department_id' => $emp?->department_id,
-                    'department' => $department,
-                    'department_name' => $department['name'] ?? null,
-                    'position' => $emp?->position,
-                ],
-                $account->must_change_password ? self::CHANGE_PASSWORD_EMPLOYEE : self::DASHBOARD_EMPLOYEE,
             ];
         }
 

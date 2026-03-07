@@ -11,7 +11,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
  */
 class LeaveType extends Model
 {
-    protected $table = 'leave_types';
+    protected $table = 'tblLeaveTypes';
 
     protected $fillable = [
         'name',
@@ -63,5 +63,15 @@ class LeaveType extends Model
     public function leaveBalances(): HasMany
     {
         return $this->hasMany(LeaveBalance::class);
+    }
+
+    public function leaveApplications(): HasMany
+    {
+        return $this->hasMany(LeaveApplication::class);
+    }
+
+    public function adminLeaveBalances(): HasMany
+    {
+        return $this->hasMany(AdminLeaveBalance::class);
     }
 }

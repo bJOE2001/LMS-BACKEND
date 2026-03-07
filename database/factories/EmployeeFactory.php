@@ -11,33 +11,53 @@ use Illuminate\Database\Eloquent\Factories\Factory;
  */
 class EmployeeFactory extends Factory
 {
-    private const POSITIONS = [
-        'Staff',
-        'Officer',
-        'Clerk',
-        'Specialist',
-        'Analyst',
-        'Coordinator',
-        'Assistant',
-        'Representative',
+    private const DESIGNATIONS = [
+        'Administrative Aide I',
+        'Administrative Aide III',
+        'Administrative Officer I',
+        'Administrative Officer III',
+        'Administrative Officer V',
+        'Clerk III',
+        'Engineer II',
+        'Accountant I',
+        'Records Officer I',
+        'Planning Officer II',
     ];
+
+    private const STATUSES = [
+        'CO-TERMINOUS',
+        'ELECTIVE',
+        'CASUAL',
+        'REGULAR',
+    ];
+
+    private static int $sequence = 0;
 
     public function definition(): array
     {
+        self::$sequence++;
+        $controlNo = str_pad((string) self::$sequence, 6, '0', STR_PAD_LEFT);
+        $department = Department::inRandomOrder()->first();
+
         return [
-            'department_id' => Department::factory(),
-            'first_name'     => fake()->firstName(),
-            'last_name'      => fake()->lastName(),
-            'birthdate'      => fake()->dateTimeBetween('-50 years', '-18 years')->format('Y-m-d'),
-            'position'       => fake()->randomElement(self::POSITIONS),
-            'status'         => fake()->randomElement(Employee::STATUSES),
+            'control_no'  => $controlNo,
+            'surname'     => fake()->lastName(),
+            'firstname'   => fake()->firstName(),
+            'middlename'  => fake()->optional(0.7)->lastName(),
+            'office'      => $department?->name ?? 'General Services',
+            'status'      => fake()->randomElement(self::STATUSES),
+            'designation' => fake()->randomElement(self::DESIGNATIONS),
+            'rate_mon'    => fake()->randomFloat(2, 10000, 80000),
         ];
     }
 
+    /**
+     * Assign the employee to a specific department (by office name).
+     */
     public function forDepartment(Department $department): static
     {
         return $this->state(fn (array $attributes) => [
-            'department_id' => $department->id,
+            'office' => $department->name,
         ]);
     }
 }

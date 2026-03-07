@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\LeaveApplication;
 use App\Models\Notification;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -19,7 +20,12 @@ class NotificationController extends Controller
     {
         $user = $request->user();
 
-        $notifications = Notification::where('notifiable_type', get_class($user))
+        $notifications = Notification::with([
+            'leaveApplication.leaveType',
+            'leaveApplication.employee',
+            'leaveApplication.applicantAdmin.department',
+        ])
+            ->where('notifiable_type', get_class($user))
             ->where('notifiable_id', $user->id)
             ->orderByDesc('created_at')
             ->limit(50)
@@ -30,6 +36,7 @@ class NotificationController extends Controller
                 'title' => $n->title,
                 'message' => $n->message,
                 'leave_application_id' => $n->leave_application_id,
+                'leave_application' => $this->formatLeaveApplication($n->leaveApplication),
                 'read_at' => $n->read_at?->toIso8601String(),
                 'created_at' => $n->created_at->toIso8601String(),
             ]);
@@ -70,6 +77,33 @@ class NotificationController extends Controller
     }
 
     /**
+     * GET /notifications/{id}/application — fetch linked leave application details for one notification.
+     */
+    public function applicationDetails(Request $request, int $id): JsonResponse
+    {
+        $user = $request->user();
+
+        $notification = Notification::where('notifiable_type', get_class($user))
+            ->where('notifiable_id', $user->id)
+            ->where('id', $id)
+            ->firstOrFail();
+
+        if (!$notification->leave_application_id) {
+            return response()->json([
+                'application' => null,
+                'message' => 'Notification is not linked to a leave application.',
+            ]);
+        }
+
+        $application = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin.department'])
+            ->find($notification->leave_application_id);
+
+        return response()->json([
+            'application' => $this->formatLeaveApplication($application),
+        ]);
+    }
+
+    /**
      * DELETE /notifications/{id} — dismiss/delete a notification.
      */
     public function destroy(Request $request, int $id): JsonResponse
@@ -84,5 +118,52 @@ class NotificationController extends Controller
         $notification->delete();
 
         return response()->json(['message' => 'Notification deleted.']);
+    }
+
+    private function formatLeaveApplication(?LeaveApplication $application): ?array
+    {
+        if (!$application) {
+            return null;
+        }
+
+        $employeeName = trim(($application->employee?->firstname ?? '') . ' ' . ($application->employee?->surname ?? ''));
+        if ($employeeName === '') {
+            $employeeName = $application->applicantAdmin?->full_name ?: null;
+        }
+
+        return [
+            'id' => $application->id,
+            'employee_id' => $application->erms_control_no,
+            'applicant_admin_id' => $application->applicant_admin_id,
+            'applicant_name' => $employeeName,
+            'office' => $application->employee?->office ?? $application->applicantAdmin?->department?->name,
+            'leave_type_id' => $application->leave_type_id,
+            'leave_type_name' => $application->leaveType?->name,
+            'start_date' => $application->start_date?->toDateString(),
+            'end_date' => $application->end_date?->toDateString(),
+            'total_days' => (float) $application->total_days,
+            'reason' => $application->reason,
+            'status' => $this->toReadableStatus($application->status),
+            'raw_status' => $application->status,
+            'remarks' => $application->remarks,
+            'selected_dates' => $application->selected_dates,
+            'commutation' => $application->commutation,
+            'is_monetization' => (bool) $application->is_monetization,
+            'equivalent_amount' => $application->equivalent_amount !== null ? (float) $application->equivalent_amount : null,
+            'date_filed' => $application->created_at?->toDateString(),
+            'admin_approved_at' => $application->admin_approved_at?->toIso8601String(),
+            'hr_approved_at' => $application->hr_approved_at?->toIso8601String(),
+        ];
+    }
+
+    private function toReadableStatus(?string $status): string
+    {
+        return match ($status) {
+            LeaveApplication::STATUS_PENDING_ADMIN => 'Pending Admin',
+            LeaveApplication::STATUS_PENDING_HR => 'Pending HR',
+            LeaveApplication::STATUS_APPROVED => 'Approved',
+            LeaveApplication::STATUS_REJECTED => 'Rejected',
+            default => (string) $status,
+        };
     }
 }

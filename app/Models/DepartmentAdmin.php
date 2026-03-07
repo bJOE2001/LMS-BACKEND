@@ -16,7 +16,7 @@ class DepartmentAdmin extends Model implements AuthenticatableContract
 {
     use HasApiTokens;
 
-    protected $table = 'department_admins';
+    protected $table = 'tblDepartmentAdmins';
 
     protected $fillable = [
         'department_id',

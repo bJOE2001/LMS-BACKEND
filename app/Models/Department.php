@@ -14,6 +14,8 @@ class Department extends Model
 {
     use HasFactory;
 
+    protected $table = 'tblDepartments';
+
     protected $fillable = [
         'name',
     ];
@@ -23,7 +25,7 @@ class Department extends Model
         return $this->hasOne(DepartmentAdmin::class, 'department_id');
     }
 
-    public function head(): HasOne
+    public function departmentHead(): HasOne
     {
         return $this->hasOne(DepartmentHead::class, 'department_id');
     }

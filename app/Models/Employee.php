@@ -6,82 +6,85 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
-use Illuminate\Database\Eloquent\Relations\HasOne;
 
 /**
- * Employee model — local LMS_DB employees table.
+ * Employee model for local LMS employee records.
  *
- * This is separate from HrisEmployee which reads from the
- * remote pmis2003.vwActive view (READ-ONLY).
+ * Active columns:
+ * - control_no (PK)
+ * - surname
+ * - firstname
+ * - middlename
+ * - office
+ * - status
+ * - designation
+ * - rate_mon
  */
 class Employee extends Model
 {
     use HasFactory;
 
+    protected $table = 'tblEmployees';
+
+    protected $primaryKey = 'control_no';
+    public $incrementing = false;
+    protected $keyType = 'string';
+
     protected $fillable = [
-        'department_id',
-        'first_name',
-        'last_name',
-        'birthdate',
-        'position',
+        'control_no',
+        'surname',
+        'firstname',
+        'middlename',
+        'office',
         'status',
-        'leave_initialized',
+        'designation',
+        'rate_mon',
     ];
 
-    /**
-     * The attributes that should be cast.
-     */
     protected function casts(): array
     {
         return [
-            'birthdate'         => 'date',
-            'status'            => 'string',
-            'leave_initialized' => 'boolean',
+            'rate_mon' => 'decimal:2',
         ];
     }
 
     /**
-     * Valid status values.
-     */
-    public const STATUSES = [
-        'CO-TERMINOUS',
-        'ELECTIVE',
-        'CASUAL',
-        'REGULAR',
-    ];
-
-    // ─── Relationships ───────────────────────────────────────────────
-
-    /**
-     * The department this employee belongs to.
+     * Resolve department by matching office name to departments.name.
      */
     public function department(): BelongsTo
     {
-        return $this->belongsTo(Department::class);
-    }
-
-    public function employeeAccount(): HasOne
-    {
-        return $this->hasOne(EmployeeAccount::class);
+        return $this->belongsTo(Department::class, 'office', 'name');
     }
 
     public function leaveApplications(): HasMany
     {
-        return $this->hasMany(LeaveApplication::class);
+        return $this->hasMany(LeaveApplication::class, 'erms_control_no', 'control_no');
     }
 
     public function leaveBalances(): HasMany
     {
-        return $this->hasMany(LeaveBalance::class);
+        return $this->hasMany(LeaveBalance::class, 'employee_id');
     }
 
-    // ─── Accessors ───────────────────────────────────────────────────
-
-    /**
-     * Full name accessor.
-     */
     public function getFullNameAttribute(): string
     {
-        return "{$this->first_name} {$this->last_name}";
+        return trim("{$this->firstname} {$this->surname}");
+    }
+
+    /**
+     * HRIS-to-LMS field map for supported employee columns.
+     */
+    public static function hrisColumnMap(): array
+    {
+        return [
+            'ControlNo' => 'control_no',
+            'Surname' => 'surname',
+            'Firstname' => 'firstname',
+            'Middlename' => 'middlename',
+            'Office' => 'office',
+            'Status' => 'status',
+            'Designation' => 'designation',
+            'RateMon' => 'rate_mon',
+        ];
     }
 }

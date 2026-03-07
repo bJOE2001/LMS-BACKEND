@@ -43,11 +43,9 @@ class Office extends Model
     protected $keyType = 'string';
 
     /**
-     * Columns to select by default for department head listings.
+     * Minimal column set for office listings.
      */
-    public const DEPARTMENT_HEAD_COLUMNS = [
+    public const OFFICE_COLUMNS = [
         'Office',
-        'DefHead',
-        'DefHeadP',
     ];
 }

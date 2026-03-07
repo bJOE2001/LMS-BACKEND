@@ -18,18 +18,16 @@ class DatabaseSeeder extends Seeder
      */
     public function run(): void
     {
-        if (! app()->environment('local')) {
+        if (!app()->environment('local')) {
             exit('Seeding allowed in local environment only.');
         }
 
         $this->call([
-            RoleAndPermissionSeeder::class,
-            HRAccountSeeder::class,
             DepartmentSeeder::class,
+            HRAccountSeeder::class,
             DepartmentAdminSeeder::class,
-            DepartmentHeadSeeder::class,
-            EmployeeSeeder::class,
             LeaveTypeSeeder::class,
+            LeaveBalanceSeeder::class,
         ]);
     }
 }

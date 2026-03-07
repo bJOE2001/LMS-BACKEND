@@ -4,34 +4,55 @@ namespace Database\Seeders;
 
 use App\Models\Department;
 use Illuminate\Database\Seeder;
+use Illuminate\Support\Facades\DB;
 
 /**
- * LOCAL DEVELOPMENT ONLY — seeds LMS_DB.
- * Does NOT connect to pmis2003 or BIOASD.
+ * LOCAL DEVELOPMENT ONLY - syncs departments from tblEmployees.office.
  */
 class DepartmentSeeder extends Seeder
 {
-    private const DEPARTMENTS = [
-        'Human Resources',
-        'Information Technology',
-        'Accounting',
-        'Engineering',
-        'Administration',
-    ];
-
     public function run(): void
     {
         if (! app()->environment('local')) {
             exit('Seeding allowed in local environment only.');
         }
 
-        \DB::transaction(function (): void {
-            foreach (self::DEPARTMENTS as $name) {
-                Department::firstOrCreate(
-                    ['name' => $name],
-                    ['name' => $name]
+        $officeNames = DB::table('tblEmployees')
+            ->selectRaw('LTRIM(RTRIM(office)) as office')
+            ->whereNotNull('office')
+            ->whereRaw("LTRIM(RTRIM(office)) <> ''")
+            ->distinct()
+            ->orderBy('office')
+            ->pluck('office')
+            ->filter()
+            ->values();
+
+        if ($officeNames->isEmpty()) {
+            $this->command?->warn('No employee office values found in tblEmployees. Departments were not changed.');
+            return;
+        }
+
+        DB::transaction(function () use ($officeNames): void {
+            $now = now();
+
+            $existing = Department::query()->pluck('name');
+            $toInsert = $officeNames->diff($existing)->values();
+
+            if ($toInsert->isNotEmpty()) {
+                DB::table('tblDepartments')->insert(
+                    $toInsert->map(fn (string $name): array => [
+                        'name' => $name,
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ])->all()
                 );
             }
+
+            // Keep departments aligned with employee offices, but never break admin FKs.
+            Department::query()
+                ->whereNotIn('name', $officeNames->all())
+                ->whereDoesntHave('admin')
+                ->delete();
         });
     }
 }

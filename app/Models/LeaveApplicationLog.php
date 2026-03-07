@@ -13,7 +13,7 @@ class LeaveApplicationLog extends Model
 {
     public $timestamps = false;
 
-    protected $table = 'leave_application_logs';
+    protected $table = 'tblLeaveApplicationLogs';
 
     protected $fillable = [
         'leave_application_id',

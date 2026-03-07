@@ -7,6 +7,8 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 class AdminLeaveBalance extends Model
 {
+    protected $table = 'tblAdminLeaveBalances';
+
     protected $fillable = [
         'admin_id',
         'leave_type_id',
