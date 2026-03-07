@@ -6,7 +6,6 @@ use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use Illuminate\Auth\Events\Lockout;
 use Illuminate\Foundation\Http\FormRequest;
-use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Str;
@@ -40,7 +39,7 @@ class LoginRequest extends FormRequest
      *
      * @throws \Illuminate\Validation\ValidationException
      */
-    public function authenticate(): void
+    public function authenticate(): HRAccount|DepartmentAdmin
     {
         $this->ensureIsNotRateLimited();
 
@@ -49,16 +48,14 @@ class LoginRequest extends FormRequest
 
         $account = HRAccount::where('username', $username)->first();
         if ($account && Hash::check($password, $account->getAuthPassword())) {
-            Auth::guard('web')->setUser($account);
             RateLimiter::clear($this->throttleKey());
-            return;
+            return $account;
         }
 
         $account = DepartmentAdmin::where('username', $username)->first();
         if ($account && Hash::check($password, $account->getAuthPassword())) {
-            Auth::guard('web')->setUser($account);
             RateLimiter::clear($this->throttleKey());
-            return;
+            return $account;
         }
 
         RateLimiter::hit($this->throttleKey());

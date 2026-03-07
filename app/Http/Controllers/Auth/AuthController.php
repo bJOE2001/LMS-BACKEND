@@ -20,9 +20,7 @@ class AuthController extends Controller
      */
     public function login(LoginRequest $request): JsonResponse
     {
-        $request->authenticate();
-
-        $account = $request->user();
+        $account = $request->authenticate();
         $tokenExpirationMinutes = (int) config('sanctum.expiration', 120);
         $tokenExpiresAt = $tokenExpirationMinutes > 0
             ? now()->addMinutes($tokenExpirationMinutes)

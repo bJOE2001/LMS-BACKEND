@@ -23,9 +23,9 @@ return [
     | Authentication Guards
     |--------------------------------------------------------------------------
     |
-    | Next, you may define every authentication guard for your application.
-    | Of course, a great default configuration has been defined for you
-    | which utilizes session storage plus the Eloquent user provider.
+    | LMS API login is handled by Sanctum personal access tokens issued for
+    | the local HRAccount and DepartmentAdmin models. The default web guard
+    | remains available for framework compatibility and non-LMS scaffolding.
     |
     | All authentication guards have a user provider, which defines how the
     | users are actually retrieved out of your database or other storage
@@ -63,6 +63,16 @@ return [
         'users' => [
             'driver' => 'eloquent',
             'model' => env('AUTH_MODEL', App\Models\User::class),
+        ],
+
+        'hr_accounts' => [
+            'driver' => 'eloquent',
+            'model' => App\Models\HRAccount::class,
+        ],
+
+        'department_admins' => [
+            'driver' => 'eloquent',
+            'model' => App\Models\DepartmentAdmin::class,
         ],
 
         // 'users' => [

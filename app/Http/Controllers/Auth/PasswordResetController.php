@@ -3,60 +3,30 @@
 namespace App\Http\Controllers\Auth;
 
 use App\Http\Controllers\Controller;
-use App\Http\Requests\Auth\ForgotPasswordRequest;
-use App\Http\Requests\Auth\ResetPasswordRequest;
 use Illuminate\Http\JsonResponse;
-use Illuminate\Support\Facades\Password;
 
 class PasswordResetController extends Controller
 {
+    private const UNSUPPORTED_MESSAGE = 'Password reset is not available for LMS accounts. Contact HR to reset your password.';
+
     /**
-     * Send a reset link to the given email.
+     * Password reset is not available for LMS accounts because local account
+     * tables do not store email addresses for broker-based recovery.
      */
-    public function forgotPassword(ForgotPasswordRequest $request): JsonResponse
+    public function forgotPassword(): JsonResponse
     {
-        $request->ensureIsNotRateLimited();
-
-        $status = Password::sendResetLink(
-            $request->only('email')
-        );
-
-        if ($status === Password::RESET_LINK_SENT) {
-            $request->throttle();
-
-            return response()->json([
-                'message' => __('If an account exists for that email, we have sent a password reset link.'),
-            ]);
-        }
-
-        // Always return the same message to prevent email enumeration
         return response()->json([
-            'message' => __('If an account exists for that email, we have sent a password reset link.'),
-        ]);
+            'message' => self::UNSUPPORTED_MESSAGE,
+        ], 501);
     }
 
     /**
-     * Reset the user's password.
+     * Password reset tokens are unsupported for LMS accounts.
      */
-    public function resetPassword(ResetPasswordRequest $request): JsonResponse
+    public function resetPassword(): JsonResponse
     {
-        $status = Password::reset(
-            $request->only('email', 'password', 'password_confirmation', 'token'),
-            function ($user, $password): void {
-                $user->forceFill([
-                    'password' => $password,
-                ])->save();
-            }
-        );
-
-        if ($status === Password::PASSWORD_RESET) {
-            return response()->json([
-                'message' => __('Your password has been reset successfully.'),
-            ]);
-        }
-
         return response()->json([
-            'message' => __('This password reset token is invalid or has expired.'),
-        ], 400);
+            'message' => self::UNSUPPORTED_MESSAGE,
+        ], 501);
     }
 }

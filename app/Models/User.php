@@ -2,24 +2,19 @@
 
 namespace App\Models;
 
-// use Illuminate\Contracts\Auth\MustVerifyEmail;
-use App\Notifications\ResetPasswordNotification;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
-use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
 use Laravel\Sanctum\HasApiTokens;
-use Spatie\Permission\Traits\HasRoles;
 
+/**
+ * Legacy Laravel scaffold model kept only for framework compatibility.
+ *
+ * LMS authentication uses HRAccount and DepartmentAdmin instead.
+ */
 class User extends Authenticatable
 {
-    /** @use HasFactory<\Database\Factories\UserFactory> */
-    use HasFactory, Notifiable, HasApiTokens, HasRoles;
-
-    /**
-     * Valid department-level roles.
-     */
-    public const ROLE_ADMIN = 'ADMIN';
+    use HasFactory, Notifiable, HasApiTokens;
 
     /**
      * The attributes that are mass assignable.
@@ -56,33 +51,5 @@ class User extends Authenticatable
             'email_verified_at' => 'datetime',
             'password' => 'hashed',
         ];
-    }
-
-    // ─── Relationships ───────────────────────────────────────────────
-
-    /**
-     * The department this user is assigned to.
-     */
-    public function department(): BelongsTo
-    {
-        return $this->belongsTo(Department::class);
-    }
-
-    // ─── Helpers ─────────────────────────────────────────────────────
-
-    /**
-     * Check if the user is a department admin.
-     */
-    public function isDepartmentAdmin(): bool
-    {
-        return $this->role === self::ROLE_ADMIN;
-    }
-
-    /**
-     * Send the password reset notification.
-     */
-    public function sendPasswordResetNotification(mixed $token): void
-    {
-        $this->notify(new ResetPasswordNotification($token));
     }
 }

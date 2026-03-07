@@ -16,6 +16,7 @@ return Application::configure(basePath: dirname(__DIR__))
 
         $middleware->alias([
             'hr' => \App\Http\Middleware\EnsureHR::class,
+            'department_admin' => \App\Http\Middleware\EnsureDepartmentAdmin::class,
             'erms.auth' => \App\Http\Middleware\VerifyERMSApiKey::class,
         ]);
     })
