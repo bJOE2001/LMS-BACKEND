@@ -203,13 +203,15 @@ class LeaveApplicationController extends Controller
         }
 
         $applications = LeaveApplication::query()
-            ->with('leaveType')
+            ->with(['leaveType', 'employee', 'applicantAdmin.department', 'logs'])
             ->where(function ($query) use ($controlNo) {
                 $query->where('erms_control_no', $controlNo)
                     ->orWhereRaw('TRY_CONVERT(INT, erms_control_no) = TRY_CONVERT(INT, ?)', [$controlNo]);
             })
             ->orderByDesc('created_at')
             ->get();
+
+        $actorDirectory = $this->buildWorkflowActorDirectory($applications);
 
         $leaveTypes = LeaveType::query()
             ->orderBy('name')
@@ -218,24 +220,9 @@ class LeaveApplicationController extends Controller
         return response()->json([
             'employee_id' => (string) $employee->control_no,
             'leave_types' => $leaveTypes,
-            'applications' => $applications->map(function (LeaveApplication $app) {
-                return [
-                    'id' => $app->id,
-                    'erms_control_no' => $app->erms_control_no ? (string) $app->erms_control_no : null,
-                    'control_no' => $app->erms_control_no ? (string) $app->erms_control_no : null,
-                    'leave_type_id' => $app->leave_type_id,
-                    'leave_type_name' => $app->leaveType?->name,
-                    'start_date' => $app->start_date?->toDateString(),
-                    'end_date' => $app->end_date?->toDateString(),
-                    'total_days' => (float) $app->total_days,
-                    'date_filed' => $app->created_at?->toDateString(),
-                    'status' => $this->ermsStatusLabel($app->status),
-                    'application_status' => $this->ermsStatusLabel($app->status),
-                    'remarks' => $app->remarks,
-                    'rejection_reason' => $app->status === LeaveApplication::STATUS_REJECTED ? $app->remarks : null,
-                    'approver_name' => null,
-                ];
-            })->values(),
+            'applications' => $applications
+                ->map(fn(LeaveApplication $app) => $this->formatErmsApplication($app, $actorDirectory))
+                ->values(),
         ]);
     }
 
@@ -1600,6 +1587,340 @@ class LeaveApplicationController extends Controller
         }
 
         return 'An employee';
+    }
+
+    private function normalizeControlNo(mixed $value): string
+    {
+        $normalized = trim((string) ($value ?? ''));
+        if ($normalized === '') {
+            return '';
+        }
+
+        if (preg_match('/^\d+$/', $normalized)) {
+            $normalized = ltrim($normalized, '0');
+            return $normalized !== '' ? $normalized : '0';
+        }
+
+        return $normalized;
+    }
+
+    private function formatEmployeeFullName(?object $employee): string
+    {
+        if (!is_object($employee)) {
+            return '';
+        }
+
+        return trim(implode(' ', array_filter([
+            trim((string) ($employee->firstname ?? $employee->first_name ?? '')),
+            trim((string) ($employee->middlename ?? $employee->middle_name ?? '')),
+            trim((string) ($employee->surname ?? $employee->last_name ?? '')),
+            trim((string) ($employee->suffix ?? '')),
+        ], static fn(string $part): bool => $part !== '')));
+    }
+
+    private function buildWorkflowActorDirectory(iterable $applications): array
+    {
+        $adminIds = [];
+        $hrIds = [];
+        $employeeNamesByControlNo = [];
+
+        foreach ($applications as $application) {
+            if (!$application instanceof LeaveApplication) {
+                continue;
+            }
+
+            if ($application->admin_id) {
+                $adminIds[] = (int) $application->admin_id;
+            }
+
+            if ($application->hr_id) {
+                $hrIds[] = (int) $application->hr_id;
+            }
+
+            $employeeControlNo = $this->normalizeControlNo($application->erms_control_no);
+            if ($employeeControlNo !== '') {
+                $employeeName = $this->formatEmployeeFullName($application->employee);
+                if ($employeeName === '') {
+                    $employeeName = trim((string) ($application->applicantAdmin?->full_name ?? ''));
+                }
+                if ($employeeName !== '') {
+                    $employeeNamesByControlNo[$employeeControlNo] = $employeeName;
+                }
+            }
+
+            if (!$application->relationLoaded('logs')) {
+                continue;
+            }
+
+            foreach ($application->logs as $log) {
+                if (!$log instanceof LeaveApplicationLog || !$log->performed_by_id) {
+                    continue;
+                }
+
+                $performerType = strtoupper((string) $log->performed_by_type);
+                if ($performerType === LeaveApplicationLog::PERFORMER_ADMIN) {
+                    $adminIds[] = (int) $log->performed_by_id;
+                } elseif ($performerType === LeaveApplicationLog::PERFORMER_HR) {
+                    $hrIds[] = (int) $log->performed_by_id;
+                }
+            }
+        }
+
+        $adminIds = array_values(array_unique(array_filter($adminIds)));
+        $hrIds = array_values(array_unique(array_filter($hrIds)));
+
+        $adminNamesById = DepartmentAdmin::query()
+            ->whereIn('id', $adminIds)
+            ->pluck('full_name', 'id')
+            ->map(fn($name) => trim((string) $name))
+            ->all();
+
+        $hrNamesById = HRAccount::query()
+            ->whereIn('id', $hrIds)
+            ->pluck('full_name', 'id')
+            ->map(fn($name) => trim((string) $name))
+            ->all();
+
+        return [
+            'admin' => $adminNamesById,
+            'hr' => $hrNamesById,
+            'employee' => $employeeNamesByControlNo,
+        ];
+    }
+
+    private function resolveWorkflowPerformerName(
+        ?LeaveApplicationLog $log,
+        array $actorDirectory,
+        string $fallbackEmployeeName = ''
+    ): ?string {
+        if (!$log) {
+            return null;
+        }
+
+        $performerType = strtoupper((string) $log->performed_by_type);
+        $performerId = (int) $log->performed_by_id;
+        if ($performerId <= 0) {
+            return null;
+        }
+
+        if ($performerType === LeaveApplicationLog::PERFORMER_ADMIN) {
+            return $actorDirectory['admin'][$performerId] ?? null;
+        }
+
+        if ($performerType === LeaveApplicationLog::PERFORMER_HR) {
+            return $actorDirectory['hr'][$performerId] ?? null;
+        }
+
+        if ($performerType === LeaveApplicationLog::PERFORMER_EMPLOYEE) {
+            $controlNo = $this->normalizeControlNo($performerId);
+            return $actorDirectory['employee'][$controlNo] ?? ($fallbackEmployeeName !== '' ? $fallbackEmployeeName : null);
+        }
+
+        return null;
+    }
+
+    private function isCancelledRemark(mixed $remarks): bool
+    {
+        return (bool) preg_match('/^cancelled\b/i', trim((string) ($remarks ?? '')));
+    }
+
+    private function mapWorkflowLogStage(LeaveApplicationLog $log): string
+    {
+        $remarks = trim((string) ($log->remarks ?? ''));
+        $performerType = strtoupper((string) $log->performed_by_type);
+
+        if ($log->action === LeaveApplicationLog::ACTION_SUBMITTED && preg_match('/^edit requested\b/i', $remarks)) {
+            return 'employee requested edit';
+        }
+
+        if (
+            $log->action === LeaveApplicationLog::ACTION_ADMIN_REJECTED
+            && $performerType === LeaveApplicationLog::PERFORMER_EMPLOYEE
+            && $this->isCancelledRemark($remarks)
+        ) {
+            return 'employee cancelled';
+        }
+
+        return match ($log->action) {
+            LeaveApplicationLog::ACTION_SUBMITTED => match ($performerType) {
+                LeaveApplicationLog::PERFORMER_ADMIN => 'department admin submitted',
+                LeaveApplicationLog::PERFORMER_HR => 'hr submitted',
+                default => 'employee submitted',
+            },
+            LeaveApplicationLog::ACTION_ADMIN_APPROVED => 'department admin approved',
+            LeaveApplicationLog::ACTION_ADMIN_REJECTED => 'department admin rejected',
+            LeaveApplicationLog::ACTION_HR_APPROVED => 'hr approved',
+            LeaveApplicationLog::ACTION_HR_REJECTED => 'hr rejected',
+            default => strtolower(str_replace('_', ' ', (string) $log->action)),
+        };
+    }
+
+    private function formatErmsApplication(LeaveApplication $app, array $actorDirectory): array
+    {
+        $employeeName = $this->formatEmployeeFullName($app->employee);
+        if ($employeeName === '') {
+            $employeeName = trim((string) ($app->applicantAdmin?->full_name ?? ''));
+        }
+        if ($employeeName === '') {
+            $employeeName = $this->resolveEmployeeDisplayName($app);
+        }
+
+        $logs = $app->relationLoaded('logs')
+            ? $app->logs->sortBy(fn(LeaveApplicationLog $log) => $log->created_at?->timestamp ?? 0)->values()
+            : collect();
+
+        $submittedLog = $logs->first(
+            fn(LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_SUBMITTED
+        );
+        $adminApprovedLog = $logs->first(
+            fn(LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_ADMIN_APPROVED
+        );
+        $hrApprovedLog = $logs->first(
+            fn(LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_APPROVED
+        );
+        $adminRejectedLog = $logs->first(
+            fn(LeaveApplicationLog $log) =>
+                $log->action === LeaveApplicationLog::ACTION_ADMIN_REJECTED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_ADMIN
+        );
+        $hrRejectedLog = $logs->first(
+            fn(LeaveApplicationLog $log) =>
+                $log->action === LeaveApplicationLog::ACTION_HR_REJECTED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
+        $cancelledLog = $logs->first(
+            fn(LeaveApplicationLog $log) =>
+                $log->action === LeaveApplicationLog::ACTION_ADMIN_REJECTED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_EMPLOYEE
+                && $this->isCancelledRemark($log->remarks)
+        );
+
+        $filedBy = $this->resolveWorkflowPerformerName($submittedLog, $actorDirectory, $employeeName) ?? $employeeName;
+        $adminActionBy = ($app->admin_id && isset($actorDirectory['admin'][(int) $app->admin_id]))
+            ? $actorDirectory['admin'][(int) $app->admin_id]
+            : $this->resolveWorkflowPerformerName($adminApprovedLog ?? $adminRejectedLog, $actorDirectory, $employeeName);
+        $hrActionBy = ($app->hr_id && isset($actorDirectory['hr'][(int) $app->hr_id]))
+            ? $actorDirectory['hr'][(int) $app->hr_id]
+            : $this->resolveWorkflowPerformerName($hrApprovedLog ?? $hrRejectedLog, $actorDirectory, $employeeName);
+
+        $isCancelled = $this->isCancelledRemark($app->remarks);
+        $cancelledBy = $cancelledLog
+            ? ($this->resolveWorkflowPerformerName($cancelledLog, $actorDirectory, $employeeName) ?? $employeeName)
+            : ($isCancelled ? $employeeName : null);
+
+        $disapprovedBy = null;
+        if ($app->status === LeaveApplication::STATUS_REJECTED) {
+            if ($cancelledBy) {
+                $disapprovedBy = $cancelledBy;
+            } elseif ($hrRejectedLog || $app->hr_id) {
+                $disapprovedBy = $this->resolveWorkflowPerformerName($hrRejectedLog, $actorDirectory, $employeeName)
+                    ?? $hrActionBy;
+            } elseif ($adminRejectedLog || $app->admin_id) {
+                $disapprovedBy = $this->resolveWorkflowPerformerName($adminRejectedLog, $actorDirectory, $employeeName)
+                    ?? $adminActionBy;
+            }
+        }
+
+        $adminActionAt = $adminApprovedLog?->created_at
+            ?? $adminRejectedLog?->created_at
+            ?? $app->admin_approved_at;
+        $hrActionAt = $hrApprovedLog?->created_at
+            ?? $hrRejectedLog?->created_at
+            ?? $app->hr_approved_at;
+        $cancelledAt = $cancelledLog?->created_at;
+
+        $disapprovedAt = null;
+        if ($app->status === LeaveApplication::STATUS_REJECTED) {
+            if ($cancelledAt) {
+                $disapprovedAt = $cancelledAt;
+            } elseif ($hrRejectedLog?->created_at) {
+                $disapprovedAt = $hrRejectedLog->created_at;
+            } elseif ($adminRejectedLog?->created_at) {
+                $disapprovedAt = $adminRejectedLog->created_at;
+            }
+        }
+
+        $processedBy = null;
+        $reviewedAt = null;
+
+        if ($isCancelled) {
+            $processedBy = $cancelledBy;
+            $reviewedAt = $cancelledAt;
+        } elseif ($app->status === LeaveApplication::STATUS_PENDING_HR) {
+            $processedBy = $adminActionBy;
+            $reviewedAt = $adminActionAt;
+        } elseif ($app->status === LeaveApplication::STATUS_APPROVED) {
+            $processedBy = $hrActionBy ?? $adminActionBy;
+            $reviewedAt = $hrActionAt ?? $adminActionAt;
+        } elseif ($app->status === LeaveApplication::STATUS_REJECTED) {
+            $processedBy = $disapprovedBy;
+            $reviewedAt = $disapprovedAt ?? $hrActionAt ?? $adminActionAt;
+        }
+
+        $statusHistory = $logs->map(function (LeaveApplicationLog $log) use ($actorDirectory, $employeeName) {
+            $actorName = $this->resolveWorkflowPerformerName($log, $actorDirectory, $employeeName);
+
+            return [
+                'action' => $log->action,
+                'stage' => $this->mapWorkflowLogStage($log),
+                'actor_name' => $actorName,
+                'action_by_name' => $actorName,
+                'action_by' => $actorName,
+                'performed_by_type' => strtoupper((string) $log->performed_by_type),
+                'remarks' => $log->remarks,
+                'created_at' => $log->created_at?->toIso8601String(),
+            ];
+        })->values();
+
+        $approverName = $processedBy ?? $hrActionBy ?? $adminActionBy;
+
+        return [
+            'id' => $app->id,
+            'erms_control_no' => $app->erms_control_no ? (string) $app->erms_control_no : null,
+            'control_no' => $app->erms_control_no ? (string) $app->erms_control_no : null,
+            'employee_id' => $app->erms_control_no ? (string) $app->erms_control_no : null,
+            'leave_type_id' => $app->leave_type_id,
+            'leave_type_name' => $app->leaveType?->name,
+            'start_date' => $app->start_date?->toDateString(),
+            'end_date' => $app->end_date?->toDateString(),
+            'total_days' => (float) $app->total_days,
+            'date_filed' => $app->created_at?->toDateString(),
+            'status' => $this->ermsStatusLabel($app->status),
+            'application_status' => $this->ermsStatusLabel($app->status),
+            'raw_status' => $app->status,
+            'rawStatus' => $app->status,
+            'remarks' => $app->remarks,
+            'rejection_reason' => $app->status === LeaveApplication::STATUS_REJECTED ? $app->remarks : null,
+            'employee_name' => $employeeName,
+            'applicant_name' => $employeeName,
+            'filed_by' => $filedBy,
+            'approver_name' => $approverName,
+            'adminActionBy' => $adminActionBy,
+            'admin_action_by' => $adminActionBy,
+            'admin_name' => $adminActionBy,
+            'hrActionBy' => $hrActionBy,
+            'hr_action_by' => $hrActionBy,
+            'hr_reviewer_name' => $hrActionBy,
+            'processedBy' => $processedBy,
+            'processed_by' => $processedBy,
+            'disapprovedBy' => $disapprovedBy,
+            'disapproved_by' => $disapprovedBy,
+            'cancelledBy' => $cancelledBy,
+            'cancelled_by' => $cancelledBy,
+            'reviewedAt' => $reviewedAt?->toIso8601String(),
+            'reviewed_at' => $reviewedAt?->toIso8601String(),
+            'adminActionAt' => $adminActionAt?->toIso8601String(),
+            'admin_action_at' => $adminActionAt?->toIso8601String(),
+            'hrActionAt' => $hrActionAt?->toIso8601String(),
+            'hr_action_at' => $hrActionAt?->toIso8601String(),
+            'disapprovedAt' => $disapprovedAt?->toIso8601String(),
+            'disapproved_at' => $disapprovedAt?->toIso8601String(),
+            'cancelledAt' => $cancelledAt?->toIso8601String(),
+            'cancelled_at' => $cancelledAt?->toIso8601String(),
+            'status_history' => $statusHistory,
+            'timeline_entries' => $statusHistory,
+            'timeline' => $statusHistory,
+        ];
     }
 
     private function validateRegularLeaveEligibility(
