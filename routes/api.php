@@ -100,6 +100,7 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::put('/employees/{controlNo}', [EmployeeController::class, 'update']);
         Route::delete('/employees/{controlNo}', [EmployeeController::class, 'destroy']);
         Route::get('/department-head', [EmployeeController::class, 'departmentHead']);
+        Route::post('/department-head', [EmployeeController::class, 'upsertDepartmentHead']);
         Route::put('/department-head', [EmployeeController::class, 'upsertDepartmentHead']);
         Route::delete('/department-head', [EmployeeController::class, 'deleteDepartmentHead']);
 

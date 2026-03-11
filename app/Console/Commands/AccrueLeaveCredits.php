@@ -3,9 +3,11 @@
 namespace App\Console\Commands;
 
 use App\Models\LeaveBalance;
+use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveType;
 use Illuminate\Console\Command;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
 
 /**
  * Monthly accrual: add accrual_rate to ACCRUED leave balances on the 1st of every month.
@@ -50,9 +52,23 @@ class AccrueLeaveCredits extends Command
                     continue;
                 }
 
-                $balance->balance += $type->accrual_rate;
-                $balance->last_accrual_date = $now->toDateString();
-                $balance->save();
+                DB::transaction(function () use ($balance, $type, $now): void {
+                    $balance->balance += $type->accrual_rate;
+                    $balance->last_accrual_date = $now->toDateString();
+                    $balance->save();
+
+                    LeaveBalanceAccrualHistory::updateOrCreate(
+                        [
+                            'leave_balance_id' => $balance->id,
+                            'accrual_date' => $now->toDateString(),
+                        ],
+                        [
+                            'credits_added' => (float) $type->accrual_rate,
+                            'source' => 'AUTOMATED',
+                        ]
+                    );
+                });
+
                 $totalAccrued++;
             }
         }

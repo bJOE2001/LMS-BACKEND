@@ -4,6 +4,7 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 /**
  * Per-employee leave balance for each leave type.
@@ -42,5 +43,12 @@ class LeaveBalance extends Model
     public function leaveType(): BelongsTo
     {
         return $this->belongsTo(LeaveType::class);
+    }
+
+    public function accrualHistories(): HasMany
+    {
+        return $this->hasMany(LeaveBalanceAccrualHistory::class)
+            ->orderByDesc('accrual_date')
+            ->orderByDesc('id');
     }
 }

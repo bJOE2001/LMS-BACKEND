@@ -8,6 +8,7 @@ use App\Models\HRAccount;
 use App\Models\LeaveApplication;
 use App\Models\LeaveApplicationLog;
 use App\Models\LeaveBalance;
+use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveType;
 use App\Models\Notification;
 
@@ -73,7 +74,9 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Leave type not found.'], 404);
         }
 
-        $balance = LeaveBalance::where('employee_id', $employee->control_no)
+        $balance = LeaveBalance::query()
+            ->with('accrualHistories')
+            ->where('employee_id', $employee->control_no)
             ->where('leave_type_id', $leaveTypeId)
             ->first();
 
@@ -91,6 +94,8 @@ class LeaveApplicationController extends Controller
      * Supports either:
      * - /erms/leave-balance/{leaveTypeId}?erms_control_no={controlNo}
      * - /erms/leave-balance/{controlNo}?leave_type_id={leaveTypeId}
+     *
+     * Includes accrual metadata so ERMS can show the latest Vacation/Sick leave credits.
      */
     public function ermsGetLeaveBalance(Request $request, int $id): JsonResponse
     {
@@ -128,21 +133,23 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Leave type not found.'], 404);
         }
 
-        $balance = LeaveBalance::where('employee_id', $employee->control_no)
+        $balance = LeaveBalance::query()
+            ->with('accrualHistories')
+            ->where('employee_id', $employee->control_no)
             ->where('leave_type_id', $leaveTypeId)
             ->first();
 
-        return response()->json([
+        $deductionHistoryByType = $this->loadEmployeeLeaveDeductionHistoryByType((string) $employee->control_no, $leaveTypeId);
+
+        return response()->json(array_merge([
             'employee_id' => (string) $employee->control_no,
-            'leave_type_id' => $leaveType->id,
-            'leave_type_name' => $leaveType->name,
-            'balance' => $balance ? (float) $balance->balance : 0,
-        ]);
+        ], $this->formatErmsLeaveBalancePayload($leaveType, $balance, $deductionHistoryByType[(int) $leaveTypeId] ?? [])));
     }
 
     /**
      * GET /erms/leave-balances/{controlNo}
      * API-key protected endpoint for loading all leave balances in one request.
+     * Also returns the latest Vacation/Sick accrued credits for ERMS leave cards.
      */
     public function ermsGetLeaveBalances(Request $request, string $controlNo): JsonResponse
     {
@@ -156,26 +163,38 @@ class LeaveApplicationController extends Controller
         }
 
         $types = LeaveType::query()
-            ->select(['id', 'name'])
+            ->select(['id', 'name', 'category', 'accrual_rate', 'accrual_day_of_month', 'is_credit_based'])
             ->orderBy('name')
             ->get();
 
-        $balancesByType = LeaveBalance::query()
-            ->where('employee_id', $employee->control_no)
-            ->pluck('balance', 'leave_type_id');
+        $typesByName = $types
+            ->keyBy(fn(LeaveType $type) => strtolower(trim((string) $type->name)))
+            ->all();
 
-        $balances = $types->map(function (LeaveType $type) use ($balancesByType) {
-            $raw = $balancesByType->get($type->id);
-            return [
-                'leave_type_id' => $type->id,
-                'leave_type_name' => $type->name,
-                'balance' => $raw !== null ? (float) $raw : 0.0,
-            ];
+        $balanceRecordsByType = LeaveBalance::query()
+            ->with('accrualHistories')
+            ->where('employee_id', $employee->control_no)
+            ->get()
+            ->keyBy(fn(LeaveBalance $balance) => (int) $balance->leave_type_id)
+            ->all();
+        $deductionHistoryByType = $this->loadEmployeeLeaveDeductionHistoryByType((string) $employee->control_no);
+
+        $balances = $types->map(function (LeaveType $type) use ($balanceRecordsByType, $deductionHistoryByType) {
+            $balance = $balanceRecordsByType[(int) $type->id] ?? null;
+            return $this->formatErmsLeaveBalancePayload(
+                $type,
+                $balance instanceof LeaveBalance ? $balance : null,
+                $deductionHistoryByType[(int) $type->id] ?? []
+            );
         })->values();
 
         return response()->json([
             'employee_id' => (string) $employee->control_no,
             'balances' => $balances,
+            'latest_accrued_credits' => [
+                'vacation' => $this->buildErmsAccruedLeaveCard($typesByName, $balanceRecordsByType, $deductionHistoryByType, 'Vacation Leave'),
+                'sick' => $this->buildErmsAccruedLeaveCard($typesByName, $balanceRecordsByType, $deductionHistoryByType, 'Sick Leave'),
+            ],
         ]);
     }
 
@@ -232,6 +251,8 @@ class LeaveApplicationController extends Controller
      */
     public function ermsStore(Request $request): JsonResponse
     {
+        $this->normalizeSelectedDatesInput($request);
+
         // Accept common ERMS key variants so frontend payload shape is less brittle.
         $request->merge(array_filter([
             'erms_control_no' => $request->input('erms_control_no')
@@ -282,7 +303,7 @@ class LeaveApplicationController extends Controller
         $employee = $this->findEmployeeByControlNo($controlNo);
 
         if (!$employee) {
-            return response()->json(['error' => 'Employee not found'], 404);
+            return response()->json(['message' => 'Employee record not found.'], 404);
         }
 
         $actor = (object) ['id' => (int) ltrim((string) $employee->control_no, '0')];
@@ -307,7 +328,8 @@ class LeaveApplicationController extends Controller
             (string) $employee->control_no,
             (string) $validated['start_date'],
             (string) $validated['end_date'],
-            $validated['selected_dates'] ?? null
+            $validated['selected_dates'] ?? null,
+            $validated['total_days']
         );
         if ($duplicateDateValidation instanceof JsonResponse) {
             return $duplicateDateValidation;
@@ -509,9 +531,12 @@ class LeaveApplicationController extends Controller
             );
         }
 
+        $application = $app->fresh(['leaveType', 'employee', 'applicantAdmin.department', 'logs']);
+        $actorDirectory = $this->buildWorkflowActorDirectory([$application]);
+
         return response()->json([
             'message' => 'Leave application cancelled successfully.',
-            'application' => $this->formatApplication($app->fresh('leaveType')),
+            'application' => $this->formatErmsApplication($application, $actorDirectory),
         ]);
     }
 
@@ -673,6 +698,8 @@ class LeaveApplicationController extends Controller
 
     public function store(Request $request): JsonResponse
     {
+        $this->normalizeSelectedDatesInput($request);
+
         $account = $request->user();
         if (!is_object($account)) {
             return response()->json(['message' => 'Only employee accounts can submit leave applications.'], 403);
@@ -716,7 +743,8 @@ class LeaveApplicationController extends Controller
             (string) $employee->control_no,
             (string) $validated['start_date'],
             (string) $validated['end_date'],
-            $validated['selected_dates'] ?? null
+            $validated['selected_dates'] ?? null,
+            $validated['total_days']
         );
         if ($duplicateDateValidation instanceof JsonResponse) {
             return $duplicateDateValidation;
@@ -1082,7 +1110,7 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
-        $applications = LeaveApplication::with(['leaveType'])
+        $applications = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin.department'])
             ->where('status', LeaveApplication::STATUS_PENDING_HR)
             ->orderByDesc('created_at')
             ->get();
@@ -1395,6 +1423,8 @@ class LeaveApplicationController extends Controller
      */
     public function adminStore(Request $request): JsonResponse
     {
+        $this->normalizeSelectedDatesInput($request);
+
         $admin = $request->user();
         if (!$admin instanceof DepartmentAdmin) {
             return response()->json(['message' => 'Only department admins can file leave on behalf of employees.'], 403);
@@ -1430,7 +1460,8 @@ class LeaveApplicationController extends Controller
             (string) $employee->control_no,
             (string) $validated['start_date'],
             (string) $validated['end_date'],
-            $validated['selected_dates'] ?? null
+            $validated['selected_dates'] ?? null,
+            $validated['total_days']
         );
         if ($duplicateDateValidation instanceof JsonResponse) {
             return $duplicateDateValidation;
@@ -1664,6 +1695,179 @@ class LeaveApplicationController extends Controller
             ->first();
     }
 
+    private function formatErmsLeaveBalancePayload(
+        LeaveType $leaveType,
+        ?LeaveBalance $balance,
+        array $deductionHistory = []
+    ): array
+    {
+        $accrualHistory = [];
+        if ($balance) {
+            $historyEntries = $balance->relationLoaded('accrualHistories')
+                ? $balance->accrualHistories
+                : $balance->accrualHistories()->get();
+
+            $accrualHistory = $historyEntries
+                ->map(function (LeaveBalanceAccrualHistory $entry): array {
+                    return [
+                        'accrual_date' => $entry->accrual_date?->toDateString(),
+                        'transaction_date' => $entry->accrual_date?->toDateString(),
+                        'credits_added' => (float) $entry->credits_added,
+                        'entry_type' => 'ACCRUAL',
+                        'transaction_type' => 'ACCRUAL',
+                        'label' => 'Monthly accrual',
+                        'description' => 'Monthly accrual',
+                        'source' => $entry->source,
+                        'created_at' => $entry->created_at?->toIso8601String(),
+                    ];
+                })
+                ->values()
+                ->all();
+        }
+
+        $creditHistory = array_merge($accrualHistory, $deductionHistory);
+        usort($creditHistory, function (array $left, array $right): int {
+            $leftDate = (string) ($left['transaction_date'] ?? $left['accrual_date'] ?? $left['created_at'] ?? '');
+            $rightDate = (string) ($right['transaction_date'] ?? $right['accrual_date'] ?? $right['created_at'] ?? '');
+            if ($leftDate !== $rightDate) {
+                return $leftDate < $rightDate ? 1 : -1;
+            }
+
+            $leftCreatedAt = (string) ($left['created_at'] ?? '');
+            $rightCreatedAt = (string) ($right['created_at'] ?? '');
+            if ($leftCreatedAt !== $rightCreatedAt) {
+                return $leftCreatedAt < $rightCreatedAt ? 1 : -1;
+            }
+
+            return ((int) ($right['leave_application_id'] ?? 0)) <=> ((int) ($left['leave_application_id'] ?? 0));
+        });
+
+        return [
+            'leave_type_id' => (int) $leaveType->id,
+            'leave_type_name' => $leaveType->name,
+            'balance' => $balance ? (float) $balance->balance : 0.0,
+            'is_credit_based' => (bool) $leaveType->is_credit_based,
+            'is_accrued' => $leaveType->category === LeaveType::CATEGORY_ACCRUED,
+            'accrual_rate' => $leaveType->accrual_rate !== null ? (float) $leaveType->accrual_rate : null,
+            'accrual_day_of_month' => $leaveType->accrual_day_of_month !== null ? (int) $leaveType->accrual_day_of_month : null,
+            'last_accrual_date' => $balance?->last_accrual_date?->toDateString(),
+            'accrual_history' => $accrualHistory,
+            'accrualHistory' => $accrualHistory,
+            'credit_history' => $creditHistory,
+            'creditHistory' => $creditHistory,
+            'updated_at' => $balance?->updated_at?->toIso8601String(),
+            'year' => $balance?->year !== null ? (int) $balance->year : null,
+        ];
+    }
+
+    private function buildErmsAccruedLeaveCard(
+        array $typesByName,
+        array $balanceRecordsByType,
+        array $deductionHistoryByType,
+        string $leaveTypeName
+    ): array
+    {
+        $type = $typesByName[strtolower(trim($leaveTypeName))] ?? null;
+        if (!$type instanceof LeaveType) {
+            return $this->emptyErmsLeaveBalancePayload($leaveTypeName);
+        }
+
+        $balance = $balanceRecordsByType[(int) $type->id] ?? null;
+
+        return $this->formatErmsLeaveBalancePayload(
+            $type,
+            $balance instanceof LeaveBalance ? $balance : null,
+            $deductionHistoryByType[(int) $type->id] ?? []
+        );
+    }
+
+    private function emptyErmsLeaveBalancePayload(string $leaveTypeName): array
+    {
+        return [
+            'leave_type_id' => null,
+            'leave_type_name' => $leaveTypeName,
+            'balance' => 0.0,
+            'is_credit_based' => null,
+            'is_accrued' => null,
+            'accrual_rate' => null,
+            'accrual_day_of_month' => null,
+            'last_accrual_date' => null,
+            'accrual_history' => [],
+            'accrualHistory' => [],
+            'credit_history' => [],
+            'creditHistory' => [],
+            'updated_at' => null,
+            'year' => null,
+        ];
+    }
+
+    private function loadEmployeeLeaveDeductionHistoryByType(string $controlNo, ?int $leaveTypeId = null): array
+    {
+        $applications = LeaveApplication::query()
+            ->with(['leaveType:id,name,is_credit_based'])
+            ->where('status', LeaveApplication::STATUS_APPROVED)
+            ->where(function ($query) use ($controlNo): void {
+                $query->where('erms_control_no', $controlNo)
+                    ->orWhereRaw('TRY_CONVERT(INT, erms_control_no) = TRY_CONVERT(INT, ?)', [$controlNo]);
+            })
+            ->when($leaveTypeId !== null, function ($query) use ($leaveTypeId): void {
+                $query->where('leave_type_id', $leaveTypeId);
+            })
+            ->orderByDesc('hr_approved_at')
+            ->orderByDesc('id')
+            ->get([
+                'id',
+                'erms_control_no',
+                'leave_type_id',
+                'total_days',
+                'is_monetization',
+                'status',
+                'hr_approved_at',
+                'created_at',
+            ]);
+
+        $historyByType = [];
+
+        foreach ($applications as $application) {
+            if (!$application instanceof LeaveApplication) {
+                continue;
+            }
+
+            $typeId = (int) $application->leave_type_id;
+            if ($typeId <= 0) {
+                continue;
+            }
+
+            $deductsEmployeeBalance = (bool) $application->is_monetization
+                || (bool) ($application->leaveType?->is_credit_based);
+            if (!$deductsEmployeeBalance) {
+                continue;
+            }
+
+            $approvedAt = $application->hr_approved_at ?? $application->created_at;
+            $creditsDeducted = round((float) $application->total_days, 2);
+            if ($approvedAt === null || $creditsDeducted <= 0) {
+                continue;
+            }
+
+            $historyByType[$typeId][] = [
+                'transaction_date' => $approvedAt->toDateString(),
+                'credits_added' => -$creditsDeducted,
+                'entry_type' => 'DEDUCTION',
+                'transaction_type' => 'DEDUCTION',
+                'label' => $application->is_monetization ? 'Monetization approved' : 'Leave approved',
+                'description' => $application->is_monetization
+                    ? 'Approved monetization'
+                    : 'Approved leave application',
+                'leave_application_id' => (int) $application->id,
+                'source' => 'LEAVE_APPLICATION',
+                'created_at' => $approvedAt->toIso8601String(),
+            ];
+        }
+
+        return $historyByType;
+    }
+
     private function ermsStatusLabel(string $status): string
     {
         return match ($status) {
@@ -1827,6 +2031,21 @@ class LeaveApplicationController extends Controller
         return (bool) preg_match('/^cancelled\b/i', trim((string) ($remarks ?? '')));
     }
 
+    private function extractCancellationReason(mixed $remarks): ?string
+    {
+        $normalizedRemarks = trim((string) ($remarks ?? ''));
+        if ($normalizedRemarks === '' || !$this->isCancelledRemark($normalizedRemarks)) {
+            return null;
+        }
+
+        if (preg_match('/^cancelled(?:\s+via\s+[a-z0-9 _-]+)?\s*:\s*(.+)$/i', $normalizedRemarks, $matches)) {
+            $reason = trim((string) ($matches[1] ?? ''));
+            return $reason !== '' ? $reason : null;
+        }
+
+        return null;
+    }
+
     private function mapWorkflowLogStage(LeaveApplicationLog $log): string
     {
         $remarks = trim((string) ($log->remarks ?? ''));
@@ -1906,7 +2125,9 @@ class LeaveApplicationController extends Controller
             ? $actorDirectory['hr'][(int) $app->hr_id]
             : $this->resolveWorkflowPerformerName($hrApprovedLog ?? $hrRejectedLog, $actorDirectory, $employeeName);
 
-        $isCancelled = $this->isCancelledRemark($app->remarks);
+        $isCancelled = $cancelledLog !== null || $this->isCancelledRemark($app->remarks);
+        $displayStatus = $isCancelled ? 'Cancelled' : $this->ermsStatusLabel($app->status);
+        $cancellationReason = $this->extractCancellationReason($app->remarks);
         $cancelledBy = $cancelledLog
             ? ($this->resolveWorkflowPerformerName($cancelledLog, $actorDirectory, $employeeName) ?? $employeeName)
             : ($isCancelled ? $employeeName : null);
@@ -1930,7 +2151,7 @@ class LeaveApplicationController extends Controller
         $hrActionAt = $hrApprovedLog?->created_at
             ?? $hrRejectedLog?->created_at
             ?? $app->hr_approved_at;
-        $cancelledAt = $cancelledLog?->created_at;
+        $cancelledAt = $cancelledLog?->created_at ?? ($isCancelled ? $app->updated_at : null);
 
         $disapprovedAt = null;
         if ($app->status === LeaveApplication::STATUS_REJECTED) {
@@ -1977,6 +2198,8 @@ class LeaveApplicationController extends Controller
 
         $approverName = $processedBy ?? $hrActionBy ?? $adminActionBy;
 
+        $selectedDates = $app->resolvedSelectedDates();
+
         return [
             'id' => $app->id,
             'erms_control_no' => $app->erms_control_no ? (string) $app->erms_control_no : null,
@@ -1986,14 +2209,16 @@ class LeaveApplicationController extends Controller
             'leave_type_name' => $app->leaveType?->name,
             'start_date' => $app->start_date?->toDateString(),
             'end_date' => $app->end_date?->toDateString(),
+            'selected_dates' => $selectedDates,
+            'selectedDates' => $selectedDates,
             'total_days' => (float) $app->total_days,
             'date_filed' => $app->created_at?->toDateString(),
-            'status' => $this->ermsStatusLabel($app->status),
-            'application_status' => $this->ermsStatusLabel($app->status),
+            'status' => $displayStatus,
+            'application_status' => $displayStatus,
             'raw_status' => $app->status,
             'rawStatus' => $app->status,
             'remarks' => $app->remarks,
-            'rejection_reason' => $app->status === LeaveApplication::STATUS_REJECTED ? $app->remarks : null,
+            'rejection_reason' => $app->status === LeaveApplication::STATUS_REJECTED && !$isCancelled ? $app->remarks : null,
             'employee_name' => $employeeName,
             'applicant_name' => $employeeName,
             'filed_by' => $filedBy,
@@ -2010,6 +2235,14 @@ class LeaveApplicationController extends Controller
             'disapproved_by' => $disapprovedBy,
             'cancelledBy' => $cancelledBy,
             'cancelled_by' => $cancelledBy,
+            'is_cancelled' => $isCancelled,
+            'is_canceled' => $isCancelled,
+            'cancelled' => $isCancelled,
+            'canceled' => $isCancelled,
+            'cancel_reason' => $cancellationReason,
+            'cancelReason' => $cancellationReason,
+            'cancellation_reason' => $cancellationReason,
+            'cancellationReason' => $cancellationReason,
             'reviewedAt' => $reviewedAt?->toIso8601String(),
             'reviewed_at' => $reviewedAt?->toIso8601String(),
             'adminActionAt' => $adminActionAt?->toIso8601String(),
@@ -2057,15 +2290,16 @@ class LeaveApplicationController extends Controller
         string $employeeControlNo,
         string $startDate,
         string $endDate,
-        ?array $selectedDates = null
+        ?array $selectedDates = null,
+        mixed $totalDays = null
     ): ?JsonResponse {
-        $requestedDates = $this->resolveLeaveDateSet($startDate, $endDate, $selectedDates);
+        $requestedDates = $this->resolveLeaveDateSet($startDate, $endDate, $selectedDates, $totalDays);
         if ($requestedDates === []) {
             return null;
         }
 
         $existingApplications = LeaveApplication::query()
-            ->select(['id', 'start_date', 'end_date', 'selected_dates'])
+            ->select(['id', 'start_date', 'end_date', 'selected_dates', 'total_days'])
             ->whereIn('status', [
                 LeaveApplication::STATUS_PENDING_ADMIN,
                 LeaveApplication::STATUS_PENDING_HR,
@@ -2082,7 +2316,8 @@ class LeaveApplicationController extends Controller
             $existingDates = $this->resolveLeaveDateSet(
                 $existingApplication->start_date?->toDateString(),
                 $existingApplication->end_date?->toDateString(),
-                is_array($existingApplication->selected_dates) ? $existingApplication->selected_dates : null
+                is_array($existingApplication->selected_dates) ? $existingApplication->selected_dates : null,
+                $existingApplication->total_days
             );
 
             foreach (array_intersect($requestedDates, $existingDates) as $duplicateDate) {
@@ -2116,49 +2351,14 @@ class LeaveApplicationController extends Controller
         ], 422);
     }
 
-    private function resolveLeaveDateSet(?string $startDate, ?string $endDate, ?array $selectedDates = null): array
+    private function resolveLeaveDateSet(
+        ?string $startDate,
+        ?string $endDate,
+        ?array $selectedDates = null,
+        mixed $totalDays = null
+    ): array
     {
-        $normalizedSelectedDates = [];
-        foreach ($selectedDates ?? [] as $selectedDate) {
-            if ($selectedDate === null || $selectedDate === '') {
-                continue;
-            }
-
-            try {
-                $normalizedSelectedDates[] = \Carbon\CarbonImmutable::parse((string) $selectedDate)->toDateString();
-            } catch (\Throwable) {
-                continue;
-            }
-        }
-
-        if ($normalizedSelectedDates !== []) {
-            $normalizedSelectedDates = array_values(array_unique($normalizedSelectedDates));
-            sort($normalizedSelectedDates);
-            return $normalizedSelectedDates;
-        }
-
-        if (!$startDate || !$endDate) {
-            return [];
-        }
-
-        try {
-            $cursor = \Carbon\CarbonImmutable::parse($startDate)->startOfDay();
-            $lastDate = \Carbon\CarbonImmutable::parse($endDate)->startOfDay();
-        } catch (\Throwable) {
-            return [];
-        }
-
-        if ($cursor->gt($lastDate)) {
-            return [];
-        }
-
-        $dates = [];
-        while ($cursor->lte($lastDate)) {
-            $dates[] = $cursor->toDateString();
-            $cursor = $cursor->addDay();
-        }
-
-        return $dates;
+        return LeaveApplication::resolveDateSet($startDate, $endDate, $selectedDates, $totalDays);
     }
 
     private function validateRegularLeaveEligibility(
@@ -2265,7 +2465,7 @@ class LeaveApplicationController extends Controller
             'rawStatus' => $app->status,
             'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
             'remarks' => $app->remarks,
-            'selected_dates' => $app->selected_dates,
+            'selected_dates' => $app->resolvedSelectedDates(),
             'commutation' => $app->commutation ?? 'Not Requested',
             'is_monetization' => (bool) $app->is_monetization,
             'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
@@ -2289,5 +2489,20 @@ class LeaveApplicationController extends Controller
         }
 
         return $data;
+    }
+
+    private function normalizeSelectedDatesInput(Request $request): void
+    {
+        $selectedDates = $request->input('selected_dates') ?? $request->input('selectedDates');
+        if (is_string($selectedDates)) {
+            $decoded = json_decode($selectedDates, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                $selectedDates = $decoded;
+            }
+        }
+
+        if ($selectedDates !== null && $selectedDates !== '') {
+            $request->merge(['selected_dates' => $selectedDates]);
+        }
     }
 }

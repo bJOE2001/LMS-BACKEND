@@ -146,7 +146,7 @@ class NotificationController extends Controller
             'status' => $this->toReadableStatus($application->status),
             'raw_status' => $application->status,
             'remarks' => $application->remarks,
-            'selected_dates' => $application->selected_dates,
+            'selected_dates' => $application->resolvedSelectedDates(),
             'commutation' => $application->commutation,
             'is_monetization' => (bool) $application->is_monetization,
             'equivalent_amount' => $application->equivalent_amount !== null ? (float) $application->equivalent_amount : null,

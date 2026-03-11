@@ -332,6 +332,8 @@ class AdminDashboardController extends Controller
      */
     public function storeSelfLeave(Request $request): JsonResponse
     {
+        $this->normalizeSelectedDatesInput($request);
+
         $admin = $request->user();
         if (!$admin instanceof DepartmentAdmin) {
             return response()->json(['message' => 'Only department admins can access this endpoint.'], 403);
@@ -785,7 +787,7 @@ class AdminDashboardController extends Controller
             'rawStatus' => $app->status,
             'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
             'remarks' => $app->remarks,
-            'selected_dates' => $app->selected_dates,
+            'selected_dates' => $app->resolvedSelectedDates(),
             'commutation' => $app->commutation ?? 'Not Requested',
             'is_monetization' => (bool) $app->is_monetization,
             'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
@@ -1053,5 +1055,20 @@ class AdminDashboardController extends Controller
         }
 
         return 0.0;
+    }
+
+    private function normalizeSelectedDatesInput(Request $request): void
+    {
+        $selectedDates = $request->input('selected_dates') ?? $request->input('selectedDates');
+        if (is_string($selectedDates)) {
+            $decoded = json_decode($selectedDates, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                $selectedDates = $decoded;
+            }
+        }
+
+        if ($selectedDates !== null && $selectedDates !== '') {
+            $request->merge(['selected_dates' => $selectedDates]);
+        }
     }
 }
