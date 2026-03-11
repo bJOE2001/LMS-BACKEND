@@ -64,7 +64,7 @@ class DepartmentAdminSeeder extends Seeder
                     'department_id' => $department->id,
                     'full_name' => "{$department->name} Admin",
                     'username' => $newUsername,
-                    'password' => Hash::make('password'),
+                    'password' => Hash::make('123'),
                 ]);
                 $created++;
             }

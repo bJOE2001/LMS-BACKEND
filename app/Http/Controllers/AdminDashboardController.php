@@ -83,8 +83,9 @@ class AdminDashboardController extends Controller
             ->all();
 
         $actorDirectory = $this->buildActorDirectory($applications, $employeesByControlNo);
+        $leaveBalanceDirectory = $this->buildLeaveBalanceDirectory($applications, $employeesByControlNo);
         $formatted = $applications->map(
-            fn($app) => $this->formatApplication($app, $employeesByControlNo, $actorDirectory)
+            fn($app) => $this->formatApplication($app, $employeesByControlNo, $actorDirectory, $leaveBalanceDirectory)
         );
         $kpiBreakdown = [
             'pending' => $this->buildEmploymentStatusBreakdown($pendingApps, $employeeStatusByControlNo),
@@ -637,7 +638,8 @@ class AdminDashboardController extends Controller
     private function formatApplication(
         LeaveApplication $app,
         array $employeesByControlNo = [],
-        array $actorDirectory = []
+        array $actorDirectory = [],
+        array $leaveBalanceDirectory = []
     ): array
     {
         $statusMap = [
@@ -762,6 +764,8 @@ class AdminDashboardController extends Controller
             $reviewedAt = $disapprovedAt ?? $hrActionAt ?? $adminActionAt;
         }
 
+        $currentLeaveBalances = $this->getCurrentLeaveBalancesForApp($app, $leaveBalanceDirectory);
+
         return [
             'id' => $app->id,
             'employee_id' => $app->erms_control_no,
@@ -798,8 +802,10 @@ class AdminDashboardController extends Controller
             'hrActionAt' => $hrActionAt?->toIso8601String(),
             'disapprovedAt' => $disapprovedAt?->toIso8601String(),
             'cancelledAt' => $cancelledAt?->toIso8601String(),
-            'leaveBalance' => $this->getBalanceForApp($app),
-            'certificationLeaveCredits' => $this->getCertificationLeaveCredits($app),
+            'leaveBalance' => $this->getBalanceForApp($app, $leaveBalanceDirectory),
+            'leaveBalances' => $currentLeaveBalances,
+            'employee_leave_balances' => $currentLeaveBalances,
+            'certificationLeaveCredits' => $this->getCertificationLeaveCredits($app, $leaveBalanceDirectory),
         ];
     }
 
@@ -851,17 +857,21 @@ class AdminDashboardController extends Controller
         $adminIds = array_values(array_unique(array_filter($adminIds)));
         $hrIds = array_values(array_unique(array_filter($hrIds)));
 
-        $adminNamesById = DepartmentAdmin::query()
-            ->whereIn('id', $adminIds)
-            ->pluck('full_name', 'id')
-            ->map(fn($name) => trim((string) $name))
-            ->all();
+        $adminNamesById = empty($adminIds)
+            ? []
+            : DepartmentAdmin::query()
+                ->whereIn('id', $adminIds)
+                ->pluck('full_name', 'id')
+                ->map(fn($name) => trim((string) $name))
+                ->all();
 
-        $hrNamesById = HRAccount::query()
-            ->whereIn('id', $hrIds)
-            ->pluck('full_name', 'id')
-            ->map(fn($name) => trim((string) $name))
-            ->all();
+        $hrNamesById = empty($hrIds)
+            ? []
+            : HRAccount::query()
+                ->whereIn('id', $hrIds)
+                ->pluck('full_name', 'id')
+                ->map(fn($name) => trim((string) $name))
+                ->all();
 
         $employeeNamesByControlNo = collect($employeesByControlNo)
             ->mapWithKeys(function (Employee $employee, string $normalizedControlNo) {
@@ -875,6 +885,63 @@ class AdminDashboardController extends Controller
             'hr' => $hrNamesById,
             'employee' => $employeeNamesByControlNo,
         ];
+    }
+
+    private function buildLeaveBalanceDirectory(Collection $applications, array $employeesByControlNo): array
+    {
+        $employeeControlNos = collect($employeesByControlNo)
+            ->map(fn(Employee $employee) => trim((string) $employee->control_no))
+            ->filter(fn(string $controlNo) => $controlNo !== '')
+            ->unique()
+            ->values();
+
+        $employeeBalances = $employeeControlNos->isEmpty()
+            ? []
+            : LeaveBalance::query()
+                ->with('leaveType:id,name')
+                ->whereIn('employee_id', $employeeControlNos->all())
+                ->get()
+                ->groupBy(fn(LeaveBalance $balance) => $this->normalizeControlNo($balance->employee_id))
+                ->map(fn(Collection $balances) => $this->formatLeaveBalanceSnapshot($balances))
+                ->all();
+
+        $adminIds = $applications
+            ->pluck('applicant_admin_id')
+            ->filter()
+            ->map(fn(mixed $id) => (int) $id)
+            ->unique()
+            ->values();
+
+        $adminBalances = $adminIds->isEmpty()
+            ? []
+            : AdminLeaveBalance::query()
+                ->with('leaveType:id,name')
+                ->whereIn('admin_id', $adminIds->all())
+                ->where('year', now()->year)
+                ->get()
+                ->groupBy(fn(AdminLeaveBalance $balance) => (int) $balance->admin_id)
+                ->map(fn(Collection $balances) => $this->formatLeaveBalanceSnapshot($balances))
+                ->all();
+
+        return [
+            'employee' => $employeeBalances,
+            'admin' => $adminBalances,
+        ];
+    }
+
+    private function formatLeaveBalanceSnapshot(Collection $balances): array
+    {
+        return $balances
+            ->sortBy(fn($balance) => strtolower(trim((string) ($balance->leaveType?->name ?? ''))))
+            ->values()
+            ->map(fn($balance) => [
+                'leave_type_id' => (int) $balance->leave_type_id,
+                'leave_type_name' => $balance->leaveType?->name ?? 'Unknown',
+                'balance' => (float) $balance->balance,
+                'year' => $balance->year !== null ? (int) $balance->year : null,
+                'updated_at' => $balance->updated_at?->toIso8601String(),
+            ])
+            ->all();
     }
 
     private function resolvePerformerName(
@@ -918,83 +985,73 @@ class AdminDashboardController extends Controller
      * Return Vacation and Sick leave credits for 7.A CERTIFICATION OF LEAVE CREDITS.
      * Keys: vacation, sick. Each has total_earned, less_this_application, balance (numbers).
      */
-    private function getCertificationLeaveCredits(LeaveApplication $app): array
+    private function getCertificationLeaveCredits(LeaveApplication $app, array $leaveBalanceDirectory = []): array
     {
-        $vacationType = LeaveType::where('name', 'Vacation Leave')->first();
-        $sickType = LeaveType::where('name', 'Sick Leave')->first();
-        $vacId = $vacationType?->id;
-        $sickId = $sickType?->id;
-        $year = now()->year;
-
-        $vacBalance = 0.0;
-        $sickBalance = 0.0;
-
-        if ($app->erms_control_no) {
-            if ($vacId) {
-                $b = LeaveBalance::where('employee_id', $app->erms_control_no)
-                    ->where('leave_type_id', $vacId)
-                    ->first();
-                $vacBalance = $b ? (float) $b->balance : 0.0;
-            }
-            if ($sickId) {
-                $b = LeaveBalance::where('employee_id', $app->erms_control_no)
-                    ->where('leave_type_id', $sickId)
-                    ->first();
-                $sickBalance = $b ? (float) $b->balance : 0.0;
-            }
-        } elseif ($app->applicant_admin_id) {
-            if ($vacId) {
-                $b = AdminLeaveBalance::where('admin_id', $app->applicant_admin_id)
-                    ->where('leave_type_id', $vacId)
-                    ->where('year', $year)
-                    ->first();
-                $vacBalance = $b ? (float) $b->balance : 0.0;
-            }
-            if ($sickId) {
-                $b = AdminLeaveBalance::where('admin_id', $app->applicant_admin_id)
-                    ->where('leave_type_id', $sickId)
-                    ->where('year', $year)
-                    ->first();
-                $sickBalance = $b ? (float) $b->balance : 0.0;
-            }
-        }
+        $currentLeaveBalances = $this->getCurrentLeaveBalancesForApp($app, $leaveBalanceDirectory);
+        $vacBalance = $this->findLeaveBalanceByName($currentLeaveBalances, 'Vacation Leave');
+        $sickBalance = $this->findLeaveBalanceByName($currentLeaveBalances, 'Sick Leave');
 
         $days = (float) $app->total_days;
-        $vacLess = ($app->leave_type_id == $vacId) ? $days : 0.0;
-        $sickLess = ($app->leave_type_id == $sickId) ? $days : 0.0;
+        $leaveTypeName = trim((string) ($app->leaveType?->name ?? ''));
+        $vacLess = strcasecmp($leaveTypeName, 'Vacation Leave') === 0 ? $days : 0.0;
+        $sickLess = strcasecmp($leaveTypeName, 'Sick Leave') === 0 ? $days : 0.0;
 
         return [
             'vacation' => [
                 'total_earned' => $vacBalance,
                 'less_this_application' => $vacLess,
-                'balance' => $vacBalance - $vacLess,
+                'balance' => $vacBalance,
+                'balance_after_application' => max($vacBalance - $vacLess, 0.0),
             ],
             'sick' => [
                 'total_earned' => $sickBalance,
                 'less_this_application' => $sickLess,
-                'balance' => $sickBalance - $sickLess,
+                'balance' => $sickBalance,
+                'balance_after_application' => max($sickBalance - $sickLess, 0.0),
             ],
             'as_of_date' => $app->created_at?->format('F j, Y') ?? now()->format('F j, Y'),
         ];
     }
 
-    private function getBalanceForApp(LeaveApplication $app): ?float
+    private function getBalanceForApp(LeaveApplication $app, array $leaveBalanceDirectory = []): ?float
+    {
+        $balance = $this->findLeaveBalanceEntryForApp($app, $leaveBalanceDirectory);
+        return $balance !== null ? (float) ($balance['balance'] ?? 0.0) : null;
+    }
+
+    private function getCurrentLeaveBalancesForApp(LeaveApplication $app, array $leaveBalanceDirectory = []): array
     {
         if ($app->erms_control_no) {
-            $balance = LeaveBalance::where('employee_id', $app->erms_control_no)
-                ->where('leave_type_id', $app->leave_type_id)
-                ->first();
-            return $balance ? (float) $balance->balance : null;
+            $employeeKey = $this->normalizeControlNo($app->erms_control_no);
+            return $leaveBalanceDirectory['employee'][$employeeKey] ?? [];
         }
 
         if ($app->applicant_admin_id) {
-            $balance = AdminLeaveBalance::where('admin_id', $app->applicant_admin_id)
-                ->where('leave_type_id', $app->leave_type_id)
-                ->where('year', now()->year)
-                ->first();
-            return $balance ? (float) $balance->balance : null;
+            return $leaveBalanceDirectory['admin'][(int) $app->applicant_admin_id] ?? [];
+        }
+
+        return [];
+    }
+
+    private function findLeaveBalanceEntryForApp(LeaveApplication $app, array $leaveBalanceDirectory = []): ?array
+    {
+        foreach ($this->getCurrentLeaveBalancesForApp($app, $leaveBalanceDirectory) as $balance) {
+            if ((int) ($balance['leave_type_id'] ?? 0) === (int) $app->leave_type_id) {
+                return $balance;
+            }
         }
 
         return null;
+    }
+
+    private function findLeaveBalanceByName(array $balances, string $leaveTypeName): float
+    {
+        foreach ($balances as $balance) {
+            if (strcasecmp((string) ($balance['leave_type_name'] ?? ''), $leaveTypeName) === 0) {
+                return (float) ($balance['balance'] ?? 0.0);
+            }
+        }
+
+        return 0.0;
     }
 }
