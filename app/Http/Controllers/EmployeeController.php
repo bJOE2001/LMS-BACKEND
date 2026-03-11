@@ -10,6 +10,8 @@ use App\Models\HRAccount;
 use App\Models\LeaveApplication;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Collection;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
 
@@ -63,6 +65,8 @@ class EmployeeController extends Controller
 
     /**
      * Create or update the current department head for the authenticated department admin.
+     * POST creates a new head and rejects a second head for the same department.
+     * PUT updates the existing head record.
      */
     public function upsertDepartmentHead(Request $request): JsonResponse
     {
@@ -74,21 +78,46 @@ class EmployeeController extends Controller
         $validated = $this->validateDepartmentHeadPayload($request);
         $attributes = $this->normalizeDepartmentHeadPayload($validated, $admin->department->name);
         $fullName = $this->buildDepartmentHeadFullName($attributes);
+        $existingDepartmentHead = DepartmentHead::query()
+            ->where('department_id', $admin->department_id)
+            ->first();
+        $payload = array_merge($attributes, [
+            'department_id' => $admin->department_id,
+            'full_name' => $fullName,
+            'position' => $attributes['designation'],
+        ]);
 
-        $departmentHead = DepartmentHead::query()->updateOrCreate(
-            ['department_id' => $admin->department_id],
-            array_merge($attributes, [
-                'full_name' => $fullName,
-                'position' => $attributes['designation'],
-            ])
-        );
+        if ($request->isMethod('post')) {
+            if ($existingDepartmentHead) {
+                return response()->json([
+                    'message' => 'A department head already exists for this department. Edit or remove the current record first.',
+                    'department_head' => $this->serializeDepartmentHead($existingDepartmentHead),
+                ], 422);
+            }
+
+            $departmentHead = DepartmentHead::query()->create($payload);
+            $this->syncDepartmentHeadToEmployeeRecord($departmentHead);
+
+            return response()->json([
+                'message' => 'Department head added successfully.',
+                'department_head' => $this->serializeDepartmentHead($departmentHead),
+            ], 201);
+        }
+
+        if (!$existingDepartmentHead) {
+            return response()->json([
+                'message' => 'Department head not found.',
+            ], 404);
+        }
+
+        $existingDepartmentHead->fill($payload);
+        $existingDepartmentHead->save();
+        $this->syncDepartmentHeadToEmployeeRecord($existingDepartmentHead);
 
         return response()->json([
-            'message' => $departmentHead->wasRecentlyCreated
-                ? 'Department head added successfully.'
-                : 'Department head updated successfully.',
-            'department_head' => $this->serializeDepartmentHead($departmentHead),
-        ], $departmentHead->wasRecentlyCreated ? 201 : 200);
+            'message' => 'Department head updated successfully.',
+            'department_head' => $this->serializeDepartmentHead($existingDepartmentHead),
+        ]);
     }
 
     /**
@@ -150,6 +179,7 @@ class EmployeeController extends Controller
         $page = max(1, (int) $request->input('page', 1));
 
         $departmentName = null;
+        $summaryDepartmentId = null;
         if ($isDepartmentAdmin) {
             $account->loadMissing('department');
 
@@ -167,74 +197,70 @@ class EmployeeController extends Controller
 
             // Enforce tenant boundary: department admins are always scoped to their own department.
             $departmentName = $account->department->name;
+            $summaryDepartmentId = (int) $account->department_id;
         } elseif ($departmentId) {
             $departmentName = Department::find($departmentId)?->name;
+            $summaryDepartmentId = $departmentName ? (int) $departmentId : null;
         }
 
-        $employees = Employee::query()
-            ->when($departmentName, function ($query) use ($departmentName) {
-                $query->where('office', $departmentName);
-            })
-            ->when($isHrAccount, function ($query) {
-                $query->where(function ($q) {
-                    $q->whereNull('status')
-                        ->orWhereRaw("UPPER(LTRIM(RTRIM(status))) <> 'CONTRACTUAL'");
-                });
-            })
-            ->when($searchTerm, function ($query, $term) {
-                $query->where(function ($q) use ($term) {
-                    $q->where('firstname', 'LIKE', "%{$term}%")
-                        ->orWhere('surname', 'LIKE', "%{$term}%");
-                });
-            })
-            ->orderBy('surname')
-            ->orderBy('firstname')
-            ->paginate($perPage, ['*'], 'page', $page);
-
-        $employees->getCollection()->transform(function (Employee $emp) {
-            return array_merge($this->serializeEmployee($emp), [
-                'has_account' => false,
-            ]);
-        });
-
-        $totalEmployeesQuery = Employee::query();
-        if ($departmentName) {
-            $totalEmployeesQuery->where('office', $departmentName);
+        $departmentHead = null;
+        $departmentHeadLookup = [];
+        if ($summaryDepartmentId) {
+            $departmentHead = DepartmentHead::query()
+                ->where('department_id', $summaryDepartmentId)
+                ->first();
+            $departmentHeadControlNo = trim((string) ($departmentHead?->control_no ?? ''));
+            $departmentHeadLookup = $departmentHead && $departmentHeadControlNo !== ''
+                ? [$departmentHeadControlNo => $departmentHead]
+                : [];
+        } elseif ($isHrAccount) {
+            $departmentHeadLookup = $this->buildDepartmentHeadLookup(null, $departmentName);
         }
+
         if ($isHrAccount) {
-            $totalEmployeesQuery->where(function ($q) {
-                $q->whereNull('status')
-                    ->orWhereRaw("UPPER(LTRIM(RTRIM(status))) <> 'CONTRACTUAL'");
-            });
-        }
-        if ($searchTerm) {
-            $totalEmployeesQuery->where(function ($q) use ($searchTerm) {
-                $q->where('firstname', 'LIKE', "%{$searchTerm}%")
-                    ->orWhere('surname', 'LIKE', "%{$searchTerm}%");
-            });
-        }
-        $totalEmployees = $totalEmployeesQuery->count();
+            [$employees, $totalEmployees, $statusCounts] = $this->buildHrEmployeeListing(
+                $request,
+                $departmentName,
+                $summaryDepartmentId,
+                $searchTerm,
+                $perPage,
+                $page,
+                $departmentHeadLookup
+            );
+        } else {
+            $employees = $this->buildDepartmentAdminEmployeePaginator(
+                $departmentName,
+                $searchTerm,
+                $perPage,
+                $page,
+                $departmentHeadLookup
+            );
+            $totalEmployees = $employees->total();
+            $statusCounts = $this->buildDepartmentAdminStatusCounts($departmentName, $searchTerm);
 
-        $statusCountsQuery = Employee::query();
-        if ($departmentName) {
-            $statusCountsQuery->where('office', $departmentName);
+            if (
+                $departmentHead
+                && $this->shouldIncludeDepartmentHeadInEmployeeSummary(
+                    $departmentHead,
+                    $departmentName,
+                    $searchTerm,
+                    false
+                )
+            ) {
+                $totalEmployees++;
+
+                $statusKey = strtoupper(trim((string) ($departmentHead->status ?? '')));
+                if ($statusKey !== '') {
+                    $statusCounts[$statusKey] = ((int) ($statusCounts[$statusKey] ?? 0)) + 1;
+                }
+            }
         }
-        if ($isHrAccount) {
-            $statusCountsQuery->where(function ($q) {
-                $q->whereNull('status')
-                    ->orWhereRaw("UPPER(LTRIM(RTRIM(status))) <> 'CONTRACTUAL'");
-            });
-        }
-        $statusCounts = $statusCountsQuery
-            ->selectRaw('status, COUNT(*) as count')
-            ->groupBy('status')
-            ->pluck('count', 'status')
-            ->toArray();
 
         return response()->json([
             'employees' => $employees,
             'total_employees' => $totalEmployees,
             'status_counts' => $statusCounts,
+            'department_head' => $departmentHead ? $this->serializeDepartmentHead($departmentHead) : null,
         ]);
     }
 
@@ -273,7 +299,18 @@ class EmployeeController extends Controller
 
         $employee = Employee::query()->find($controlNo);
         if (!$employee) {
-            return response()->json(['message' => 'Employee not found.'], 404);
+            $departmentHead = DepartmentHead::query()
+                ->where('control_no', $controlNo)
+                ->first();
+
+            if (!$departmentHead) {
+                return response()->json(['message' => 'Employee not found.'], 404);
+            }
+
+            return response()->json([
+                'employee' => $this->serializeDepartmentHeadAsEmployee($departmentHead),
+                'applications' => [],
+            ]);
         }
 
         if (trim((string) $employee->office) !== trim((string) $admin->department->name)) {
@@ -560,6 +597,289 @@ class EmployeeController extends Controller
             'full_name' => $departmentHead->full_name,
             'position' => $departmentHead->position,
         ];
+    }
+
+    private function serializeDepartmentHeadAsEmployee(DepartmentHead $departmentHead): array
+    {
+        return array_merge($this->serializeDepartmentHead($departmentHead), [
+            'has_account' => false,
+            'is_department_head_record' => true,
+        ]);
+    }
+
+    private function buildDepartmentAdminEmployeePaginator(
+        ?string $departmentName,
+        ?string $searchTerm,
+        int $perPage,
+        int $page,
+        array $departmentHeadLookup = []
+    ): LengthAwarePaginator {
+        $employees = Employee::query()
+            ->when($departmentName, function ($query) use ($departmentName) {
+                $query->where('office', $departmentName);
+            })
+            ->when($searchTerm, function ($query, $term) {
+                $query->where(function ($q) use ($term) {
+                    $q->where('firstname', 'LIKE', "%{$term}%")
+                        ->orWhere('surname', 'LIKE', "%{$term}%");
+                });
+            })
+            ->orderBy('surname')
+            ->orderBy('firstname')
+            ->paginate($perPage, ['*'], 'page', $page);
+
+        $employees->getCollection()->transform(function (Employee $emp) use ($departmentHeadLookup) {
+            $controlNo = trim((string) $emp->control_no);
+            return array_merge($this->serializeEmployee($emp), [
+                'has_account' => false,
+                'is_department_head_record' => $controlNo !== '' && isset($departmentHeadLookup[$controlNo]),
+            ]);
+        });
+
+        return $employees;
+    }
+
+    private function buildDepartmentAdminStatusCounts(?string $departmentName, ?string $searchTerm): array
+    {
+        $statusCountsQuery = Employee::query();
+        if ($departmentName) {
+            $statusCountsQuery->where('office', $departmentName);
+        }
+        if ($searchTerm) {
+            $statusCountsQuery->where(function ($q) use ($searchTerm) {
+                $q->where('firstname', 'LIKE', "%{$searchTerm}%")
+                    ->orWhere('surname', 'LIKE', "%{$searchTerm}%");
+            });
+        }
+
+        return $statusCountsQuery
+            ->selectRaw('status, COUNT(*) as count')
+            ->groupBy('status')
+            ->pluck('count', 'status')
+            ->toArray();
+    }
+
+    private function buildHrEmployeeListing(
+        Request $request,
+        ?string $departmentName,
+        ?int $departmentId,
+        ?string $searchTerm,
+        int $perPage,
+        int $page,
+        array $departmentHeadLookup = []
+    ): array {
+        $employeeRows = Employee::query()
+            ->when($departmentName, function ($query) use ($departmentName) {
+                $query->where('office', $departmentName);
+            })
+            ->where(function ($q) {
+                $q->whereNull('status')
+                    ->orWhereRaw("UPPER(LTRIM(RTRIM(status))) <> 'CONTRACTUAL'");
+            })
+            ->when($searchTerm, function ($query, $term) {
+                $query->where(function ($q) use ($term) {
+                    $q->where('firstname', 'LIKE', "%{$term}%")
+                        ->orWhere('surname', 'LIKE', "%{$term}%");
+                });
+            })
+            ->orderBy('surname')
+            ->orderBy('firstname')
+            ->get()
+            ->map(function (Employee $employee) use ($departmentHeadLookup): array {
+                $controlNo = trim((string) $employee->control_no);
+                return array_merge($this->serializeEmployee($employee), [
+                    'has_account' => false,
+                    'is_department_head_record' => $controlNo !== '' && isset($departmentHeadLookup[$controlNo]),
+                ]);
+            });
+
+        $existingEmployeeControlNos = $employeeRows
+            ->map(fn(array $employee): string => trim((string) ($employee['control_no'] ?? '')))
+            ->filter()
+            ->values()
+            ->all();
+        $existingEmployeeControlNoLookup = array_fill_keys($existingEmployeeControlNos, true);
+
+        $departmentHeadRows = DepartmentHead::query()
+            ->when($departmentId, function ($query) use ($departmentId) {
+                $query->where('department_id', $departmentId);
+            }, function ($query) use ($departmentName) {
+                if ($departmentName) {
+                    $query->where('office', $departmentName);
+                }
+            })
+            ->orderBy('surname')
+            ->orderBy('firstname')
+            ->get()
+            ->filter(function (DepartmentHead $departmentHead) use (
+                $departmentName,
+                $searchTerm,
+                $existingEmployeeControlNoLookup
+            ): bool {
+                if (!$this->matchesDepartmentHeadEmployeeFilters($departmentHead, $searchTerm, true)) {
+                    return false;
+                }
+
+                $controlNo = trim((string) ($departmentHead->control_no ?? ''));
+                if ($controlNo !== '' && isset($existingEmployeeControlNoLookup[$controlNo])) {
+                    return false;
+                }
+
+                return true;
+            })
+            ->map(fn(DepartmentHead $departmentHead): array => $this->serializeDepartmentHeadAsEmployee($departmentHead));
+
+        $combinedRows = $employeeRows
+            ->concat($departmentHeadRows)
+            ->sort(function (array $left, array $right): int {
+                $leftSurname = mb_strtoupper(trim((string) ($left['surname'] ?? '')));
+                $rightSurname = mb_strtoupper(trim((string) ($right['surname'] ?? '')));
+                if ($leftSurname !== $rightSurname) {
+                    return $leftSurname <=> $rightSurname;
+                }
+
+                $leftFirstname = mb_strtoupper(trim((string) ($left['firstname'] ?? '')));
+                $rightFirstname = mb_strtoupper(trim((string) ($right['firstname'] ?? '')));
+                if ($leftFirstname !== $rightFirstname) {
+                    return $leftFirstname <=> $rightFirstname;
+                }
+
+                return strcmp(
+                    trim((string) ($left['control_no'] ?? '')),
+                    trim((string) ($right['control_no'] ?? ''))
+                );
+            })
+            ->values();
+
+        $paginatedRows = new LengthAwarePaginator(
+            $combinedRows->forPage($page, $perPage)->values(),
+            $combinedRows->count(),
+            $perPage,
+            $page,
+            [
+                'path' => $request->url(),
+                'pageName' => 'page',
+            ]
+        );
+
+        return [
+            $paginatedRows,
+            $combinedRows->count(),
+            $this->buildStatusCountsFromRows($combinedRows),
+        ];
+    }
+
+    private function buildStatusCountsFromRows(Collection $rows): array
+    {
+        $counts = [];
+
+        foreach ($rows as $row) {
+            $statusKey = strtoupper(trim((string) ($row['status'] ?? '')));
+            if ($statusKey === '') {
+                continue;
+            }
+
+            $counts[$statusKey] = ((int) ($counts[$statusKey] ?? 0)) + 1;
+        }
+
+        ksort($counts);
+
+        return $counts;
+    }
+
+    private function buildDepartmentHeadLookup(?int $departmentId = null, ?string $departmentName = null): array
+    {
+        return DepartmentHead::query()
+            ->when($departmentId !== null, function ($query) use ($departmentId) {
+                $query->where('department_id', $departmentId);
+            })
+            ->when($departmentId === null && $departmentName, function ($query) use ($departmentName) {
+                $query->where('office', $departmentName);
+            })
+            ->get()
+            ->mapWithKeys(function (DepartmentHead $departmentHead): array {
+                $controlNo = trim((string) $departmentHead->control_no);
+                return $controlNo !== '' ? [$controlNo => $departmentHead] : [];
+            })
+            ->all();
+    }
+
+    private function syncDepartmentHeadToEmployeeRecord(DepartmentHead $departmentHead): void
+    {
+        $controlNo = trim((string) ($departmentHead->control_no ?? ''));
+        if ($controlNo === '') {
+            return;
+        }
+
+        Employee::query()->updateOrCreate(
+            ['control_no' => $controlNo],
+            [
+                'surname' => trim((string) ($departmentHead->surname ?? '')),
+                'firstname' => trim((string) ($departmentHead->firstname ?? '')),
+                'middlename' => $this->trimNullable($departmentHead->middlename),
+                'office' => trim((string) ($departmentHead->office ?? '')),
+                'status' => strtoupper(trim((string) ($departmentHead->status ?? ''))),
+                'designation' => $this->trimNullable($departmentHead->designation),
+                'rate_mon' => $departmentHead->rate_mon !== null ? round((float) $departmentHead->rate_mon, 2) : null,
+            ]
+        );
+    }
+
+    private function shouldIncludeDepartmentHeadInEmployeeSummary(
+        DepartmentHead $departmentHead,
+        ?string $departmentName,
+        ?string $searchTerm,
+        bool $isHrAccount
+    ): bool {
+        if (!$this->matchesDepartmentHeadEmployeeFilters($departmentHead, $searchTerm, $isHrAccount)) {
+            return false;
+        }
+
+        $controlNo = trim((string) ($departmentHead->control_no ?? ''));
+        if ($controlNo === '') {
+            return true;
+        }
+
+        return !Employee::query()
+            ->when($departmentName, function ($query) use ($departmentName) {
+                $query->where('office', $departmentName);
+            })
+            ->when($isHrAccount, function ($query) {
+                $query->where(function ($q) {
+                    $q->whereNull('status')
+                        ->orWhereRaw("UPPER(LTRIM(RTRIM(status))) <> 'CONTRACTUAL'");
+                });
+            })
+            ->when($searchTerm, function ($query, $term) {
+                $query->where(function ($q) use ($term) {
+                    $q->where('firstname', 'LIKE', "%{$term}%")
+                        ->orWhere('surname', 'LIKE', "%{$term}%");
+                });
+            })
+            ->where('control_no', $controlNo)
+            ->exists();
+    }
+
+    private function matchesDepartmentHeadEmployeeFilters(
+        DepartmentHead $departmentHead,
+        ?string $searchTerm,
+        bool $isHrAccount
+    ): bool {
+        $status = strtoupper(trim((string) ($departmentHead->status ?? '')));
+        if ($isHrAccount && $status === 'CONTRACTUAL') {
+            return false;
+        }
+
+        $term = trim((string) ($searchTerm ?? ''));
+        if ($term === '') {
+            return true;
+        }
+
+        $firstname = trim((string) ($departmentHead->firstname ?? ''));
+        $surname = trim((string) ($departmentHead->surname ?? ''));
+
+        return str_contains(strtolower($firstname), strtolower($term))
+            || str_contains(strtolower($surname), strtolower($term));
     }
 
     private function buildDepartmentHeadFullName(array $attributes): string

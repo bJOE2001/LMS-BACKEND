@@ -89,6 +89,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::put('/admin/employees/{controlNo}', [EmployeeController::class, 'update']);
     Route::delete('/admin/employees/{controlNo}', [EmployeeController::class, 'destroy']);
     Route::get('/admin/department-head', [EmployeeController::class, 'departmentHead']);
+    Route::post('/admin/department-head', [EmployeeController::class, 'upsertDepartmentHead']);
     Route::put('/admin/department-head', [EmployeeController::class, 'upsertDepartmentHead']);
     Route::delete('/admin/department-head', [EmployeeController::class, 'deleteDepartmentHead']);
     Route::get('/hr/employees/{controlNo}/leave-history', [EmployeeController::class, 'leaveHistory'])->middleware('hr');
