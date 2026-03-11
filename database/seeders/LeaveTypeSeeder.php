@@ -185,7 +185,7 @@ class LeaveTypeSeeder extends Seeder
                 'description' => 'Applied for upon separation from service.',
             ],
             [
-                'name' => 'Monetization of Leave Credits',
+                'name' => 'Monetization Leave',
                 'category' => 'EVENT',
                 'accrual_rate' => null,
                 'accrual_day_of_month' => null,

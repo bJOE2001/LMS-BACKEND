@@ -303,6 +303,16 @@ class LeaveApplicationController extends Controller
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
         ]);
 
+        $duplicateDateValidation = $this->validateNoDuplicateLeaveDates(
+            (string) $employee->control_no,
+            (string) $validated['start_date'],
+            (string) $validated['end_date'],
+            $validated['selected_dates'] ?? null
+        );
+        if ($duplicateDateValidation instanceof JsonResponse) {
+            return $duplicateDateValidation;
+        }
+
         $eligibility = $this->validateRegularLeaveEligibility(
             (string) $employee->control_no,
             (int) $validated['leave_type_id'],
@@ -702,6 +712,16 @@ class LeaveApplicationController extends Controller
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
         ]);
 
+        $duplicateDateValidation = $this->validateNoDuplicateLeaveDates(
+            (string) $employee->control_no,
+            (string) $validated['start_date'],
+            (string) $validated['end_date'],
+            $validated['selected_dates'] ?? null
+        );
+        if ($duplicateDateValidation instanceof JsonResponse) {
+            return $duplicateDateValidation;
+        }
+
         $eligibility = $this->validateRegularLeaveEligibility(
             (string) $employee->control_no,
             (int) $validated['leave_type_id'],
@@ -1096,6 +1116,9 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => "Cannot approve: application status is '{$app->status}', expected 'PENDING_HR'."], 422);
         }
 
+        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
+        $shouldDeductForcedLeave = $this->shouldDeductForcedLeaveWithVacation($app, $forcedLeaveTypeId);
+
         // Determine if balance deduction is needed
         $needsDeduction = ($app->leaveType && $app->leaveType->is_credit_based) || $app->is_monetization;
 
@@ -1137,37 +1160,107 @@ class LeaveApplicationController extends Controller
             }
         }
 
-        DB::transaction(function () use ($app, $hr, $request, $needsDeduction) {
-            $app->update([
-                'status' => LeaveApplication::STATUS_APPROVED,
-                'hr_id' => $hr->id,
-                'hr_approved_at' => now(),
-                'remarks' => $request->input('remarks'),
-            ]);
+        $balanceConflictError = 'HR_APPROVAL_BALANCE_CONFLICT';
 
-            // Deduct balance for credit-based leave types and monetization
-            if ($needsDeduction) {
-                if ($app->erms_control_no) {
-                    LeaveBalance::where('employee_id', $app->erms_control_no)
-                        ->where('leave_type_id', $app->leave_type_id)
-                        ->decrement('balance', $app->total_days);
-                } elseif ($app->applicant_admin_id) {
-                    \App\Models\AdminLeaveBalance::where('admin_id', $app->applicant_admin_id)
-                        ->where('leave_type_id', $app->leave_type_id)
-                        ->where('year', now()->year)
-                        ->decrement('balance', $app->total_days);
+        try {
+            DB::transaction(function () use ($app, $hr, $request, $needsDeduction, $balanceConflictError, $forcedLeaveTypeId, $shouldDeductForcedLeave) {
+                // Deduct balance for credit-based leave types and monetization.
+                // Locking the exact target row avoids race conditions and cross-row side effects.
+                if ($needsDeduction) {
+                    if ($app->erms_control_no) {
+                        $lockedBalance = LeaveBalance::query()
+                            ->where('employee_id', $app->erms_control_no)
+                            ->where('leave_type_id', $app->leave_type_id)
+                            ->lockForUpdate()
+                            ->first();
+
+                        if (!$lockedBalance || (float) $lockedBalance->balance < (float) $app->total_days) {
+                            throw new \RuntimeException($balanceConflictError);
+                        }
+
+                        $lockedBalance->decrement('balance', (float) $app->total_days);
+
+                        // Business rule: approving Vacation Leave also consumes Forced Leave credits.
+                        // If Forced Leave is zero/missing, no extra deduction is applied.
+                        if ($shouldDeductForcedLeave && $forcedLeaveTypeId !== null) {
+                            $forcedBalance = LeaveBalance::query()
+                                ->where('employee_id', $app->erms_control_no)
+                                ->where('leave_type_id', $forcedLeaveTypeId)
+                                ->lockForUpdate()
+                                ->first();
+
+                            $forcedAvailable = $forcedBalance ? (float) $forcedBalance->balance : 0.0;
+                            $forcedToDeduct = min((float) $app->total_days, max($forcedAvailable, 0.0));
+
+                            if ($forcedBalance && $forcedToDeduct > 0.0) {
+                                $forcedBalance->decrement('balance', $forcedToDeduct);
+                            }
+                        }
+                    } elseif ($app->applicant_admin_id) {
+                        $lockedBalance = \App\Models\AdminLeaveBalance::query()
+                            ->where('admin_id', $app->applicant_admin_id)
+                            ->where('leave_type_id', $app->leave_type_id)
+                            ->where('year', now()->year)
+                            ->lockForUpdate()
+                            ->first();
+
+                        if (!$lockedBalance || (float) $lockedBalance->balance < (float) $app->total_days) {
+                            throw new \RuntimeException($balanceConflictError);
+                        }
+
+                        $lockedBalance->decrement('balance', (float) $app->total_days);
+                    }
                 }
+
+                $app->update([
+                    'status' => LeaveApplication::STATUS_APPROVED,
+                    'hr_id' => $hr->id,
+                    'hr_approved_at' => now(),
+                    'remarks' => $request->input('remarks'),
+                ]);
+
+                LeaveApplicationLog::create([
+                    'leave_application_id' => $app->id,
+                    'action' => LeaveApplicationLog::ACTION_HR_APPROVED,
+                    'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
+                    'performed_by_id' => $hr->id,
+                    'remarks' => $request->input('remarks'),
+                    'created_at' => now(),
+                ]);
+            });
+        } catch (\RuntimeException $exception) {
+            if ($exception->getMessage() !== $balanceConflictError) {
+                throw $exception;
             }
 
-            LeaveApplicationLog::create([
-                'leave_application_id' => $app->id,
-                'action' => LeaveApplicationLog::ACTION_HR_APPROVED,
-                'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
-                'performed_by_id' => $hr->id,
-                'remarks' => $request->input('remarks'),
-                'created_at' => now(),
-            ]);
-        });
+            if ($app->erms_control_no) {
+                $currentBalance = (float) (LeaveBalance::query()
+                    ->where('employee_id', $app->erms_control_no)
+                    ->where('leave_type_id', $app->leave_type_id)
+                    ->value('balance') ?? 0);
+
+                if ($app->is_monetization && $currentBalance < 10) {
+                    return response()->json([
+                        'message' => 'Minimum of 10 leave credits required for monetization.',
+                    ], 422);
+                }
+
+                $label = $app->is_monetization ? 'monetization' : 'leave';
+                return response()->json([
+                    'message' => "Insufficient leave balance for {$label}. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($app->total_days) . ".",
+                ], 422);
+            }
+
+            $currentBalance = (float) (\App\Models\AdminLeaveBalance::query()
+                ->where('admin_id', $app->applicant_admin_id)
+                ->where('leave_type_id', $app->leave_type_id)
+                ->where('year', now()->year)
+                ->value('balance') ?? 0);
+
+            return response()->json([
+                'message' => "Insufficient leave balance. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($app->total_days) . ".",
+            ], 422);
+        }
 
         // Notify the applicant
         $isMonetization = (bool) $app->is_monetization;
@@ -1331,6 +1424,16 @@ class LeaveApplicationController extends Controller
         $employee = Employee::find($validated['employee_id']);
         if (!$employee || $employee->office !== $admin->department?->name) {
             return response()->json(['message' => 'You can only file leave for employees in your department.'], 403);
+        }
+
+        $duplicateDateValidation = $this->validateNoDuplicateLeaveDates(
+            (string) $employee->control_no,
+            (string) $validated['start_date'],
+            (string) $validated['end_date'],
+            $validated['selected_dates'] ?? null
+        );
+        if ($duplicateDateValidation instanceof JsonResponse) {
+            return $duplicateDateValidation;
         }
 
         $eligibility = $this->validateRegularLeaveEligibility(
@@ -1923,6 +2026,141 @@ class LeaveApplicationController extends Controller
         ];
     }
 
+    private function resolveForcedLeaveTypeId(): ?int
+    {
+        $value = LeaveType::query()
+            ->whereRaw('LOWER(name) = ?', ['mandatory / forced leave'])
+            ->value('id');
+
+        return $value !== null ? (int) $value : null;
+    }
+
+    private function shouldDeductForcedLeaveWithVacation(LeaveApplication $app, ?int $forcedLeaveTypeId): bool
+    {
+        if ($forcedLeaveTypeId === null) {
+            return false;
+        }
+
+        if ($app->is_monetization) {
+            return false;
+        }
+
+        if ((int) $app->leave_type_id === $forcedLeaveTypeId) {
+            return false;
+        }
+
+        $leaveTypeName = trim((string) ($app->leaveType?->name ?? ''));
+        return strcasecmp($leaveTypeName, 'Vacation Leave') === 0;
+    }
+
+    private function validateNoDuplicateLeaveDates(
+        string $employeeControlNo,
+        string $startDate,
+        string $endDate,
+        ?array $selectedDates = null
+    ): ?JsonResponse {
+        $requestedDates = $this->resolveLeaveDateSet($startDate, $endDate, $selectedDates);
+        if ($requestedDates === []) {
+            return null;
+        }
+
+        $existingApplications = LeaveApplication::query()
+            ->select(['id', 'start_date', 'end_date', 'selected_dates'])
+            ->whereIn('status', [
+                LeaveApplication::STATUS_PENDING_ADMIN,
+                LeaveApplication::STATUS_PENDING_HR,
+                LeaveApplication::STATUS_APPROVED,
+            ])
+            ->where(function ($query) use ($employeeControlNo): void {
+                $query->where('erms_control_no', $employeeControlNo)
+                    ->orWhereRaw('TRY_CONVERT(INT, erms_control_no) = TRY_CONVERT(INT, ?)', [$employeeControlNo]);
+            })
+            ->get();
+
+        $duplicateDateMap = [];
+        foreach ($existingApplications as $existingApplication) {
+            $existingDates = $this->resolveLeaveDateSet(
+                $existingApplication->start_date?->toDateString(),
+                $existingApplication->end_date?->toDateString(),
+                is_array($existingApplication->selected_dates) ? $existingApplication->selected_dates : null
+            );
+
+            foreach (array_intersect($requestedDates, $existingDates) as $duplicateDate) {
+                $duplicateDateMap[$duplicateDate] = true;
+            }
+        }
+
+        if ($duplicateDateMap === []) {
+            return null;
+        }
+
+        $duplicateDates = array_keys($duplicateDateMap);
+        sort($duplicateDates);
+
+        $previewDates = array_slice($duplicateDates, 0, 3);
+        $formattedPreview = implode(', ', array_map(
+            static fn(string $date): string => \Carbon\CarbonImmutable::parse($date)->format('M j, Y'),
+            $previewDates
+        ));
+        if (count($duplicateDates) > count($previewDates)) {
+            $remainingCount = count($duplicateDates) - count($previewDates);
+            $formattedPreview .= " and {$remainingCount} more";
+        }
+
+        return response()->json([
+            'message' => "Duplicate leave date detected. You already have a leave application for {$formattedPreview}.",
+            'errors' => [
+                'selected_dates' => ['Duplicate leave dates are not allowed for the same employee.'],
+            ],
+            'duplicate_dates' => $duplicateDates,
+        ], 422);
+    }
+
+    private function resolveLeaveDateSet(?string $startDate, ?string $endDate, ?array $selectedDates = null): array
+    {
+        $normalizedSelectedDates = [];
+        foreach ($selectedDates ?? [] as $selectedDate) {
+            if ($selectedDate === null || $selectedDate === '') {
+                continue;
+            }
+
+            try {
+                $normalizedSelectedDates[] = \Carbon\CarbonImmutable::parse((string) $selectedDate)->toDateString();
+            } catch (\Throwable) {
+                continue;
+            }
+        }
+
+        if ($normalizedSelectedDates !== []) {
+            $normalizedSelectedDates = array_values(array_unique($normalizedSelectedDates));
+            sort($normalizedSelectedDates);
+            return $normalizedSelectedDates;
+        }
+
+        if (!$startDate || !$endDate) {
+            return [];
+        }
+
+        try {
+            $cursor = \Carbon\CarbonImmutable::parse($startDate)->startOfDay();
+            $lastDate = \Carbon\CarbonImmutable::parse($endDate)->startOfDay();
+        } catch (\Throwable) {
+            return [];
+        }
+
+        if ($cursor->gt($lastDate)) {
+            return [];
+        }
+
+        $dates = [];
+        while ($cursor->lte($lastDate)) {
+            $dates[] = $cursor->toDateString();
+            $cursor = $cursor->addDay();
+        }
+
+        return $dates;
+    }
+
     private function validateRegularLeaveEligibility(
         string $employeeControlNo,
         int $leaveTypeId,
@@ -1969,19 +2207,40 @@ class LeaveApplicationController extends Controller
         }
 
         $currentBalance = (float) $balance->balance;
-        if ($currentBalance < $requestedDays) {
-            $fmtAvail = self::formatDays($currentBalance);
+        $pendingReservedDays = (float) LeaveApplication::query()
+            ->where('leave_type_id', $leaveTypeId)
+            ->whereIn('status', [
+                LeaveApplication::STATUS_PENDING_ADMIN,
+                LeaveApplication::STATUS_PENDING_HR,
+            ])
+            ->where(function ($query) use ($employeeControlNo): void {
+                $query->where('erms_control_no', $employeeControlNo)
+                    ->orWhereRaw('TRY_CONVERT(INT, erms_control_no) = TRY_CONVERT(INT, ?)', [$employeeControlNo]);
+            })
+            ->sum('total_days');
+
+        $availableBalance = max(round($currentBalance - $pendingReservedDays, 2), 0.0);
+
+        if ($availableBalance < $requestedDays) {
+            $fmtAvail = self::formatDays($availableBalance);
             $fmtReq = self::formatDays($requestedDays);
+            $fmtCurrent = self::formatDays($currentBalance);
+            $fmtPending = self::formatDays($pendingReservedDays);
 
             return response()->json([
-                'message' => "Insufficient leave balance. You have {$fmtAvail} available but requested {$fmtReq}.",
+                'message' => "Insufficient leave balance. You have {$fmtAvail} available (current {$fmtCurrent}, pending {$fmtPending}) but requested {$fmtReq}.",
                 'errors' => [
                     'total_days' => ["Insufficient leave balance. Available: {$fmtAvail}."],
                 ],
             ], 422);
         }
 
-        return ['leave_type' => $leaveType, 'balance' => $currentBalance];
+        return [
+            'leave_type' => $leaveType,
+            'balance' => $currentBalance,
+            'available_balance' => $availableBalance,
+            'pending_reserved_days' => $pendingReservedDays,
+        ];
     }
 
     private function formatApplication(LeaveApplication $app): array
