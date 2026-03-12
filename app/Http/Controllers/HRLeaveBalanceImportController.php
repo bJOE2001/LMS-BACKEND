@@ -40,7 +40,7 @@ class HRLeaveBalanceImportController extends Controller
         $leaveTypeId = (int) $validated['leave_type_id'];
         $balance = round((float) $validated['balance'], 2);
 
-        $employee = Employee::query()->find($employeeId);
+        $employee = Employee::findByControlNo($employeeId);
         if (!$employee) {
             return response()->json(['message' => 'Employee not found.'], 422);
         }
@@ -145,7 +145,7 @@ class HRLeaveBalanceImportController extends Controller
                     $balanceRaw = isset($row['balance']) ? trim((string) $row['balance']) : '';
 
                     // 1) Validate employee exists (by control_no)
-                    $employee = $employeeId !== '' ? Employee::find($employeeId) : null;
+                    $employee = $employeeId !== '' ? Employee::findByControlNo($employeeId) : null;
                     if (!$employee) {
                         $errors[] = [
                             'row' => $oneBasedRow,

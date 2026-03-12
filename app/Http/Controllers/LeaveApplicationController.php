@@ -64,7 +64,7 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Only employee accounts can access this endpoint.'], 403);
         }
 
-        $employee = Employee::find($controlNo);
+        $employee = Employee::findByControlNo($controlNo);
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
         }
@@ -946,7 +946,7 @@ class LeaveApplicationController extends Controller
         }
 
         $deptName = $admin->department?->name;
-        $applications = LeaveApplication::with(['leaveType'])
+        $applications = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin.department'])
             ->where('status', LeaveApplication::STATUS_PENDING_ADMIN)
             ->whereIn('erms_control_no', function ($query) use ($deptName) {
                 $query->select('control_no')
@@ -1451,7 +1451,7 @@ class LeaveApplicationController extends Controller
 
         // Verify the employee belongs to the admin's department (by office name)
         $admin->loadMissing('department');
-        $employee = Employee::find($validated['employee_id']);
+        $employee = Employee::findByControlNo($validated['employee_id']);
         if (!$employee || $employee->office !== $admin->department?->name) {
             return response()->json(['message' => 'You can only file leave for employees in your department.'], 403);
         }
@@ -1550,7 +1550,7 @@ class LeaveApplicationController extends Controller
         ]);
 
         $admin->loadMissing('department');
-        $employee = Employee::find($validated['employee_id']);
+        $employee = Employee::findByControlNo($validated['employee_id']);
         if (!$employee || $employee->office !== $admin->department?->name) {
             return response()->json(['message' => 'You can only file for employees in your department.'], 403);
         }
@@ -1689,10 +1689,7 @@ class LeaveApplicationController extends Controller
             return null;
         }
 
-        return DB::table('tblEmployees')
-            ->where('control_no', $controlNo)
-            ->orWhereRaw('TRY_CONVERT(INT, control_no) = TRY_CONVERT(INT, ?)', [$controlNo])
-            ->first();
+        return Employee::findByControlNo($controlNo);
     }
 
     private function formatErmsLeaveBalancePayload(
@@ -2445,10 +2442,13 @@ class LeaveApplicationController extends Controller
 
     private function formatApplication(LeaveApplication $app): array
     {
-        $employeeName = $app->employee
-            ? trim(($app->employee->firstname ?? '') . ' ' . ($app->employee->surname ?? ''))
-            : null;
-        $applicantName = $employeeName ?: ($app->applicantAdmin ? $app->applicantAdmin->full_name : 'Unknown');
+        $employeeName = $this->formatEmployeeFullName($app->employee);
+        $applicantName = $employeeName !== ''
+            ? $employeeName
+            : trim((string) ($app->applicantAdmin?->full_name ?? ''));
+        if ($applicantName === '') {
+            $applicantName = $this->resolveEmployeeDisplayName($app);
+        }
         $office = $app->employee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
 
         $data = [
@@ -2464,6 +2464,10 @@ class LeaveApplicationController extends Controller
             'status' => $this->statusToFrontend($app->status),
             'rawStatus' => $app->status,
             'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
+            'filedAt' => $app->created_at?->toIso8601String(),
+            'filed_at' => $app->created_at?->toIso8601String(),
+            'createdAt' => $app->created_at?->toIso8601String(),
+            'created_at' => $app->created_at?->toIso8601String(),
             'remarks' => $app->remarks,
             'selected_dates' => $app->resolvedSelectedDates(),
             'commutation' => $app->commutation ?? 'Not Requested',
@@ -2473,7 +2477,10 @@ class LeaveApplicationController extends Controller
             'hr_id' => $app->hr_id,
             'admin_approved_at' => $app->admin_approved_at?->toIso8601String(),
             'hr_approved_at' => $app->hr_approved_at?->toIso8601String(),
+            'employeeName' => $applicantName,
+            'employee_name' => $applicantName,
             'applicantName' => $applicantName,
+            'applicant_name' => $applicantName,
             'office' => $office,
         ];
 
@@ -2481,8 +2488,9 @@ class LeaveApplicationController extends Controller
             $data['employee'] = [
                 'control_no' => $app->employee->control_no,
                 'firstname' => $app->employee->firstname,
+                'middlename' => $app->employee->middlename,
                 'surname' => $app->employee->surname,
-                'full_name' => trim(($app->employee->firstname ?? '') . ' ' . ($app->employee->surname ?? '')),
+                'full_name' => $this->formatEmployeeFullName($app->employee),
                 'designation' => $app->employee->designation,
                 'office' => $app->employee->office,
             ];

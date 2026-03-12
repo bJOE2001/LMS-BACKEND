@@ -297,7 +297,7 @@ class EmployeeController extends Controller
             return $admin;
         }
 
-        $employee = Employee::query()->find($controlNo);
+        $employee = Employee::findByControlNo($controlNo);
         if (!$employee) {
             $departmentHead = DepartmentHead::query()
                 ->where('control_no', $controlNo)
@@ -342,7 +342,7 @@ class EmployeeController extends Controller
             return $admin;
         }
 
-        $employee = Employee::query()->find($controlNo);
+        $employee = Employee::findByControlNo($controlNo);
         if (!$employee) {
             return response()->json(['message' => 'Employee not found.'], 404);
         }
@@ -370,7 +370,7 @@ class EmployeeController extends Controller
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
-        $employee = Employee::query()->find($controlNo);
+        $employee = Employee::findByControlNo($controlNo);
         if (!$employee) {
             return response()->json(['message' => 'Employee not found.'], 404);
         }
