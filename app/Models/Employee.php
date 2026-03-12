@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
@@ -12,6 +13,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
  *
  * Active columns:
  * - control_no (PK)
+ * - control_no_int
  * - surname
  * - firstname
  * - middlename
@@ -44,6 +46,7 @@ class Employee extends Model
     protected function casts(): array
     {
         return [
+            'control_no_int' => 'integer',
             'rate_mon' => 'decimal:2',
         ];
     }
@@ -58,7 +61,7 @@ class Employee extends Model
 
     public function leaveApplications(): HasMany
     {
-        return $this->hasMany(LeaveApplication::class, 'erms_control_no', 'control_no');
+        return $this->hasMany(LeaveApplication::class, 'erms_control_no', 'control_no_int');
     }
 
     public function leaveBalances(): HasMany
@@ -69,6 +72,41 @@ class Employee extends Model
     public function getFullNameAttribute(): string
     {
         return trim("{$this->firstname} {$this->surname}");
+    }
+
+    public function scopeMatchingControlNo(Builder $query, mixed $controlNo): Builder
+    {
+        $rawControlNo = trim((string) ($controlNo ?? ''));
+        if ($rawControlNo === '') {
+            return $query->whereRaw('1 = 0');
+        }
+
+        $normalizedControlNo = self::normalizeControlNoInt($rawControlNo);
+
+        return $query->where(function (Builder $nestedQuery) use ($rawControlNo, $normalizedControlNo): void {
+            $nestedQuery->where('control_no', $rawControlNo);
+
+            if ($normalizedControlNo !== null) {
+                $nestedQuery->orWhere('control_no_int', $normalizedControlNo);
+            }
+        });
+    }
+
+    public static function findByControlNo(mixed $controlNo): ?self
+    {
+        return self::query()
+            ->matchingControlNo($controlNo)
+            ->first();
+    }
+
+    private static function normalizeControlNoInt(mixed $controlNo): ?int
+    {
+        $normalized = ltrim(trim((string) ($controlNo ?? '')), '0');
+        if ($normalized === '') {
+            $normalized = '0';
+        }
+
+        return preg_match('/^\d+$/', $normalized) ? (int) $normalized : null;
     }
 
     /**

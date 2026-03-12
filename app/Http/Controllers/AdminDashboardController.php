@@ -306,7 +306,7 @@ class AdminDashboardController extends Controller
         }
 
         $admin->loadMissing('department');
-        $employee = Employee::find($employeeId);
+        $employee = Employee::findByControlNo($employeeId);
         if (!$employee || $employee->office !== $admin->department?->name) {
             return response()->json(['message' => 'Employee not found in your department.'], 404);
         }
@@ -786,6 +786,10 @@ class AdminDashboardController extends Controller
             'status' => $statusMap[$app->status] ?? $app->status,
             'rawStatus' => $app->status,
             'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
+            'filedAt' => $app->created_at?->toIso8601String(),
+            'filed_at' => $app->created_at?->toIso8601String(),
+            'createdAt' => $app->created_at?->toIso8601String(),
+            'created_at' => $app->created_at?->toIso8601String(),
             'remarks' => $app->remarks,
             'selected_dates' => $app->resolvedSelectedDates(),
             'commutation' => $app->commutation ?? 'Not Requested',
