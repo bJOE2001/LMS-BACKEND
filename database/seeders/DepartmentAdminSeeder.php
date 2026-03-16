@@ -6,6 +6,7 @@ use App\Models\Department;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use Illuminate\Database\Seeder;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 
 /**
@@ -46,7 +47,7 @@ class DepartmentAdminSeeder extends Seeder
         $created = 0;
         $updated = 0;
 
-        \DB::transaction(function () use ($departments, $adminsByDepartment, &$usedUsernameLookup, &$created, &$updated): void {
+        DB::transaction(function () use ($departments, $adminsByDepartment, &$usedUsernameLookup, &$created, &$updated): void {
             foreach ($departments as $department) {
                 $admin = $adminsByDepartment->get($department->id);
                 $newUsername = $this->generateUniqueSixDigitUsername($usedUsernameLookup);

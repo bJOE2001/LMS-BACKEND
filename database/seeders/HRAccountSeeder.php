@@ -4,6 +4,7 @@ namespace Database\Seeders;
 
 use App\Models\HRAccount;
 use Illuminate\Database\Seeder;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 
 /**
@@ -17,7 +18,7 @@ class HRAccountSeeder extends Seeder
             exit('Seeding allowed in local environment only.');
         }
 
-        \DB::transaction(function (): void {
+        DB::transaction(function (): void {
             $accounts = [
                 [
                     'username' => 'hr',

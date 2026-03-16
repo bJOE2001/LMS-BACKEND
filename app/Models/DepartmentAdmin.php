@@ -20,6 +20,7 @@ class DepartmentAdmin extends Model implements AuthenticatableContract
 
     protected $fillable = [
         'department_id',
+        'employee_control_no',
         'full_name',
         'username',
         'password',
@@ -41,6 +42,11 @@ class DepartmentAdmin extends Model implements AuthenticatableContract
     public function department(): BelongsTo
     {
         return $this->belongsTo(Department::class);
+    }
+
+    public function employee(): BelongsTo
+    {
+        return $this->belongsTo(Employee::class, 'employee_control_no', 'control_no');
     }
 
     public function leaveBalances(): HasMany

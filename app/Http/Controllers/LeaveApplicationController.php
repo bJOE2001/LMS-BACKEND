@@ -74,6 +74,11 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Leave type not found.'], 404);
         }
 
+        $leaveTypeBalanceAccess = $this->assertEmployeeCanAccessLeaveTypeBalance($employee, $leaveType);
+        if ($leaveTypeBalanceAccess instanceof JsonResponse) {
+            return $leaveTypeBalanceAccess;
+        }
+
         $balance = LeaveBalance::query()
             ->with('accrualHistories')
             ->where('employee_id', $employee->control_no)
@@ -101,11 +106,10 @@ class LeaveApplicationController extends Controller
     {
         $validated = $request->validate([
             'erms_control_no' => ['nullable', 'string', 'regex:/^\d+$/'],
-            'employee_id' => ['nullable', 'string', 'regex:/^\d+$/'],
             'leave_type_id' => ['nullable', 'integer', 'exists:tblLeaveTypes,id'],
         ]);
 
-        $queryControlNo = $validated['erms_control_no'] ?? $validated['employee_id'] ?? null;
+        $queryControlNo = $validated['erms_control_no'] ?? null;
         $queryLeaveTypeId = $validated['leave_type_id'] ?? null;
 
         if ($queryControlNo !== null && $queryLeaveTypeId === null) {
@@ -119,7 +123,7 @@ class LeaveApplicationController extends Controller
             $leaveTypeId = (int) $queryLeaveTypeId;
         } else {
             return response()->json([
-                'message' => 'Provide either erms_control_no (or employee_id), or leave_type_id query parameter.',
+                'message' => 'Provide either erms_control_no, or leave_type_id query parameter.',
             ], 422);
         }
 
@@ -133,6 +137,11 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Leave type not found.'], 404);
         }
 
+        $leaveTypeBalanceAccess = $this->assertEmployeeCanAccessLeaveTypeBalance($employee, $leaveType);
+        if ($leaveTypeBalanceAccess instanceof JsonResponse) {
+            return $leaveTypeBalanceAccess;
+        }
+
         $balance = LeaveBalance::query()
             ->with('accrualHistories')
             ->where('employee_id', $employee->control_no)
@@ -142,7 +151,7 @@ class LeaveApplicationController extends Controller
         $deductionHistoryByType = $this->loadEmployeeLeaveDeductionHistoryByType((string) $employee->control_no, $leaveTypeId);
 
         return response()->json(array_merge([
-            'employee_id' => (string) $employee->control_no,
+            'erms_control_no' => (string) $employee->control_no,
         ], $this->formatErmsLeaveBalancePayload($leaveType, $balance, $deductionHistoryByType[(int) $leaveTypeId] ?? [])));
     }
 
@@ -162,7 +171,7 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Employee record not found.'], 404);
         }
 
-        $types = LeaveType::query()
+        $types = $this->getAllowedErmsLeaveTypesQuery($employee)
             ->select(['id', 'name', 'category', 'accrual_rate', 'accrual_day_of_month', 'is_credit_based'])
             ->orderBy('name')
             ->get();
@@ -189,30 +198,31 @@ class LeaveApplicationController extends Controller
         })->values();
 
         return response()->json([
-            'employee_id' => (string) $employee->control_no,
+            'erms_control_no' => (string) $employee->control_no,
             'balances' => $balances,
-            'latest_accrued_credits' => [
-                'vacation' => $this->buildErmsAccruedLeaveCard($typesByName, $balanceRecordsByType, $deductionHistoryByType, 'Vacation Leave'),
-                'sick' => $this->buildErmsAccruedLeaveCard($typesByName, $balanceRecordsByType, $deductionHistoryByType, 'Sick Leave'),
-            ],
+            'latest_accrued_credits' => $this->buildErmsLatestAccruedCreditsPayload(
+                $employee,
+                $typesByName,
+                $balanceRecordsByType,
+                $deductionHistoryByType
+            ),
         ]);
     }
 
     /**
-     * GET /apply-leave (and aliases)
+     * GET /erms/apply-leave
      * API-key protected endpoint for ERMS/HRPDS personal leave records listing.
      */
     public function ermsIndex(Request $request): JsonResponse
     {
         $validated = $request->validate([
             'erms_control_no' => ['nullable', 'string', 'regex:/^\d+$/'],
-            'employee_id' => ['nullable', 'string', 'regex:/^\d+$/'],
         ]);
 
-        $controlNo = trim((string) ($validated['erms_control_no'] ?? $validated['employee_id'] ?? ''));
+        $controlNo = trim((string) ($validated['erms_control_no'] ?? ''));
         if ($controlNo === '') {
             return response()->json([
-                'message' => 'The erms_control_no (or employee_id) query parameter is required.',
+                'message' => 'The erms_control_no query parameter is required.',
             ], 422);
         }
 
@@ -232,12 +242,15 @@ class LeaveApplicationController extends Controller
 
         $actorDirectory = $this->buildWorkflowActorDirectory($applications);
 
-        $leaveTypes = LeaveType::query()
-            ->orderBy('name')
-            ->get(['id', 'name', 'category', 'max_days', 'is_credit_based']);
+        $employeeContext = $this->formatErmsEmployeeContext($employee);
+        $leaveTypes = $this->getAllowedErmsLeaveTypesForEmployee($employee);
 
         return response()->json([
-            'employee_id' => (string) $employee->control_no,
+            'erms_control_no' => (string) $employee->control_no,
+            'employment_status' => $employeeContext['status'],
+            'employment_status_key' => $employeeContext['employment_status_key'],
+            'ui_variant' => $employeeContext['ui_variant'],
+            'employee' => $employeeContext,
             'leave_types' => $leaveTypes,
             'applications' => $applications
                 ->map(fn(LeaveApplication $app) => $this->formatErmsApplication($app, $actorDirectory))
@@ -246,59 +259,19 @@ class LeaveApplicationController extends Controller
     }
 
     /**
-     * POST /erms/apply-leave and POST /apply-leave
+     * POST /erms/apply-leave
      * API-key protected endpoint for ERMS-to-LMS leave application submission.
      */
     public function ermsStore(Request $request): JsonResponse
     {
         $this->normalizeSelectedDatesInput($request);
 
-        // Accept common ERMS key variants so frontend payload shape is less brittle.
-        $request->merge(array_filter([
-            'erms_control_no' => $request->input('erms_control_no')
-                ?? $request->input('employee_id')
-                ?? $request->input('employeeId')
-                ?? $request->input('control_no')
-                ?? $request->input('controlNo'),
-            'employee_id' => $request->input('employee_id')
-                ?? $request->input('employeeId')
-                ?? $request->input('erms_control_no')
-                ?? $request->input('control_no')
-                ?? $request->input('controlNo'),
-            'is_monetization' => $request->input('is_monetization')
-                ?? $request->input('isMonetization'),
-        ], static fn ($value) => $value !== null && $value !== ''));
-
         $baseValidated = $request->validate([
-            'erms_control_no' => ['nullable', 'string', 'regex:/^\d+$/', 'required_without:employee_id'],
-            'employee_id' => ['nullable', 'string', 'regex:/^\d+$/', 'required_without:erms_control_no'],
+            'erms_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'is_monetization' => ['nullable', 'boolean'],
         ]);
 
-        $controlNo = trim((string) ($baseValidated['erms_control_no'] ?? $baseValidated['employee_id']));
-
-        // Normalize alias so downstream validation/helpers can rely on one key.
-        $request->merge(['erms_control_no' => $controlNo]);
-
-        // Accept snake_case and camelCase fields for leave payload.
-        $request->merge(array_filter([
-            'leave_type_id' => $request->input('leave_type_id')
-                ?? $request->input('leaveTypeId')
-                ?? $request->input('leave_type'),
-            'start_date' => $request->input('start_date')
-                ?? $request->input('startDate'),
-            'end_date' => $request->input('end_date')
-                ?? $request->input('endDate'),
-            'total_days' => $request->input('total_days')
-                ?? $request->input('totalDays')
-                ?? $request->input('days'),
-            'reason' => $request->input('reason')
-                ?? $request->input('remarks'),
-            'selected_dates' => $request->input('selected_dates')
-                ?? $request->input('selectedDates'),
-            'commutation' => $request->input('commutation')
-                ?? $request->input('commutation_option'),
-        ], static fn ($value) => $value !== null && $value !== ''));
+        $controlNo = trim((string) $baseValidated['erms_control_no']);
 
         $employee = $this->findEmployeeByControlNo($controlNo);
 
@@ -389,9 +362,7 @@ class LeaveApplicationController extends Controller
     // ─── Employee: Submit new leave application ──────────────────────
 
     /**
-     * POST /erms/cancel-leave/{id?}
-     * POST /cancel-leave/{id?}
-     * POST /leave-applications/{id}/cancel
+     * POST /erms/leave-applications/{id}/cancel
      *
      * API-key protected endpoint for ERMS-to-LMS leave cancellation.
      * Cancels only pending applications owned by the provided employee.
@@ -400,33 +371,14 @@ class LeaveApplicationController extends Controller
     {
         $routeId = $id;
 
-        // Accept common ERMS key variants so cancellation requests are resilient.
         $request->merge(array_filter([
             'leave_application_id' => $request->input('leave_application_id')
-                ?? $request->input('application_id')
-                ?? $request->input('id')
                 ?? $routeId,
-            'erms_control_no' => $request->input('erms_control_no')
-                ?? $request->input('employee_id')
-                ?? $request->input('employeeId')
-                ?? $request->input('control_no')
-                ?? $request->input('controlNo'),
-            'employee_id' => $request->input('employee_id')
-                ?? $request->input('employeeId')
-                ?? $request->input('erms_control_no')
-                ?? $request->input('control_no')
-                ?? $request->input('controlNo'),
-            'cancellation_reason' => $request->input('cancellation_reason')
-                ?? $request->input('cancel_reason')
-                ?? $request->input('cancelReason')
-                ?? $request->input('reason')
-                ?? $request->input('remarks'),
         ], static fn($value) => $value !== null && $value !== ''));
 
         $validated = $request->validate([
             'leave_application_id' => ['required', 'integer'],
-            'erms_control_no' => ['nullable', 'string', 'regex:/^\d+$/', 'required_without:employee_id'],
-            'employee_id' => ['nullable', 'string', 'regex:/^\d+$/', 'required_without:erms_control_no'],
+            'erms_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'cancellation_reason' => ['nullable', 'string', 'max:2000'],
         ]);
 
@@ -437,7 +389,7 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
-        $controlNo = trim((string) ($validated['erms_control_no'] ?? $validated['employee_id']));
+        $controlNo = trim((string) $validated['erms_control_no']);
         $employee = $this->findEmployeeByControlNo($controlNo);
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
@@ -541,12 +493,7 @@ class LeaveApplicationController extends Controller
     }
 
     /**
-     * POST /erms/request-edit-leave/{id?}
-     * POST /request-edit-leave/{id?}
-     * POST /leave-applications/{id}/request-edit
-     * POST /leave-applications/{id}/edit-request
-     * POST /leave-applications/{id}/actions/request-edit
-     * POST /leave-applications/request-edit
+     * POST /erms/leave-applications/{id}/request-edit
      *
      * API-key protected endpoint for ERMS-to-LMS leave edit request.
      * Accepts reason/remarks and notifies admin/HR for pending applications.
@@ -555,33 +502,14 @@ class LeaveApplicationController extends Controller
     {
         $routeId = $id;
 
-        // Accept common ERMS key variants so request-edit payload is resilient.
         $request->merge(array_filter([
             'leave_application_id' => $request->input('leave_application_id')
-                ?? $request->input('application_id')
-                ?? $request->input('id')
                 ?? $routeId,
-            'erms_control_no' => $request->input('erms_control_no')
-                ?? $request->input('employee_id')
-                ?? $request->input('employeeId')
-                ?? $request->input('control_no')
-                ?? $request->input('controlNo'),
-            'employee_id' => $request->input('employee_id')
-                ?? $request->input('employeeId')
-                ?? $request->input('erms_control_no')
-                ?? $request->input('control_no')
-                ?? $request->input('controlNo'),
-            'edit_reason' => $request->input('edit_reason')
-                ?? $request->input('request_reason')
-                ?? $request->input('editReason')
-                ?? $request->input('reason')
-                ?? $request->input('remarks'),
         ], static fn($value) => $value !== null && $value !== ''));
 
         $validated = $request->validate([
             'leave_application_id' => ['required', 'integer'],
-            'erms_control_no' => ['nullable', 'string', 'regex:/^\d+$/', 'required_without:employee_id'],
-            'employee_id' => ['nullable', 'string', 'regex:/^\d+$/', 'required_without:erms_control_no'],
+            'erms_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'edit_reason' => ['nullable', 'string', 'max:2000'],
         ]);
 
@@ -592,7 +520,7 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
-        $controlNo = trim((string) ($validated['erms_control_no'] ?? $validated['employee_id']));
+        $controlNo = trim((string) $validated['erms_control_no']);
         $employee = $this->findEmployeeByControlNo($controlNo);
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
@@ -820,6 +748,13 @@ class LeaveApplicationController extends Controller
 
         // Validate that the selected leave type is either Vacation Leave or Sick Leave
         $leaveType = LeaveType::find($validated['leave_type_id']);
+        $leaveTypeRestriction = $leaveType
+            ? $this->assertEmployeeCanApplyForLeaveType($employee, $leaveType)
+            : null;
+        if ($leaveTypeRestriction instanceof JsonResponse) {
+            return $leaveTypeRestriction;
+        }
+
         if (!$leaveType || !in_array($leaveType->name, ['Vacation Leave', 'Sick Leave'], true)) {
             return response()->json([
                 'message' => 'Monetization is only allowed for Vacation Leave or Sick Leave.',
@@ -1556,6 +1491,13 @@ class LeaveApplicationController extends Controller
         }
 
         $leaveType = LeaveType::find($validated['leave_type_id']);
+        $leaveTypeRestriction = $leaveType
+            ? $this->assertEmployeeCanApplyForLeaveType($employee, $leaveType)
+            : null;
+        if ($leaveTypeRestriction instanceof JsonResponse) {
+            return $leaveTypeRestriction;
+        }
+
         if (!$leaveType || !in_array($leaveType->name, ['Vacation Leave', 'Sick Leave'], true)) {
             return response()->json([
                 'message' => 'Monetization is only allowed for Vacation Leave or Sick Leave.',
@@ -1692,6 +1634,122 @@ class LeaveApplicationController extends Controller
         return Employee::findByControlNo($controlNo);
     }
 
+    private function formatErmsEmployeeContext(object $employee): array
+    {
+        $statusKey = $this->resolveEmploymentStatusKey($employee->status ?? null);
+
+        return [
+            'control_no' => (string) ($employee->control_no ?? ''),
+            'firstname' => $employee->firstname ?? null,
+            'surname' => $employee->surname ?? null,
+            'middlename' => $employee->middlename ?? null,
+            'office' => $employee->office ?? null,
+            'designation' => $employee->designation ?? null,
+            'status' => $this->formatEmploymentStatusLabel($employee->status ?? null),
+            'raw_status' => $this->trimNullableString($employee->status ?? null),
+            'employment_status_key' => $statusKey,
+            'ui_variant' => $statusKey === 'contractual' ? 'contractual' : 'default',
+            'allowed_leave_scope' => $statusKey === 'contractual' ? 'wellness_only' : 'all',
+            'is_contractual' => $statusKey === 'contractual',
+        ];
+    }
+
+    private function getAllowedErmsLeaveTypesQuery(object $employee)
+    {
+        return LeaveType::query()
+            ->when($this->isContractualEmployee($employee), function ($query): void {
+                $query->whereRaw('LOWER(LTRIM(RTRIM(name))) = ?', ['wellness leave']);
+            });
+    }
+
+    private function getAllowedErmsLeaveTypesForEmployee(object $employee)
+    {
+        return $this->getAllowedErmsLeaveTypesQuery($employee)
+            ->orderBy('name')
+            ->get(['id', 'name', 'category', 'max_days', 'is_credit_based']);
+    }
+
+    private function assertEmployeeCanApplyForLeaveType(object $employee, LeaveType $leaveType): ?JsonResponse
+    {
+        return $this->assertEmployeeCanUseWellnessOnlyRule(
+            $employee,
+            $leaveType,
+            'Contractual employees can only apply for Wellness Leave.'
+        );
+    }
+
+    private function assertEmployeeCanAccessLeaveTypeBalance(object $employee, LeaveType $leaveType): ?JsonResponse
+    {
+        return $this->assertEmployeeCanUseWellnessOnlyRule(
+            $employee,
+            $leaveType,
+            'Contractual employees can only access Wellness Leave balances.'
+        );
+    }
+
+    private function assertEmployeeCanUseWellnessOnlyRule(
+        object $employee,
+        LeaveType $leaveType,
+        string $message
+    ): ?JsonResponse {
+        if (!$this->isContractualEmployee($employee) || $this->isWellnessLeaveType($leaveType)) {
+            return null;
+        }
+
+        return response()->json([
+            'message' => $message,
+            'errors' => [
+                'leave_type_id' => [$message],
+            ],
+        ], 422);
+    }
+
+    private function isContractualEmployee(object $employee): bool
+    {
+        return $this->resolveEmploymentStatusKey($employee->status ?? null) === 'contractual';
+    }
+
+    private function isWellnessLeaveType(LeaveType $leaveType): bool
+    {
+        return strtolower(trim((string) $leaveType->name)) === 'wellness leave';
+    }
+
+    private function resolveEmploymentStatusKey(?string $status): ?string
+    {
+        $normalizedStatus = strtoupper(trim((string) ($status ?? '')));
+
+        return match ($normalizedStatus) {
+            '' => null,
+            'REGULAR' => 'regular',
+            'ELECTIVE' => 'elective',
+            'CO-TERMINOUS', 'CO TERMINOUS', 'COTERMINOUS' => 'co_terminous',
+            'CASUAL' => 'casual',
+            'CONTRACTUAL' => 'contractual',
+            default => strtolower(str_replace([' ', '-'], '_', $normalizedStatus)),
+        };
+    }
+
+    private function formatEmploymentStatusLabel(?string $status): ?string
+    {
+        $statusKey = $this->resolveEmploymentStatusKey($status);
+
+        return match ($statusKey) {
+            null => null,
+            'regular' => 'Regular',
+            'elective' => 'Elective',
+            'co_terminous' => 'Co-Terminous',
+            'casual' => 'Casual',
+            'contractual' => 'Contractual',
+            default => $this->trimNullableString($status),
+        };
+    }
+
+    private function trimNullableString(mixed $value): ?string
+    {
+        $trimmed = trim((string) ($value ?? ''));
+        return $trimmed === '' ? null : $trimmed;
+    }
+
     private function formatErmsLeaveBalancePayload(
         LeaveType $leaveType,
         ?LeaveBalance $balance,
@@ -1776,6 +1834,41 @@ class LeaveApplicationController extends Controller
             $balance instanceof LeaveBalance ? $balance : null,
             $deductionHistoryByType[(int) $type->id] ?? []
         );
+    }
+
+    private function buildErmsLatestAccruedCreditsPayload(
+        object $employee,
+        array $typesByName,
+        array $balanceRecordsByType,
+        array $deductionHistoryByType
+    ): array {
+        if ($this->isContractualEmployee($employee)) {
+            return [
+                'vacation' => $this->emptyErmsLeaveBalancePayload('Vacation Leave'),
+                'sick' => $this->emptyErmsLeaveBalancePayload('Sick Leave'),
+                'wellness' => $this->buildErmsAccruedLeaveCard(
+                    $typesByName,
+                    $balanceRecordsByType,
+                    $deductionHistoryByType,
+                    'Wellness Leave'
+                ),
+            ];
+        }
+
+        return [
+            'vacation' => $this->buildErmsAccruedLeaveCard(
+                $typesByName,
+                $balanceRecordsByType,
+                $deductionHistoryByType,
+                'Vacation Leave'
+            ),
+            'sick' => $this->buildErmsAccruedLeaveCard(
+                $typesByName,
+                $balanceRecordsByType,
+                $deductionHistoryByType,
+                'Sick Leave'
+            ),
+        ];
     }
 
     private function emptyErmsLeaveBalancePayload(string $leaveTypeName): array
@@ -2200,59 +2293,35 @@ class LeaveApplicationController extends Controller
         return [
             'id' => $app->id,
             'erms_control_no' => $app->erms_control_no ? (string) $app->erms_control_no : null,
-            'control_no' => $app->erms_control_no ? (string) $app->erms_control_no : null,
-            'employee_id' => $app->erms_control_no ? (string) $app->erms_control_no : null,
             'leave_type_id' => $app->leave_type_id,
             'leave_type_name' => $app->leaveType?->name,
             'start_date' => $app->start_date?->toDateString(),
             'end_date' => $app->end_date?->toDateString(),
             'selected_dates' => $selectedDates,
-            'selectedDates' => $selectedDates,
             'total_days' => (float) $app->total_days,
             'date_filed' => $app->created_at?->toDateString(),
+            'filed_at' => $app->created_at?->toIso8601String(),
+            'created_at' => $app->created_at?->toIso8601String(),
             'status' => $displayStatus,
-            'application_status' => $displayStatus,
             'raw_status' => $app->status,
-            'rawStatus' => $app->status,
             'remarks' => $app->remarks,
             'rejection_reason' => $app->status === LeaveApplication::STATUS_REJECTED && !$isCancelled ? $app->remarks : null,
             'employee_name' => $employeeName,
-            'applicant_name' => $employeeName,
             'filed_by' => $filedBy,
             'approver_name' => $approverName,
-            'adminActionBy' => $adminActionBy,
             'admin_action_by' => $adminActionBy,
-            'admin_name' => $adminActionBy,
-            'hrActionBy' => $hrActionBy,
             'hr_action_by' => $hrActionBy,
-            'hr_reviewer_name' => $hrActionBy,
-            'processedBy' => $processedBy,
             'processed_by' => $processedBy,
-            'disapprovedBy' => $disapprovedBy,
             'disapproved_by' => $disapprovedBy,
-            'cancelledBy' => $cancelledBy,
             'cancelled_by' => $cancelledBy,
-            'is_cancelled' => $isCancelled,
-            'is_canceled' => $isCancelled,
             'cancelled' => $isCancelled,
-            'canceled' => $isCancelled,
-            'cancel_reason' => $cancellationReason,
-            'cancelReason' => $cancellationReason,
             'cancellation_reason' => $cancellationReason,
-            'cancellationReason' => $cancellationReason,
-            'reviewedAt' => $reviewedAt?->toIso8601String(),
             'reviewed_at' => $reviewedAt?->toIso8601String(),
-            'adminActionAt' => $adminActionAt?->toIso8601String(),
             'admin_action_at' => $adminActionAt?->toIso8601String(),
-            'hrActionAt' => $hrActionAt?->toIso8601String(),
             'hr_action_at' => $hrActionAt?->toIso8601String(),
-            'disapprovedAt' => $disapprovedAt?->toIso8601String(),
             'disapproved_at' => $disapprovedAt?->toIso8601String(),
-            'cancelledAt' => $cancelledAt?->toIso8601String(),
             'cancelled_at' => $cancelledAt?->toIso8601String(),
             'status_history' => $statusHistory,
-            'timeline_entries' => $statusHistory,
-            'timeline' => $statusHistory,
         ];
     }
 
@@ -2371,6 +2440,14 @@ class LeaveApplicationController extends Controller
                     'leave_type_id' => ['Selected leave type is not available.'],
                 ],
             ], 422);
+        }
+
+        $employee = $this->findEmployeeByControlNo($employeeControlNo);
+        if ($employee) {
+            $leaveTypeRestriction = $this->assertEmployeeCanApplyForLeaveType($employee, $leaveType);
+            if ($leaveTypeRestriction instanceof JsonResponse) {
+                return $leaveTypeRestriction;
+            }
         }
 
         if ($leaveType->max_days && $requestedDays > (float) $leaveType->max_days) {
@@ -2501,7 +2578,7 @@ class LeaveApplicationController extends Controller
 
     private function normalizeSelectedDatesInput(Request $request): void
     {
-        $selectedDates = $request->input('selected_dates') ?? $request->input('selectedDates');
+        $selectedDates = $request->input('selected_dates');
         if (is_string($selectedDates)) {
             $decoded = json_decode($selectedDates, true);
             if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
