@@ -13,10 +13,10 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
  *
  * Active columns:
  * - control_no (PK)
- * - control_no_int
  * - surname
  * - firstname
  * - middlename
+ * - birth_date
  * - office
  * - status
  * - designation
@@ -37,6 +37,7 @@ class Employee extends Model
         'surname',
         'firstname',
         'middlename',
+        'birth_date',
         'office',
         'status',
         'designation',
@@ -46,7 +47,7 @@ class Employee extends Model
     protected function casts(): array
     {
         return [
-            'control_no_int' => 'integer',
+            'birth_date' => 'date',
             'rate_mon' => 'decimal:2',
         ];
     }
@@ -61,7 +62,7 @@ class Employee extends Model
 
     public function leaveApplications(): HasMany
     {
-        return $this->hasMany(LeaveApplication::class, 'erms_control_no', 'control_no_int');
+        return $this->hasMany(LeaveApplication::class, 'erms_control_no', 'control_no');
     }
 
     public function leaveBalances(): HasMany
@@ -86,8 +87,8 @@ class Employee extends Model
         return $query->where(function (Builder $nestedQuery) use ($rawControlNo, $normalizedControlNo): void {
             $nestedQuery->where('control_no', $rawControlNo);
 
-            if ($normalizedControlNo !== null) {
-                $nestedQuery->orWhere('control_no_int', $normalizedControlNo);
+            if ($normalizedControlNo !== null && $normalizedControlNo !== $rawControlNo) {
+                $nestedQuery->orWhere('control_no', $normalizedControlNo);
             }
         });
     }
@@ -99,14 +100,14 @@ class Employee extends Model
             ->first();
     }
 
-    private static function normalizeControlNoInt(mixed $controlNo): ?int
+    private static function normalizeControlNoInt(mixed $controlNo): ?string
     {
         $normalized = ltrim(trim((string) ($controlNo ?? '')), '0');
         if ($normalized === '') {
             $normalized = '0';
         }
 
-        return preg_match('/^\d+$/', $normalized) ? (int) $normalized : null;
+        return preg_match('/^\d+$/', $normalized) ? $normalized : null;
     }
 
     /**
@@ -119,6 +120,7 @@ class Employee extends Model
             'Surname' => 'surname',
             'Firstname' => 'firstname',
             'Middlename' => 'middlename',
+            'BirthDate' => 'birth_date',
             'Office' => 'office',
             'Status' => 'status',
             'Designation' => 'designation',

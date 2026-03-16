@@ -9,7 +9,7 @@ use Illuminate\Support\Facades\Schedule;
 // ─── Scheduled Tasks ─────────────────────────────────────────────────────────
 Schedule::command('leave:accrue')->monthlyOn(1, '00:01');
 Schedule::command('leave:reset')->yearlyOn(1, 1, '00:05');
-// Employee records are maintained manually by LMS department admins.
+Schedule::command('hris:sync-employees')->dailyAt('00:10');
 
 Artisan::command('inspire', function () {
     $this->comment(Inspiring::quote());

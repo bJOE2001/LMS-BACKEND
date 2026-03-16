@@ -96,7 +96,7 @@ class LeaveApplication extends Model
 
     public function employee(): BelongsTo
     {
-        return $this->belongsTo(Employee::class, 'erms_control_no', 'control_no_int');
+        return $this->belongsTo(Employee::class, 'erms_control_no', 'control_no');
     }
 
     public static function resolveSelectedDates(

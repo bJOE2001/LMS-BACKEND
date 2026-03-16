@@ -367,11 +367,6 @@ BEGIN TRY
         ON DELETE NO ACTION;
 
     ALTER TABLE dbo.tblLeaveApplications
-        ADD CONSTRAINT FK_tblLeaveApplications_erms_control_no
-        FOREIGN KEY (erms_control_no) REFERENCES dbo.tblEmployees(control_no_int)
-        ON DELETE NO ACTION;
-
-    ALTER TABLE dbo.tblLeaveApplications
         ADD CONSTRAINT tblleaveapplications_leave_type_id_foreign
         FOREIGN KEY (leave_type_id) REFERENCES dbo.tblLeaveTypes(id)
         ON DELETE CASCADE;

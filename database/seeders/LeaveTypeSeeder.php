@@ -62,6 +62,17 @@ class LeaveTypeSeeder extends Seeder
                 'description' => '3 days per year. Resets every January 1.',
             ],
             [
+                'name' => 'Wellness Leave',
+                'category' => 'RESETTABLE',
+                'accrual_rate' => null,
+                'accrual_day_of_month' => null,
+                'max_days' => 3,
+                'is_credit_based' => true,
+                'resets_yearly' => true,
+                'requires_documents' => false,
+                'description' => '3 days per year. Resets every January 1.',
+            ],
+            [
                 'name' => 'Solo Parent Leave',
                 'category' => 'RESETTABLE',
                 'accrual_rate' => null,

@@ -8,6 +8,7 @@ use App\Http\Controllers\HRDashboardController;
 use App\Http\Controllers\HRLeaveBalanceImportController;
 use App\Http\Controllers\HRLeaveTypeController;
 use App\Http\Controllers\HRReportController;
+use App\Http\Controllers\HRUserManagementController;
 use App\Http\Controllers\LeaveApplicationController;
 use App\Http\Controllers\NotificationController;
 use App\Http\Controllers\SettingsController;
@@ -44,31 +45,8 @@ Route::prefix('erms')->middleware('erms.auth')->group(function () {
     Route::get('/leave-balances/{controlNo}', [LeaveApplicationController::class, 'ermsGetLeaveBalances']);
     Route::get('/apply-leave', [LeaveApplicationController::class, 'ermsIndex']);
     Route::post('/apply-leave', [LeaveApplicationController::class, 'ermsStore']);
-    Route::post('/cancel-leave/{id?}', [LeaveApplicationController::class, 'ermsCancel']);
-    Route::post('/leave-applications/{id}/cancel', [LeaveApplicationController::class, 'ermsCancel']);
-    Route::post('/request-edit-leave/{id?}', [LeaveApplicationController::class, 'ermsRequestEdit']);
-    Route::post('/leave-applications/{id}/request-edit', [LeaveApplicationController::class, 'ermsRequestEdit']);
-    Route::post('/leave-applications/{id}/edit-request', [LeaveApplicationController::class, 'ermsRequestEdit']);
-    Route::post('/leave-applications/{id}/actions/request-edit', [LeaveApplicationController::class, 'ermsRequestEdit']);
-    Route::post('/leave-applications/request-edit', [LeaveApplicationController::class, 'ermsRequestEdit']);
-});
-
-// HRPDS/LMS integration compatibility endpoints (API key protected)
-Route::middleware('erms.auth')->group(function () {
-    Route::get('/apply-leave', [LeaveApplicationController::class, 'ermsIndex']);
-    Route::post('/apply-leave', [LeaveApplicationController::class, 'ermsStore']);
-    Route::post('/cancel-leave/{id?}', [LeaveApplicationController::class, 'ermsCancel']);
-    Route::post('/request-edit-leave/{id?}', [LeaveApplicationController::class, 'ermsRequestEdit']);
-
-    // Aliases used by some ERMS/HRPDS clients when probing list routes
-    Route::get('/leave-applications', [LeaveApplicationController::class, 'ermsIndex']);
-    Route::get('/personal-leave-records', [LeaveApplicationController::class, 'ermsIndex']);
-    Route::get('/leave-records', [LeaveApplicationController::class, 'ermsIndex']);
     Route::post('/leave-applications/{id}/cancel', [LeaveApplicationController::class, 'ermsCancel']);
     Route::post('/leave-applications/{id}/request-edit', [LeaveApplicationController::class, 'ermsRequestEdit']);
-    Route::post('/leave-applications/{id}/edit-request', [LeaveApplicationController::class, 'ermsRequestEdit']);
-    Route::post('/leave-applications/{id}/actions/request-edit', [LeaveApplicationController::class, 'ermsRequestEdit']);
-    Route::post('/leave-applications/request-edit', [LeaveApplicationController::class, 'ermsRequestEdit']);
 });
 
 /*
@@ -126,6 +104,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::middleware('hr')->prefix('hr')->group(function () {
         // Employee management
         Route::get('/employees/{controlNo}/leave-history', [EmployeeController::class, 'leaveHistory']);
+        Route::get('/employees/{controlNo}/leave-balance-ledger', [EmployeeController::class, 'leaveCreditsLedger']);
+        Route::get('/employees/{controlNo}/leave-credits-ledger', [EmployeeController::class, 'leaveCreditsLedger']);
 
         // Dashboard
         Route::get('/dashboard', [HRDashboardController::class, 'index']);
@@ -134,6 +114,13 @@ Route::middleware('auth:sanctum')->group(function () {
         // Leave balance management
         Route::post('/leave-balances', [HRLeaveBalanceImportController::class, 'store']);
         Route::post('/leave-balances/import', [HRLeaveBalanceImportController::class, 'import']);
+
+        // User management
+        Route::get('/user-management/department-admins', [HRUserManagementController::class, 'index']);
+        Route::get('/user-management/departments/{departmentId}/eligible-employees', [HRUserManagementController::class, 'eligibleEmployees']);
+        Route::post('/user-management/department-admins', [HRUserManagementController::class, 'store']);
+        Route::put('/user-management/department-admins/{id}', [HRUserManagementController::class, 'update']);
+        Route::delete('/user-management/department-admins/{id}', [HRUserManagementController::class, 'destroy']);
 
         Route::prefix('leave-types')->group(function () {
             Route::get('/', [HRLeaveTypeController::class, 'index']);
