@@ -375,10 +375,8 @@ class EmployeeController extends Controller
             return response()->json(['message' => 'Employee not found.'], 404);
         }
 
-        $normalizedControlNo = (int) ltrim((string) $controlNo, '0');
-
         $applications = LeaveApplication::with(['leaveType'])
-            ->where('erms_control_no', $normalizedControlNo)
+            ->where('erms_control_no', (string) $employee->control_no)
             ->orderByDesc('created_at')
             ->get()
             ->map(function (LeaveApplication $application) {

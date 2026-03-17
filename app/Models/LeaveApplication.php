@@ -58,7 +58,7 @@ class LeaveApplication extends Model
     protected function casts(): array
     {
         return [
-            'erms_control_no' => 'integer',
+            'erms_control_no' => 'string',
             'start_date' => 'date',
             'end_date' => 'date',
             'total_days' => 'decimal:2',

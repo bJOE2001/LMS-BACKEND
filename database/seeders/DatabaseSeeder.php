@@ -24,9 +24,7 @@ class DatabaseSeeder extends Seeder
 
         $this->call([
             HRAccountSeeder::class,
-            DepartmentAdminSeeder::class,
             LeaveTypeSeeder::class,
-            LeaveBalanceSeeder::class,
         ]);
     }
 }

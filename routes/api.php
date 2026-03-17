@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\AdminDashboardController;
+use App\Http\Controllers\COCApplicationController;
 use App\Http\Controllers\Auth\AuthController;
 use App\Http\Controllers\Auth\PasswordResetController;
 use App\Http\Controllers\EmployeeController;
@@ -45,6 +46,8 @@ Route::prefix('erms')->middleware('erms.auth')->group(function () {
     Route::get('/leave-balances/{controlNo}', [LeaveApplicationController::class, 'ermsGetLeaveBalances']);
     Route::get('/apply-leave', [LeaveApplicationController::class, 'ermsIndex']);
     Route::post('/apply-leave', [LeaveApplicationController::class, 'ermsStore']);
+    Route::get('/apply-coc', [COCApplicationController::class, 'ermsIndex']);
+    Route::post('/apply-coc', [COCApplicationController::class, 'ermsStore']);
     Route::post('/leave-applications/{id}/cancel', [LeaveApplicationController::class, 'ermsCancel']);
     Route::post('/leave-applications/{id}/request-edit', [LeaveApplicationController::class, 'ermsRequestEdit']);
 });
@@ -55,7 +58,7 @@ Route::prefix('erms')->middleware('erms.auth')->group(function () {
 |--------------------------------------------------------------------------
 */
 
-Route::middleware('auth:sanctum')->group(function () {
+Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
     // Auth
     Route::post('/logout', [AuthController::class, 'logout']);
     Route::get('/me', [AuthController::class, 'me']);
@@ -95,6 +98,9 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/leave-applications', [LeaveApplicationController::class, 'adminIndex']);
         Route::post('/leave-applications/{id}/approve', [LeaveApplicationController::class, 'adminApprove']);
         Route::post('/leave-applications/{id}/reject', [LeaveApplicationController::class, 'adminReject']);
+        Route::get('/coc-applications', [COCApplicationController::class, 'adminIndex']);
+        Route::post('/coc-applications/{id}/approve', [COCApplicationController::class, 'adminApprove']);
+        Route::post('/coc-applications/{id}/reject', [COCApplicationController::class, 'adminReject']);
 
         // Apply leave on behalf of employee
         Route::get('/employees-for-leave', [LeaveApplicationController::class, 'adminEmployees']);
@@ -133,6 +139,9 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/leave-applications', [LeaveApplicationController::class, 'hrIndex']);
         Route::post('/leave-applications/{id}/approve', [LeaveApplicationController::class, 'hrApprove']);
         Route::post('/leave-applications/{id}/reject', [LeaveApplicationController::class, 'hrReject']);
+        Route::get('/coc-applications', [COCApplicationController::class, 'hrIndex']);
+        Route::post('/coc-applications/{id}/approve', [COCApplicationController::class, 'hrApprove']);
+        Route::post('/coc-applications/{id}/reject', [COCApplicationController::class, 'hrReject']);
 
         // Reports
         Route::prefix('reports')->group(function () {

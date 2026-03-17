@@ -36,6 +36,7 @@ class AuthController extends Controller
         $response = [
             'message' => 'Login successful.',
             'user' => $userPayload,
+            'must_change_password' => (bool) ($userPayload['must_change_password'] ?? false),
             'dashboard_route' => $dashboardRoute,
             'token' => $token,
         ];
@@ -82,6 +83,7 @@ class AuthController extends Controller
                     'name' => $account->full_name,
                     'username' => $account->username,
                     'role' => 'hr',
+                    'must_change_password' => false,
                 ],
                 self::DASHBOARD_HR,
             ];
@@ -97,6 +99,7 @@ class AuthController extends Controller
                 'department_id' => $account->department_id,
                 'department' => $account->department ? ['id' => $account->department->id, 'name' => $account->department->name] : null,
                 'position' => 'Admin',
+                'must_change_password' => (bool) $account->must_change_password,
             ],
             self::DASHBOARD_DEPARTMENT_ADMIN,
         ];

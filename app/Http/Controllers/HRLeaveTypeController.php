@@ -25,7 +25,7 @@ class HRLeaveTypeController extends Controller
         $category = $validated['category'] ?? null;
 
         $leaveTypes = LeaveType::query()
-            ->withCount(['leaveApplications', 'leaveBalances', 'adminLeaveBalances'])
+            ->withCount(['leaveApplications', 'leaveBalances'])
             ->when($search !== '', function ($query) use ($search): void {
                 $query->where('name', 'like', "%{$search}%");
             })
@@ -48,7 +48,7 @@ class HRLeaveTypeController extends Controller
         $payload = $this->normalizePayload($validated);
 
         $leaveType = LeaveType::create($payload);
-        $leaveType->loadCount(['leaveApplications', 'leaveBalances', 'adminLeaveBalances']);
+        $leaveType->loadCount(['leaveApplications', 'leaveBalances']);
 
         return response()->json([
             'message' => 'Leave type created successfully.',
@@ -67,7 +67,7 @@ class HRLeaveTypeController extends Controller
         $payload = $this->normalizePayload($validated);
 
         $leaveType->update($payload);
-        $leaveType->refresh()->loadCount(['leaveApplications', 'leaveBalances', 'adminLeaveBalances']);
+        $leaveType->refresh()->loadCount(['leaveApplications', 'leaveBalances']);
 
         return response()->json([
             'message' => 'Leave type updated successfully.',
@@ -78,7 +78,7 @@ class HRLeaveTypeController extends Controller
     public function destroy(int $id): JsonResponse
     {
         $leaveType = LeaveType::query()
-            ->withCount(['leaveApplications', 'leaveBalances', 'adminLeaveBalances'])
+            ->withCount(['leaveApplications', 'leaveBalances'])
             ->find($id);
 
         if (!$leaveType) {
@@ -86,8 +86,7 @@ class HRLeaveTypeController extends Controller
         }
 
         $usageTotal = (int) $leaveType->leave_applications_count
-            + (int) $leaveType->leave_balances_count
-            + (int) $leaveType->admin_leave_balances_count;
+            + (int) $leaveType->leave_balances_count;
 
         if ($usageTotal > 0) {
             return response()->json([
@@ -95,7 +94,7 @@ class HRLeaveTypeController extends Controller
                 'usage' => [
                     'applications' => (int) $leaveType->leave_applications_count,
                     'employee_balances' => (int) $leaveType->leave_balances_count,
-                    'admin_balances' => (int) $leaveType->admin_leave_balances_count,
+                    'admin_balances' => 0,
                     'total' => $usageTotal,
                 ],
             ], 422);
@@ -180,7 +179,7 @@ class HRLeaveTypeController extends Controller
     {
         $applications = (int) ($type->leave_applications_count ?? 0);
         $employeeBalances = (int) ($type->leave_balances_count ?? 0);
-        $adminBalances = (int) ($type->admin_leave_balances_count ?? 0);
+        $adminBalances = 0;
 
         return [
             'id' => $type->id,

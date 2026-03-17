@@ -2,6 +2,8 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\DepartmentAdmin;
+use App\Models\Employee;
 use App\Models\HRAccount;
 use App\Models\LeaveApplication;
 use App\Models\LeaveBalance;
@@ -74,6 +76,7 @@ class HRDashboardController extends Controller
             : null;
         $applicantName = $employeeName ?: ($app->applicantAdmin ? $app->applicantAdmin->full_name : 'Unknown');
         $office = $app->employee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
+        $durationDays = (float) $app->total_days;
 
         return [
             'id' => $app->id,
@@ -83,7 +86,12 @@ class HRDashboardController extends Controller
             'leaveType' => $app->leaveType?->name ?? 'Unknown',
             'startDate' => $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : null,
             'endDate' => $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : null,
-            'days' => (float) $app->total_days,
+            'days' => $durationDays,
+            'duration_value' => $durationDays,
+            'duration_unit' => 'day',
+            'duration_label' => $durationDays == (int) $durationDays
+                ? ((int) $durationDays) . ' ' . ((int) $durationDays === 1 ? 'day' : 'days')
+                : $durationDays . ' days',
             'reason' => $app->reason,
             'status' => $statusMap[$app->status] ?? $app->status,
             'rawStatus' => $app->status,
@@ -99,21 +107,80 @@ class HRDashboardController extends Controller
     private function getBalanceForApp(LeaveApplication $app): ?float
     {
         if ($app->erms_control_no) {
-            $balance = \App\Models\LeaveBalance::where('employee_id', $app->erms_control_no)
+            $employeeControlNo = trim((string) $app->erms_control_no);
+            $candidateEmployeeIds = $this->controlNoCandidates($employeeControlNo);
+            if ($candidateEmployeeIds === []) {
+                return null;
+            }
+
+            $balance = LeaveBalance::query()
                 ->where('leave_type_id', $app->leave_type_id)
+                ->whereIn('employee_id', $candidateEmployeeIds)
                 ->first();
             return $balance ? (float) $balance->balance : null;
         }
 
         if ($app->applicant_admin_id) {
-            $balance = \App\Models\AdminLeaveBalance::where('admin_id', $app->applicant_admin_id)
+            $adminControlNo = $this->resolveAdminEmployeeControlNo((int) $app->applicant_admin_id);
+            if ($adminControlNo === null) {
+                return null;
+            }
+
+            $candidateEmployeeIds = $this->controlNoCandidates($adminControlNo);
+            if ($candidateEmployeeIds === []) {
+                return null;
+            }
+
+            $balance = LeaveBalance::query()
                 ->where('leave_type_id', $app->leave_type_id)
-                ->where('year', now()->year)
+                ->whereIn('employee_id', $candidateEmployeeIds)
                 ->first();
             return $balance ? (float) $balance->balance : null;
         }
 
         return null;
+    }
+
+    private function resolveAdminEmployeeControlNo(int $adminId): ?string
+    {
+        if ($adminId <= 0) {
+            return null;
+        }
+
+        $admin = DepartmentAdmin::query()->find($adminId);
+        if (!$admin) {
+            return null;
+        }
+
+        $rawControlNo = trim((string) $admin->employee_control_no);
+        if ($rawControlNo === '') {
+            return null;
+        }
+
+        $employee = Employee::findByControlNo($rawControlNo);
+        return trim((string) ($employee?->control_no ?? $rawControlNo));
+    }
+
+    private function controlNoCandidates(string $controlNo): array
+    {
+        $rawControlNo = trim($controlNo);
+        if ($rawControlNo === '') {
+            return [];
+        }
+
+        $normalizedControlNo = ltrim($rawControlNo, '0');
+        if ($normalizedControlNo === '') {
+            $normalizedControlNo = '0';
+        }
+
+        $candidates = [$rawControlNo, $normalizedControlNo];
+
+        $employee = Employee::findByControlNo($rawControlNo);
+        if ($employee && trim((string) $employee->control_no) !== '') {
+            $candidates[] = trim((string) $employee->control_no);
+        }
+
+        return array_values(array_unique(array_filter($candidates, fn(string $value): bool => $value !== '')));
     }
 
     /**
@@ -162,6 +229,11 @@ class HRDashboardController extends Controller
             'endDate' => $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : '',
             'selected_dates' => $app->resolvedSelectedDates(),
             'days' => (float) $app->total_days,
+            'duration_value' => (float) $app->total_days,
+            'duration_unit' => 'day',
+            'duration_label' => ((float) $app->total_days == (int) $app->total_days)
+                ? ((int) $app->total_days) . ' ' . ((int) $app->total_days === 1 ? 'day' : 'days')
+                : ((float) $app->total_days) . ' days',
             'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
             'status' => 'Approved',
         ]);

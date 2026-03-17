@@ -5,7 +5,6 @@ namespace App\Models;
 use Illuminate\Contracts\Auth\Authenticatable as AuthenticatableContract;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
-use Illuminate\Database\Eloquent\Relations\HasMany;
 use Laravel\Sanctum\HasApiTokens;
 
 /**
@@ -24,7 +23,7 @@ class DepartmentAdmin extends Model implements AuthenticatableContract
         'full_name',
         'username',
         'password',
-        'leave_initialized',
+        'must_change_password',
     ];
 
     protected $hidden = [
@@ -35,7 +34,7 @@ class DepartmentAdmin extends Model implements AuthenticatableContract
     {
         return [
             'password' => 'hashed',
-            'leave_initialized' => 'boolean',
+            'must_change_password' => 'boolean',
         ];
     }
 
@@ -47,11 +46,6 @@ class DepartmentAdmin extends Model implements AuthenticatableContract
     public function employee(): BelongsTo
     {
         return $this->belongsTo(Employee::class, 'employee_control_no', 'control_no');
-    }
-
-    public function leaveBalances(): HasMany
-    {
-        return $this->hasMany(AdminLeaveBalance::class, 'admin_id');
     }
 
     public function getAuthIdentifierName(): string

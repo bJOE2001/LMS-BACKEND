@@ -39,8 +39,8 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Only employee accounts can list their leave applications.'], 403);
         }
 
-        $applications = LeaveApplication::with('leaveType')
-            ->where('erms_control_no', $controlNo)
+        $applications = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin.department'])
+            ->where(fn($query) => $this->applyApplicationOwnershipFilter($query, (string) $controlNo))
             ->orderByDesc('created_at')
             ->get();
 
@@ -233,10 +233,7 @@ class LeaveApplicationController extends Controller
 
         $applications = LeaveApplication::query()
             ->with(['leaveType', 'employee', 'applicantAdmin.department', 'logs'])
-            ->where(function ($query) use ($controlNo) {
-                $query->where('erms_control_no', $controlNo)
-                    ->orWhereRaw('TRY_CONVERT(INT, erms_control_no) = TRY_CONVERT(INT, ?)', [$controlNo]);
-            })
+            ->where(fn($query) => $this->applyApplicationOwnershipFilter($query, $controlNo))
             ->orderByDesc('created_at')
             ->get();
 
@@ -319,7 +316,7 @@ class LeaveApplicationController extends Controller
 
         $app = DB::transaction(function () use ($validated, $employee, $actor) {
             $application = LeaveApplication::create([
-                'erms_control_no' => (int) $employee->control_no,
+                'erms_control_no' => (string) $employee->control_no,
                 'leave_type_id' => $validated['leave_type_id'],
                 'start_date' => $validated['start_date'],
                 'end_date' => $validated['end_date'],
@@ -398,10 +395,7 @@ class LeaveApplicationController extends Controller
         $app = LeaveApplication::query()
             ->with('leaveType')
             ->where('id', $applicationId)
-            ->where(function ($query) use ($controlNo) {
-                $query->where('erms_control_no', $controlNo)
-                    ->orWhereRaw('TRY_CONVERT(INT, erms_control_no) = TRY_CONVERT(INT, ?)', [$controlNo]);
-            })
+            ->where(fn($query) => $this->applyApplicationOwnershipFilter($query, $controlNo))
             ->first();
 
         if (!$app) {
@@ -529,9 +523,8 @@ class LeaveApplicationController extends Controller
         $app = LeaveApplication::query()
             ->with('leaveType')
             ->where('id', $applicationId)
-            ->where(function ($query) use ($controlNo) {
-                $query->where('erms_control_no', $controlNo)
-                    ->orWhereRaw('TRY_CONVERT(INT, erms_control_no) = TRY_CONVERT(INT, ?)', [$controlNo]);
+            ->where(function ($query) use ($controlNo): void {
+                $query->whereIn('erms_control_no', $this->controlNoCandidates($controlNo));
             })
             ->first();
 
@@ -634,15 +627,13 @@ class LeaveApplicationController extends Controller
         }
 
         $baseValidated = $request->validate([
-            'erms_control_no' => ['required', 'integer'],
+            'erms_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'is_monetization' => ['nullable', 'boolean'],
         ]);
 
         // This system uses ERMS ControlNo as the authoritative employee identifier.
         // Employee records are resolved from LMS tblEmployees.
-        $employee = DB::table('tblEmployees')
-            ->where('control_no', $baseValidated['erms_control_no'])
-            ->first();
+        $employee = $this->findEmployeeByControlNo((string) $baseValidated['erms_control_no']);
 
         if (!$employee) {
             return response()->json(['error' => 'Employee not found'], 404);
@@ -656,7 +647,7 @@ class LeaveApplicationController extends Controller
         }
 
         $validated = $request->validate([
-            'erms_control_no' => ['required', 'integer'],
+            'erms_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
             'start_date' => ['required', 'date'],
             'end_date' => ['required', 'date', 'after_or_equal:start_date'],
@@ -689,7 +680,7 @@ class LeaveApplicationController extends Controller
 
         $app = DB::transaction(function () use ($validated, $employee, $account) {
             $application = LeaveApplication::create([
-                'erms_control_no' => (int) $employee->control_no,
+                'erms_control_no' => (string) $employee->control_no,
                 'leave_type_id' => $validated['leave_type_id'],
                 'start_date' => $validated['start_date'],
                 'end_date' => $validated['end_date'],
@@ -739,7 +730,7 @@ class LeaveApplicationController extends Controller
     private function storeMonetization(Request $request, object $employee, object $account): JsonResponse
     {
         $validated = $request->validate([
-            'erms_control_no' => ['required', 'integer'],
+            'erms_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
             'total_days' => ['required', 'numeric', 'min:1', 'max:999'],
             'reason' => ['nullable', 'string', 'max:2000'],
@@ -803,7 +794,7 @@ class LeaveApplicationController extends Controller
 
         $app = DB::transaction(function () use ($validated, $employee, $account, $equivalentAmount) {
             $application = LeaveApplication::create([
-                'erms_control_no' => (int) $employee->control_no,
+                'erms_control_no' => (string) $employee->control_no,
                 'leave_type_id' => $validated['leave_type_id'],
                 'start_date' => null,
                 'end_date' => null,
@@ -855,7 +846,8 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Only employee accounts can view leave applications.'], 403);
         }
 
-        if ((string) $leaveApplication->erms_control_no !== (string) $controlNo) {
+        $allowedControlNos = $this->controlNoCandidates((string) $controlNo);
+        if (!in_array((string) $leaveApplication->erms_control_no, $allowedControlNos, true)) {
             return response()->json(['message' => 'Leave application not found.'], 404);
         }
 
@@ -916,8 +908,9 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Leave application not found.'], 404);
         }
 
-        // Security: admin can only act on their own department's applications
-        if ($app->employee?->office !== $admin->department?->name) {
+        // Security: admin can only act on their own department's applications.
+        $applicationEmployee = $this->resolveApplicationEmployee($app);
+        if (($applicationEmployee?->office ?? null) !== $admin->department?->name) {
             return response()->json(['message' => 'You can only manage applications from your department.'], 403);
         }
 
@@ -989,7 +982,8 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Leave application not found.'], 404);
         }
 
-        if ($app->employee?->office !== $admin->department?->name) {
+        $applicationEmployee = $this->resolveApplicationEmployee($app);
+        if (($applicationEmployee?->office ?? null) !== $admin->department?->name) {
             return response()->json(['message' => 'You can only manage applications from your department.'], 403);
         }
 
@@ -1109,10 +1103,10 @@ class LeaveApplicationController extends Controller
                     ], 422);
                 }
             } elseif ($app->applicant_admin_id) {
-                $balance = \App\Models\AdminLeaveBalance::where('admin_id', $app->applicant_admin_id)
-                    ->where('leave_type_id', $app->leave_type_id)
-                    ->where('year', now()->year)
-                    ->first();
+                $balance = $this->findAdminEmployeeLeaveBalance(
+                    (int) $app->applicant_admin_id,
+                    (int) $app->leave_type_id
+                );
 
                 if (!$balance || (float) $balance->balance < (float) $app->total_days) {
                     $currentBalance = $balance ? (float) $balance->balance : 0;
@@ -1160,12 +1154,11 @@ class LeaveApplicationController extends Controller
                             }
                         }
                     } elseif ($app->applicant_admin_id) {
-                        $lockedBalance = \App\Models\AdminLeaveBalance::query()
-                            ->where('admin_id', $app->applicant_admin_id)
-                            ->where('leave_type_id', $app->leave_type_id)
-                            ->where('year', now()->year)
-                            ->lockForUpdate()
-                            ->first();
+                        $lockedBalance = $this->findAdminEmployeeLeaveBalance(
+                            (int) $app->applicant_admin_id,
+                            (int) $app->leave_type_id,
+                            true
+                        );
 
                         if (!$lockedBalance || (float) $lockedBalance->balance < (float) $app->total_days) {
                             throw new \RuntimeException($balanceConflictError);
@@ -1214,11 +1207,12 @@ class LeaveApplicationController extends Controller
                 ], 422);
             }
 
-            $currentBalance = (float) (\App\Models\AdminLeaveBalance::query()
-                ->where('admin_id', $app->applicant_admin_id)
-                ->where('leave_type_id', $app->leave_type_id)
-                ->where('year', now()->year)
-                ->value('balance') ?? 0);
+            $currentBalance = (float) (
+                $this->findAdminEmployeeLeaveBalance(
+                    (int) $app->applicant_admin_id,
+                    (int) $app->leave_type_id
+                )?->balance ?? 0
+            );
 
             return response()->json([
                 'message' => "Insufficient leave balance. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($app->total_days) . ".",
@@ -1413,7 +1407,7 @@ class LeaveApplicationController extends Controller
 
         $app = DB::transaction(function () use ($validated, $employee, $admin) {
             $application = LeaveApplication::create([
-                'erms_control_no' => (int) $employee->control_no,
+                'erms_control_no' => (string) $employee->control_no,
                 'leave_type_id' => $validated['leave_type_id'],
                 'start_date' => $validated['start_date'],
                 'end_date' => $validated['end_date'],
@@ -1535,7 +1529,7 @@ class LeaveApplicationController extends Controller
 
         $app = DB::transaction(function () use ($validated, $employee, $admin, $equivalentAmount) {
             $application = LeaveApplication::create([
-                'erms_control_no' => (int) $employee->control_no,
+                'erms_control_no' => (string) $employee->control_no,
                 'leave_type_id' => $validated['leave_type_id'],
                 'start_date' => null,
                 'end_date' => null,
@@ -1632,6 +1626,106 @@ class LeaveApplicationController extends Controller
         }
 
         return Employee::findByControlNo($controlNo);
+    }
+
+    private function controlNoCandidates(string $controlNo): array
+    {
+        $rawControlNo = trim($controlNo);
+        if ($rawControlNo === '') {
+            return [];
+        }
+
+        $candidates = [
+            $rawControlNo,
+            $this->normalizeControlNo($rawControlNo),
+        ];
+
+        $employee = $this->findEmployeeByControlNo($rawControlNo);
+        if ($employee && trim((string) ($employee->control_no ?? '')) !== '') {
+            $candidates[] = trim((string) $employee->control_no);
+        }
+
+        return array_values(array_unique(array_filter(
+            $candidates,
+            static fn(string $value): bool => trim($value) !== ''
+        )));
+    }
+
+    private function resolveApplicationEmployee(LeaveApplication $app): ?object
+    {
+        if ($app->employee) {
+            return $app->employee;
+        }
+
+        if ($app->erms_control_no === null) {
+            return null;
+        }
+
+        return $this->findEmployeeByControlNo((string) $app->erms_control_no);
+    }
+
+    private function applyApplicationOwnershipFilter($query, string $controlNo): void
+    {
+        $controlNoCandidates = $this->controlNoCandidates($controlNo);
+        if ($controlNoCandidates === []) {
+            $query->whereRaw('1 = 0');
+            return;
+        }
+
+        $query->where(function ($nestedQuery) use ($controlNoCandidates): void {
+            $nestedQuery->whereIn('erms_control_no', $controlNoCandidates)
+                ->orWhereHas('applicantAdmin', function ($adminQuery) use ($controlNoCandidates): void {
+                    $adminQuery->whereIn('employee_control_no', $controlNoCandidates);
+                });
+        });
+    }
+
+    private function findAdminEmployeeControlNo(int $adminId): ?string
+    {
+        if ($adminId <= 0) {
+            return null;
+        }
+
+        $admin = DepartmentAdmin::query()->find($adminId);
+        if (!$admin) {
+            return null;
+        }
+
+        $rawControlNo = trim((string) $admin->employee_control_no);
+        if ($rawControlNo === '') {
+            return null;
+        }
+
+        $employee = Employee::findByControlNo($rawControlNo);
+        return trim((string) ($employee?->control_no ?? $rawControlNo));
+    }
+
+    private function queryLeaveBalancesByEmployeeControlNo(string $employeeControlNo)
+    {
+        $candidateEmployeeIds = $this->controlNoCandidates($employeeControlNo);
+        if ($candidateEmployeeIds === []) {
+            return LeaveBalance::query()->whereRaw('1 = 0');
+        }
+
+        return LeaveBalance::query()
+            ->whereIn('employee_id', $candidateEmployeeIds);
+    }
+
+    private function findAdminEmployeeLeaveBalance(int $adminId, int $leaveTypeId, bool $lockForUpdate = false): ?LeaveBalance
+    {
+        $employeeControlNo = $this->findAdminEmployeeControlNo($adminId);
+        if ($employeeControlNo === null) {
+            return null;
+        }
+
+        $query = $this->queryLeaveBalancesByEmployeeControlNo($employeeControlNo)
+            ->where('leave_type_id', $leaveTypeId);
+
+        if ($lockForUpdate) {
+            $query->lockForUpdate();
+        }
+
+        return $query->first();
     }
 
     private function formatErmsEmployeeContext(object $employee): array
@@ -1896,10 +1990,7 @@ class LeaveApplicationController extends Controller
         $applications = LeaveApplication::query()
             ->with(['leaveType:id,name,is_credit_based'])
             ->where('status', LeaveApplication::STATUS_APPROVED)
-            ->where(function ($query) use ($controlNo): void {
-                $query->where('erms_control_no', $controlNo)
-                    ->orWhereRaw('TRY_CONVERT(INT, erms_control_no) = TRY_CONVERT(INT, ?)', [$controlNo]);
-            })
+            ->whereIn('erms_control_no', $this->controlNoCandidates($controlNo))
             ->when($leaveTypeId !== null, function ($query) use ($leaveTypeId): void {
                 $query->where('leave_type_id', $leaveTypeId);
             })
@@ -1970,20 +2061,22 @@ class LeaveApplicationController extends Controller
 
     private function resolveEmployeeDisplayName(LeaveApplication $app): string
     {
-        $name = trim((string) (($app->employee?->firstname ?? '') . ' ' . ($app->employee?->surname ?? '')));
+        $employee = $this->resolveApplicationEmployee($app);
+        $name = trim((string) (($employee?->firstname ?? '') . ' ' . ($employee?->surname ?? '')));
         if ($name !== '') {
             return $name;
         }
 
-        if ($app->erms_control_no !== null) {
-            $employee = $this->findEmployeeByControlNo((string) $app->erms_control_no);
-            $fallback = trim((string) (($employee->firstname ?? '') . ' ' . ($employee->surname ?? '')));
-            if ($fallback !== '') {
-                return $fallback;
-            }
+        $adminFallback = trim((string) ($app->applicantAdmin?->full_name ?? ''));
+        if ($adminFallback !== '') {
+            return $adminFallback;
         }
 
-        return 'An employee';
+        if ($app->erms_control_no !== null) {
+            return 'Employee ' . $this->normalizeControlNo((string) $app->erms_control_no);
+        }
+
+        return 'Employee';
     }
 
     private function normalizeControlNo(mixed $value): string
@@ -2036,7 +2129,7 @@ class LeaveApplicationController extends Controller
 
             $employeeControlNo = $this->normalizeControlNo($application->erms_control_no);
             if ($employeeControlNo !== '') {
-                $employeeName = $this->formatEmployeeFullName($application->employee);
+                $employeeName = $this->formatEmployeeFullName($this->resolveApplicationEmployee($application));
                 if ($employeeName === '') {
                     $employeeName = trim((string) ($application->applicantAdmin?->full_name ?? ''));
                 }
@@ -2169,7 +2262,7 @@ class LeaveApplicationController extends Controller
 
     private function formatErmsApplication(LeaveApplication $app, array $actorDirectory): array
     {
-        $employeeName = $this->formatEmployeeFullName($app->employee);
+        $employeeName = $this->formatEmployeeFullName($this->resolveApplicationEmployee($app));
         if ($employeeName === '') {
             $employeeName = trim((string) ($app->applicantAdmin?->full_name ?? ''));
         }
@@ -2371,10 +2464,7 @@ class LeaveApplicationController extends Controller
                 LeaveApplication::STATUS_PENDING_HR,
                 LeaveApplication::STATUS_APPROVED,
             ])
-            ->where(function ($query) use ($employeeControlNo): void {
-                $query->where('erms_control_no', $employeeControlNo)
-                    ->orWhereRaw('TRY_CONVERT(INT, erms_control_no) = TRY_CONVERT(INT, ?)', [$employeeControlNo]);
-            })
+            ->whereIn('erms_control_no', $this->controlNoCandidates($employeeControlNo))
             ->get();
 
         $duplicateDateMap = [];
@@ -2465,10 +2555,7 @@ class LeaveApplicationController extends Controller
 
         $balance = LeaveBalance::query()
             ->where('leave_type_id', $leaveTypeId)
-            ->where(function ($query) use ($employeeControlNo): void {
-                $query->where('employee_id', $employeeControlNo)
-                    ->orWhereRaw('TRY_CONVERT(INT, employee_id) = TRY_CONVERT(INT, ?)', [$employeeControlNo]);
-            })
+            ->whereIn('employee_id', $this->controlNoCandidates($employeeControlNo))
             ->first();
 
         if (!$balance) {
@@ -2487,10 +2574,7 @@ class LeaveApplicationController extends Controller
                 LeaveApplication::STATUS_PENDING_ADMIN,
                 LeaveApplication::STATUS_PENDING_HR,
             ])
-            ->where(function ($query) use ($employeeControlNo): void {
-                $query->where('erms_control_no', $employeeControlNo)
-                    ->orWhereRaw('TRY_CONVERT(INT, erms_control_no) = TRY_CONVERT(INT, ?)', [$employeeControlNo]);
-            })
+            ->whereIn('erms_control_no', $this->controlNoCandidates($employeeControlNo))
             ->sum('total_days');
 
         $availableBalance = max(round($currentBalance - $pendingReservedDays, 2), 0.0);
@@ -2519,14 +2603,16 @@ class LeaveApplicationController extends Controller
 
     private function formatApplication(LeaveApplication $app): array
     {
-        $employeeName = $this->formatEmployeeFullName($app->employee);
+        $resolvedEmployee = $this->resolveApplicationEmployee($app);
+        $employeeName = $this->formatEmployeeFullName($resolvedEmployee);
         $applicantName = $employeeName !== ''
             ? $employeeName
             : trim((string) ($app->applicantAdmin?->full_name ?? ''));
         if ($applicantName === '') {
             $applicantName = $this->resolveEmployeeDisplayName($app);
         }
-        $office = $app->employee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
+        $office = $resolvedEmployee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
+        $durationDays = (float) $app->total_days;
 
         $data = [
             'id' => $app->id,
@@ -2536,7 +2622,10 @@ class LeaveApplicationController extends Controller
             'leaveType' => $app->leaveType?->name ?? 'Unknown',
             'startDate' => $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : null,
             'endDate' => $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : null,
-            'days' => (float) $app->total_days,
+            'days' => $durationDays,
+            'duration_value' => $durationDays,
+            'duration_unit' => 'day',
+            'duration_label' => self::formatDays($durationDays),
             'reason' => $app->reason,
             'status' => $this->statusToFrontend($app->status),
             'rawStatus' => $app->status,
@@ -2561,15 +2650,15 @@ class LeaveApplicationController extends Controller
             'office' => $office,
         ];
 
-        if ($app->employee) {
+        if ($resolvedEmployee) {
             $data['employee'] = [
-                'control_no' => $app->employee->control_no,
-                'firstname' => $app->employee->firstname,
-                'middlename' => $app->employee->middlename,
-                'surname' => $app->employee->surname,
-                'full_name' => $this->formatEmployeeFullName($app->employee),
-                'designation' => $app->employee->designation,
-                'office' => $app->employee->office,
+                'control_no' => $resolvedEmployee->control_no,
+                'firstname' => $resolvedEmployee->firstname,
+                'middlename' => $resolvedEmployee->middlename,
+                'surname' => $resolvedEmployee->surname,
+                'full_name' => $this->formatEmployeeFullName($resolvedEmployee),
+                'designation' => $resolvedEmployee->designation,
+                'office' => $resolvedEmployee->office,
             ];
         }
 
