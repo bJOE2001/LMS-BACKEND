@@ -108,6 +108,17 @@ class LeaveTypeSeeder extends Seeder
 
             // ─── EVENT-BASED (Triggered by Event — No Accrual, No Reset) ─────
             [
+                'name' => 'CTO Leave',
+                'category' => 'EVENT',
+                'accrual_rate' => null,
+                'accrual_day_of_month' => null,
+                'max_days' => null,
+                'is_credit_based' => true,
+                'resets_yearly' => false,
+                'requires_documents' => false,
+                'description' => 'Compensatory Time Off credits converted from approved COC applications.',
+            ],
+            [
                 'name' => 'Maternity Leave',
                 'category' => 'EVENT',
                 'accrual_rate' => null,

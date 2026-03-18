@@ -71,6 +71,11 @@ return new class extends Migration {
         ]) {
             // Already ordered consistently.
         } elseif (Schema::hasTable('tblLeaveApplications')) {
+            $sourceControlNoColumn = $this->resolveLeaveApplicationControlNoSourceColumn();
+            if ($sourceControlNoColumn === null) {
+                return;
+            }
+
             $this->rebuildLeaveApplications([
                 'id',
                 'applicant_admin_id',
@@ -92,7 +97,7 @@ return new class extends Migration {
                 'remarks',
                 'created_at',
                 'updated_at',
-            ], false);
+            ], false, $sourceControlNoColumn);
         }
     }
 
@@ -276,9 +281,43 @@ END CATCH;
 SQL);
     }
 
-    private function rebuildLeaveApplications(array $order, bool $legacyOrder): void
+    private function resolveLeaveApplicationControlNoSourceColumn(): ?string
     {
-        $selectColumns = implode(', ', $order);
+        if (!Schema::hasTable('tblLeaveApplications')) {
+            return null;
+        }
+
+        if (Schema::hasColumn('tblLeaveApplications', 'erms_control_no')) {
+            return 'erms_control_no';
+        }
+
+        if (Schema::hasColumn('tblLeaveApplications', 'employee_id')) {
+            return 'employee_id';
+        }
+
+        return null;
+    }
+
+    private function rebuildLeaveApplications(
+        array $order,
+        bool $legacyOrder,
+        string $sourceControlNoColumn = 'erms_control_no'
+    ): void
+    {
+        $selectColumns = implode(', ', array_map(
+            static function (string $column) use ($sourceControlNoColumn): string {
+                if ($column !== 'erms_control_no') {
+                    return $column;
+                }
+
+                if ($sourceControlNoColumn === 'employee_id') {
+                    return "TRY_CONVERT(INT, NULLIF(LTRIM(RTRIM(employee_id)), '')) AS erms_control_no";
+                }
+
+                return 'erms_control_no';
+            },
+            $order
+        ));
         $insertColumns = implode(', ', $order);
         $tableDefinition = $legacyOrder
             ? <<<SQL

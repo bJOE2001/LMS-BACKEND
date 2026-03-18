@@ -20,6 +20,7 @@ class HRAccount extends Model implements AuthenticatableContract
         'full_name',
         'username',
         'password',
+        'must_change_password',
     ];
 
     protected $hidden = [
@@ -30,6 +31,7 @@ class HRAccount extends Model implements AuthenticatableContract
     {
         return [
             'password' => 'hashed',
+            'must_change_password' => 'boolean',
         ];
     }
 

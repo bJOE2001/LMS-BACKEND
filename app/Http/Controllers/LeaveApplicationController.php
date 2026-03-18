@@ -2,11 +2,13 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\COCApplication;
 use App\Models\DepartmentAdmin;
 use App\Models\Employee;
 use App\Models\HRAccount;
 use App\Models\LeaveApplication;
 use App\Models\LeaveApplicationLog;
+use App\Models\LeaveApplicationUpdateRequest;
 use App\Models\LeaveBalance;
 use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveType;
@@ -39,8 +41,8 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Only employee accounts can list their leave applications.'], 403);
         }
 
-        $applications = LeaveApplication::with('leaveType')
-            ->where('erms_control_no', $controlNo)
+        $applications = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin.department', 'updateRequests'])
+            ->where(fn($query) => $this->applyApplicationOwnershipFilter($query, (string) $controlNo))
             ->orderByDesc('created_at')
             ->get();
 
@@ -149,10 +151,15 @@ class LeaveApplicationController extends Controller
             ->first();
 
         $deductionHistoryByType = $this->loadEmployeeLeaveDeductionHistoryByType((string) $employee->control_no, $leaveTypeId);
+        $cocCreditHistoryByType = $this->loadEmployeeCOCCreditHistoryByType((string) $employee->control_no, $leaveTypeId);
+        $creditHistoryByType = $this->mergeCreditHistoriesByType(
+            $deductionHistoryByType,
+            $cocCreditHistoryByType
+        );
 
         return response()->json(array_merge([
             'erms_control_no' => (string) $employee->control_no,
-        ], $this->formatErmsLeaveBalancePayload($leaveType, $balance, $deductionHistoryByType[(int) $leaveTypeId] ?? [])));
+        ], $this->formatErmsLeaveBalancePayload($leaveType, $balance, $creditHistoryByType[(int) $leaveTypeId] ?? [])));
     }
 
     /**
@@ -187,13 +194,18 @@ class LeaveApplicationController extends Controller
             ->keyBy(fn(LeaveBalance $balance) => (int) $balance->leave_type_id)
             ->all();
         $deductionHistoryByType = $this->loadEmployeeLeaveDeductionHistoryByType((string) $employee->control_no);
+        $cocCreditHistoryByType = $this->loadEmployeeCOCCreditHistoryByType((string) $employee->control_no);
+        $creditHistoryByType = $this->mergeCreditHistoriesByType(
+            $deductionHistoryByType,
+            $cocCreditHistoryByType
+        );
 
-        $balances = $types->map(function (LeaveType $type) use ($balanceRecordsByType, $deductionHistoryByType) {
+        $balances = $types->map(function (LeaveType $type) use ($balanceRecordsByType, $creditHistoryByType) {
             $balance = $balanceRecordsByType[(int) $type->id] ?? null;
             return $this->formatErmsLeaveBalancePayload(
                 $type,
                 $balance instanceof LeaveBalance ? $balance : null,
-                $deductionHistoryByType[(int) $type->id] ?? []
+                $creditHistoryByType[(int) $type->id] ?? []
             );
         })->values();
 
@@ -204,7 +216,7 @@ class LeaveApplicationController extends Controller
                 $employee,
                 $typesByName,
                 $balanceRecordsByType,
-                $deductionHistoryByType
+                $creditHistoryByType
             ),
         ]);
     }
@@ -232,11 +244,8 @@ class LeaveApplicationController extends Controller
         }
 
         $applications = LeaveApplication::query()
-            ->with(['leaveType', 'employee', 'applicantAdmin.department', 'logs'])
-            ->where(function ($query) use ($controlNo) {
-                $query->where('erms_control_no', $controlNo)
-                    ->orWhereRaw('TRY_CONVERT(INT, erms_control_no) = TRY_CONVERT(INT, ?)', [$controlNo]);
-            })
+            ->with(['leaveType', 'employee', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->where(fn($query) => $this->applyApplicationOwnershipFilter($query, $controlNo))
             ->orderByDesc('created_at')
             ->get();
 
@@ -294,14 +303,59 @@ class LeaveApplicationController extends Controller
             'reason' => ['nullable', 'string', 'max:2000'],
             'selected_dates' => ['nullable', 'array'],
             'selected_dates.*' => ['date'],
+            'selected_date_pay_status' => ['nullable', 'array'],
+            'selected_date_pay_status.*' => ['nullable', 'string', 'in:WP,WOP'],
+            'selected_date_coverage' => ['nullable', 'array'],
+            'selected_date_coverage.*' => ['nullable', 'string', 'in:whole,half'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
+            'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
         ]);
+
+        $requestedPayMode = $this->resolveRequestedPayMode(
+            $request,
+            $validated,
+            false,
+            LeaveApplication::PAY_MODE_WITH_PAY
+        );
+        $selectedDatePayStatus = $this->normalizeSelectedDatePayStatusMap(
+            array_key_exists('selected_date_pay_status', $validated)
+                ? $validated['selected_date_pay_status']
+                : $request->input('selected_date_pay_status')
+        );
+        $selectedDateCoverage = $this->normalizeSelectedDateCoverageMap(
+            array_key_exists('selected_date_coverage', $validated)
+                ? $validated['selected_date_coverage']
+                : $request->input('selected_date_coverage')
+        );
+        $resolvedSelectedDates = LeaveApplication::resolveSelectedDates(
+            $validated['start_date'],
+            $validated['end_date'],
+            is_array($validated['selected_dates'] ?? null) ? $validated['selected_dates'] : null,
+            (float) $validated['total_days']
+        );
+        $selectedDatePayStatus = $this->compactSelectedDatePayStatusMap(
+            $selectedDatePayStatus,
+            $resolvedSelectedDates,
+            $requestedPayMode
+        );
+        $selectedDateCoverage = $this->compactSelectedDateCoverageMap(
+            $selectedDateCoverage,
+            $resolvedSelectedDates
+        );
+        $deductibleDays = $this->computeDeductibleDays(
+            (float) $validated['total_days'],
+            $resolvedSelectedDates,
+            $selectedDatePayStatus,
+            $selectedDateCoverage,
+            false,
+            $requestedPayMode
+        );
 
         $duplicateDateValidation = $this->validateNoDuplicateLeaveDates(
             (string) $employee->control_no,
             (string) $validated['start_date'],
             (string) $validated['end_date'],
-            $validated['selected_dates'] ?? null,
+            $resolvedSelectedDates,
             $validated['total_days']
         );
         if ($duplicateDateValidation instanceof JsonResponse) {
@@ -311,22 +365,37 @@ class LeaveApplicationController extends Controller
         $eligibility = $this->validateRegularLeaveEligibility(
             (string) $employee->control_no,
             (int) $validated['leave_type_id'],
-            (float) $validated['total_days']
+            (float) $validated['total_days'],
+            $requestedPayMode,
+            $deductibleDays
         );
         if ($eligibility instanceof JsonResponse) {
             return $eligibility;
         }
 
-        $app = DB::transaction(function () use ($validated, $employee, $actor) {
+        $app = DB::transaction(function () use (
+            $validated,
+            $employee,
+            $actor,
+            $requestedPayMode,
+            $selectedDatePayStatus,
+            $selectedDateCoverage,
+            $resolvedSelectedDates,
+            $deductibleDays
+        ) {
             $application = LeaveApplication::create([
-                'erms_control_no' => (int) $employee->control_no,
+                'erms_control_no' => (string) $employee->control_no,
                 'leave_type_id' => $validated['leave_type_id'],
                 'start_date' => $validated['start_date'],
                 'end_date' => $validated['end_date'],
                 'total_days' => $validated['total_days'],
+                'deductible_days' => $deductibleDays,
                 'reason' => $validated['reason'] ?? null,
-                'selected_dates' => $validated['selected_dates'] ?? null,
+                'selected_dates' => $resolvedSelectedDates,
+                'selected_date_pay_status' => $selectedDatePayStatus,
+                'selected_date_coverage' => $selectedDateCoverage,
                 'commutation' => $validated['commutation'] ?? 'Not Requested',
+                'pay_mode' => $requestedPayMode,
                 'status' => LeaveApplication::STATUS_PENDING_ADMIN,
             ]);
 
@@ -398,10 +467,7 @@ class LeaveApplicationController extends Controller
         $app = LeaveApplication::query()
             ->with('leaveType')
             ->where('id', $applicationId)
-            ->where(function ($query) use ($controlNo) {
-                $query->where('erms_control_no', $controlNo)
-                    ->orWhereRaw('TRY_CONVERT(INT, erms_control_no) = TRY_CONVERT(INT, ?)', [$controlNo]);
-            })
+            ->where(fn($query) => $this->applyApplicationOwnershipFilter($query, $controlNo))
             ->first();
 
         if (!$app) {
@@ -421,8 +487,8 @@ class LeaveApplicationController extends Controller
 
         $reason = trim((string) ($validated['cancellation_reason'] ?? ''));
         $remarks = $reason !== ''
-            ? "Cancelled via ERMS: {$reason}"
-            : 'Cancelled via ERMS';
+            ? "Cancelled by employee: {$reason}"
+            : 'Cancelled by employee';
         $statusBeforeCancel = $app->status;
 
         $performedById = (int) ltrim((string) $employee->control_no, '0');
@@ -495,11 +561,24 @@ class LeaveApplicationController extends Controller
     /**
      * POST /erms/leave-applications/{id}/request-edit
      *
-     * API-key protected endpoint for ERMS-to-LMS leave edit request.
-     * Accepts reason/remarks and notifies admin/HR for pending applications.
+     * Backward-compatible alias for the newer request-update flow.
      */
     public function ermsRequestEdit(Request $request, ?int $id = null): JsonResponse
     {
+        return $this->ermsRequestUpdate($request, $id);
+    }
+
+    /**
+     * POST /erms/leave-applications/{id}/request-update
+     *
+     * API-key protected endpoint for ERMS-to-LMS leave update request.
+     * - Pending applications: logs a legacy edit request note.
+     * - Approved applications: stores requested field updates for HR approval.
+     */
+    public function ermsRequestUpdate(Request $request, ?int $id = null): JsonResponse
+    {
+        $this->normalizeSelectedDatesInput($request);
+
         $routeId = $id;
 
         $request->merge(array_filter([
@@ -510,7 +589,25 @@ class LeaveApplicationController extends Controller
         $validated = $request->validate([
             'leave_application_id' => ['required', 'integer'],
             'erms_control_no' => ['required', 'string', 'regex:/^\d+$/'],
+            'request_update' => ['nullable', 'boolean'],
             'edit_reason' => ['nullable', 'string', 'max:2000'],
+            'update_reason' => ['nullable', 'string', 'max:2000'],
+            'remarks' => ['nullable', 'string', 'max:2000'],
+            'reason' => ['nullable', 'string', 'max:2000'],
+            'reason_purpose' => ['nullable', 'string', 'max:2000'],
+            'leave_type_id' => ['nullable', 'integer', 'exists:tblLeaveTypes,id'],
+            'start_date' => ['nullable', 'date'],
+            'end_date' => ['nullable', 'date', 'after_or_equal:start_date'],
+            'selected_dates' => ['nullable', 'array'],
+            'selected_dates.*' => ['date'],
+            'selected_date_pay_status' => ['nullable', 'array'],
+            'selected_date_pay_status.*' => ['nullable', 'string', 'in:WP,WOP'],
+            'selected_date_coverage' => ['nullable', 'array'],
+            'selected_date_coverage.*' => ['nullable', 'string', 'in:whole,half'],
+            'total_days' => ['nullable', 'numeric', 'min:0.5', 'max:365'],
+            'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
+            'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
+            'is_monetization' => ['nullable', 'boolean'],
         ]);
 
         $applicationId = (int) $validated['leave_application_id'];
@@ -529,9 +626,8 @@ class LeaveApplicationController extends Controller
         $app = LeaveApplication::query()
             ->with('leaveType')
             ->where('id', $applicationId)
-            ->where(function ($query) use ($controlNo) {
-                $query->where('erms_control_no', $controlNo)
-                    ->orWhereRaw('TRY_CONVERT(INT, erms_control_no) = TRY_CONVERT(INT, ?)', [$controlNo]);
+            ->where(function ($query) use ($controlNo): void {
+                $query->whereIn('erms_control_no', $this->controlNoCandidates($controlNo));
             })
             ->first();
 
@@ -539,37 +635,133 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Leave application not found for this employee.'], 404);
         }
 
+        $requestReason = trim((string) (
+            $validated['edit_reason']
+            ?? $validated['update_reason']
+            ?? $validated['remarks']
+            ?? ''
+        ));
+        $remarksLine = $requestReason !== ''
+            ? "Edit request submitted by employee. Reason: {$requestReason}"
+            : 'Edit request submitted by employee.';
+
+        $isApprovedApplication = $app->status === LeaveApplication::STATUS_APPROVED;
         $editableStatuses = [
             LeaveApplication::STATUS_PENDING_ADMIN,
             LeaveApplication::STATUS_PENDING_HR,
         ];
 
-        if (!in_array($app->status, $editableStatuses, true)) {
+        if (!$isApprovedApplication && !in_array($app->status, $editableStatuses, true)) {
             return response()->json([
-                'message' => "Cannot request edit: application status is '{$this->ermsStatusLabel($app->status)}'. Only pending applications can request edits.",
+                'message' => "Cannot request edit: application status is '{$this->ermsStatusLabel($app->status)}'. Only pending or approved applications can request edits.",
             ], 422);
         }
 
-        $reason = trim((string) ($validated['edit_reason'] ?? ''));
-        $remarksLine = $reason !== ''
-            ? "Edit requested via ERMS: {$reason}"
-            : 'Edit requested via ERMS';
+        $requestedUpdatePayload = $this->buildRequestedLeaveUpdatePayload($request, $validated, $app);
+        if ($requestedUpdatePayload instanceof JsonResponse) {
+            return $requestedUpdatePayload;
+        }
 
-        $existingRemarks = trim((string) ($app->remarks ?? ''));
-        $updatedRemarks = $existingRemarks === ''
-            ? $remarksLine
-            : "{$existingRemarks}\n{$remarksLine}";
+        $hasDataChanges = $this->hasRequestedLeaveUpdateChanges($app, $requestedUpdatePayload);
+
+        if ($isApprovedApplication && !$hasDataChanges) {
+            return response()->json([
+                'message' => 'No editable field changes were detected for this approved application.',
+            ], 422);
+        }
+
+        if ($isApprovedApplication && !(bool) ($requestedUpdatePayload['is_monetization'] ?? false)) {
+            $duplicateDateValidation = $this->validateNoDuplicateLeaveDates(
+                (string) $employee->control_no,
+                (string) ($requestedUpdatePayload['start_date'] ?? ''),
+                (string) ($requestedUpdatePayload['end_date'] ?? ''),
+                is_array($requestedUpdatePayload['selected_dates'] ?? null)
+                    ? $requestedUpdatePayload['selected_dates']
+                    : null,
+                $requestedUpdatePayload['total_days'] ?? null,
+                (int) $app->id
+            );
+            if ($duplicateDateValidation instanceof JsonResponse) {
+                return $duplicateDateValidation;
+            }
+        }
+
+        $targetLeaveTypeId = (int) ($requestedUpdatePayload['leave_type_id'] ?? 0);
+        $targetLeaveType = LeaveType::find($targetLeaveTypeId);
+        if (!$targetLeaveType) {
+            return response()->json([
+                'message' => 'Selected leave type is not available.',
+            ], 422);
+        }
+
+        $leaveTypeRestriction = $this->assertEmployeeCanApplyForLeaveType($employee, $targetLeaveType);
+        if ($leaveTypeRestriction instanceof JsonResponse) {
+            return $leaveTypeRestriction;
+        }
+
+        $requestedDays = (float) ($requestedUpdatePayload['total_days'] ?? 0);
+        if ($targetLeaveType->max_days && $requestedDays > (float) $targetLeaveType->max_days) {
+            return response()->json([
+                'message' => "This leave type is limited to {$targetLeaveType->max_days} days per application.",
+                'errors' => [
+                    'total_days' => ["Maximum of {$targetLeaveType->max_days} days allowed for {$targetLeaveType->name}."],
+                ],
+            ], 422);
+        }
 
         $performedById = (int) ltrim((string) $employee->control_no, '0');
         if ($performedById <= 0) {
             $performedById = (int) ($app->erms_control_no ?: 1);
         }
 
-        DB::transaction(function () use ($app, $updatedRemarks, $remarksLine, $performedById): void {
-            $app->update([
-                // Keep pending status; this endpoint requests edit review, not status transition.
-                'remarks' => $updatedRemarks,
-            ]);
+        DB::transaction(function () use (
+            $app,
+            $remarksLine,
+            $performedById,
+            $isApprovedApplication,
+            $requestedUpdatePayload,
+            $requestReason
+        ): void {
+            $existingRemarks = trim((string) ($app->remarks ?? ''));
+            $updatedRemarks = $existingRemarks === ''
+                ? $remarksLine
+                : "{$existingRemarks}\n{$remarksLine}";
+
+            if ($isApprovedApplication) {
+                $app->update([
+                    'status' => LeaveApplication::STATUS_PENDING_HR,
+                    'remarks' => $updatedRemarks,
+                ]);
+
+                $pendingRequest = LeaveApplicationUpdateRequest::query()
+                    ->where('leave_application_id', (int) $app->id)
+                    ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
+                    ->whereRaw('UPPER(LTRIM(RTRIM(previous_status))) = ?', [LeaveApplication::STATUS_APPROVED])
+                    ->latest('id')
+                    ->first();
+
+                $requestPayload = [
+                    'requested_payload' => $requestedUpdatePayload,
+                    'requested_reason' => $requestReason !== '' ? $requestReason : null,
+                    'previous_status' => LeaveApplication::STATUS_APPROVED,
+                    'requested_by_control_no' => (string) ($app->erms_control_no ?? ''),
+                    'requested_at' => now(),
+                ];
+
+                if ($pendingRequest) {
+                    $pendingRequest->update($requestPayload);
+                } else {
+                    LeaveApplicationUpdateRequest::create(array_merge($requestPayload, [
+                        'leave_application_id' => (int) $app->id,
+                        'status' => LeaveApplicationUpdateRequest::STATUS_PENDING,
+                    ]));
+                }
+            } else {
+                // Legacy behavior for already-pending applications.
+                $app->update([
+                    'remarks' => $updatedRemarks,
+                ]);
+            }
 
             // Reuse SUBMITTED action because current log schema has no dedicated EDIT_REQUESTED enum.
             LeaveApplicationLog::create([
@@ -587,24 +779,33 @@ class LeaveApplicationController extends Controller
             $employeeName = 'Employee ' . (string) $employee->control_no;
         }
         $leaveTypeName = $app->leaveType?->name ?? 'leave';
-        $pendingStage = $app->status === LeaveApplication::STATUS_PENDING_HR
+        $pendingStage = $isApprovedApplication
             ? 'pending HR review'
-            : 'pending department review';
-        $message = "{$employeeName} requested an edit for a {$leaveTypeName} application ({$pendingStage}).";
-        if ($reason !== '') {
-            $message .= " Reason: {$reason}";
+            : ($app->status === LeaveApplication::STATUS_PENDING_HR
+                ? 'pending HR review'
+                : 'pending department review');
+        $message = $isApprovedApplication
+            ? "{$employeeName} requested an update to an approved {$leaveTypeName} application ({$pendingStage})."
+            : "{$employeeName} requested an edit for a {$leaveTypeName} application ({$pendingStage}).";
+        if ($requestReason !== '') {
+            $message .= " Reason: {$requestReason}";
         }
 
-        $title = 'Leave Application Edit Requested';
-        $admins = DepartmentAdmin::whereHas('department', fn($q) => $q->where('name', $employee->office))->get();
-        foreach ($admins as $deptAdmin) {
-            Notification::send(
-                $deptAdmin,
-                Notification::TYPE_LEAVE_EDIT_REQUEST,
-                $title,
-                $message,
-                $app->id
-            );
+        $title = $isApprovedApplication
+            ? 'Approved Leave Update Requested'
+            : 'Leave Application Edit Requested';
+
+        if (!$isApprovedApplication) {
+            $admins = DepartmentAdmin::whereHas('department', fn($q) => $q->where('name', $employee->office))->get();
+            foreach ($admins as $deptAdmin) {
+                Notification::send(
+                    $deptAdmin,
+                    Notification::TYPE_LEAVE_EDIT_REQUEST,
+                    $title,
+                    $message,
+                    $app->id
+                );
+            }
         }
 
         $hrAccounts = HRAccount::all();
@@ -619,8 +820,10 @@ class LeaveApplicationController extends Controller
         }
 
         return response()->json([
-            'message' => 'Leave edit request submitted successfully.',
-            'application' => $this->formatApplication($app->fresh('leaveType')),
+            'message' => $isApprovedApplication
+                ? 'Leave update request submitted and forwarded to HR for approval.'
+                : 'Leave edit request submitted successfully.',
+            'application' => $this->formatApplication($app->fresh(['leaveType', 'employee', 'applicantAdmin.department'])),
         ]);
     }
 
@@ -634,15 +837,13 @@ class LeaveApplicationController extends Controller
         }
 
         $baseValidated = $request->validate([
-            'erms_control_no' => ['required', 'integer'],
+            'erms_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'is_monetization' => ['nullable', 'boolean'],
         ]);
 
         // This system uses ERMS ControlNo as the authoritative employee identifier.
         // Employee records are resolved from LMS tblEmployees.
-        $employee = DB::table('tblEmployees')
-            ->where('control_no', $baseValidated['erms_control_no'])
-            ->first();
+        $employee = $this->findEmployeeByControlNo((string) $baseValidated['erms_control_no']);
 
         if (!$employee) {
             return response()->json(['error' => 'Employee not found'], 404);
@@ -656,7 +857,7 @@ class LeaveApplicationController extends Controller
         }
 
         $validated = $request->validate([
-            'erms_control_no' => ['required', 'integer'],
+            'erms_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
             'start_date' => ['required', 'date'],
             'end_date' => ['required', 'date', 'after_or_equal:start_date'],
@@ -664,14 +865,59 @@ class LeaveApplicationController extends Controller
             'reason' => ['nullable', 'string', 'max:2000'],
             'selected_dates' => ['nullable', 'array'],
             'selected_dates.*' => ['date'],
+            'selected_date_pay_status' => ['nullable', 'array'],
+            'selected_date_pay_status.*' => ['nullable', 'string', 'in:WP,WOP'],
+            'selected_date_coverage' => ['nullable', 'array'],
+            'selected_date_coverage.*' => ['nullable', 'string', 'in:whole,half'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
+            'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
         ]);
+
+        $requestedPayMode = $this->resolveRequestedPayMode(
+            $request,
+            $validated,
+            false,
+            LeaveApplication::PAY_MODE_WITH_PAY
+        );
+        $selectedDatePayStatus = $this->normalizeSelectedDatePayStatusMap(
+            array_key_exists('selected_date_pay_status', $validated)
+                ? $validated['selected_date_pay_status']
+                : $request->input('selected_date_pay_status')
+        );
+        $selectedDateCoverage = $this->normalizeSelectedDateCoverageMap(
+            array_key_exists('selected_date_coverage', $validated)
+                ? $validated['selected_date_coverage']
+                : $request->input('selected_date_coverage')
+        );
+        $resolvedSelectedDates = LeaveApplication::resolveSelectedDates(
+            $validated['start_date'],
+            $validated['end_date'],
+            is_array($validated['selected_dates'] ?? null) ? $validated['selected_dates'] : null,
+            (float) $validated['total_days']
+        );
+        $selectedDatePayStatus = $this->compactSelectedDatePayStatusMap(
+            $selectedDatePayStatus,
+            $resolvedSelectedDates,
+            $requestedPayMode
+        );
+        $selectedDateCoverage = $this->compactSelectedDateCoverageMap(
+            $selectedDateCoverage,
+            $resolvedSelectedDates
+        );
+        $deductibleDays = $this->computeDeductibleDays(
+            (float) $validated['total_days'],
+            $resolvedSelectedDates,
+            $selectedDatePayStatus,
+            $selectedDateCoverage,
+            false,
+            $requestedPayMode
+        );
 
         $duplicateDateValidation = $this->validateNoDuplicateLeaveDates(
             (string) $employee->control_no,
             (string) $validated['start_date'],
             (string) $validated['end_date'],
-            $validated['selected_dates'] ?? null,
+            $resolvedSelectedDates,
             $validated['total_days']
         );
         if ($duplicateDateValidation instanceof JsonResponse) {
@@ -681,22 +927,37 @@ class LeaveApplicationController extends Controller
         $eligibility = $this->validateRegularLeaveEligibility(
             (string) $employee->control_no,
             (int) $validated['leave_type_id'],
-            (float) $validated['total_days']
+            (float) $validated['total_days'],
+            $requestedPayMode,
+            $deductibleDays
         );
         if ($eligibility instanceof JsonResponse) {
             return $eligibility;
         }
 
-        $app = DB::transaction(function () use ($validated, $employee, $account) {
+        $app = DB::transaction(function () use (
+            $validated,
+            $employee,
+            $account,
+            $requestedPayMode,
+            $selectedDatePayStatus,
+            $selectedDateCoverage,
+            $resolvedSelectedDates,
+            $deductibleDays
+        ) {
             $application = LeaveApplication::create([
-                'erms_control_no' => (int) $employee->control_no,
+                'erms_control_no' => (string) $employee->control_no,
                 'leave_type_id' => $validated['leave_type_id'],
                 'start_date' => $validated['start_date'],
                 'end_date' => $validated['end_date'],
                 'total_days' => $validated['total_days'],
+                'deductible_days' => $deductibleDays,
                 'reason' => $validated['reason'] ?? null,
-                'selected_dates' => $validated['selected_dates'] ?? null,
+                'selected_dates' => $resolvedSelectedDates,
+                'selected_date_pay_status' => $selectedDatePayStatus,
+                'selected_date_coverage' => $selectedDateCoverage,
                 'commutation' => $validated['commutation'] ?? 'Not Requested',
+                'pay_mode' => $requestedPayMode,
                 'status' => LeaveApplication::STATUS_PENDING_ADMIN,
             ]);
 
@@ -739,7 +1000,7 @@ class LeaveApplicationController extends Controller
     private function storeMonetization(Request $request, object $employee, object $account): JsonResponse
     {
         $validated = $request->validate([
-            'erms_control_no' => ['required', 'integer'],
+            'erms_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
             'total_days' => ['required', 'numeric', 'min:1', 'max:999'],
             'reason' => ['nullable', 'string', 'max:2000'],
@@ -803,14 +1064,16 @@ class LeaveApplicationController extends Controller
 
         $app = DB::transaction(function () use ($validated, $employee, $account, $equivalentAmount) {
             $application = LeaveApplication::create([
-                'erms_control_no' => (int) $employee->control_no,
+                'erms_control_no' => (string) $employee->control_no,
                 'leave_type_id' => $validated['leave_type_id'],
                 'start_date' => null,
                 'end_date' => null,
                 'total_days' => $validated['total_days'],
+                'deductible_days' => (float) $validated['total_days'],
                 'reason' => $validated['reason'] ?? null,
                 'status' => LeaveApplication::STATUS_PENDING_ADMIN,
                 'is_monetization' => true,
+                'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
                 'equivalent_amount' => $equivalentAmount,
             ]);
 
@@ -855,7 +1118,8 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Only employee accounts can view leave applications.'], 403);
         }
 
-        if ((string) $leaveApplication->erms_control_no !== (string) $controlNo) {
+        $allowedControlNos = $this->controlNoCandidates((string) $controlNo);
+        if (!in_array((string) $leaveApplication->erms_control_no, $allowedControlNos, true)) {
             return response()->json(['message' => 'Leave application not found.'], 404);
         }
 
@@ -881,12 +1145,12 @@ class LeaveApplicationController extends Controller
         }
 
         $deptName = $admin->department?->name;
-        $applications = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin.department'])
+        $applications = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin.department', 'updateRequests'])
             ->where('status', LeaveApplication::STATUS_PENDING_ADMIN)
             ->whereIn('erms_control_no', function ($query) use ($deptName) {
                 $query->select('control_no')
-                    ->from('tblEmployees')
-                    ->where('office', $deptName);
+                ->from('tblEmployees')
+                ->where('office', $deptName);
             })
             ->orderByDesc('created_at')
             ->get();
@@ -916,8 +1180,9 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Leave application not found.'], 404);
         }
 
-        // Security: admin can only act on their own department's applications
-        if ($app->employee?->office !== $admin->department?->name) {
+        // Security: admin can only act on their own department's applications.
+        $applicationEmployee = $this->resolveApplicationEmployee($app);
+        if (($applicationEmployee?->office ?? null) !== $admin->department?->name) {
             return response()->json(['message' => 'You can only manage applications from your department.'], 403);
         }
 
@@ -989,7 +1254,8 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Leave application not found.'], 404);
         }
 
-        if ($app->employee?->office !== $admin->department?->name) {
+        $applicationEmployee = $this->resolveApplicationEmployee($app);
+        if (($applicationEmployee?->office ?? null) !== $admin->department?->name) {
             return response()->json(['message' => 'You can only manage applications from your department.'], 403);
         }
 
@@ -1045,7 +1311,7 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
-        $applications = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin.department'])
+        $applications = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin.department', 'updateRequests'])
             ->where('status', LeaveApplication::STATUS_PENDING_HR)
             ->orderByDesc('created_at')
             ->get();
@@ -1079,11 +1345,21 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => "Cannot approve: application status is '{$app->status}', expected 'PENDING_HR'."], 422);
         }
 
+        if ($this->isPendingApprovedUpdateRequest($app)) {
+            return $this->hrApprovePendingUpdateRequest($request, $app, $hr);
+        }
+
         $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
         $shouldDeductForcedLeave = $this->shouldDeductForcedLeaveWithVacation($app, $forcedLeaveTypeId);
+        $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
+        $daysToDeduct = $this->resolveApplicationDeductibleDays($app);
 
         // Determine if balance deduction is needed
-        $needsDeduction = ($app->leaveType && $app->leaveType->is_credit_based) || $app->is_monetization;
+        $needsDeduction = $this->applicationDeductsEmployeeBalance(
+            (bool) $app->is_monetization,
+            $app->leaveType,
+            $normalizedPayMode
+        ) && $daysToDeduct > 0;
 
         if ($needsDeduction) {
             if ($app->erms_control_no) {
@@ -1094,11 +1370,11 @@ class LeaveApplicationController extends Controller
                     ->where('leave_type_id', $deductTypeId)
                     ->first();
 
-                if (!$balance || (float) $balance->balance < (float) $app->total_days) {
+                if (!$balance || (float) $balance->balance < $daysToDeduct) {
                     $currentBalance = $balance ? (float) $balance->balance : 0;
                     $label = $app->is_monetization ? 'monetization' : 'leave';
                     return response()->json([
-                        'message' => "Insufficient leave balance for {$label}. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($app->total_days) . ".",
+                        'message' => "Insufficient leave balance for {$label}. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($daysToDeduct) . ".",
                     ], 422);
                 }
 
@@ -1109,15 +1385,15 @@ class LeaveApplicationController extends Controller
                     ], 422);
                 }
             } elseif ($app->applicant_admin_id) {
-                $balance = \App\Models\AdminLeaveBalance::where('admin_id', $app->applicant_admin_id)
-                    ->where('leave_type_id', $app->leave_type_id)
-                    ->where('year', now()->year)
-                    ->first();
+                $balance = $this->findAdminEmployeeLeaveBalance(
+                    (int) $app->applicant_admin_id,
+                    (int) $app->leave_type_id
+                );
 
-                if (!$balance || (float) $balance->balance < (float) $app->total_days) {
+                if (!$balance || (float) $balance->balance < $daysToDeduct) {
                     $currentBalance = $balance ? (float) $balance->balance : 0;
                     return response()->json([
-                        'message' => "Insufficient leave balance. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($app->total_days) . ".",
+                        'message' => "Insufficient leave balance. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($daysToDeduct) . ".",
                     ], 422);
                 }
             }
@@ -1126,7 +1402,7 @@ class LeaveApplicationController extends Controller
         $balanceConflictError = 'HR_APPROVAL_BALANCE_CONFLICT';
 
         try {
-            DB::transaction(function () use ($app, $hr, $request, $needsDeduction, $balanceConflictError, $forcedLeaveTypeId, $shouldDeductForcedLeave) {
+            DB::transaction(function () use ($app, $hr, $request, $needsDeduction, $balanceConflictError, $forcedLeaveTypeId, $shouldDeductForcedLeave, $daysToDeduct) {
                 // Deduct balance for credit-based leave types and monetization.
                 // Locking the exact target row avoids race conditions and cross-row side effects.
                 if ($needsDeduction) {
@@ -1137,11 +1413,11 @@ class LeaveApplicationController extends Controller
                             ->lockForUpdate()
                             ->first();
 
-                        if (!$lockedBalance || (float) $lockedBalance->balance < (float) $app->total_days) {
+                        if (!$lockedBalance || (float) $lockedBalance->balance < $daysToDeduct) {
                             throw new \RuntimeException($balanceConflictError);
                         }
 
-                        $lockedBalance->decrement('balance', (float) $app->total_days);
+                        $lockedBalance->decrement('balance', $daysToDeduct);
 
                         // Business rule: approving Vacation Leave also consumes Forced Leave credits.
                         // If Forced Leave is zero/missing, no extra deduction is applied.
@@ -1153,25 +1429,24 @@ class LeaveApplicationController extends Controller
                                 ->first();
 
                             $forcedAvailable = $forcedBalance ? (float) $forcedBalance->balance : 0.0;
-                            $forcedToDeduct = min((float) $app->total_days, max($forcedAvailable, 0.0));
+                            $forcedToDeduct = min($daysToDeduct, max($forcedAvailable, 0.0));
 
                             if ($forcedBalance && $forcedToDeduct > 0.0) {
                                 $forcedBalance->decrement('balance', $forcedToDeduct);
                             }
                         }
                     } elseif ($app->applicant_admin_id) {
-                        $lockedBalance = \App\Models\AdminLeaveBalance::query()
-                            ->where('admin_id', $app->applicant_admin_id)
-                            ->where('leave_type_id', $app->leave_type_id)
-                            ->where('year', now()->year)
-                            ->lockForUpdate()
-                            ->first();
+                        $lockedBalance = $this->findAdminEmployeeLeaveBalance(
+                            (int) $app->applicant_admin_id,
+                            (int) $app->leave_type_id,
+                            true
+                        );
 
-                        if (!$lockedBalance || (float) $lockedBalance->balance < (float) $app->total_days) {
+                        if (!$lockedBalance || (float) $lockedBalance->balance < $daysToDeduct) {
                             throw new \RuntimeException($balanceConflictError);
                         }
 
-                        $lockedBalance->decrement('balance', (float) $app->total_days);
+                        $lockedBalance->decrement('balance', $daysToDeduct);
                     }
                 }
 
@@ -1210,18 +1485,19 @@ class LeaveApplicationController extends Controller
 
                 $label = $app->is_monetization ? 'monetization' : 'leave';
                 return response()->json([
-                    'message' => "Insufficient leave balance for {$label}. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($app->total_days) . ".",
+                    'message' => "Insufficient leave balance for {$label}. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($daysToDeduct) . ".",
                 ], 422);
             }
 
-            $currentBalance = (float) (\App\Models\AdminLeaveBalance::query()
-                ->where('admin_id', $app->applicant_admin_id)
-                ->where('leave_type_id', $app->leave_type_id)
-                ->where('year', now()->year)
-                ->value('balance') ?? 0);
+            $currentBalance = (float) (
+                $this->findAdminEmployeeLeaveBalance(
+                    (int) $app->applicant_admin_id,
+                    (int) $app->leave_type_id
+                )?->balance ?? 0
+            );
 
             return response()->json([
-                'message' => "Insufficient leave balance. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($app->total_days) . ".",
+                'message' => "Insufficient leave balance. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($daysToDeduct) . ".",
             ], 422);
         }
 
@@ -1261,6 +1537,10 @@ class LeaveApplicationController extends Controller
 
         if ($app->status !== LeaveApplication::STATUS_PENDING_HR) {
             return response()->json(['message' => "Cannot reject: application status is '{$app->status}', expected 'PENDING_HR'."], 422);
+        }
+
+        if ($this->isPendingApprovedUpdateRequest($app)) {
+            return $this->hrRejectPendingUpdateRequest($request, $app, $hr);
         }
 
         DB::transaction(function () use ($app, $hr, $request) {
@@ -1381,8 +1661,53 @@ class LeaveApplicationController extends Controller
             'reason' => ['nullable', 'string', 'max:2000'],
             'selected_dates' => ['nullable', 'array'],
             'selected_dates.*' => ['date'],
+            'selected_date_pay_status' => ['nullable', 'array'],
+            'selected_date_pay_status.*' => ['nullable', 'string', 'in:WP,WOP'],
+            'selected_date_coverage' => ['nullable', 'array'],
+            'selected_date_coverage.*' => ['nullable', 'string', 'in:whole,half'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
+            'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
         ]);
+
+        $requestedPayMode = $this->resolveRequestedPayMode(
+            $request,
+            $validated,
+            false,
+            LeaveApplication::PAY_MODE_WITH_PAY
+        );
+        $selectedDatePayStatus = $this->normalizeSelectedDatePayStatusMap(
+            array_key_exists('selected_date_pay_status', $validated)
+                ? $validated['selected_date_pay_status']
+                : $request->input('selected_date_pay_status')
+        );
+        $selectedDateCoverage = $this->normalizeSelectedDateCoverageMap(
+            array_key_exists('selected_date_coverage', $validated)
+                ? $validated['selected_date_coverage']
+                : $request->input('selected_date_coverage')
+        );
+        $resolvedSelectedDates = LeaveApplication::resolveSelectedDates(
+            $validated['start_date'],
+            $validated['end_date'],
+            is_array($validated['selected_dates'] ?? null) ? $validated['selected_dates'] : null,
+            (float) $validated['total_days']
+        );
+        $selectedDatePayStatus = $this->compactSelectedDatePayStatusMap(
+            $selectedDatePayStatus,
+            $resolvedSelectedDates,
+            $requestedPayMode
+        );
+        $selectedDateCoverage = $this->compactSelectedDateCoverageMap(
+            $selectedDateCoverage,
+            $resolvedSelectedDates
+        );
+        $deductibleDays = $this->computeDeductibleDays(
+            (float) $validated['total_days'],
+            $resolvedSelectedDates,
+            $selectedDatePayStatus,
+            $selectedDateCoverage,
+            false,
+            $requestedPayMode
+        );
 
         // Verify the employee belongs to the admin's department (by office name)
         $admin->loadMissing('department');
@@ -1395,7 +1720,7 @@ class LeaveApplicationController extends Controller
             (string) $employee->control_no,
             (string) $validated['start_date'],
             (string) $validated['end_date'],
-            $validated['selected_dates'] ?? null,
+            $resolvedSelectedDates,
             $validated['total_days']
         );
         if ($duplicateDateValidation instanceof JsonResponse) {
@@ -1405,22 +1730,37 @@ class LeaveApplicationController extends Controller
         $eligibility = $this->validateRegularLeaveEligibility(
             (string) $employee->control_no,
             (int) $validated['leave_type_id'],
-            (float) $validated['total_days']
+            (float) $validated['total_days'],
+            $requestedPayMode,
+            $deductibleDays
         );
         if ($eligibility instanceof JsonResponse) {
             return $eligibility;
         }
 
-        $app = DB::transaction(function () use ($validated, $employee, $admin) {
+        $app = DB::transaction(function () use (
+            $validated,
+            $employee,
+            $admin,
+            $requestedPayMode,
+            $selectedDatePayStatus,
+            $selectedDateCoverage,
+            $resolvedSelectedDates,
+            $deductibleDays
+        ) {
             $application = LeaveApplication::create([
-                'erms_control_no' => (int) $employee->control_no,
+                'erms_control_no' => (string) $employee->control_no,
                 'leave_type_id' => $validated['leave_type_id'],
                 'start_date' => $validated['start_date'],
                 'end_date' => $validated['end_date'],
                 'total_days' => $validated['total_days'],
+                'deductible_days' => $deductibleDays,
                 'reason' => $validated['reason'] ?? null,
-                'selected_dates' => $validated['selected_dates'] ?? null,
+                'selected_dates' => $resolvedSelectedDates,
+                'selected_date_pay_status' => $selectedDatePayStatus,
+                'selected_date_coverage' => $selectedDateCoverage,
                 'commutation' => $validated['commutation'] ?? 'Not Requested',
+                'pay_mode' => $requestedPayMode,
                 'status' => LeaveApplication::STATUS_PENDING_HR,
                 'admin_id' => $admin->id,
                 'admin_approved_at' => now(),
@@ -1535,16 +1875,18 @@ class LeaveApplicationController extends Controller
 
         $app = DB::transaction(function () use ($validated, $employee, $admin, $equivalentAmount) {
             $application = LeaveApplication::create([
-                'erms_control_no' => (int) $employee->control_no,
+                'erms_control_no' => (string) $employee->control_no,
                 'leave_type_id' => $validated['leave_type_id'],
                 'start_date' => null,
                 'end_date' => null,
                 'total_days' => $validated['total_days'],
+                'deductible_days' => (float) $validated['total_days'],
                 'reason' => $validated['reason'] ?? null,
                 'status' => LeaveApplication::STATUS_PENDING_HR,
                 'admin_id' => $admin->id,
                 'admin_approved_at' => now(),
                 'is_monetization' => true,
+                'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
                 'equivalent_amount' => $equivalentAmount,
             ]);
 
@@ -1632,6 +1974,106 @@ class LeaveApplicationController extends Controller
         }
 
         return Employee::findByControlNo($controlNo);
+    }
+
+    private function controlNoCandidates(string $controlNo): array
+    {
+        $rawControlNo = trim($controlNo);
+        if ($rawControlNo === '') {
+            return [];
+        }
+
+        $candidates = [
+            $rawControlNo,
+            $this->normalizeControlNo($rawControlNo),
+        ];
+
+        $employee = $this->findEmployeeByControlNo($rawControlNo);
+        if ($employee && trim((string) ($employee->control_no ?? '')) !== '') {
+            $candidates[] = trim((string) $employee->control_no);
+        }
+
+        return array_values(array_unique(array_filter(
+            $candidates,
+            static fn(string $value): bool => trim($value) !== ''
+        )));
+    }
+
+    private function resolveApplicationEmployee(LeaveApplication $app): ?object
+    {
+        if ($app->employee) {
+            return $app->employee;
+        }
+
+        if ($app->erms_control_no === null) {
+            return null;
+        }
+
+        return $this->findEmployeeByControlNo((string) $app->erms_control_no);
+    }
+
+    private function applyApplicationOwnershipFilter($query, string $controlNo): void
+    {
+        $controlNoCandidates = $this->controlNoCandidates($controlNo);
+        if ($controlNoCandidates === []) {
+            $query->whereRaw('1 = 0');
+            return;
+        }
+
+        $query->where(function ($nestedQuery) use ($controlNoCandidates): void {
+            $nestedQuery->whereIn('erms_control_no', $controlNoCandidates)
+                ->orWhereHas('applicantAdmin', function ($adminQuery) use ($controlNoCandidates): void {
+                    $adminQuery->whereIn('employee_control_no', $controlNoCandidates);
+                });
+        });
+    }
+
+    private function findAdminEmployeeControlNo(int $adminId): ?string
+    {
+        if ($adminId <= 0) {
+            return null;
+        }
+
+        $admin = DepartmentAdmin::query()->find($adminId);
+        if (!$admin) {
+            return null;
+        }
+
+        $rawControlNo = trim((string) $admin->employee_control_no);
+        if ($rawControlNo === '') {
+            return null;
+        }
+
+        $employee = Employee::findByControlNo($rawControlNo);
+        return trim((string) ($employee?->control_no ?? $rawControlNo));
+    }
+
+    private function queryLeaveBalancesByEmployeeControlNo(string $employeeControlNo)
+    {
+        $candidateEmployeeIds = $this->controlNoCandidates($employeeControlNo);
+        if ($candidateEmployeeIds === []) {
+            return LeaveBalance::query()->whereRaw('1 = 0');
+        }
+
+        return LeaveBalance::query()
+            ->whereIn('employee_id', $candidateEmployeeIds);
+    }
+
+    private function findAdminEmployeeLeaveBalance(int $adminId, int $leaveTypeId, bool $lockForUpdate = false): ?LeaveBalance
+    {
+        $employeeControlNo = $this->findAdminEmployeeControlNo($adminId);
+        if ($employeeControlNo === null) {
+            return null;
+        }
+
+        $query = $this->queryLeaveBalancesByEmployeeControlNo($employeeControlNo)
+            ->where('leave_type_id', $leaveTypeId);
+
+        if ($lockForUpdate) {
+            $query->lockForUpdate();
+        }
+
+        return $query->first();
     }
 
     private function formatErmsEmployeeContext(object $employee): array
@@ -1891,15 +2333,39 @@ class LeaveApplicationController extends Controller
         ];
     }
 
+    private function mergeCreditHistoriesByType(array ...$historyGroups): array
+    {
+        $merged = [];
+
+        foreach ($historyGroups as $group) {
+            foreach ($group as $typeId => $entries) {
+                $normalizedTypeId = (int) $typeId;
+                if ($normalizedTypeId <= 0 || !is_array($entries) || $entries === []) {
+                    continue;
+                }
+
+                if (!array_key_exists($normalizedTypeId, $merged)) {
+                    $merged[$normalizedTypeId] = [];
+                }
+
+                foreach ($entries as $entry) {
+                    if (!is_array($entry)) {
+                        continue;
+                    }
+                    $merged[$normalizedTypeId][] = $entry;
+                }
+            }
+        }
+
+        return $merged;
+    }
+
     private function loadEmployeeLeaveDeductionHistoryByType(string $controlNo, ?int $leaveTypeId = null): array
     {
         $applications = LeaveApplication::query()
             ->with(['leaveType:id,name,is_credit_based'])
             ->where('status', LeaveApplication::STATUS_APPROVED)
-            ->where(function ($query) use ($controlNo): void {
-                $query->where('erms_control_no', $controlNo)
-                    ->orWhereRaw('TRY_CONVERT(INT, erms_control_no) = TRY_CONVERT(INT, ?)', [$controlNo]);
-            })
+            ->whereIn('erms_control_no', $this->controlNoCandidates($controlNo))
             ->when($leaveTypeId !== null, function ($query) use ($leaveTypeId): void {
                 $query->where('leave_type_id', $leaveTypeId);
             })
@@ -1910,6 +2376,8 @@ class LeaveApplicationController extends Controller
                 'erms_control_no',
                 'leave_type_id',
                 'total_days',
+                'deductible_days',
+                'pay_mode',
                 'is_monetization',
                 'status',
                 'hr_approved_at',
@@ -1928,19 +2396,23 @@ class LeaveApplicationController extends Controller
                 continue;
             }
 
-            $deductsEmployeeBalance = (bool) $application->is_monetization
-                || (bool) ($application->leaveType?->is_credit_based);
+            $deductsEmployeeBalance = $this->applicationDeductsEmployeeBalance(
+                (bool) $application->is_monetization,
+                $application->leaveType,
+                $application->pay_mode
+            );
             if (!$deductsEmployeeBalance) {
                 continue;
             }
 
             $approvedAt = $application->hr_approved_at ?? $application->created_at;
-            $creditsDeducted = round((float) $application->total_days, 2);
+            $creditsDeducted = round((float) ($application->deductible_days ?? $application->total_days ?? 0), 2);
             if ($approvedAt === null || $creditsDeducted <= 0) {
                 continue;
             }
 
             $historyByType[$typeId][] = [
+                'accrual_date' => $approvedAt->toDateString(),
                 'transaction_date' => $approvedAt->toDateString(),
                 'credits_added' => -$creditsDeducted,
                 'entry_type' => 'DEDUCTION',
@@ -1949,9 +2421,73 @@ class LeaveApplicationController extends Controller
                 'description' => $application->is_monetization
                     ? 'Approved monetization'
                     : 'Approved leave application',
+                'application_id' => (int) $application->id,
                 'leave_application_id' => (int) $application->id,
                 'source' => 'LEAVE_APPLICATION',
                 'created_at' => $approvedAt->toIso8601String(),
+            ];
+        }
+
+        return $historyByType;
+    }
+
+    private function loadEmployeeCOCCreditHistoryByType(string $controlNo, ?int $leaveTypeId = null): array
+    {
+        $applications = COCApplication::query()
+            ->where('status', COCApplication::STATUS_APPROVED)
+            ->whereIn('erms_control_no', $this->controlNoCandidates($controlNo))
+            ->whereNotNull('cto_leave_type_id')
+            ->whereNotNull('cto_credited_days')
+            ->where('cto_credited_days', '>', 0)
+            ->when($leaveTypeId !== null, function ($query) use ($leaveTypeId): void {
+                $query->where('cto_leave_type_id', $leaveTypeId);
+            })
+            ->orderByDesc('cto_credited_at')
+            ->orderByDesc('reviewed_at')
+            ->orderByDesc('id')
+            ->get([
+                'id',
+                'cto_leave_type_id',
+                'cto_credited_days',
+                'cto_credited_at',
+                'reviewed_at',
+                'created_at',
+            ]);
+
+        $historyByType = [];
+
+        foreach ($applications as $application) {
+            if (!$application instanceof COCApplication) {
+                continue;
+            }
+
+            $typeId = (int) ($application->cto_leave_type_id ?? 0);
+            if ($typeId <= 0) {
+                continue;
+            }
+
+            $creditsAdded = round((float) ($application->cto_credited_days ?? 0), 2);
+            if ($creditsAdded <= 0) {
+                continue;
+            }
+
+            $creditedAt = $application->cto_credited_at ?? $application->reviewed_at ?? $application->created_at;
+            if ($creditedAt === null) {
+                continue;
+            }
+
+            $historyByType[$typeId][] = [
+                'accrual_date' => $creditedAt->toDateString(),
+                'transaction_date' => $creditedAt->toDateString(),
+                'credits_added' => $creditsAdded,
+                'entry_type' => 'CREDIT',
+                'transaction_type' => 'CREDIT',
+                'label' => 'COC converted to CTO',
+                'description' => 'Approved COC application converted to CTO credits',
+                'application_id' => 'COC-' . (int) $application->id,
+                'coc_application_id' => (int) $application->id,
+                'source' => 'COC_APPLICATION',
+                'created_at' => $creditedAt->toIso8601String(),
             ];
         }
 
@@ -1970,20 +2506,22 @@ class LeaveApplicationController extends Controller
 
     private function resolveEmployeeDisplayName(LeaveApplication $app): string
     {
-        $name = trim((string) (($app->employee?->firstname ?? '') . ' ' . ($app->employee?->surname ?? '')));
+        $employee = $this->resolveApplicationEmployee($app);
+        $name = trim((string) (($employee?->firstname ?? '') . ' ' . ($employee?->surname ?? '')));
         if ($name !== '') {
             return $name;
         }
 
-        if ($app->erms_control_no !== null) {
-            $employee = $this->findEmployeeByControlNo((string) $app->erms_control_no);
-            $fallback = trim((string) (($employee->firstname ?? '') . ' ' . ($employee->surname ?? '')));
-            if ($fallback !== '') {
-                return $fallback;
-            }
+        $adminFallback = trim((string) ($app->applicantAdmin?->full_name ?? ''));
+        if ($adminFallback !== '') {
+            return $adminFallback;
         }
 
-        return 'An employee';
+        if ($app->erms_control_no !== null) {
+            return 'Employee ' . $this->normalizeControlNo((string) $app->erms_control_no);
+        }
+
+        return 'Employee';
     }
 
     private function normalizeControlNo(mixed $value): string
@@ -2036,7 +2574,7 @@ class LeaveApplicationController extends Controller
 
             $employeeControlNo = $this->normalizeControlNo($application->erms_control_no);
             if ($employeeControlNo !== '') {
-                $employeeName = $this->formatEmployeeFullName($application->employee);
+                $employeeName = $this->formatEmployeeFullName($this->resolveApplicationEmployee($application));
                 if ($employeeName === '') {
                     $employeeName = trim((string) ($application->applicantAdmin?->full_name ?? ''));
                 }
@@ -2169,7 +2707,7 @@ class LeaveApplicationController extends Controller
 
     private function formatErmsApplication(LeaveApplication $app, array $actorDirectory): array
     {
-        $employeeName = $this->formatEmployeeFullName($app->employee);
+        $employeeName = $this->formatEmployeeFullName($this->resolveApplicationEmployee($app));
         if ($employeeName === '') {
             $employeeName = trim((string) ($app->applicantAdmin?->full_name ?? ''));
         }
@@ -2289,6 +2827,11 @@ class LeaveApplicationController extends Controller
         $approverName = $processedBy ?? $hrActionBy ?? $adminActionBy;
 
         $selectedDates = $app->resolvedSelectedDates();
+        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
+        $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
+        $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
+        $withoutPay = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
+        $deductibleDays = $this->resolveApplicationDeductibleDays($app);
 
         return [
             'id' => $app->id,
@@ -2298,13 +2841,34 @@ class LeaveApplicationController extends Controller
             'start_date' => $app->start_date?->toDateString(),
             'end_date' => $app->end_date?->toDateString(),
             'selected_dates' => $selectedDates,
+            'selected_date_pay_status' => is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null,
+            'selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
             'total_days' => (float) $app->total_days,
+            'deductible_days' => $deductibleDays,
+            'pay_mode' => $normalizedPayMode,
+            'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
+            'without_pay' => $withoutPay,
+            'with_pay' => !$withoutPay,
             'date_filed' => $app->created_at?->toDateString(),
             'filed_at' => $app->created_at?->toIso8601String(),
             'created_at' => $app->created_at?->toIso8601String(),
             'status' => $displayStatus,
             'raw_status' => $app->status,
             'remarks' => $app->remarks,
+            'pending_update' => $pendingUpdateMeta['payload'],
+            'pending_update_reason' => $pendingUpdateMeta['reason'],
+            'pending_update_previous_status' => $pendingUpdateMeta['previous_status'],
+            'pending_update_requested_by' => $pendingUpdateMeta['requested_by'],
+            'pending_update_requested_at' => $pendingUpdateMeta['requested_at']?->toIso8601String(),
+            'has_pending_update_request' => $this->isPendingApprovedUpdateRequest($app),
+            'latest_update_request_status' => $latestUpdateMeta['status'],
+            'latest_update_request_payload' => $latestUpdateMeta['payload'],
+            'latest_update_request_reason' => $latestUpdateMeta['reason'],
+            'latest_update_request_previous_status' => $latestUpdateMeta['previous_status'],
+            'latest_update_requested_by' => $latestUpdateMeta['requested_by'],
+            'latest_update_requested_at' => $latestUpdateMeta['requested_at']?->toIso8601String(),
+            'latest_update_reviewed_at' => $latestUpdateMeta['reviewed_at']?->toIso8601String(),
+            'latest_update_review_remarks' => $latestUpdateMeta['review_remarks'],
             'rejection_reason' => $app->status === LeaveApplication::STATUS_REJECTED && !$isCancelled ? $app->remarks : null,
             'employee_name' => $employeeName,
             'filed_by' => $filedBy,
@@ -2323,6 +2887,775 @@ class LeaveApplicationController extends Controller
             'cancelled_at' => $cancelledAt?->toIso8601String(),
             'status_history' => $statusHistory,
         ];
+    }
+
+    private function buildRequestedLeaveUpdatePayload(Request $request, array $validated, LeaveApplication $app): array|JsonResponse
+    {
+        $requestedIsMonetization = array_key_exists('is_monetization', $validated)
+            ? (bool) $validated['is_monetization']
+            : (bool) $app->is_monetization;
+
+        // Keep update flow scoped to editing values, not changing application mode.
+        if ($requestedIsMonetization !== (bool) $app->is_monetization) {
+            return response()->json([
+                'message' => 'Switching between leave and monetization modes is not allowed in update requests.',
+            ], 422);
+        }
+
+        $requestedReason = array_key_exists('reason', $validated) || array_key_exists('reason_purpose', $validated)
+            ? $this->trimNullableString($validated['reason'] ?? $validated['reason_purpose'] ?? null)
+            : $this->trimNullableString($app->reason);
+
+        $requestedSelectedDatePayStatus = $requestedIsMonetization
+            ? null
+            : $this->normalizeSelectedDatePayStatusMap(
+                array_key_exists('selected_date_pay_status', $validated)
+                    ? $validated['selected_date_pay_status']
+                    : $request->input('selected_date_pay_status')
+            );
+        $requestedSelectedDateCoverage = $requestedIsMonetization
+            ? null
+            : $this->normalizeSelectedDateCoverageMap(
+                array_key_exists('selected_date_coverage', $validated)
+                    ? $validated['selected_date_coverage']
+                    : $request->input('selected_date_coverage')
+            );
+
+        $resolvedStartDate = $requestedIsMonetization
+            ? null
+            : ($validated['start_date'] ?? $app->start_date?->toDateString());
+        $resolvedEndDate = $requestedIsMonetization
+            ? null
+            : ($validated['end_date'] ?? $app->end_date?->toDateString());
+        $resolvedSelectedDates = $requestedIsMonetization
+            ? null
+            : LeaveApplication::resolveSelectedDates(
+                $resolvedStartDate,
+                $resolvedEndDate,
+                array_key_exists('selected_dates', $validated)
+                    ? (is_array($validated['selected_dates']) ? $validated['selected_dates'] : null)
+                    : $app->resolvedSelectedDates(),
+                (float) ($validated['total_days'] ?? $app->total_days)
+            );
+        $resolvedTotalDays = array_key_exists('total_days', $validated)
+            ? (float) $validated['total_days']
+            : (float) $app->total_days;
+        $resolvedPayMode = $this->resolveRequestedPayMode(
+            $request,
+            $validated,
+            $requestedIsMonetization,
+            $app->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY
+        );
+        $requestedSelectedDatePayStatus = $requestedIsMonetization
+            ? null
+            : $this->compactSelectedDatePayStatusMap(
+                $requestedSelectedDatePayStatus,
+                $resolvedSelectedDates,
+                $resolvedPayMode
+            );
+        $requestedSelectedDateCoverage = $requestedIsMonetization
+            ? null
+            : $this->compactSelectedDateCoverageMap(
+                $requestedSelectedDateCoverage,
+                $resolvedSelectedDates
+            );
+        $resolvedDeductibleDays = $this->computeDeductibleDays(
+            $resolvedTotalDays,
+            is_array($resolvedSelectedDates) ? $resolvedSelectedDates : null,
+            $requestedSelectedDatePayStatus,
+            $requestedSelectedDateCoverage,
+            $requestedIsMonetization,
+            $resolvedPayMode
+        );
+
+        $rawPayload = [
+            'leave_type_id' => (int) ($validated['leave_type_id'] ?? $app->leave_type_id),
+            'start_date' => $resolvedStartDate,
+            'end_date' => $resolvedEndDate,
+            'selected_dates' => $resolvedSelectedDates,
+            'selected_date_pay_status' => $requestedSelectedDatePayStatus,
+            'selected_date_coverage' => $requestedSelectedDateCoverage,
+            'total_days' => $resolvedTotalDays,
+            'deductible_days' => $resolvedDeductibleDays,
+            'reason' => $requestedReason,
+            'commutation' => array_key_exists('commutation', $validated)
+                ? $validated['commutation']
+                : ($app->commutation ?? 'Not Requested'),
+            'pay_mode' => $resolvedPayMode,
+            'is_monetization' => $requestedIsMonetization,
+        ];
+
+        $payload = $this->normalizePendingUpdatePayload($rawPayload);
+        if ($payload === null) {
+            return response()->json([
+                'message' => 'The update request payload is invalid.',
+            ], 422);
+        }
+
+        if ($payload['leave_type_id'] <= 0) {
+            return response()->json([
+                'message' => 'The leave_type_id field is required for update requests.',
+            ], 422);
+        }
+
+        if (($payload['total_days'] ?? 0) <= 0) {
+            return response()->json([
+                'message' => 'The total_days field must be greater than zero.',
+            ], 422);
+        }
+
+        if (!(bool) $payload['is_monetization']) {
+            if (($payload['start_date'] ?? null) === null || ($payload['end_date'] ?? null) === null) {
+                return response()->json([
+                    'message' => 'Both start_date and end_date are required for leave update requests.',
+                ], 422);
+            }
+        }
+
+        return $payload;
+    }
+
+    private function hasRequestedLeaveUpdateChanges(LeaveApplication $app, array $requestedPayload): bool
+    {
+        $currentPayload = $this->normalizePendingUpdatePayload([
+            'leave_type_id' => (int) $app->leave_type_id,
+            'start_date' => $app->start_date?->toDateString(),
+            'end_date' => $app->end_date?->toDateString(),
+            'selected_dates' => $app->resolvedSelectedDates(),
+            'selected_date_pay_status' => is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null,
+            'selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
+            'total_days' => (float) $app->total_days,
+            'deductible_days' => $this->resolveApplicationDeductibleDays($app),
+            'reason' => $app->reason,
+            'commutation' => $app->commutation ?? 'Not Requested',
+            'pay_mode' => $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization),
+            'is_monetization' => (bool) $app->is_monetization,
+        ]);
+
+        $normalizedRequestedPayload = $this->normalizePendingUpdatePayload($requestedPayload);
+
+        if ($currentPayload === null || $normalizedRequestedPayload === null) {
+            return true;
+        }
+
+        if ((int) $currentPayload['leave_type_id'] !== (int) $normalizedRequestedPayload['leave_type_id']) {
+            return true;
+        }
+
+        if ((bool) $currentPayload['is_monetization'] !== (bool) $normalizedRequestedPayload['is_monetization']) {
+            return true;
+        }
+
+        if (($currentPayload['start_date'] ?? null) !== ($normalizedRequestedPayload['start_date'] ?? null)) {
+            return true;
+        }
+
+        if (($currentPayload['end_date'] ?? null) !== ($normalizedRequestedPayload['end_date'] ?? null)) {
+            return true;
+        }
+
+        if (round((float) ($currentPayload['total_days'] ?? 0), 2) !== round((float) ($normalizedRequestedPayload['total_days'] ?? 0), 2)) {
+            return true;
+        }
+
+        if (($currentPayload['selected_dates'] ?? null) !== ($normalizedRequestedPayload['selected_dates'] ?? null)) {
+            return true;
+        }
+
+        if (($currentPayload['selected_date_pay_status'] ?? null) !== ($normalizedRequestedPayload['selected_date_pay_status'] ?? null)) {
+            return true;
+        }
+
+        if (($currentPayload['selected_date_coverage'] ?? null) !== ($normalizedRequestedPayload['selected_date_coverage'] ?? null)) {
+            return true;
+        }
+
+        if ($this->trimNullableString($currentPayload['reason'] ?? null) !== $this->trimNullableString($normalizedRequestedPayload['reason'] ?? null)) {
+            return true;
+        }
+
+        if (round((float) ($currentPayload['deductible_days'] ?? 0), 2) !== round((float) ($normalizedRequestedPayload['deductible_days'] ?? 0), 2)) {
+            return true;
+        }
+
+        if (($currentPayload['pay_mode'] ?? LeaveApplication::PAY_MODE_WITH_PAY) !== ($normalizedRequestedPayload['pay_mode'] ?? LeaveApplication::PAY_MODE_WITH_PAY)) {
+            return true;
+        }
+
+        return ($currentPayload['commutation'] ?? 'Not Requested') !== ($normalizedRequestedPayload['commutation'] ?? 'Not Requested');
+    }
+
+    private function isPendingApprovedUpdateRequest(LeaveApplication $app): bool
+    {
+        if ($app->status !== LeaveApplication::STATUS_PENDING_HR) {
+            return false;
+        }
+
+        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
+        return ($pendingUpdateMeta['payload'] ?? null) !== null
+            && strtoupper(trim((string) ($pendingUpdateMeta['previous_status'] ?? ''))) === LeaveApplication::STATUS_APPROVED;
+    }
+
+    private function hrApprovePendingUpdateRequest(Request $request, LeaveApplication $app, HRAccount $hr): JsonResponse
+    {
+        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
+        $payload = $pendingUpdateMeta['payload'] ?? null;
+        $pendingUpdateRequest = $pendingUpdateMeta['request_record'] ?? null;
+
+        if ($payload === null) {
+            return response()->json([
+                'message' => 'No pending update payload was found for this application.',
+            ], 422);
+        }
+
+        $targetLeaveTypeId = (int) ($payload['leave_type_id'] ?? 0);
+        $targetLeaveType = LeaveType::find($targetLeaveTypeId);
+        if (!$targetLeaveType) {
+            return response()->json([
+                'message' => 'The requested leave type for this update no longer exists.',
+            ], 422);
+        }
+
+        $targetIsMonetization = (bool) ($payload['is_monetization'] ?? $app->is_monetization);
+        if ($targetIsMonetization !== (bool) $app->is_monetization) {
+            return response()->json([
+                'message' => 'This update request contains an unsupported application mode change.',
+            ], 422);
+        }
+        $targetPayMode = $this->normalizePayMode($payload['pay_mode'] ?? null, $targetIsMonetization);
+
+        $targetTotalDays = round((float) ($payload['total_days'] ?? 0), 2);
+        if ($targetTotalDays <= 0) {
+            return response()->json([
+                'message' => 'Invalid total_days value in the pending update request.',
+            ], 422);
+        }
+
+        $targetStartDate = $targetIsMonetization ? null : $this->trimNullableString($payload['start_date'] ?? null);
+        $targetEndDate = $targetIsMonetization ? null : $this->trimNullableString($payload['end_date'] ?? null);
+        $targetSelectedDates = $targetIsMonetization
+            ? null
+            : LeaveApplication::resolveSelectedDates(
+                $targetStartDate,
+                $targetEndDate,
+                is_array($payload['selected_dates'] ?? null) ? $payload['selected_dates'] : null,
+                $targetTotalDays
+            );
+        $targetSelectedDatePayStatus = $targetIsMonetization
+            ? null
+            : $this->compactSelectedDatePayStatusMap(
+                $this->normalizeSelectedDatePayStatusMap($payload['selected_date_pay_status'] ?? null),
+                $targetSelectedDates,
+                $targetPayMode
+            );
+        $targetSelectedDateCoverage = $targetIsMonetization
+            ? null
+            : $this->compactSelectedDateCoverageMap(
+                $this->normalizeSelectedDateCoverageMap($payload['selected_date_coverage'] ?? null),
+                $targetSelectedDates
+            );
+        $targetDeductibleDays = $this->computeDeductibleDays(
+            $targetTotalDays,
+            is_array($targetSelectedDates) ? $targetSelectedDates : null,
+            $targetSelectedDatePayStatus,
+            $targetSelectedDateCoverage,
+            $targetIsMonetization,
+            $targetPayMode
+        );
+
+        if (!$targetIsMonetization && ($targetStartDate === null || $targetEndDate === null)) {
+            return response()->json([
+                'message' => 'Pending update request is missing start_date or end_date.',
+            ], 422);
+        }
+
+        if (!$targetIsMonetization) {
+            $duplicateDateValidation = $this->validateNoDuplicateLeaveDates(
+                (string) ($app->erms_control_no ?? ''),
+                (string) $targetStartDate,
+                (string) $targetEndDate,
+                is_array($targetSelectedDates) ? $targetSelectedDates : null,
+                $targetTotalDays,
+                (int) $app->id
+            );
+            if ($duplicateDateValidation instanceof JsonResponse) {
+                return $duplicateDateValidation;
+            }
+        }
+
+        if ($targetLeaveType->max_days && $targetTotalDays > (float) $targetLeaveType->max_days) {
+            return response()->json([
+                'message' => "This leave type is limited to {$targetLeaveType->max_days} days per application.",
+                'errors' => [
+                    'total_days' => ["Maximum of {$targetLeaveType->max_days} days allowed for {$targetLeaveType->name}."],
+                ],
+            ], 422);
+        }
+
+        $applicationEmployee = $this->resolveApplicationEmployee($app);
+        if ($applicationEmployee) {
+            $leaveTypeRestriction = $this->assertEmployeeCanApplyForLeaveType($applicationEmployee, $targetLeaveType);
+            if ($leaveTypeRestriction instanceof JsonResponse) {
+                return $leaveTypeRestriction;
+            }
+        }
+
+        $sourceLeaveType = LeaveType::find((int) $app->leave_type_id);
+        $balanceAdjustments = $this->buildLeaveBalanceAdjustments(
+            (bool) $app->is_monetization,
+            $sourceLeaveType,
+            (int) $app->leave_type_id,
+            $this->resolveApplicationDeductibleDays($app),
+            $app->pay_mode,
+            $targetIsMonetization,
+            $targetLeaveType,
+            $targetLeaveTypeId,
+            $targetDeductibleDays,
+            $targetPayMode
+        );
+
+        $balanceConflictError = 'HR_UPDATE_BALANCE_CONFLICT';
+
+        try {
+            DB::transaction(function () use (
+                $app,
+                $hr,
+                $request,
+                $pendingUpdateRequest,
+                $payload,
+                $targetLeaveTypeId,
+                $targetStartDate,
+                $targetEndDate,
+                $targetSelectedDates,
+                $targetSelectedDatePayStatus,
+                $targetSelectedDateCoverage,
+                $targetTotalDays,
+                $targetDeductibleDays,
+                $targetIsMonetization,
+                $targetPayMode,
+                $balanceAdjustments,
+                $balanceConflictError
+            ): void {
+                if ($app->erms_control_no && $balanceAdjustments !== []) {
+                    $adjusted = $this->applyEmployeeLeaveBalanceAdjustments(
+                        (string) $app->erms_control_no,
+                        $balanceAdjustments
+                    );
+
+                    if (!$adjusted) {
+                        throw new \RuntimeException($balanceConflictError);
+                    }
+                }
+
+                $app->update([
+                    'leave_type_id' => $targetLeaveTypeId,
+                    'start_date' => $targetIsMonetization ? null : $targetStartDate,
+                    'end_date' => $targetIsMonetization ? null : $targetEndDate,
+                    'total_days' => $targetTotalDays,
+                    'deductible_days' => $targetDeductibleDays,
+                    'reason' => $this->trimNullableString($payload['reason'] ?? null),
+                    'selected_dates' => $targetIsMonetization ? null : $targetSelectedDates,
+                    'selected_date_pay_status' => $targetIsMonetization ? null : $targetSelectedDatePayStatus,
+                    'selected_date_coverage' => $targetIsMonetization ? null : $targetSelectedDateCoverage,
+                    'commutation' => (string) ($payload['commutation'] ?? 'Not Requested'),
+                    'pay_mode' => $targetPayMode,
+                    'is_monetization' => $targetIsMonetization,
+                    'status' => LeaveApplication::STATUS_APPROVED,
+                    'hr_id' => $hr->id,
+                    'hr_approved_at' => now(),
+                    'remarks' => $request->input('remarks'),
+                ]);
+
+                if ($pendingUpdateRequest instanceof LeaveApplicationUpdateRequest) {
+                    $pendingUpdateRequest->update([
+                        'status' => LeaveApplicationUpdateRequest::STATUS_APPROVED,
+                        'reviewed_by_hr_id' => $hr->id,
+                        'reviewed_at' => now(),
+                        'review_remarks' => $request->input('remarks'),
+                    ]);
+                }
+
+                LeaveApplicationLog::create([
+                    'leave_application_id' => $app->id,
+                    'action' => LeaveApplicationLog::ACTION_HR_APPROVED,
+                    'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
+                    'performed_by_id' => $hr->id,
+                    'remarks' => $request->input('remarks') ?: 'Approved leave update request and applied changes.',
+                    'created_at' => now(),
+                ]);
+            });
+        } catch (\RuntimeException $exception) {
+            if ($exception->getMessage() !== $balanceConflictError) {
+                throw $exception;
+            }
+
+            return response()->json([
+                'message' => 'Insufficient leave balance to apply this approved update request.',
+            ], 422);
+        }
+
+        $app = $app->fresh(['leaveType', 'employee', 'applicantAdmin']);
+
+        return response()->json([
+            'message' => 'Leave update request approved by HR and changes were applied.',
+            'application' => $this->formatApplication($app),
+        ]);
+    }
+
+    private function hrRejectPendingUpdateRequest(Request $request, LeaveApplication $app, HRAccount $hr): JsonResponse
+    {
+        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
+        $pendingUpdateRequest = $pendingUpdateMeta['request_record'] ?? null;
+
+        $previousStatus = strtoupper(trim((string) ($pendingUpdateMeta['previous_status'] ?? '')));
+        if ($previousStatus !== LeaveApplication::STATUS_APPROVED) {
+            $previousStatus = LeaveApplication::STATUS_APPROVED;
+        }
+
+        DB::transaction(function () use ($app, $request, $hr, $previousStatus, $pendingUpdateRequest): void {
+            $app->update([
+                'status' => $previousStatus,
+                'remarks' => $request->input('remarks'),
+            ]);
+
+            if ($pendingUpdateRequest instanceof LeaveApplicationUpdateRequest) {
+                $pendingUpdateRequest->update([
+                    'status' => LeaveApplicationUpdateRequest::STATUS_REJECTED,
+                    'reviewed_by_hr_id' => $hr->id,
+                    'reviewed_at' => now(),
+                    'review_remarks' => $request->input('remarks'),
+                ]);
+            }
+
+            LeaveApplicationLog::create([
+                'leave_application_id' => $app->id,
+                'action' => LeaveApplicationLog::ACTION_HR_REJECTED,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
+                'performed_by_id' => $hr->id,
+                'remarks' => $request->input('remarks') ?: 'Rejected leave update request.',
+                'created_at' => now(),
+            ]);
+        });
+
+        $app = $app->fresh(['leaveType', 'employee', 'applicantAdmin']);
+
+        return response()->json([
+            'message' => 'Leave update request rejected by HR. Original approved application remains unchanged.',
+            'application' => $this->formatApplication($app),
+        ]);
+    }
+
+    private function getPendingApprovedUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
+    {
+        if (!$app->id) {
+            return null;
+        }
+
+        if ($app->relationLoaded('updateRequests')) {
+            $record = $app->updateRequests
+                ->filter(fn($item) => $item instanceof LeaveApplicationUpdateRequest)
+                ->sortByDesc(fn(LeaveApplicationUpdateRequest $item) => (int) $item->id)
+                ->first(function (LeaveApplicationUpdateRequest $item): bool {
+                    return strtoupper(trim((string) $item->status)) === LeaveApplicationUpdateRequest::STATUS_PENDING
+                        && strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED;
+                });
+
+            return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
+        }
+
+        $record = LeaveApplicationUpdateRequest::query()
+            ->where('leave_application_id', (int) $app->id)
+            ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
+            ->latest('id')
+            ->first();
+
+        if (!$record) {
+            return null;
+        }
+
+        $previousStatus = strtoupper(trim((string) ($record->previous_status ?? '')));
+        return $previousStatus === LeaveApplication::STATUS_APPROVED ? $record : null;
+    }
+
+    private function resolvePendingUpdateMeta(LeaveApplication $app): array
+    {
+        $pendingRequest = $this->getPendingApprovedUpdateRequestRecord($app);
+        if ($pendingRequest instanceof LeaveApplicationUpdateRequest) {
+            return [
+                'payload' => $this->normalizePendingUpdatePayload($pendingRequest->requested_payload),
+                'reason' => $this->trimNullableString($pendingRequest->requested_reason),
+                'previous_status' => strtoupper(trim((string) ($pendingRequest->previous_status ?? ''))),
+                'requested_by' => $this->trimNullableString($pendingRequest->requested_by_control_no),
+                'requested_at' => $pendingRequest->requested_at,
+                'request_record' => $pendingRequest,
+            ];
+        }
+
+        return [
+            'payload' => null,
+            'reason' => null,
+            'previous_status' => null,
+            'requested_by' => null,
+            'requested_at' => null,
+            'request_record' => null,
+        ];
+    }
+
+    private function getLatestApprovedUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
+    {
+        if (!$app->id) {
+            return null;
+        }
+
+        if ($app->relationLoaded('updateRequests')) {
+            $record = $app->updateRequests
+                ->filter(fn($item) => $item instanceof LeaveApplicationUpdateRequest)
+                ->sortByDesc(fn(LeaveApplicationUpdateRequest $item) => (int) $item->id)
+                ->first(function (LeaveApplicationUpdateRequest $item): bool {
+                    return strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED;
+                });
+
+            return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
+        }
+
+        $record = LeaveApplicationUpdateRequest::query()
+            ->where('leave_application_id', (int) $app->id)
+            ->latest('id')
+            ->first();
+
+        if (!$record) {
+            return null;
+        }
+
+        $previousStatus = strtoupper(trim((string) ($record->previous_status ?? '')));
+        return $previousStatus === LeaveApplication::STATUS_APPROVED ? $record : null;
+    }
+
+    private function resolveLatestUpdateMeta(LeaveApplication $app): array
+    {
+        $latestRequest = $this->getLatestApprovedUpdateRequestRecord($app);
+        if ($latestRequest instanceof LeaveApplicationUpdateRequest) {
+            return [
+                'status' => strtoupper(trim((string) ($latestRequest->status ?? ''))),
+                'payload' => $this->normalizePendingUpdatePayload($latestRequest->requested_payload),
+                'reason' => $this->trimNullableString($latestRequest->requested_reason),
+                'previous_status' => strtoupper(trim((string) ($latestRequest->previous_status ?? ''))),
+                'requested_by' => $this->trimNullableString($latestRequest->requested_by_control_no),
+                'requested_at' => $latestRequest->requested_at,
+                'reviewed_at' => $latestRequest->reviewed_at,
+                'review_remarks' => $this->trimNullableString($latestRequest->review_remarks),
+            ];
+        }
+
+        return [
+            'status' => null,
+            'payload' => null,
+            'reason' => null,
+            'previous_status' => null,
+            'requested_by' => null,
+            'requested_at' => null,
+            'reviewed_at' => null,
+            'review_remarks' => null,
+        ];
+    }
+
+    private function normalizePendingUpdatePayload(mixed $payload): ?array
+    {
+        if (is_string($payload)) {
+            $decoded = json_decode($payload, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $payload = $decoded;
+            }
+        }
+
+        if (!is_array($payload) || $payload === []) {
+            return null;
+        }
+
+        $isMonetization = (bool) ($payload['is_monetization'] ?? false);
+        $payMode = $this->normalizePayMode($payload['pay_mode'] ?? null, $isMonetization);
+        $selectedDatesInput = is_array($payload['selected_dates'] ?? null)
+            ? LeaveApplication::resolveDateSet(null, null, $payload['selected_dates'], null)
+            : null;
+        $selectedDatePayStatus = $isMonetization
+            ? null
+            : $this->normalizeSelectedDatePayStatusMap($payload['selected_date_pay_status'] ?? null);
+        $selectedDateCoverage = $isMonetization
+            ? null
+            : $this->normalizeSelectedDateCoverageMap($payload['selected_date_coverage'] ?? null);
+
+        $startDate = $isMonetization ? null : $this->trimNullableString($payload['start_date'] ?? null);
+        $endDate = $isMonetization ? null : $this->trimNullableString($payload['end_date'] ?? null);
+
+        $commutation = $this->trimNullableString($payload['commutation'] ?? null) ?? 'Not Requested';
+        $leaveTypeId = (int) ($payload['leave_type_id'] ?? 0);
+        $totalDays = round((float) ($payload['total_days'] ?? 0), 2);
+        $selectedDates = $isMonetization
+            ? null
+            : LeaveApplication::resolveSelectedDates(
+                $startDate,
+                $endDate,
+                is_array($selectedDatesInput) ? $selectedDatesInput : null,
+                $totalDays
+            );
+
+        if (!$isMonetization && is_array($selectedDates) && $selectedDates !== []) {
+            $startDate ??= $selectedDates[0];
+            $endDate ??= $selectedDates[count($selectedDates) - 1];
+        }
+
+        $selectedDatePayStatus = $isMonetization
+            ? null
+            : $this->compactSelectedDatePayStatusMap(
+                $selectedDatePayStatus,
+                $selectedDates,
+                $payMode
+            );
+        $selectedDateCoverage = $isMonetization
+            ? null
+            : $this->compactSelectedDateCoverageMap(
+                $selectedDateCoverage,
+                $selectedDates
+            );
+        $deductibleDays = $this->computeDeductibleDays(
+            $totalDays,
+            is_array($selectedDates) ? $selectedDates : null,
+            $selectedDatePayStatus,
+            $selectedDateCoverage,
+            $isMonetization,
+            $payMode
+        );
+        $withoutPay = $payMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
+
+        static $leaveTypeNameCache = [];
+        $leaveTypeName = null;
+        if ($leaveTypeId > 0) {
+            if (!array_key_exists($leaveTypeId, $leaveTypeNameCache)) {
+                $leaveTypeNameCache[$leaveTypeId] = LeaveType::query()
+                    ->whereKey($leaveTypeId)
+                    ->value('name');
+            }
+
+            $resolvedLeaveTypeName = $leaveTypeNameCache[$leaveTypeId];
+            $leaveTypeName = is_string($resolvedLeaveTypeName) ? trim($resolvedLeaveTypeName) : null;
+        }
+
+        return [
+            'leave_type_id' => $leaveTypeId,
+            'leave_type_name' => $leaveTypeName,
+            'start_date' => $startDate,
+            'end_date' => $endDate,
+            'selected_dates' => $selectedDates,
+            'selected_date_pay_status' => $selectedDatePayStatus,
+            'selected_date_coverage' => $selectedDateCoverage,
+            'total_days' => $totalDays,
+            'deductible_days' => $deductibleDays,
+            'reason' => $this->trimNullableString($payload['reason'] ?? null),
+            'commutation' => $commutation,
+            'pay_mode' => $payMode,
+            'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
+            'without_pay' => $withoutPay,
+            'with_pay' => !$withoutPay,
+            'is_monetization' => $isMonetization,
+        ];
+    }
+
+    private function buildLeaveBalanceAdjustments(
+        bool $sourceIsMonetization,
+        ?LeaveType $sourceLeaveType,
+        int $sourceLeaveTypeId,
+        float $sourceDeductibleDays,
+        mixed $sourcePayMode,
+        bool $targetIsMonetization,
+        LeaveType $targetLeaveType,
+        int $targetLeaveTypeId,
+        float $targetDeductibleDays,
+        mixed $targetPayMode
+    ): array {
+        $adjustments = [];
+
+        $sourceDeductsBalance = $this->applicationDeductsEmployeeBalance(
+            $sourceIsMonetization,
+            $sourceLeaveType,
+            $sourcePayMode
+        );
+        if ($sourceDeductsBalance && $sourceLeaveTypeId > 0 && $sourceDeductibleDays > 0) {
+            $adjustments[$sourceLeaveTypeId] = ($adjustments[$sourceLeaveTypeId] ?? 0.0) - $sourceDeductibleDays;
+        }
+
+        $targetDeductsBalance = $this->applicationDeductsEmployeeBalance(
+            $targetIsMonetization,
+            $targetLeaveType,
+            $targetPayMode
+        );
+        if ($targetDeductsBalance && $targetLeaveTypeId > 0 && $targetDeductibleDays > 0) {
+            $adjustments[$targetLeaveTypeId] = ($adjustments[$targetLeaveTypeId] ?? 0.0) + $targetDeductibleDays;
+        }
+
+        foreach ($adjustments as $leaveTypeId => $delta) {
+            $normalizedDelta = round((float) $delta, 2);
+            if (abs($normalizedDelta) < 0.00001) {
+                unset($adjustments[$leaveTypeId]);
+                continue;
+            }
+
+            $adjustments[$leaveTypeId] = $normalizedDelta;
+        }
+
+        return $adjustments;
+    }
+
+    private function applyEmployeeLeaveBalanceAdjustments(string $employeeControlNo, array $adjustments): bool
+    {
+        $controlNoCandidates = $this->controlNoCandidates($employeeControlNo);
+        if ($controlNoCandidates === []) {
+            return false;
+        }
+
+        foreach ($adjustments as $leaveTypeId => $delta) {
+            $normalizedLeaveTypeId = (int) $leaveTypeId;
+            $normalizedDelta = round((float) $delta, 2);
+            if ($normalizedLeaveTypeId <= 0 || abs($normalizedDelta) < 0.00001) {
+                continue;
+            }
+
+            $query = LeaveBalance::query()
+                ->whereIn('employee_id', $controlNoCandidates)
+                ->where('leave_type_id', $normalizedLeaveTypeId)
+                ->lockForUpdate();
+
+            $balance = $query->first();
+
+            if ($normalizedDelta > 0) {
+                if (!$balance || (float) $balance->balance < $normalizedDelta) {
+                    return false;
+                }
+
+                $balance->decrement('balance', $normalizedDelta);
+                continue;
+            }
+
+            $refundDays = abs($normalizedDelta);
+
+            if (!$balance) {
+                $canonicalControlNo = trim((string) ($this->findEmployeeByControlNo($employeeControlNo)?->control_no ?? $employeeControlNo));
+                if ($canonicalControlNo === '') {
+                    return false;
+                }
+
+                $balance = LeaveBalance::create([
+                    'employee_id' => $canonicalControlNo,
+                    'leave_type_id' => $normalizedLeaveTypeId,
+                    'balance' => 0,
+                    'initialized_at' => now(),
+                    'year' => (int) now()->year,
+                ]);
+            }
+
+            $balance->increment('balance', $refundDays);
+        }
+
+        return true;
     }
 
     private function resolveForcedLeaveTypeId(): ?int
@@ -2352,12 +3685,478 @@ class LeaveApplicationController extends Controller
         return strcasecmp($leaveTypeName, 'Vacation Leave') === 0;
     }
 
+    private function normalizePayMode(mixed $payMode, bool $isMonetization = false): string
+    {
+        if ($isMonetization) {
+            return LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+
+        $normalized = strtoupper(trim((string) ($payMode ?? LeaveApplication::PAY_MODE_WITH_PAY)));
+        if (in_array($normalized, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
+            return $normalized;
+        }
+
+        return LeaveApplication::PAY_MODE_WITH_PAY;
+    }
+
+    private function resolveRequestedPayMode(
+        Request $request,
+        array $validated,
+        bool $isMonetization = false,
+        mixed $fallback = null
+    ): string {
+        if ($isMonetization) {
+            return LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+
+        $explicitPayMode = array_key_exists('pay_mode', $validated)
+            ? $validated['pay_mode']
+            : $request->input('pay_mode');
+        if ($explicitPayMode !== null && trim((string) $explicitPayMode) !== '') {
+            return $this->normalizePayMode($explicitPayMode);
+        }
+
+        $withoutPayFlag = $this->normalizeBooleanFlag(
+            array_key_exists('without_pay', $validated)
+                ? $validated['without_pay']
+                : $request->input('without_pay')
+        );
+        if ($withoutPayFlag !== null) {
+            return $withoutPayFlag
+                ? LeaveApplication::PAY_MODE_WITHOUT_PAY
+                : LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+
+        $withPayFlag = $this->normalizeBooleanFlag(
+            array_key_exists('with_pay', $validated)
+                ? $validated['with_pay']
+                : $request->input('with_pay')
+        );
+        if ($withPayFlag !== null) {
+            return $withPayFlag
+                ? LeaveApplication::PAY_MODE_WITH_PAY
+                : LeaveApplication::PAY_MODE_WITHOUT_PAY;
+        }
+
+        $payStatusMode = $this->resolvePayModeFromStatusValue(
+            array_key_exists('pay_status', $validated)
+                ? $validated['pay_status']
+                : ($request->input('pay_status') ?? $request->input('payStatus'))
+        );
+        if ($payStatusMode !== null) {
+            return $payStatusMode;
+        }
+
+        $selectedDatePayStatus = array_key_exists('selected_date_pay_status', $validated)
+            ? $validated['selected_date_pay_status']
+            : ($request->input('selected_date_pay_status') ?? $request->input('selectedDatePayStatus'));
+
+        if (is_array($selectedDatePayStatus) && $selectedDatePayStatus !== []) {
+            $hasWithPay = false;
+            $hasWithoutPay = false;
+
+            foreach ($selectedDatePayStatus as $value) {
+                $mode = $this->resolvePayModeFromStatusValue($value);
+                if ($mode === LeaveApplication::PAY_MODE_WITH_PAY) {
+                    $hasWithPay = true;
+                } elseif ($mode === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
+                    $hasWithoutPay = true;
+                }
+            }
+
+            if ($hasWithoutPay && !$hasWithPay) {
+                return LeaveApplication::PAY_MODE_WITHOUT_PAY;
+            }
+
+            if ($hasWithPay) {
+                return LeaveApplication::PAY_MODE_WITH_PAY;
+            }
+        }
+
+        return $this->normalizePayMode($fallback);
+    }
+
+    private function resolvePayModeFromStatusValue(mixed $value): ?string
+    {
+        $normalized = strtolower(trim((string) $value));
+        if ($normalized === '') {
+            return null;
+        }
+
+        $normalized = str_replace(['_', '-'], ' ', $normalized);
+        $normalized = preg_replace('/\s+/', ' ', $normalized) ?? $normalized;
+
+        if (in_array($normalized, ['wop', 'without pay', 'withoutpay', 'unpaid', 'no pay'], true)) {
+            return LeaveApplication::PAY_MODE_WITHOUT_PAY;
+        }
+
+        if (in_array($normalized, ['wp', 'with pay', 'withpay', 'paid'], true)) {
+            return LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+
+        return null;
+    }
+
+    private function normalizeBooleanFlag(mixed $value): ?bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+
+        if (is_int($value) || is_float($value)) {
+            return (float) $value !== 0.0;
+        }
+
+        $normalized = strtolower(trim((string) $value));
+        if ($normalized === '') {
+            return null;
+        }
+
+        if (in_array($normalized, ['1', 'true', 'yes', 'y', 'on'], true)) {
+            return true;
+        }
+
+        if (in_array($normalized, ['0', 'false', 'no', 'n', 'off'], true)) {
+            return false;
+        }
+
+        return null;
+    }
+
+    private function normalizeSelectedDatePayStatusMap(mixed $value): ?array
+    {
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $value = $decoded;
+            }
+        }
+
+        if (!is_array($value) || $value === []) {
+            return null;
+        }
+
+        $normalized = [];
+        foreach ($value as $rawDate => $rawStatus) {
+            $dateKey = trim((string) $rawDate);
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $resolvedMode = $this->resolvePayModeFromStatusValue($rawStatus);
+            if ($resolvedMode === null) {
+                continue;
+            }
+
+            $normalized[$dateKey] = $resolvedMode;
+        }
+
+        if ($normalized === []) {
+            return null;
+        }
+
+        ksort($normalized);
+        return $normalized;
+    }
+
+    private function normalizeSelectedDateCoverageMap(mixed $value): ?array
+    {
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $value = $decoded;
+            }
+        }
+
+        if (!is_array($value) || $value === []) {
+            return null;
+        }
+
+        $normalized = [];
+        foreach ($value as $rawDate => $rawCoverage) {
+            $dateKey = trim((string) $rawDate);
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $coverage = strtolower(trim((string) $rawCoverage));
+            if ($coverage === 'half') {
+                $normalized[$dateKey] = 'half';
+                continue;
+            }
+
+            if ($coverage === 'whole') {
+                $normalized[$dateKey] = 'whole';
+            }
+        }
+
+        if ($normalized === []) {
+            return null;
+        }
+
+        ksort($normalized);
+        return $normalized;
+    }
+
+    private function compactSelectedDatePayStatusMap(
+        ?array $selectedDatePayStatus,
+        ?array $selectedDates,
+        string $payMode
+    ): ?array {
+        if (!is_array($selectedDatePayStatus) || $selectedDatePayStatus === []) {
+            return null;
+        }
+
+        $defaultMode = $this->normalizePayMode($payMode, false);
+        $dateSet = [];
+        if (is_array($selectedDates)) {
+            foreach ($selectedDates as $rawDate) {
+                $dateKey = trim((string) $rawDate);
+                if ($dateKey === '') {
+                    continue;
+                }
+
+                $dateSet[$dateKey] = true;
+            }
+        }
+        $restrictToSelectedDates = $dateSet !== [];
+
+        $compacted = [];
+        foreach ($selectedDatePayStatus as $rawDate => $rawStatus) {
+            $dateKey = trim((string) $rawDate);
+            if ($dateKey === '') {
+                continue;
+            }
+
+            if ($restrictToSelectedDates && !array_key_exists($dateKey, $dateSet)) {
+                continue;
+            }
+
+            $resolvedMode = $this->resolvePayModeFromStatusValue($rawStatus);
+            if ($resolvedMode === null) {
+                continue;
+            }
+
+            if ($restrictToSelectedDates && $resolvedMode === $defaultMode) {
+                continue;
+            }
+
+            $compacted[$dateKey] = $resolvedMode;
+        }
+
+        if ($compacted === []) {
+            return null;
+        }
+
+        ksort($compacted);
+        return $compacted;
+    }
+
+    private function compactSelectedDateCoverageMap(
+        ?array $selectedDateCoverage,
+        ?array $selectedDates
+    ): ?array {
+        if (!is_array($selectedDateCoverage) || $selectedDateCoverage === []) {
+            return null;
+        }
+
+        $dateSet = [];
+        if (is_array($selectedDates)) {
+            foreach ($selectedDates as $rawDate) {
+                $dateKey = trim((string) $rawDate);
+                if ($dateKey === '') {
+                    continue;
+                }
+
+                $dateSet[$dateKey] = true;
+            }
+        }
+        $restrictToSelectedDates = $dateSet !== [];
+
+        $compacted = [];
+        foreach ($selectedDateCoverage as $rawDate => $rawCoverage) {
+            $dateKey = trim((string) $rawDate);
+            if ($dateKey === '') {
+                continue;
+            }
+
+            if ($restrictToSelectedDates && !array_key_exists($dateKey, $dateSet)) {
+                continue;
+            }
+
+            $coverage = strtolower(trim((string) $rawCoverage));
+            if ($coverage === 'half') {
+                $compacted[$dateKey] = 'half';
+                continue;
+            }
+
+            if (!$restrictToSelectedDates && $coverage === 'whole') {
+                $compacted[$dateKey] = 'whole';
+                continue;
+            }
+
+            if ($restrictToSelectedDates) {
+                continue;
+            }
+        }
+
+        if ($compacted === []) {
+            return null;
+        }
+
+        ksort($compacted);
+        return $compacted;
+    }
+
+    private function computeDeductibleDays(
+        float $totalDays,
+        ?array $selectedDates,
+        ?array $selectedDatePayStatus,
+        ?array $selectedDateCoverage,
+        bool $isMonetization,
+        string $payMode
+    ): float {
+        $normalizedTotalDays = round(max($totalDays, 0.0), 2);
+        if ($normalizedTotalDays <= 0) {
+            return 0.0;
+        }
+
+        if ($isMonetization) {
+            return $normalizedTotalDays;
+        }
+
+        $normalizedPayMode = $this->normalizePayMode($payMode, false);
+
+        $resolvedDates = [];
+        if (is_array($selectedDates)) {
+            foreach ($selectedDates as $rawDate) {
+                $dateKey = trim((string) $rawDate);
+                if ($dateKey === '') {
+                    continue;
+                }
+                $resolvedDates[] = $dateKey;
+            }
+        }
+        $resolvedDates = array_values(array_unique($resolvedDates));
+        sort($resolvedDates);
+
+        $payStatusMap = is_array($selectedDatePayStatus) ? $selectedDatePayStatus : [];
+        $coverageMap = is_array($selectedDateCoverage) ? $selectedDateCoverage : [];
+        $hasCoverageOverrides = $coverageMap !== [];
+
+        if ($resolvedDates === []) {
+            $resolvedDates = array_values(array_unique(array_merge(
+                array_keys($payStatusMap),
+                array_keys($coverageMap)
+            )));
+            sort($resolvedDates);
+        }
+
+        if ($resolvedDates === []) {
+            return $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $normalizedTotalDays;
+        }
+
+        $defaultCoverageWeight = 1.0;
+        $dateCount = count($resolvedDates);
+        if ($dateCount > 0) {
+            $halfMatch = abs(($dateCount * 0.5) - $normalizedTotalDays) < 0.00001;
+            $wholeMatch = abs(((float) $dateCount) - $normalizedTotalDays) < 0.00001;
+            if ($halfMatch) {
+                $defaultCoverageWeight = 0.5;
+            } elseif (!$wholeMatch) {
+                $defaultCoverageWeight = max(min($normalizedTotalDays / $dateCount, 1.0), 0.5);
+            }
+        }
+
+        $weightedTotal = 0.0;
+        $weightedPaid = 0.0;
+        foreach ($resolvedDates as $dateKey) {
+            $hasCoverageValue = array_key_exists($dateKey, $coverageMap);
+            $coverage = $hasCoverageValue ? strtolower(trim((string) ($coverageMap[$dateKey] ?? ''))) : '';
+            if ($coverage === 'half') {
+                $weight = 0.5;
+            } elseif ($coverage === 'whole') {
+                $weight = 1.0;
+            } elseif ($hasCoverageOverrides) {
+                // Stored coverage maps are sparse (half-day overrides only), so missing keys mean whole-day.
+                $weight = 1.0;
+            } else {
+                $weight = $defaultCoverageWeight;
+            }
+
+            $weightedTotal += $weight;
+
+            $status = $payStatusMap[$dateKey] ?? $normalizedPayMode;
+            $resolvedMode = $this->resolvePayModeFromStatusValue($status);
+            $effectiveMode = $resolvedMode ?? $normalizedPayMode;
+            if ($effectiveMode === LeaveApplication::PAY_MODE_WITH_PAY) {
+                $weightedPaid += $weight;
+            }
+        }
+
+        if ($weightedTotal <= 0.0) {
+            return $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $normalizedTotalDays;
+        }
+
+        $scale = $normalizedTotalDays / $weightedTotal;
+        $deductible = round(max($weightedPaid * $scale, 0.0), 2);
+        if ($deductible > $normalizedTotalDays) {
+            $deductible = $normalizedTotalDays;
+        }
+
+        return $deductible;
+    }
+
+    private function resolveApplicationDeductibleDays(LeaveApplication $app): float
+    {
+        $totalDays = round((float) ($app->total_days ?? 0), 2);
+        if ($totalDays <= 0) {
+            return 0.0;
+        }
+
+        if ($app->deductible_days !== null) {
+            $stored = round((float) $app->deductible_days, 2);
+            if ($stored < 0) {
+                return 0.0;
+            }
+            if ($stored > $totalDays) {
+                return $totalDays;
+            }
+            return $stored;
+        }
+
+        if ((bool) $app->is_monetization) {
+            return $totalDays;
+        }
+
+        return $this->normalizePayMode($app->pay_mode ?? null, false) === LeaveApplication::PAY_MODE_WITHOUT_PAY
+            ? 0.0
+            : $totalDays;
+    }
+
+    private function applicationDeductsEmployeeBalance(
+        bool $isMonetization,
+        ?LeaveType $leaveType,
+        mixed $payMode
+    ): bool {
+        if ($isMonetization) {
+            return true;
+        }
+
+        if ($this->normalizePayMode($payMode, false) === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
+            return false;
+        }
+
+        return (bool) ($leaveType?->is_credit_based);
+    }
+
     private function validateNoDuplicateLeaveDates(
         string $employeeControlNo,
         string $startDate,
         string $endDate,
         ?array $selectedDates = null,
-        mixed $totalDays = null
+        mixed $totalDays = null,
+        ?int $excludeApplicationId = null
     ): ?JsonResponse {
         $requestedDates = $this->resolveLeaveDateSet($startDate, $endDate, $selectedDates, $totalDays);
         if ($requestedDates === []) {
@@ -2371,9 +4170,9 @@ class LeaveApplicationController extends Controller
                 LeaveApplication::STATUS_PENDING_HR,
                 LeaveApplication::STATUS_APPROVED,
             ])
-            ->where(function ($query) use ($employeeControlNo): void {
-                $query->where('erms_control_no', $employeeControlNo)
-                    ->orWhereRaw('TRY_CONVERT(INT, erms_control_no) = TRY_CONVERT(INT, ?)', [$employeeControlNo]);
+            ->whereIn('erms_control_no', $this->controlNoCandidates($employeeControlNo))
+            ->when($excludeApplicationId !== null, function ($query) use ($excludeApplicationId): void {
+                $query->where('id', '<>', $excludeApplicationId);
             })
             ->get();
 
@@ -2430,7 +4229,9 @@ class LeaveApplicationController extends Controller
     private function validateRegularLeaveEligibility(
         string $employeeControlNo,
         int $leaveTypeId,
-        float $requestedDays
+        float $requestedDays,
+        string $payMode = LeaveApplication::PAY_MODE_WITH_PAY,
+        ?float $requestedDeductibleDays = null
     ): array|JsonResponse {
         $leaveType = LeaveType::find($leaveTypeId);
         if (!$leaveType) {
@@ -2459,16 +4260,19 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
-        if (!$leaveType->is_credit_based) {
+        $normalizedPayMode = $this->normalizePayMode($payMode);
+        $requiredBalanceDays = round(max((float) ($requestedDeductibleDays ?? $requestedDays), 0.0), 2);
+        if (
+            !$leaveType->is_credit_based
+            || $requiredBalanceDays <= 0
+            || $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
+        ) {
             return ['leave_type' => $leaveType, 'balance' => null];
         }
 
         $balance = LeaveBalance::query()
             ->where('leave_type_id', $leaveTypeId)
-            ->where(function ($query) use ($employeeControlNo): void {
-                $query->where('employee_id', $employeeControlNo)
-                    ->orWhereRaw('TRY_CONVERT(INT, employee_id) = TRY_CONVERT(INT, ?)', [$employeeControlNo]);
-            })
+            ->whereIn('employee_id', $this->controlNoCandidates($employeeControlNo))
             ->first();
 
         if (!$balance) {
@@ -2487,17 +4291,21 @@ class LeaveApplicationController extends Controller
                 LeaveApplication::STATUS_PENDING_ADMIN,
                 LeaveApplication::STATUS_PENDING_HR,
             ])
-            ->where(function ($query) use ($employeeControlNo): void {
-                $query->where('erms_control_no', $employeeControlNo)
-                    ->orWhereRaw('TRY_CONVERT(INT, erms_control_no) = TRY_CONVERT(INT, ?)', [$employeeControlNo]);
+            ->where(function ($query): void {
+                $query->where('is_monetization', true)
+                    ->orWhereRaw(
+                        'UPPER(LTRIM(RTRIM(COALESCE(pay_mode, ?)))) <> ?',
+                        [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY]
+                    );
             })
-            ->sum('total_days');
+            ->whereIn('erms_control_no', $this->controlNoCandidates($employeeControlNo))
+            ->sum(DB::raw('COALESCE(deductible_days, total_days)'));
 
         $availableBalance = max(round($currentBalance - $pendingReservedDays, 2), 0.0);
 
-        if ($availableBalance < $requestedDays) {
+        if ($availableBalance < $requiredBalanceDays) {
             $fmtAvail = self::formatDays($availableBalance);
-            $fmtReq = self::formatDays($requestedDays);
+            $fmtReq = self::formatDays($requiredBalanceDays);
             $fmtCurrent = self::formatDays($currentBalance);
             $fmtPending = self::formatDays($pendingReservedDays);
 
@@ -2519,14 +4327,23 @@ class LeaveApplicationController extends Controller
 
     private function formatApplication(LeaveApplication $app): array
     {
-        $employeeName = $this->formatEmployeeFullName($app->employee);
+        $resolvedEmployee = $this->resolveApplicationEmployee($app);
+        $employeeName = $this->formatEmployeeFullName($resolvedEmployee);
         $applicantName = $employeeName !== ''
             ? $employeeName
             : trim((string) ($app->applicantAdmin?->full_name ?? ''));
         if ($applicantName === '') {
             $applicantName = $this->resolveEmployeeDisplayName($app);
         }
-        $office = $app->employee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
+        $office = $resolvedEmployee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
+        $durationDays = (float) $app->total_days;
+        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
+        $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
+        $leaveBalanceSnapshot = $this->getApplicationLeaveBalanceSnapshot($app);
+        $currentLeaveBalance = $this->findLeaveTypeBalanceInSnapshot($leaveBalanceSnapshot, (int) $app->leave_type_id);
+        $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
+        $withoutPay = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
+        $deductibleDays = $this->resolveApplicationDeductibleDays($app);
 
         $data = [
             'id' => $app->id,
@@ -2536,7 +4353,10 @@ class LeaveApplicationController extends Controller
             'leaveType' => $app->leaveType?->name ?? 'Unknown',
             'startDate' => $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : null,
             'endDate' => $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : null,
-            'days' => (float) $app->total_days,
+            'days' => $durationDays,
+            'duration_value' => $durationDays,
+            'duration_unit' => 'day',
+            'duration_label' => self::formatDays($durationDays),
             'reason' => $app->reason,
             'status' => $this->statusToFrontend($app->status),
             'rawStatus' => $app->status,
@@ -2546,10 +4366,35 @@ class LeaveApplicationController extends Controller
             'createdAt' => $app->created_at?->toIso8601String(),
             'created_at' => $app->created_at?->toIso8601String(),
             'remarks' => $app->remarks,
+            'pending_update' => $pendingUpdateMeta['payload'],
+            'pending_update_reason' => $pendingUpdateMeta['reason'],
+            'pending_update_previous_status' => $pendingUpdateMeta['previous_status'],
+            'pending_update_requested_by' => $pendingUpdateMeta['requested_by'],
+            'pending_update_requested_at' => $pendingUpdateMeta['requested_at']?->toIso8601String(),
+            'has_pending_update_request' => $this->isPendingApprovedUpdateRequest($app),
+            'latest_update_request_status' => $latestUpdateMeta['status'],
+            'latest_update_request_payload' => $latestUpdateMeta['payload'],
+            'latest_update_request_reason' => $latestUpdateMeta['reason'],
+            'latest_update_request_previous_status' => $latestUpdateMeta['previous_status'],
+            'latest_update_requested_by' => $latestUpdateMeta['requested_by'],
+            'latest_update_requested_at' => $latestUpdateMeta['requested_at']?->toIso8601String(),
+            'latest_update_reviewed_at' => $latestUpdateMeta['reviewed_at']?->toIso8601String(),
+            'latest_update_review_remarks' => $latestUpdateMeta['review_remarks'],
             'selected_dates' => $app->resolvedSelectedDates(),
+            'selected_date_pay_status' => is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null,
+            'selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
             'commutation' => $app->commutation ?? 'Not Requested',
+            'pay_mode' => $normalizedPayMode,
+            'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
+            'without_pay' => $withoutPay,
+            'with_pay' => !$withoutPay,
             'is_monetization' => (bool) $app->is_monetization,
             'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
+            'deductible_days' => $deductibleDays,
+            'leaveBalance' => $currentLeaveBalance,
+            'leaveBalances' => $leaveBalanceSnapshot,
+            'leave_balances' => $leaveBalanceSnapshot,
+            'employee_leave_balances' => $leaveBalanceSnapshot,
             'admin_id' => $app->admin_id,
             'hr_id' => $app->hr_id,
             'admin_approved_at' => $app->admin_approved_at?->toIso8601String(),
@@ -2561,19 +4406,87 @@ class LeaveApplicationController extends Controller
             'office' => $office,
         ];
 
-        if ($app->employee) {
+        if ($resolvedEmployee) {
             $data['employee'] = [
-                'control_no' => $app->employee->control_no,
-                'firstname' => $app->employee->firstname,
-                'middlename' => $app->employee->middlename,
-                'surname' => $app->employee->surname,
-                'full_name' => $this->formatEmployeeFullName($app->employee),
-                'designation' => $app->employee->designation,
-                'office' => $app->employee->office,
+                'control_no' => $resolvedEmployee->control_no,
+                'firstname' => $resolvedEmployee->firstname,
+                'middlename' => $resolvedEmployee->middlename,
+                'surname' => $resolvedEmployee->surname,
+                'full_name' => $this->formatEmployeeFullName($resolvedEmployee),
+                'designation' => $resolvedEmployee->designation,
+                'office' => $resolvedEmployee->office,
             ];
         }
 
         return $data;
+    }
+
+    private function getApplicationLeaveBalanceSnapshot(LeaveApplication $app): array
+    {
+        static $balanceSnapshotCache = [];
+
+        $lookupControlNo = $this->resolveApplicationBalanceLookupControlNo($app);
+        if ($lookupControlNo === null) {
+            return [];
+        }
+
+        if (array_key_exists($lookupControlNo, $balanceSnapshotCache)) {
+            return $balanceSnapshotCache[$lookupControlNo];
+        }
+
+        $controlNoCandidates = $this->controlNoCandidates($lookupControlNo);
+        if ($controlNoCandidates === []) {
+            $balanceSnapshotCache[$lookupControlNo] = [];
+            return [];
+        }
+
+        $snapshot = LeaveBalance::query()
+            ->with('leaveType')
+            ->whereIn('employee_id', $controlNoCandidates)
+            ->get()
+            ->sortByDesc(fn(LeaveBalance $balance) => $balance->updated_at?->timestamp ?? 0)
+            ->unique(fn(LeaveBalance $balance) => (int) $balance->leave_type_id)
+            ->sortBy(fn(LeaveBalance $balance) => strtolower(trim((string) ($balance->leaveType?->name ?? ''))))
+            ->values()
+            ->map(fn(LeaveBalance $balance) => [
+                'leave_type_id' => (int) $balance->leave_type_id,
+                'leave_type_name' => $balance->leaveType?->name ?? 'Unknown',
+                'balance' => (float) $balance->balance,
+                'year' => $balance->year !== null ? (int) $balance->year : null,
+                'updated_at' => $balance->updated_at?->toIso8601String(),
+            ])
+            ->values()
+            ->all();
+
+        $balanceSnapshotCache[$lookupControlNo] = $snapshot;
+        return $snapshot;
+    }
+
+    private function resolveApplicationBalanceLookupControlNo(LeaveApplication $app): ?string
+    {
+        $directControlNo = trim((string) ($app->erms_control_no ?? ''));
+        if ($directControlNo !== '') {
+            return $directControlNo;
+        }
+
+        $resolvedEmployee = $this->resolveApplicationEmployee($app);
+        $employeeControlNo = trim((string) ($resolvedEmployee?->control_no ?? ''));
+        return $employeeControlNo !== '' ? $employeeControlNo : null;
+    }
+
+    private function findLeaveTypeBalanceInSnapshot(array $snapshot, int $leaveTypeId): ?float
+    {
+        if ($leaveTypeId <= 0 || $snapshot === []) {
+            return null;
+        }
+
+        foreach ($snapshot as $entry) {
+            if ((int) ($entry['leave_type_id'] ?? 0) === $leaveTypeId) {
+                return (float) ($entry['balance'] ?? 0.0);
+            }
+        }
+
+        return null;
     }
 
     private function normalizeSelectedDatesInput(Request $request): void

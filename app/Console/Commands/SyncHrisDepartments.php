@@ -17,7 +17,7 @@ use Throwable;
  */
 class SyncHrisDepartments extends Command
 {
-    protected $signature = 'hris:sync-departments
+    protected $signature = 'departments:sync
         {--connection=hr : HRIS database connection name}
         {--table=vwActive : HRIS table/view name}
         {--column=Office : HRIS office/department column}

@@ -6,6 +6,7 @@ use App\Models\Department;
 use App\Models\DepartmentAdmin;
 use App\Models\Employee;
 use App\Models\HRAccount;
+use App\Models\LeaveBalance;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
@@ -26,8 +27,8 @@ class HRUserManagementController extends Controller
 
         $departments = Department::query()
             ->with([
-                'admin:id,department_id,employee_control_no,full_name,username,leave_initialized,created_at,updated_at',
-                'admin.employee:control_no,surname,firstname,middlename,office,status,designation',
+                'admin:id,department_id,employee_control_no,full_name,username,must_change_password,created_at,updated_at',
+                'admin.employee:control_no,surname,firstname,middlename,birth_date,office,status,designation',
             ])
             ->when($searchTerm !== '', function ($query) use ($searchTerm): void {
                 $query->where(function ($nestedQuery) use ($searchTerm): void {
@@ -84,6 +85,7 @@ class HRUserManagementController extends Controller
                 'surname',
                 'firstname',
                 'middlename',
+                'birth_date',
                 'office',
                 'status',
                 'designation',
@@ -127,8 +129,6 @@ class HRUserManagementController extends Controller
             'department_id' => ['required', 'integer', 'exists:tblDepartments,id', Rule::unique('tblDepartmentAdmins', 'department_id')],
             'employee_control_no' => ['required', 'string', 'max:50', 'regex:/^\d+$/'],
             'username' => ['required', 'string', 'max:255', Rule::unique('tblDepartmentAdmins', 'username')],
-            'password' => ['required', 'string', 'min:3', 'max:255'],
-            'leave_initialized' => ['sometimes', 'boolean'],
         ]);
 
         $department = Department::query()->find((int) $validated['department_id']);
@@ -143,22 +143,23 @@ class HRUserManagementController extends Controller
             (string) $validated['employee_control_no']
         );
         $this->assertUsernameAvailableForDepartmentAdmin((string) $validated['username']);
+        $generatedPassword = $this->buildGeneratedPasswordFromBirthDate($employee);
 
         $admin = DepartmentAdmin::query()->create([
             'department_id' => $department->id,
             'employee_control_no' => trim((string) $employee->control_no),
             'full_name' => $this->buildEmployeeFullName($employee),
             'username' => trim((string) $validated['username']),
-            'password' => (string) $validated['password'],
-            'leave_initialized' => (bool) ($validated['leave_initialized'] ?? false),
+            'password' => $generatedPassword,
+            'must_change_password' => true,
         ]);
         $admin->load([
             'department:id,name',
-            'employee:control_no,surname,firstname,middlename,office,status,designation',
+            'employee:control_no,surname,firstname,middlename,birth_date,office,status,designation',
         ]);
 
         return response()->json([
-            'message' => 'Department admin assigned successfully.',
+            'message' => 'Department admin assigned successfully. Default password is employee birthdate (MMDDYY).',
             'department_admin' => $this->serializeDepartmentAdmin($admin),
         ], 201);
     }
@@ -180,7 +181,6 @@ class HRUserManagementController extends Controller
             'employee_control_no' => ['required', 'string', 'max:50', 'regex:/^\d+$/'],
             'username' => ['required', 'string', 'max:255', Rule::unique('tblDepartmentAdmins', 'username')->ignore($admin->id)],
             'password' => ['nullable', 'string', 'min:3', 'max:255'],
-            'leave_initialized' => ['sometimes', 'boolean'],
         ]);
 
         $department = Department::query()->find((int) $validated['department_id']);
@@ -198,21 +198,23 @@ class HRUserManagementController extends Controller
             (string) $validated['username'],
             (int) $admin->id
         );
+        $employeeChanged = trim((string) $admin->employee_control_no) !== trim((string) $employee->control_no);
 
         $admin->department_id = $department->id;
         $admin->employee_control_no = trim((string) $employee->control_no);
         $admin->full_name = $this->buildEmployeeFullName($employee);
         $admin->username = trim((string) $validated['username']);
-        if (array_key_exists('leave_initialized', $validated)) {
-            $admin->leave_initialized = (bool) $validated['leave_initialized'];
-        }
         if (array_key_exists('password', $validated) && trim((string) $validated['password']) !== '') {
             $admin->password = (string) $validated['password'];
+            $admin->must_change_password = true;
+        } elseif ($employeeChanged) {
+            $admin->password = $this->buildGeneratedPasswordFromBirthDate($employee);
+            $admin->must_change_password = true;
         }
         $admin->save();
         $admin->load([
             'department:id,name',
-            'employee:control_no,surname,firstname,middlename,office,status,designation',
+            'employee:control_no,surname,firstname,middlename,birth_date,office,status,designation',
         ]);
 
         return response()->json([
@@ -363,7 +365,8 @@ class HRUserManagementController extends Controller
                 : null,
             'full_name' => $admin->full_name,
             'username' => $admin->username,
-            'leave_initialized' => (bool) $admin->leave_initialized,
+            'must_change_password' => (bool) $admin->must_change_password,
+            'leave_initialized' => $this->resolveLeaveInitializedForEmployeeControlNo((string) $admin->employee_control_no),
             'employee' => $employee ? $this->serializeEligibleEmployee($employee) : null,
             'created_at' => $admin->created_at?->toIso8601String(),
             'updated_at' => $admin->updated_at?->toIso8601String(),
@@ -380,9 +383,71 @@ class HRUserManagementController extends Controller
             'firstname' => trim((string) $employee->firstname),
             'middlename' => trim((string) $employee->middlename) !== '' ? trim((string) $employee->middlename) : null,
             'full_name' => $this->buildEmployeeDisplayName($employee),
+            'birth_date' => $employee->birth_date instanceof \DateTimeInterface
+                ? $employee->birth_date->format('Y-m-d')
+                : (trim((string) ($employee->birth_date ?? '')) !== '' ? trim((string) $employee->birth_date) : null),
             'office' => trim((string) $employee->office),
             'status' => $status !== '' ? $status : null,
             'designation' => trim((string) $employee->designation) !== '' ? trim((string) $employee->designation) : null,
         ];
+    }
+
+    private function buildGeneratedPasswordFromBirthDate(Employee $employee): string
+    {
+        $birthDate = $this->resolveEmployeeBirthDate($employee);
+        if (!$birthDate) {
+            throw ValidationException::withMessages([
+                'employee_control_no' => ['Selected employee has no birth date in HRIS. Cannot generate default password.'],
+            ]);
+        }
+
+        return $birthDate->format('mdy');
+    }
+
+    private function resolveEmployeeBirthDate(Employee $employee): ?\DateTimeInterface
+    {
+        $value = $employee->birth_date;
+
+        if ($value instanceof \DateTimeInterface) {
+            return $value;
+        }
+
+        $text = trim((string) ($value ?? ''));
+        if ($text === '') {
+            return null;
+        }
+
+        $date = date_create($text);
+
+        return $date === false ? null : $date;
+    }
+
+    private function resolveLeaveInitializedForEmployeeControlNo(string $employeeControlNo): bool
+    {
+        $employeeControlNo = trim($employeeControlNo);
+        if ($employeeControlNo === '') {
+            return false;
+        }
+
+        $candidateEmployeeIds = [$employeeControlNo];
+        $normalizedControlNo = ltrim($employeeControlNo, '0');
+        if ($normalizedControlNo === '') {
+            $normalizedControlNo = '0';
+        }
+        $candidateEmployeeIds[] = $normalizedControlNo;
+
+        $employee = Employee::findByControlNo($employeeControlNo);
+        if ($employee && trim((string) $employee->control_no) !== '') {
+            $candidateEmployeeIds[] = trim((string) $employee->control_no);
+        }
+
+        $candidateEmployeeIds = array_values(array_unique(array_filter(
+            $candidateEmployeeIds,
+            static fn(string $value): bool => $value !== ''
+        )));
+
+        return LeaveBalance::query()
+            ->whereIn('employee_id', $candidateEmployeeIds)
+            ->exists();
     }
 }

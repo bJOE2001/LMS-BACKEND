@@ -2,8 +2,11 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\DepartmentAdmin;
+use App\Models\Employee;
 use App\Models\HRAccount;
 use App\Models\LeaveApplication;
+use App\Models\LeaveApplicationUpdateRequest;
 use App\Models\LeaveBalance;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -24,7 +27,7 @@ class HRDashboardController extends Controller
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
-        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin.department'])
+        $applications = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin.department', 'updateRequests'])
             ->orderByDesc('created_at')
             ->get();
 
@@ -74,6 +77,9 @@ class HRDashboardController extends Controller
             : null;
         $applicantName = $employeeName ?: ($app->applicantAdmin ? $app->applicantAdmin->full_name : 'Unknown');
         $office = $app->employee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
+        $durationDays = (float) $app->total_days;
+        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
+        $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
 
         return [
             'id' => $app->id,
@@ -83,11 +89,30 @@ class HRDashboardController extends Controller
             'leaveType' => $app->leaveType?->name ?? 'Unknown',
             'startDate' => $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : null,
             'endDate' => $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : null,
-            'days' => (float) $app->total_days,
+            'days' => $durationDays,
+            'duration_value' => $durationDays,
+            'duration_unit' => 'day',
+            'duration_label' => $durationDays == (int) $durationDays
+                ? ((int) $durationDays) . ' ' . ((int) $durationDays === 1 ? 'day' : 'days')
+                : $durationDays . ' days',
             'reason' => $app->reason,
             'status' => $statusMap[$app->status] ?? $app->status,
             'rawStatus' => $app->status,
             'remarks' => $app->remarks,
+            'pending_update' => $pendingUpdateMeta['payload'],
+            'pending_update_reason' => $pendingUpdateMeta['reason'],
+            'pending_update_previous_status' => $pendingUpdateMeta['previous_status'],
+            'pending_update_requested_by' => $pendingUpdateMeta['requested_by'],
+            'pending_update_requested_at' => $pendingUpdateMeta['requested_at']?->toIso8601String(),
+            'has_pending_update_request' => ($pendingUpdateMeta['payload'] ?? null) !== null,
+            'latest_update_request_status' => $latestUpdateMeta['status'],
+            'latest_update_request_payload' => $latestUpdateMeta['payload'],
+            'latest_update_request_reason' => $latestUpdateMeta['reason'],
+            'latest_update_request_previous_status' => $latestUpdateMeta['previous_status'],
+            'latest_update_requested_by' => $latestUpdateMeta['requested_by'],
+            'latest_update_requested_at' => $latestUpdateMeta['requested_at']?->toIso8601String(),
+            'latest_update_reviewed_at' => $latestUpdateMeta['reviewed_at']?->toIso8601String(),
+            'latest_update_review_remarks' => $latestUpdateMeta['review_remarks'],
             'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
             'selected_dates' => $app->resolvedSelectedDates(),
             'is_monetization' => (bool) $app->is_monetization,
@@ -96,24 +121,205 @@ class HRDashboardController extends Controller
         ];
     }
 
+    private function getPendingApprovedUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
+    {
+        if (!$app->id) {
+            return null;
+        }
+
+        if ($app->relationLoaded('updateRequests')) {
+            $record = $app->updateRequests
+                ->filter(fn($item) => $item instanceof LeaveApplicationUpdateRequest)
+                ->sortByDesc(fn(LeaveApplicationUpdateRequest $item) => (int) $item->id)
+                ->first(function (LeaveApplicationUpdateRequest $item): bool {
+                    return strtoupper(trim((string) $item->status)) === LeaveApplicationUpdateRequest::STATUS_PENDING
+                        && strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED;
+                });
+
+            return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
+        }
+
+        $record = LeaveApplicationUpdateRequest::query()
+            ->where('leave_application_id', (int) $app->id)
+            ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
+            ->latest('id')
+            ->first();
+
+        if (!$record) {
+            return null;
+        }
+
+        $previousStatus = strtoupper(trim((string) ($record->previous_status ?? '')));
+        return $previousStatus === LeaveApplication::STATUS_APPROVED ? $record : null;
+    }
+
+    private function resolvePendingUpdateMeta(LeaveApplication $app): array
+    {
+        $pendingRequest = $this->getPendingApprovedUpdateRequestRecord($app);
+        if ($pendingRequest instanceof LeaveApplicationUpdateRequest) {
+            return [
+                'payload' => is_array($pendingRequest->requested_payload) ? $pendingRequest->requested_payload : null,
+                'reason' => $this->trimNullableString($pendingRequest->requested_reason),
+                'previous_status' => strtoupper(trim((string) ($pendingRequest->previous_status ?? ''))),
+                'requested_by' => $this->trimNullableString($pendingRequest->requested_by_control_no),
+                'requested_at' => $pendingRequest->requested_at,
+            ];
+        }
+
+        return [
+            'payload' => null,
+            'reason' => null,
+            'previous_status' => null,
+            'requested_by' => null,
+            'requested_at' => null,
+        ];
+    }
+
+    private function getLatestApprovedUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
+    {
+        if (!$app->id) {
+            return null;
+        }
+
+        if ($app->relationLoaded('updateRequests')) {
+            $record = $app->updateRequests
+                ->filter(fn($item) => $item instanceof LeaveApplicationUpdateRequest)
+                ->sortByDesc(fn(LeaveApplicationUpdateRequest $item) => (int) $item->id)
+                ->first(function (LeaveApplicationUpdateRequest $item): bool {
+                    return strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED;
+                });
+
+            return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
+        }
+
+        $record = LeaveApplicationUpdateRequest::query()
+            ->where('leave_application_id', (int) $app->id)
+            ->latest('id')
+            ->first();
+
+        if (!$record) {
+            return null;
+        }
+
+        $previousStatus = strtoupper(trim((string) ($record->previous_status ?? '')));
+        return $previousStatus === LeaveApplication::STATUS_APPROVED ? $record : null;
+    }
+
+    private function resolveLatestUpdateMeta(LeaveApplication $app): array
+    {
+        $latestRequest = $this->getLatestApprovedUpdateRequestRecord($app);
+        if ($latestRequest instanceof LeaveApplicationUpdateRequest) {
+            return [
+                'status' => strtoupper(trim((string) ($latestRequest->status ?? ''))),
+                'payload' => is_array($latestRequest->requested_payload) ? $latestRequest->requested_payload : null,
+                'reason' => $this->trimNullableString($latestRequest->requested_reason),
+                'previous_status' => strtoupper(trim((string) ($latestRequest->previous_status ?? ''))),
+                'requested_by' => $this->trimNullableString($latestRequest->requested_by_control_no),
+                'requested_at' => $latestRequest->requested_at,
+                'reviewed_at' => $latestRequest->reviewed_at,
+                'review_remarks' => $this->trimNullableString($latestRequest->review_remarks),
+            ];
+        }
+
+        return [
+            'status' => null,
+            'payload' => null,
+            'reason' => null,
+            'previous_status' => null,
+            'requested_by' => null,
+            'requested_at' => null,
+            'reviewed_at' => null,
+            'review_remarks' => null,
+        ];
+    }
+
+    private function trimNullableString(mixed $value): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+
+        $trimmed = trim((string) $value);
+        return $trimmed === '' ? null : $trimmed;
+    }
+
     private function getBalanceForApp(LeaveApplication $app): ?float
     {
         if ($app->erms_control_no) {
-            $balance = \App\Models\LeaveBalance::where('employee_id', $app->erms_control_no)
+            $employeeControlNo = trim((string) $app->erms_control_no);
+            $candidateEmployeeIds = $this->controlNoCandidates($employeeControlNo);
+            if ($candidateEmployeeIds === []) {
+                return null;
+            }
+
+            $balance = LeaveBalance::query()
                 ->where('leave_type_id', $app->leave_type_id)
+                ->whereIn('employee_id', $candidateEmployeeIds)
                 ->first();
             return $balance ? (float) $balance->balance : null;
         }
 
         if ($app->applicant_admin_id) {
-            $balance = \App\Models\AdminLeaveBalance::where('admin_id', $app->applicant_admin_id)
+            $adminControlNo = $this->resolveAdminEmployeeControlNo((int) $app->applicant_admin_id);
+            if ($adminControlNo === null) {
+                return null;
+            }
+
+            $candidateEmployeeIds = $this->controlNoCandidates($adminControlNo);
+            if ($candidateEmployeeIds === []) {
+                return null;
+            }
+
+            $balance = LeaveBalance::query()
                 ->where('leave_type_id', $app->leave_type_id)
-                ->where('year', now()->year)
+                ->whereIn('employee_id', $candidateEmployeeIds)
                 ->first();
             return $balance ? (float) $balance->balance : null;
         }
 
         return null;
+    }
+
+    private function resolveAdminEmployeeControlNo(int $adminId): ?string
+    {
+        if ($adminId <= 0) {
+            return null;
+        }
+
+        $admin = DepartmentAdmin::query()->find($adminId);
+        if (!$admin) {
+            return null;
+        }
+
+        $rawControlNo = trim((string) $admin->employee_control_no);
+        if ($rawControlNo === '') {
+            return null;
+        }
+
+        $employee = Employee::findByControlNo($rawControlNo);
+        return trim((string) ($employee?->control_no ?? $rawControlNo));
+    }
+
+    private function controlNoCandidates(string $controlNo): array
+    {
+        $rawControlNo = trim($controlNo);
+        if ($rawControlNo === '') {
+            return [];
+        }
+
+        $normalizedControlNo = ltrim($rawControlNo, '0');
+        if ($normalizedControlNo === '') {
+            $normalizedControlNo = '0';
+        }
+
+        $candidates = [$rawControlNo, $normalizedControlNo];
+
+        $employee = Employee::findByControlNo($rawControlNo);
+        if ($employee && trim((string) $employee->control_no) !== '') {
+            $candidates[] = trim((string) $employee->control_no);
+        }
+
+        return array_values(array_unique(array_filter($candidates, fn(string $value): bool => $value !== '')));
     }
 
     /**
@@ -162,6 +368,11 @@ class HRDashboardController extends Controller
             'endDate' => $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : '',
             'selected_dates' => $app->resolvedSelectedDates(),
             'days' => (float) $app->total_days,
+            'duration_value' => (float) $app->total_days,
+            'duration_unit' => 'day',
+            'duration_label' => ((float) $app->total_days == (int) $app->total_days)
+                ? ((int) $app->total_days) . ' ' . ((int) $app->total_days === 1 ? 'day' : 'days')
+                : ((float) $app->total_days) . ' days',
             'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
             'status' => 'Approved',
         ]);

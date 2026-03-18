@@ -11,22 +11,31 @@ class DatabaseSeeder extends Seeder
 
     /**
      * Seed the application's database.
-     * LOCAL DEVELOPMENT ONLY — uses LMS_DB. Order matters.
+     *
+     * Non-local execution is blocked unless:
+     *   APP_ALLOW_NON_LOCAL_SEEDING=true
      *
      * Example: php artisan db:seed
      * Or:      php artisan db:seed --class=DepartmentSeeder
      */
     public function run(): void
     {
-        if (!app()->environment('local')) {
-            exit('Seeding allowed in local environment only.');
+        $isLocal = app()->environment('local');
+        $allowNonLocal = filter_var(
+            (string) env('APP_ALLOW_NON_LOCAL_SEEDING', 'false'),
+            FILTER_VALIDATE_BOOLEAN
+        );
+
+        if (! $isLocal && ! $allowNonLocal) {
+            throw new \RuntimeException(
+                'DatabaseSeeder is blocked outside local unless APP_ALLOW_NON_LOCAL_SEEDING=true.'
+            );
         }
 
         $this->call([
             HRAccountSeeder::class,
-            DepartmentAdminSeeder::class,
             LeaveTypeSeeder::class,
-            LeaveBalanceSeeder::class,
         ]);
     }
 }
+

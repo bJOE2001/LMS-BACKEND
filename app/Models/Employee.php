@@ -83,13 +83,33 @@ class Employee extends Model
         }
 
         $normalizedControlNo = self::normalizeControlNoInt($rawControlNo);
+        $driver = $query->getConnection()->getDriverName();
 
-        return $query->where(function (Builder $nestedQuery) use ($rawControlNo, $normalizedControlNo): void {
+        return $query->where(function (Builder $nestedQuery) use ($rawControlNo, $normalizedControlNo, $driver): void {
             $nestedQuery->where('control_no', $rawControlNo);
 
             if ($normalizedControlNo !== null && $normalizedControlNo !== $rawControlNo) {
                 $nestedQuery->orWhere('control_no', $normalizedControlNo);
             }
+
+            if ($normalizedControlNo === null) {
+                return;
+            }
+
+            // Support matching canonical numeric control numbers when stored
+            // with leading zeros (e.g., "11790" <-> "011790").
+            if ($driver === 'sqlsrv') {
+                $nestedQuery->orWhereRaw(
+                    'TRY_CONVERT(BIGINT, control_no) = TRY_CONVERT(BIGINT, ?)',
+                    [$normalizedControlNo]
+                );
+                return;
+            }
+
+            $nestedQuery->orWhereRaw(
+                'CAST(control_no AS INTEGER) = CAST(? AS INTEGER)',
+                [$normalizedControlNo]
+            );
         });
     }
 

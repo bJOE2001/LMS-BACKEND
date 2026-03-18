@@ -69,9 +69,4 @@ class LeaveType extends Model
     {
         return $this->hasMany(LeaveApplication::class);
     }
-
-    public function adminLeaveBalances(): HasMany
-    {
-        return $this->hasMany(AdminLeaveBalance::class);
-    }
 }

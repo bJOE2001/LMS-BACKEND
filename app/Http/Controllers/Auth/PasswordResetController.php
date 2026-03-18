@@ -7,7 +7,7 @@ use Illuminate\Http\JsonResponse;
 
 class PasswordResetController extends Controller
 {
-    private const UNSUPPORTED_MESSAGE = 'Password reset is not available for LMS accounts. Contact HR to reset your password.';
+    private const UNSUPPORTED_MESSAGE = 'Password reset via tokens is not available for LMS accounts. Contact your system administrator for a manual reset.';
 
     /**
      * Password reset is not available for LMS accounts because local account

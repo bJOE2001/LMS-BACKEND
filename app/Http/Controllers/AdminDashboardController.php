@@ -2,7 +2,6 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\AdminLeaveBalance;
 use App\Models\DepartmentAdmin;
 use App\Models\Employee;
 use App\Models\HRAccount;
@@ -12,11 +11,11 @@ use App\Models\LeaveBalance;
 use App\Models\LeaveType;
 use App\Models\Notification;
 
+use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Log;
 
 /**
  * Admin Dashboard — department-level leave application statistics.
@@ -93,6 +92,7 @@ class AdminDashboardController extends Controller
             'total_approved' => $this->buildEmploymentStatusBreakdown($totalApprovedApps, $employeeStatusByControlNo),
             'total' => $this->buildEmploymentStatusBreakdown($applications, $employeeStatusByControlNo),
         ];
+        $analytics = $this->buildDashboardTrendAnalytics($applications);
 
         return response()->json([
             'pending_count' => $pending,
@@ -100,6 +100,7 @@ class AdminDashboardController extends Controller
             'total_approved' => $totalApproved,
             'total_count' => $applications->count(),
             'kpi_breakdown' => $kpiBreakdown,
+            'analytics' => $analytics,
             'applications' => $formatted,
         ]);
     }
@@ -116,8 +117,9 @@ class AdminDashboardController extends Controller
             return response()->json(['message' => 'Only department admins can access this endpoint.'], 403);
         }
 
-        $balances = AdminLeaveBalance::where('admin_id', $admin->id)
-            ->where('year', now()->year)
+        $leaveInitialized = $this->resolveLeaveInitializedState($admin);
+
+        $balances = $this->queryAdminEmployeeBalances($admin)
             ->with('leaveType')
             ->get()
             ->keyBy('leave_type_id');
@@ -160,7 +162,7 @@ class AdminDashboardController extends Controller
         ])->values();
 
         return response()->json([
-            'leave_initialized' => (bool) $admin->leave_initialized,
+            'leave_initialized' => $leaveInitialized,
             'accrued' => $accrued,
             'resettable' => $resettable,
             'event_based' => $eventBased,
@@ -177,7 +179,7 @@ class AdminDashboardController extends Controller
             return response()->json(['message' => 'Only department admins can access this endpoint.'], 403);
         }
 
-        if ($admin->leave_initialized) {
+        if ($this->resolveLeaveInitializedState($admin)) {
             return response()->json([
                 'message' => 'Leave balances already initialized.',
                 'leave_initialized' => true,
@@ -208,8 +210,15 @@ class AdminDashboardController extends Controller
             return response()->json(['message' => 'Only department admins can access this endpoint.'], 403);
         }
 
-        if ($admin->leave_initialized) {
+        if ($this->resolveLeaveInitializedState($admin)) {
             return response()->json(['message' => 'Leave balances already initialized.'], 422);
+        }
+
+        $adminEmployeeControlNo = $this->resolveAdminEmployeeControlNo($admin);
+        if ($adminEmployeeControlNo === null) {
+            return response()->json([
+                'message' => 'Admin employee record not found. Cannot initialize leave balances.',
+            ], 422);
         }
 
         $allowedTypeIds = LeaveType::whereIn('category', [
@@ -247,18 +256,21 @@ class AdminDashboardController extends Controller
             return response()->json(['message' => 'Validation failed.', 'errors' => $errors], 422);
         }
 
-        DB::transaction(function () use ($admin, $balances) {
+        DB::transaction(function () use ($admin, $balances, $adminEmployeeControlNo) {
             $now = now();
             foreach ($balances as $typeId => $value) {
-                AdminLeaveBalance::create([
-                    'admin_id' => $admin->id,
-                    'leave_type_id' => (int) $typeId,
-                    'balance' => (float) $value,
-                    'initialized_at' => $now,
-                    'year' => $now->year,
-                ]);
+                LeaveBalance::query()->updateOrCreate(
+                    [
+                        'employee_id' => $adminEmployeeControlNo,
+                        'leave_type_id' => (int) $typeId,
+                    ],
+                    [
+                        'balance' => (float) $value,
+                        'initialized_at' => $now,
+                        'year' => $now->year,
+                    ]
+                );
             }
-            $admin->update(['leave_initialized' => true]);
         });
 
         return response()->json(['message' => 'Leave balances initialized successfully.']);
@@ -281,10 +293,7 @@ class AdminDashboardController extends Controller
             return response()->json(['message' => 'Leave type not found.'], 404);
         }
 
-        $balance = AdminLeaveBalance::where('admin_id', $admin->id)
-            ->where('leave_type_id', $leaveTypeId)
-            ->where('year', now()->year)
-            ->first();
+        $balance = $this->findAdminEmployeeBalanceByLeaveType($admin, $leaveTypeId);
 
         return response()->json([
             'leave_type_id' => $leaveType->id,
@@ -316,8 +325,10 @@ class AdminDashboardController extends Controller
             return response()->json(['message' => 'Leave type not found.'], 404);
         }
 
-        $balance = LeaveBalance::where('employee_id', $employeeId)
+        $employeeControlNo = trim((string) $employee->control_no);
+        $balance = LeaveBalance::query()
             ->where('leave_type_id', $leaveTypeId)
+            ->whereIn('employee_id', $this->buildControlNoCandidates($employeeControlNo))
             ->first();
 
         return response()->json([
@@ -339,10 +350,6 @@ class AdminDashboardController extends Controller
             return response()->json(['message' => 'Only department admins can access this endpoint.'], 403);
         }
 
-        if (!$admin->leave_initialized) {
-            return response()->json(['message' => 'Please initialize your leave balances first.'], 422);
-        }
-
         // Detect monetization request
         $isMonetization = (bool) $request->input('is_monetization', false);
 
@@ -358,7 +365,10 @@ class AdminDashboardController extends Controller
             'reason' => 'required|string',
             'selected_dates' => ['nullable', 'array'],
             'selected_dates.*' => ['date'],
+            'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
         ]);
+
+        $requestedPayMode = $this->normalizePayMode($validated['pay_mode'] ?? null);
 
         $leaveType = LeaveType::find($validated['leave_type_id']);
 
@@ -381,11 +391,11 @@ class AdminDashboardController extends Controller
         }
 
         // Check balance if credit-based
-        if ($leaveType->is_credit_based) {
-            $balance = AdminLeaveBalance::where('admin_id', $admin->id)
-                ->where('leave_type_id', $leaveType->id)
-                ->where('year', now()->year)
-                ->first();
+        if (
+            $leaveType->is_credit_based
+            && $requestedPayMode !== LeaveApplication::PAY_MODE_WITHOUT_PAY
+        ) {
+            $balance = $this->findAdminEmployeeBalanceByLeaveType($admin, (int) $leaveType->id);
 
             if (!$balance) {
                 return response()->json([
@@ -409,17 +419,20 @@ class AdminDashboardController extends Controller
             }
         }
 
+        $adminEmployeeControlNo = $this->resolveAdminEmployeeControlNo($admin);
+
         // 3. Create the application
-        $application = DB::transaction(function () use ($validated, $admin, $leaveType) {
+        $application = DB::transaction(function () use ($validated, $admin, $leaveType, $adminEmployeeControlNo, $requestedPayMode) {
             $app = LeaveApplication::create([
                 'applicant_admin_id' => $admin->id,
-                'erms_control_no' => null,
+                'erms_control_no' => $this->canonicalizeControlNo($adminEmployeeControlNo),
                 'leave_type_id' => $leaveType->id,
                 'start_date' => $validated['start_date'],
                 'end_date' => $validated['end_date'],
                 'total_days' => $validated['total_days'],
                 'reason' => $validated['reason'],
                 'selected_dates' => $validated['selected_dates'] ?? null,
+                'pay_mode' => $requestedPayMode,
                 'status' => LeaveApplication::STATUS_PENDING_HR,
                 'admin_id' => $admin->id,
                 'admin_approved_at' => now(),
@@ -483,10 +496,7 @@ class AdminDashboardController extends Controller
             ], 422);
         }
 
-        $balance = AdminLeaveBalance::where('admin_id', $admin->id)
-            ->where('leave_type_id', $validated['leave_type_id'])
-            ->where('year', now()->year)
-            ->first();
+        $balance = $this->findAdminEmployeeBalanceByLeaveType($admin, (int) $validated['leave_type_id']);
 
         $currentBalance = $balance ? (float) $balance->balance : 0;
 
@@ -512,10 +522,12 @@ class AdminDashboardController extends Controller
             $equivalentAmount = round($requestedDays * $dailyRate, 2);
         }
 
-        $application = DB::transaction(function () use ($validated, $admin, $equivalentAmount) {
+        $adminEmployeeControlNo = $this->resolveAdminEmployeeControlNo($admin);
+
+        $application = DB::transaction(function () use ($validated, $admin, $equivalentAmount, $adminEmployeeControlNo) {
             $app = LeaveApplication::create([
                 'applicant_admin_id' => $admin->id,
-                'erms_control_no' => null,
+                'erms_control_no' => $this->canonicalizeControlNo($adminEmployeeControlNo),
                 'leave_type_id' => $validated['leave_type_id'],
                 'start_date' => null,
                 'end_date' => null,
@@ -525,6 +537,7 @@ class AdminDashboardController extends Controller
                 'admin_id' => $admin->id,
                 'admin_approved_at' => now(),
                 'is_monetization' => true,
+                'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
                 'equivalent_amount' => $equivalentAmount,
             ]);
 
@@ -578,6 +591,91 @@ class AdminDashboardController extends Controller
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────
+
+    private function buildDashboardTrendAnalytics(Collection $applications): array
+    {
+        $trendYear = (int) now()->year;
+        $monthlyTrend = array_fill(0, 12, 0);
+        $leaveTypeMonthlyTrend = [];
+
+        foreach ($applications as $application) {
+            if (!$application instanceof LeaveApplication) {
+                continue;
+            }
+
+            $trendDate = $this->resolveDashboardTrendDate($application);
+            if (!$trendDate || (int) $trendDate->year !== $trendYear) {
+                continue;
+            }
+
+            $monthIndex = max(0, min(11, (int) $trendDate->month - 1));
+            $monthlyTrend[$monthIndex]++;
+
+            $leaveTypeName = $this->resolveDashboardTrendLeaveTypeName($application);
+            if (!array_key_exists($leaveTypeName, $leaveTypeMonthlyTrend)) {
+                $leaveTypeMonthlyTrend[$leaveTypeName] = array_fill(0, 12, 0);
+            }
+
+            $leaveTypeMonthlyTrend[$leaveTypeName][$monthIndex]++;
+        }
+
+        if ($leaveTypeMonthlyTrend !== []) {
+            ksort($leaveTypeMonthlyTrend, SORT_NATURAL | SORT_FLAG_CASE);
+        }
+
+        return [
+            'trend_year' => $trendYear,
+            'monthly_leave_trend' => $monthlyTrend,
+            'leave_type_monthly_trend' => $leaveTypeMonthlyTrend,
+        ];
+    }
+
+    private function resolveDashboardTrendDate(LeaveApplication $application): ?CarbonImmutable
+    {
+        $candidates = [
+            $application->getAttribute('date_filed'),
+            $application->getAttribute('created_at'),
+            $application->getAttribute('start_date'),
+        ];
+
+        foreach ($candidates as $candidate) {
+            if ($candidate === null || $candidate === '') {
+                continue;
+            }
+
+            try {
+                if ($candidate instanceof \DateTimeInterface) {
+                    return CarbonImmutable::instance($candidate)->startOfDay();
+                }
+
+                return CarbonImmutable::parse((string) $candidate)->startOfDay();
+            } catch (\Throwable) {
+                continue;
+            }
+        }
+
+        return null;
+    }
+
+    private function resolveDashboardTrendLeaveTypeName(LeaveApplication $application): string
+    {
+        $name = trim((string) ($application->leaveType?->name ?? ''));
+        return $name !== '' ? $name : 'Unknown';
+    }
+
+    private function normalizePayMode(mixed $payMode, bool $isMonetization = false): string
+    {
+        if ($isMonetization) {
+            return LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+
+        $normalized = strtoupper(trim((string) ($payMode ?? LeaveApplication::PAY_MODE_WITH_PAY)));
+        if (in_array($normalized, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
+            return $normalized;
+        }
+
+        return LeaveApplication::PAY_MODE_WITH_PAY;
+    }
 
     private function emptyEmploymentBreakdown(): array
     {
@@ -767,6 +865,7 @@ class AdminDashboardController extends Controller
         }
 
         $currentLeaveBalances = $this->getCurrentLeaveBalancesForApp($app, $leaveBalanceDirectory);
+        $durationDays = (float) $app->total_days;
 
         return [
             'id' => $app->id,
@@ -781,7 +880,10 @@ class AdminDashboardController extends Controller
             'leaveType' => $app->leaveType?->name ?? 'Unknown',
             'startDate' => $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : null,
             'endDate' => $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : null,
-            'days' => (float) $app->total_days,
+            'days' => $durationDays,
+            'duration_value' => $durationDays,
+            'duration_unit' => 'day',
+            'duration_label' => self::formatDays($durationDays),
             'reason' => $app->reason,
             'status' => $statusMap[$app->status] ?? $app->status,
             'rawStatus' => $app->status,
@@ -793,6 +895,7 @@ class AdminDashboardController extends Controller
             'remarks' => $app->remarks,
             'selected_dates' => $app->resolvedSelectedDates(),
             'commutation' => $app->commutation ?? 'Not Requested',
+            'pay_mode' => $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization),
             'is_monetization' => (bool) $app->is_monetization,
             'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
             'admin_id' => $app->admin_id,
@@ -918,16 +1021,45 @@ class AdminDashboardController extends Controller
             ->unique()
             ->values();
 
-        $adminBalances = $adminIds->isEmpty()
-            ? []
-            : AdminLeaveBalance::query()
-                ->with('leaveType:id,name')
-                ->whereIn('admin_id', $adminIds->all())
-                ->where('year', now()->year)
-                ->get()
-                ->groupBy(fn(AdminLeaveBalance $balance) => (int) $balance->admin_id)
-                ->map(fn(Collection $balances) => $this->formatLeaveBalanceSnapshot($balances))
-                ->all();
+        $adminBalances = [];
+        if (!$adminIds->isEmpty()) {
+            $admins = DepartmentAdmin::query()
+                ->whereIn('id', $adminIds->all())
+                ->get(['id', 'employee_control_no']);
+
+            $adminEmployeeControlNoById = [];
+            $adminEmployeeControlNoCandidates = [];
+
+            foreach ($admins as $admin) {
+                $employeeControlNo = $this->resolveAdminEmployeeControlNo($admin);
+                if ($employeeControlNo === null) {
+                    continue;
+                }
+
+                $adminEmployeeControlNoById[(int) $admin->id] = $employeeControlNo;
+                $adminEmployeeControlNoCandidates = array_merge(
+                    $adminEmployeeControlNoCandidates,
+                    $this->buildControlNoCandidates($employeeControlNo)
+                );
+            }
+
+            $adminEmployeeControlNoCandidates = array_values(array_unique($adminEmployeeControlNoCandidates));
+
+            $adminEmployeeBalancesByControlNo = empty($adminEmployeeControlNoCandidates)
+                ? []
+                : LeaveBalance::query()
+                    ->with('leaveType:id,name')
+                    ->whereIn('employee_id', $adminEmployeeControlNoCandidates)
+                    ->get()
+                    ->groupBy(fn(LeaveBalance $balance) => $this->normalizeControlNo($balance->employee_id))
+                    ->all();
+
+            foreach ($adminEmployeeControlNoById as $adminId => $employeeControlNo) {
+                $adminBalances[$adminId] = $this->formatLeaveBalanceSnapshot(
+                    collect($adminEmployeeBalancesByControlNo[$this->normalizeControlNo($employeeControlNo)] ?? [])
+                );
+            }
+        }
 
         return [
             'employee' => $employeeBalances,
@@ -938,6 +1070,8 @@ class AdminDashboardController extends Controller
     private function formatLeaveBalanceSnapshot(Collection $balances): array
     {
         return $balances
+            ->sortByDesc(fn($balance) => $balance->updated_at?->timestamp ?? 0)
+            ->unique(fn($balance) => (int) $balance->leave_type_id)
             ->sortBy(fn($balance) => strtolower(trim((string) ($balance->leaveType?->name ?? ''))))
             ->values()
             ->map(fn($balance) => [
@@ -1059,6 +1193,81 @@ class AdminDashboardController extends Controller
         }
 
         return 0.0;
+    }
+
+    private function resolveLeaveInitializedState(DepartmentAdmin $admin): bool
+    {
+        return $this->queryAdminEmployeeBalances($admin)->exists();
+    }
+
+    private function queryAdminEmployeeBalances(DepartmentAdmin $admin)
+    {
+        $employeeControlNo = $this->resolveAdminEmployeeControlNo($admin);
+        $candidateEmployeeIds = $this->buildControlNoCandidates($employeeControlNo);
+
+        $query = LeaveBalance::query();
+        if ($candidateEmployeeIds === []) {
+            return $query->whereRaw('1 = 0');
+        }
+
+        return $query->whereIn('employee_id', $candidateEmployeeIds);
+    }
+
+    private function findAdminEmployeeBalanceByLeaveType(DepartmentAdmin $admin, int $leaveTypeId): ?LeaveBalance
+    {
+        return $this->queryAdminEmployeeBalances($admin)
+            ->where('leave_type_id', $leaveTypeId)
+            ->orderByDesc('updated_at')
+            ->orderByDesc('id')
+            ->first();
+    }
+
+    private function resolveAdminEmployeeControlNo(DepartmentAdmin $admin): ?string
+    {
+        $rawControlNo = trim((string) $admin->employee_control_no);
+        if ($rawControlNo === '') {
+            return null;
+        }
+
+        $employee = Employee::findByControlNo($rawControlNo);
+        if ($employee) {
+            return trim((string) $employee->control_no);
+        }
+
+        return $rawControlNo;
+    }
+
+    private function buildControlNoCandidates(?string $controlNo): array
+    {
+        $controlNo = trim((string) $controlNo);
+        if ($controlNo === '') {
+            return [];
+        }
+
+        $normalized = ltrim($controlNo, '0');
+        if ($normalized === '') {
+            $normalized = '0';
+        }
+
+        return array_values(array_unique(array_filter([
+            $controlNo,
+            $normalized,
+        ], fn(string $value): bool => $value !== '')));
+    }
+
+    private function canonicalizeControlNo(?string $controlNo): ?string
+    {
+        $controlNo = trim((string) $controlNo);
+        if ($controlNo === '' || !preg_match('/^\d+$/', $controlNo)) {
+            return null;
+        }
+
+        $employee = Employee::findByControlNo($controlNo);
+        if ($employee) {
+            return trim((string) $employee->control_no);
+        }
+
+        return $controlNo;
     }
 
     private function normalizeSelectedDatesInput(Request $request): void
