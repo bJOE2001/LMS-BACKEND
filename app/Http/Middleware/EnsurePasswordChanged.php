@@ -3,12 +3,13 @@
 namespace App\Http\Middleware;
 
 use App\Models\DepartmentAdmin;
+use App\Models\HRAccount;
 use Closure;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\Response;
 
 /**
- * Require department admins with temporary credentials to update their password
+ * Require LMS accounts with temporary credentials to update their password
  * before using protected resources outside account settings.
  */
 class EnsurePasswordChanged
@@ -17,7 +18,8 @@ class EnsurePasswordChanged
     {
         $user = $request->user();
 
-        if (! $user instanceof DepartmentAdmin || ! (bool) $user->must_change_password) {
+        $isLmsAccount = $user instanceof DepartmentAdmin || $user instanceof HRAccount;
+        if (! $isLmsAccount || ! (bool) $user->must_change_password) {
             return $next($request);
         }
 

@@ -46,9 +46,13 @@ Route::prefix('erms')->middleware('erms.auth')->group(function () {
     Route::get('/leave-balances/{controlNo}', [LeaveApplicationController::class, 'ermsGetLeaveBalances']);
     Route::get('/apply-leave', [LeaveApplicationController::class, 'ermsIndex']);
     Route::post('/apply-leave', [LeaveApplicationController::class, 'ermsStore']);
+    Route::post('/apply-leave/request-update', [LeaveApplicationController::class, 'ermsRequestUpdate']);
+    Route::post('/apply-leave/{id}/request-update', [LeaveApplicationController::class, 'ermsRequestUpdate']);
     Route::get('/apply-coc', [COCApplicationController::class, 'ermsIndex']);
     Route::post('/apply-coc', [COCApplicationController::class, 'ermsStore']);
     Route::post('/leave-applications/{id}/cancel', [LeaveApplicationController::class, 'ermsCancel']);
+    Route::post('/leave-applications/{id}/request-update', [LeaveApplicationController::class, 'ermsRequestUpdate']);
+    Route::post('/leave-applications/{id}/edit-request', [LeaveApplicationController::class, 'ermsRequestUpdate']);
     Route::post('/leave-applications/{id}/request-edit', [LeaveApplicationController::class, 'ermsRequestEdit']);
 });
 

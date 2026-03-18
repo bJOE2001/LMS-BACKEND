@@ -38,7 +38,7 @@ class HRLeaveBalanceImportController extends Controller
 
         $employeeId = trim((string) $validated['employee_id']);
         $leaveTypeId = (int) $validated['leave_type_id'];
-        $balance = round((float) $validated['balance'], 2);
+        $creditsToAdd = round((float) $validated['balance'], 2);
 
         $employee = Employee::findByControlNo($employeeId);
         if (!$employee) {
@@ -56,26 +56,45 @@ class HRLeaveBalanceImportController extends Controller
 
         $year = (int) now()->format('Y');
 
-        $leaveBalance = LeaveBalance::updateOrCreate(
-            [
+        $leaveBalance = DB::transaction(function () use ($employee, $leaveType, $creditsToAdd, $year): LeaveBalance {
+            $existing = LeaveBalance::query()
+                ->where('employee_id', $employee->control_no)
+                ->where('leave_type_id', $leaveType->id)
+                ->lockForUpdate()
+                ->first();
+
+            $previousBalance = round((float) ($existing?->balance ?? 0), 2);
+            $newBalance = round($previousBalance + $creditsToAdd, 2);
+
+            if ($existing) {
+                $existing->balance = $newBalance;
+                $existing->year = $year;
+                if (!$existing->initialized_at) {
+                    $existing->initialized_at = now();
+                }
+                $existing->save();
+
+                return $existing->fresh();
+            }
+
+            return LeaveBalance::query()->create([
                 'employee_id' => $employee->control_no,
                 'leave_type_id' => $leaveType->id,
-            ],
-            [
-                'balance' => $balance,
+                'balance' => $newBalance,
                 'year' => $year,
                 'initialized_at' => now(),
-            ]
-        );
+            ]);
+        });
 
         return response()->json([
-            'message' => 'Leave credits saved successfully.',
+            'message' => 'Leave credits added successfully.',
             'leave_balance' => [
                 'id' => (int) $leaveBalance->id,
                 'employee_id' => (string) $leaveBalance->employee_id,
                 'employee_name' => trim("{$employee->firstname} {$employee->surname}"),
                 'leave_type_id' => (int) $leaveBalance->leave_type_id,
                 'leave_type_name' => $leaveType->name,
+                'added_credits' => $creditsToAdd,
                 'balance' => (float) $leaveBalance->balance,
                 'year' => (int) $leaveBalance->year,
                 'updated_at' => $leaveBalance->updated_at?->toIso8601String(),

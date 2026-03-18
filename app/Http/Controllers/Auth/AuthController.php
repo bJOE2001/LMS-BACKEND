@@ -83,7 +83,7 @@ class AuthController extends Controller
                     'name' => $account->full_name,
                     'username' => $account->username,
                     'role' => 'hr',
-                    'must_change_password' => false,
+                    'must_change_password' => (bool) $account->must_change_password,
                 ],
                 self::DASHBOARD_HR,
             ];

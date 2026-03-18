@@ -6,6 +6,7 @@ use App\Models\DepartmentAdmin;
 use App\Models\Employee;
 use App\Models\HRAccount;
 use App\Models\LeaveApplication;
+use App\Models\LeaveApplicationUpdateRequest;
 use App\Models\LeaveBalance;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -26,7 +27,7 @@ class HRDashboardController extends Controller
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
-        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin.department'])
+        $applications = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin.department', 'updateRequests'])
             ->orderByDesc('created_at')
             ->get();
 
@@ -77,6 +78,8 @@ class HRDashboardController extends Controller
         $applicantName = $employeeName ?: ($app->applicantAdmin ? $app->applicantAdmin->full_name : 'Unknown');
         $office = $app->employee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
         $durationDays = (float) $app->total_days;
+        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
+        $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
 
         return [
             'id' => $app->id,
@@ -96,12 +99,148 @@ class HRDashboardController extends Controller
             'status' => $statusMap[$app->status] ?? $app->status,
             'rawStatus' => $app->status,
             'remarks' => $app->remarks,
+            'pending_update' => $pendingUpdateMeta['payload'],
+            'pending_update_reason' => $pendingUpdateMeta['reason'],
+            'pending_update_previous_status' => $pendingUpdateMeta['previous_status'],
+            'pending_update_requested_by' => $pendingUpdateMeta['requested_by'],
+            'pending_update_requested_at' => $pendingUpdateMeta['requested_at']?->toIso8601String(),
+            'has_pending_update_request' => ($pendingUpdateMeta['payload'] ?? null) !== null,
+            'latest_update_request_status' => $latestUpdateMeta['status'],
+            'latest_update_request_payload' => $latestUpdateMeta['payload'],
+            'latest_update_request_reason' => $latestUpdateMeta['reason'],
+            'latest_update_request_previous_status' => $latestUpdateMeta['previous_status'],
+            'latest_update_requested_by' => $latestUpdateMeta['requested_by'],
+            'latest_update_requested_at' => $latestUpdateMeta['requested_at']?->toIso8601String(),
+            'latest_update_reviewed_at' => $latestUpdateMeta['reviewed_at']?->toIso8601String(),
+            'latest_update_review_remarks' => $latestUpdateMeta['review_remarks'],
             'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
             'selected_dates' => $app->resolvedSelectedDates(),
             'is_monetization' => (bool) $app->is_monetization,
             'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
             'leaveBalance' => $this->getBalanceForApp($app),
         ];
+    }
+
+    private function getPendingApprovedUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
+    {
+        if (!$app->id) {
+            return null;
+        }
+
+        if ($app->relationLoaded('updateRequests')) {
+            $record = $app->updateRequests
+                ->filter(fn($item) => $item instanceof LeaveApplicationUpdateRequest)
+                ->sortByDesc(fn(LeaveApplicationUpdateRequest $item) => (int) $item->id)
+                ->first(function (LeaveApplicationUpdateRequest $item): bool {
+                    return strtoupper(trim((string) $item->status)) === LeaveApplicationUpdateRequest::STATUS_PENDING
+                        && strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED;
+                });
+
+            return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
+        }
+
+        $record = LeaveApplicationUpdateRequest::query()
+            ->where('leave_application_id', (int) $app->id)
+            ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
+            ->latest('id')
+            ->first();
+
+        if (!$record) {
+            return null;
+        }
+
+        $previousStatus = strtoupper(trim((string) ($record->previous_status ?? '')));
+        return $previousStatus === LeaveApplication::STATUS_APPROVED ? $record : null;
+    }
+
+    private function resolvePendingUpdateMeta(LeaveApplication $app): array
+    {
+        $pendingRequest = $this->getPendingApprovedUpdateRequestRecord($app);
+        if ($pendingRequest instanceof LeaveApplicationUpdateRequest) {
+            return [
+                'payload' => is_array($pendingRequest->requested_payload) ? $pendingRequest->requested_payload : null,
+                'reason' => $this->trimNullableString($pendingRequest->requested_reason),
+                'previous_status' => strtoupper(trim((string) ($pendingRequest->previous_status ?? ''))),
+                'requested_by' => $this->trimNullableString($pendingRequest->requested_by_control_no),
+                'requested_at' => $pendingRequest->requested_at,
+            ];
+        }
+
+        return [
+            'payload' => null,
+            'reason' => null,
+            'previous_status' => null,
+            'requested_by' => null,
+            'requested_at' => null,
+        ];
+    }
+
+    private function getLatestApprovedUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
+    {
+        if (!$app->id) {
+            return null;
+        }
+
+        if ($app->relationLoaded('updateRequests')) {
+            $record = $app->updateRequests
+                ->filter(fn($item) => $item instanceof LeaveApplicationUpdateRequest)
+                ->sortByDesc(fn(LeaveApplicationUpdateRequest $item) => (int) $item->id)
+                ->first(function (LeaveApplicationUpdateRequest $item): bool {
+                    return strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED;
+                });
+
+            return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
+        }
+
+        $record = LeaveApplicationUpdateRequest::query()
+            ->where('leave_application_id', (int) $app->id)
+            ->latest('id')
+            ->first();
+
+        if (!$record) {
+            return null;
+        }
+
+        $previousStatus = strtoupper(trim((string) ($record->previous_status ?? '')));
+        return $previousStatus === LeaveApplication::STATUS_APPROVED ? $record : null;
+    }
+
+    private function resolveLatestUpdateMeta(LeaveApplication $app): array
+    {
+        $latestRequest = $this->getLatestApprovedUpdateRequestRecord($app);
+        if ($latestRequest instanceof LeaveApplicationUpdateRequest) {
+            return [
+                'status' => strtoupper(trim((string) ($latestRequest->status ?? ''))),
+                'payload' => is_array($latestRequest->requested_payload) ? $latestRequest->requested_payload : null,
+                'reason' => $this->trimNullableString($latestRequest->requested_reason),
+                'previous_status' => strtoupper(trim((string) ($latestRequest->previous_status ?? ''))),
+                'requested_by' => $this->trimNullableString($latestRequest->requested_by_control_no),
+                'requested_at' => $latestRequest->requested_at,
+                'reviewed_at' => $latestRequest->reviewed_at,
+                'review_remarks' => $this->trimNullableString($latestRequest->review_remarks),
+            ];
+        }
+
+        return [
+            'status' => null,
+            'payload' => null,
+            'reason' => null,
+            'previous_status' => null,
+            'requested_by' => null,
+            'requested_at' => null,
+            'reviewed_at' => null,
+            'review_remarks' => null,
+        ];
+    }
+
+    private function trimNullableString(mixed $value): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+
+        $trimmed = trim((string) $value);
+        return $trimmed === '' ? null : $trimmed;
     }
 
     private function getBalanceForApp(LeaveApplication $app): ?float

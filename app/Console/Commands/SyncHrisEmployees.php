@@ -26,7 +26,7 @@ class SyncHrisEmployees extends Command
         'CONTRACTUAL',
     ];
 
-    protected $signature = 'hris:sync-employees
+    protected $signature = 'employees:sync
         {--connection=hr : HRIS database connection name}
         {--table=vwActive : HRIS table/view name}
         {--chunk=500 : Number of rows per upsert batch}
@@ -73,11 +73,16 @@ class SyncHrisEmployees extends Command
         }
 
         [$rowsToSync, $stats] = $this->normalizeRows($sourceRows);
+        $statusCounts = $this->buildAllowedStatusCounts($rowsToSync);
 
         if ($rowsToSync === []) {
             $this->warn('No eligible employee rows after filtering. Nothing changed.');
             $this->line('Rows skipped due to disallowed status: '.$stats['skipped_status']);
             $this->line('Rows skipped due to missing control_no: '.$stats['skipped_control_no']);
+            $this->line('Eligible rows by status:');
+            foreach (self::ALLOWED_STATUSES as $status) {
+                $this->line("  {$status}: ".($statusCounts[$status] ?? 0));
+            }
             return self::SUCCESS;
         }
 
@@ -121,6 +126,10 @@ class SyncHrisEmployees extends Command
         $this->line('Rows skipped due to disallowed status: '.$stats['skipped_status']);
         $this->line('Rows skipped due to missing control_no: '.$stats['skipped_control_no']);
         $this->line('Rows overwritten due to duplicate control_no: '.$stats['duplicate_control_no']);
+        $this->line('Eligible rows by status:');
+        foreach (self::ALLOWED_STATUSES as $status) {
+            $this->line("  {$status}: ".($statusCounts[$status] ?? 0));
+        }
 
         if ($dryRun) {
             $this->warn('Dry run enabled. No rows were written.');
@@ -292,6 +301,26 @@ class SyncHrisEmployees extends Command
         $safeChunkSize = max(1, (int) floor(2000 / $columnCount));
 
         return min($requestedChunkSize, $safeChunkSize);
+    }
+
+    /**
+     * @param  array<string, array<string, mixed>>  $rowsToSync
+     * @return array<string, int>
+     */
+    private function buildAllowedStatusCounts(array $rowsToSync): array
+    {
+        $counts = array_fill_keys(self::ALLOWED_STATUSES, 0);
+
+        foreach ($rowsToSync as $row) {
+            $status = strtoupper(trim((string) ($row['status'] ?? '')));
+            if (! isset($counts[$status])) {
+                continue;
+            }
+
+            $counts[$status]++;
+        }
+
+        return $counts;
     }
 
     private function isSafeIdentifier(string $value): bool

@@ -27,7 +27,7 @@ class SettingsController extends Controller
             $profile['full_name'] = $user->full_name;
         }
 
-        if ($user instanceof DepartmentAdmin) {
+        if ($user instanceof HRAccount || $user instanceof DepartmentAdmin) {
             $profile['must_change_password'] = (bool) $user->must_change_password;
         }
 
@@ -84,7 +84,7 @@ class SettingsController extends Controller
             'password' => Hash::make($validated['password']),
         ];
 
-        if ($user instanceof DepartmentAdmin) {
+        if ($user instanceof HRAccount || $user instanceof DepartmentAdmin) {
             $data['must_change_password'] = false;
         }
 

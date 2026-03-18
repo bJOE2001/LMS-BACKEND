@@ -8,35 +8,43 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 
 /**
- * LOCAL DEVELOPMENT ONLY — seeds LMS_DB.
+ * HR account seeder.
+ *
+ * Enabled by default in local, disabled by default in non-local.
+ * Toggle with: HR_SEEDER_ENABLED=true|false
  */
 class HRAccountSeeder extends Seeder
 {
     public function run(): void
     {
-        if (! app()->environment('local')) {
-            exit('Seeding allowed in local environment only.');
+        $enabled = filter_var(
+            (string) env('HR_SEEDER_ENABLED', app()->environment('local') ? 'true' : 'false'),
+            FILTER_VALIDATE_BOOLEAN
+        );
+
+        if (! $enabled) {
+            return;
         }
 
-        DB::transaction(function (): void {
+        $seedPassword = trim((string) env('HR_SEEDER_PASSWORD', ''));
+        if ($seedPassword === '') {
+            throw new \RuntimeException('HR_SEEDER_PASSWORD is required when HR_SEEDER_ENABLED=true.');
+        }
+
+        $resetExistingPasswords = filter_var(
+            (string) env('HR_SEEDER_RESET_PASSWORDS', 'false'),
+            FILTER_VALIDATE_BOOLEAN
+        );
+
+        DB::transaction(function () use ($seedPassword, $resetExistingPasswords): void {
             $accounts = [
                 [
                     'username' => 'hr',
-                    'legacy_usernames' => ['hr_admin'],
-                    'full_name' => 'HR Admin',
-                    'password' => '123',
+                    'full_name' => 'Jake Baranda',
                 ],
                 [
                     'username' => 'hr2',
-                    'legacy_usernames' => ['hr_admin_2'],
-                    'full_name' => 'HR Admin 2',
-                    'password' => '123',
-                ],
-                [
-                    'username' => 'hr3',
-                    'legacy_usernames' => ['hr_admin_3'],
-                    'full_name' => 'HR Admin 3',
-                    'password' => '123',
+                    'full_name' => 'Kenneth Andallaza',
                 ],
             ];
 
@@ -45,27 +53,27 @@ class HRAccountSeeder extends Seeder
                     ->where('username', $account['username'])
                     ->first();
 
-                if (!$existing && !empty($account['legacy_usernames'])) {
-                    $existing = HRAccount::query()
-                        ->whereIn('username', $account['legacy_usernames'])
-                        ->orderBy('id')
-                        ->first();
-                }
-
                 if ($existing) {
-                    $existing->forceFill([
+                    $payload = [
                         'username' => $account['username'],
                         'full_name' => $account['full_name'],
-                        'password' => Hash::make($account['password']),
-                    ])->save();
+                        'must_change_password' => true,
+                    ];
 
+                    // Keep current password by default on re-seed.
+                    if ($resetExistingPasswords) {
+                        $payload['password'] = Hash::make($seedPassword);
+                    }
+
+                    $existing->forceFill($payload)->save();
                     continue;
                 }
 
                 HRAccount::query()->create([
                     'username' => $account['username'],
                     'full_name' => $account['full_name'],
-                    'password'  => Hash::make($account['password']),
+                    'password' => Hash::make($seedPassword),
+                    'must_change_password' => true,
                 ]);
             }
         });

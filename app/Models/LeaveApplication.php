@@ -16,11 +16,23 @@ class LeaveApplication extends Model
 {
     protected $table = 'tblLeaveApplications';
 
+    public const PAY_MODE_WITH_PAY = 'WP';
+    public const PAY_MODE_WITHOUT_PAY = 'WOP';
+
     protected static function booted(): void
     {
         static::saving(function (self $application): void {
+            $rawPayMode = strtoupper(trim((string) ($application->pay_mode ?? self::PAY_MODE_WITH_PAY)));
+            $application->pay_mode = in_array($rawPayMode, [self::PAY_MODE_WITH_PAY, self::PAY_MODE_WITHOUT_PAY], true)
+                ? $rawPayMode
+                : self::PAY_MODE_WITH_PAY;
+
             if ((bool) $application->is_monetization) {
+                $application->pay_mode = self::PAY_MODE_WITH_PAY;
                 $application->selected_dates = null;
+                $application->selected_date_pay_status = null;
+                $application->selected_date_coverage = null;
+                $application->deductible_days = round((float) ($application->total_days ?? 0), 2);
                 return;
             }
 
@@ -30,6 +42,22 @@ class LeaveApplication extends Model
                 $application->selected_dates,
                 $application->total_days
             );
+
+            $totalDays = round((float) ($application->total_days ?? 0), 2);
+            $fallbackDeductible = $application->pay_mode === self::PAY_MODE_WITHOUT_PAY ? 0.0 : $totalDays;
+            $deductibleDays = $application->deductible_days !== null
+                ? round((float) $application->deductible_days, 2)
+                : $fallbackDeductible;
+
+            if ($deductibleDays < 0) {
+                $deductibleDays = 0.0;
+            }
+
+            if ($totalDays > 0 && $deductibleDays > $totalDays) {
+                $deductibleDays = $totalDays;
+            }
+
+            $application->deductible_days = $deductibleDays;
         });
     }
 
@@ -43,6 +71,7 @@ class LeaveApplication extends Model
         'end_date',
         'total_days',
         'reason',
+        'deductible_days',
         'status',
         'admin_id',
         'hr_id',
@@ -50,7 +79,10 @@ class LeaveApplication extends Model
         'hr_approved_at',
         'remarks',
         'selected_dates',
+        'selected_date_pay_status',
+        'selected_date_coverage',
         'commutation',
+        'pay_mode',
         'is_monetization',
         'equivalent_amount',
     ];
@@ -62,9 +94,13 @@ class LeaveApplication extends Model
             'start_date' => 'date',
             'end_date' => 'date',
             'total_days' => 'decimal:2',
+            'deductible_days' => 'decimal:2',
             'admin_approved_at' => 'datetime',
             'hr_approved_at' => 'datetime',
             'selected_dates' => 'array',
+            'selected_date_pay_status' => 'array',
+            'selected_date_coverage' => 'array',
+            'pay_mode' => 'string',
             'is_monetization' => 'boolean',
             'equivalent_amount' => 'decimal:2',
         ];
@@ -87,6 +123,11 @@ class LeaveApplication extends Model
     public function logs(): HasMany
     {
         return $this->hasMany(LeaveApplicationLog::class);
+    }
+
+    public function updateRequests(): HasMany
+    {
+        return $this->hasMany(LeaveApplicationUpdateRequest::class, 'leave_application_id');
     }
 
     public function applicantAdmin(): BelongsTo
