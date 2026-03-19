@@ -366,6 +366,12 @@ class AdminDashboardController extends Controller
             'selected_dates' => ['nullable', 'array'],
             'selected_dates.*' => ['date'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
+            'medical_certificate' => ['nullable', 'file', 'max:10240'],
+            'medical_certificate_submitted' => ['nullable', 'boolean'],
+            'medical_certificate_attached' => ['nullable', 'boolean'],
+            'has_medical_certificate' => ['nullable', 'boolean'],
+            'with_medical_certificate' => ['nullable', 'boolean'],
+            'medical_certificate_reference' => ['nullable', 'string', 'max:500'],
         ]);
 
         $requestedPayMode = $this->normalizePayMode($validated['pay_mode'] ?? null);
@@ -390,39 +396,72 @@ class AdminDashboardController extends Controller
             ], 422);
         }
 
+        $medicalCertificateState = $this->resolveMedicalCertificateStateFromRequest($request, $validated);
+        $requestedTotalDays = round((float) $validated['total_days'], 2);
+        $isSickLeave = $this->isSickLeaveType($leaveType);
+        $selectedDates = is_array($validated['selected_dates'] ?? null)
+            ? $validated['selected_dates']
+            : (is_array($request->input('selected_dates')) ? $request->input('selected_dates') : null);
+        $medicalCertificateRequired = $isSickLeave && $requestedTotalDays >= 5.0;
+        if ($medicalCertificateRequired && !(bool) ($medicalCertificateState['medical_certificate_submitted'] ?? false)) {
+            return response()->json([
+                'message' => 'Medical certificate is required for Sick Leave applications of 5 days or more.',
+                'errors' => [
+                    'medical_certificate' => ['Medical certificate is required for Sick Leave applications of 5 days or more.'],
+                ],
+            ], 422);
+        }
+
+        if ($isSickLeave) {
+            $graceWindowPayMode = $this->resolveSickLeavePayModeFromFilingWindow(
+                $selectedDates,
+                $request->input('date_filed') ?? now(),
+                (string) $validated['start_date'],
+                (string) $validated['end_date']
+            );
+
+            if ($graceWindowPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
+                $requestedPayMode = LeaveApplication::PAY_MODE_WITHOUT_PAY;
+            }
+        }
+
+        $deductibleDays = $requestedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
+            ? 0.0
+            : $requestedTotalDays;
+        $autoConvertedToWop = false;
+        $autoWithoutPayDays = 0.0;
+
         // Check balance if credit-based
         if (
             $leaveType->is_credit_based
             && $requestedPayMode !== LeaveApplication::PAY_MODE_WITHOUT_PAY
         ) {
             $balance = $this->findAdminEmployeeBalanceByLeaveType($admin, (int) $leaveType->id);
+            $currentBalance = $balance ? (float) $balance->balance : 0.0;
 
-            if (!$balance) {
-                return response()->json([
-                    'message' => "{$leaveType->name} is not available for this account.",
-                    'errors' => [
-                        'leave_type_id' => ["{$leaveType->name} is not available for this account."],
-                    ],
-                ], 422);
-            }
-
-            $currentBalance = (float) $balance->balance;
-
-            if ($currentBalance < (float) $validated['total_days']) {
-                $fmtAvail = self::formatDays($currentBalance);
-                return response()->json([
-                    'message' => "Insufficient leave balance. Available: {$fmtAvail}.",
-                    'errors' => [
-                        'total_days' => ["Insufficient leave balance. Available: {$fmtAvail}."]
-                    ],
-                ], 422);
+            if ($currentBalance + 1e-9 < $deductibleDays) {
+                $deductibleDays = round(min($requestedTotalDays, max($currentBalance, 0.0)), 2);
+                $requestedPayMode = $deductibleDays <= 0
+                    ? LeaveApplication::PAY_MODE_WITHOUT_PAY
+                    : LeaveApplication::PAY_MODE_WITH_PAY;
+                $autoWithoutPayDays = round(max($requestedTotalDays - $deductibleDays, 0.0), 2);
+                $autoConvertedToWop = $autoWithoutPayDays > 0;
             }
         }
 
         $adminEmployeeControlNo = $this->resolveAdminEmployeeControlNo($admin);
 
         // 3. Create the application
-        $application = DB::transaction(function () use ($validated, $admin, $leaveType, $adminEmployeeControlNo, $requestedPayMode) {
+        $application = DB::transaction(function () use (
+            $validated,
+            $admin,
+            $leaveType,
+            $adminEmployeeControlNo,
+            $requestedPayMode,
+            $deductibleDays,
+            $medicalCertificateRequired,
+            $medicalCertificateState
+        ) {
             $app = LeaveApplication::create([
                 'applicant_admin_id' => $admin->id,
                 'erms_control_no' => $this->canonicalizeControlNo($adminEmployeeControlNo),
@@ -430,9 +469,13 @@ class AdminDashboardController extends Controller
                 'start_date' => $validated['start_date'],
                 'end_date' => $validated['end_date'],
                 'total_days' => $validated['total_days'],
+                'deductible_days' => $deductibleDays,
                 'reason' => $validated['reason'],
                 'selected_dates' => $validated['selected_dates'] ?? null,
                 'pay_mode' => $requestedPayMode,
+                'medical_certificate_required' => $medicalCertificateRequired,
+                'medical_certificate_submitted' => (bool) ($medicalCertificateState['medical_certificate_submitted'] ?? false),
+                'medical_certificate_reference' => $medicalCertificateState['medical_certificate_reference'] ?? null,
                 'status' => LeaveApplication::STATUS_PENDING_HR,
                 'admin_id' => $admin->id,
                 'admin_approved_at' => now(),
@@ -471,8 +514,12 @@ class AdminDashboardController extends Controller
         }
 
         return response()->json([
-            'message' => 'Leave application submitted successfully.',
+            'message' => $autoConvertedToWop
+                ? 'Leave application submitted successfully with partial Without Pay due to insufficient leave balance.'
+                : 'Leave application submitted successfully.',
             'application' => $this->formatApplication($application->fresh(['leaveType', 'applicantAdmin'])),
+            'auto_converted_to_wop' => $autoConvertedToWop,
+            'auto_without_pay_days' => $autoWithoutPayDays,
         ]);
     }
 
@@ -675,6 +722,179 @@ class AdminDashboardController extends Controller
         }
 
         return LeaveApplication::PAY_MODE_WITH_PAY;
+    }
+
+    private function isSickLeaveType(?LeaveType $leaveType = null): bool
+    {
+        $name = trim((string) ($leaveType?->name ?? ''));
+        return strcasecmp($name, 'Sick Leave') === 0;
+    }
+
+    private function resolveSickLeavePayModeFromFilingWindow(
+        ?array $selectedDates,
+        mixed $filedAt = null,
+        ?string $absenceStartDate = null,
+        ?string $absenceEndDate = null
+    ): string {
+        [$startDate, $lastAbsentDate] = $this->resolveSickLeaveAbsenceDateRange($selectedDates);
+        if ($absenceStartDate !== null) {
+            $startDate = $this->resolveIsoDate($absenceStartDate) ?? $startDate;
+        }
+        if ($absenceEndDate !== null) {
+            $lastAbsentDate = $this->resolveIsoDate($absenceEndDate) ?? $lastAbsentDate;
+        }
+        if (!$startDate || !$lastAbsentDate) {
+            return LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+
+        $filedDate = $this->resolvePolicyFilingDate($filedAt);
+        if ($filedDate->lt($startDate)) {
+            return LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+
+        $workingDaysElapsed = $this->countWorkingDaysFromNextDay($lastAbsentDate, $filedDate);
+        return $workingDaysElapsed <= 5
+            ? LeaveApplication::PAY_MODE_WITH_PAY
+            : LeaveApplication::PAY_MODE_WITHOUT_PAY;
+    }
+
+    private function resolveSickLeaveAbsenceDateRange(?array $selectedDates): array
+    {
+        if (!is_array($selectedDates) || $selectedDates === []) {
+            return [null, null];
+        }
+
+        $earliest = null;
+        $latest = null;
+
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = trim((string) $rawDate);
+            if ($dateKey === '') {
+                continue;
+            }
+
+            try {
+                $parsed = CarbonImmutable::parse($dateKey)->startOfDay();
+            } catch (\Throwable) {
+                continue;
+            }
+
+            if ($earliest === null || $parsed->lt($earliest)) {
+                $earliest = $parsed;
+            }
+
+            if ($latest === null || $parsed->gt($latest)) {
+                $latest = $parsed;
+            }
+        }
+
+        return [$earliest, $latest];
+    }
+
+    private function resolveIsoDate(?string $rawDate): ?CarbonImmutable
+    {
+        $raw = trim((string) ($rawDate ?? ''));
+        if ($raw === '') {
+            return null;
+        }
+
+        try {
+            return CarbonImmutable::parse($raw)->startOfDay();
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function resolvePolicyFilingDate(mixed $filedAt = null): CarbonImmutable
+    {
+        if ($filedAt instanceof \DateTimeInterface) {
+            return CarbonImmutable::instance($filedAt)->startOfDay();
+        }
+
+        $raw = trim((string) ($filedAt ?? ''));
+        if ($raw !== '') {
+            try {
+                return CarbonImmutable::parse($raw)->startOfDay();
+            } catch (\Throwable) {
+                // Fall back to now() when parsing fails.
+            }
+        }
+
+        return CarbonImmutable::now()->startOfDay();
+    }
+
+    private function countWorkingDaysFromNextDay(
+        CarbonImmutable $lastAbsentDate,
+        CarbonImmutable $filedDate
+    ): int {
+        if ($filedDate->lte($lastAbsentDate)) {
+            return 0;
+        }
+
+        $count = 0;
+        $cursor = $lastAbsentDate->addDay()->startOfDay();
+        $end = $filedDate->startOfDay();
+
+        while ($cursor->lte($end)) {
+            if ($cursor->isWeekday()) {
+                $count++;
+            }
+
+            $cursor = $cursor->addDay();
+        }
+
+        return $count;
+    }
+
+    private function resolveMedicalCertificateStateFromRequest(Request $request, array $validated): array
+    {
+        $submitted = false;
+        $reference = null;
+
+        $booleanKeys = [
+            'medical_certificate_submitted',
+            'medical_certificate_attached',
+            'has_medical_certificate',
+            'with_medical_certificate',
+        ];
+        foreach ($booleanKeys as $key) {
+            if (!array_key_exists($key, $validated) && $request->input($key) === null) {
+                continue;
+            }
+
+            $flag = filter_var(
+                array_key_exists($key, $validated) ? $validated[$key] : $request->input($key),
+                FILTER_VALIDATE_BOOLEAN,
+                FILTER_NULL_ON_FAILURE
+            );
+
+            if ($flag !== null) {
+                $submitted = $flag;
+            }
+        }
+
+        $candidateReference = trim((string) ($validated['medical_certificate_reference'] ?? $request->input('medical_certificate_reference') ?? ''));
+        if ($candidateReference !== '') {
+            $reference = $candidateReference;
+            $submitted = true;
+        }
+
+        if ($request->hasFile('medical_certificate')) {
+            $uploadedFile = $request->file('medical_certificate');
+            if ($uploadedFile && $uploadedFile->isValid()) {
+                $reference = $uploadedFile->store('leave-medical-certificates');
+                $submitted = true;
+            }
+        }
+
+        if (!$submitted) {
+            $reference = null;
+        }
+
+        return [
+            'medical_certificate_submitted' => $submitted,
+            'medical_certificate_reference' => $reference,
+        ];
     }
 
     private function emptyEmploymentBreakdown(): array
@@ -896,6 +1116,9 @@ class AdminDashboardController extends Controller
             'selected_dates' => $app->resolvedSelectedDates(),
             'commutation' => $app->commutation ?? 'Not Requested',
             'pay_mode' => $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization),
+            'medical_certificate_required' => (bool) ($app->medical_certificate_required ?? false),
+            'medical_certificate_submitted' => (bool) ($app->medical_certificate_submitted ?? false),
+            'medical_certificate_reference' => $app->medical_certificate_reference ? (string) $app->medical_certificate_reference : null,
             'is_monetization' => (bool) $app->is_monetization,
             'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
             'admin_id' => $app->admin_id,

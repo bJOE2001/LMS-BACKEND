@@ -83,6 +83,9 @@ class LeaveApplication extends Model
         'selected_date_coverage',
         'commutation',
         'pay_mode',
+        'medical_certificate_required',
+        'medical_certificate_submitted',
+        'medical_certificate_reference',
         'is_monetization',
         'equivalent_amount',
     ];
@@ -101,6 +104,9 @@ class LeaveApplication extends Model
             'selected_date_pay_status' => 'array',
             'selected_date_coverage' => 'array',
             'pay_mode' => 'string',
+            'medical_certificate_required' => 'boolean',
+            'medical_certificate_submitted' => 'boolean',
+            'medical_certificate_reference' => 'string',
             'is_monetization' => 'boolean',
             'equivalent_amount' => 'decimal:2',
         ];

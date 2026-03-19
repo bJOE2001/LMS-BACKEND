@@ -335,6 +335,7 @@ class COCApplicationController extends Controller
                 'leave_type_id' => (int) $result['leave_type']->id,
                 'leave_type_name' => (string) $result['leave_type']->name,
                 'credited_days' => (float) $result['days'],
+                'expires_on' => now()->addYearNoOverflow()->toDateString(),
                 'updated_balance' => (float) $result['balance'],
             ],
         ]);
@@ -560,6 +561,7 @@ class COCApplicationController extends Controller
             'cto_leave_type_name' => $app->ctoLeaveType?->name,
             'cto_credited_days' => $app->cto_credited_days !== null ? (float) $app->cto_credited_days : null,
             'cto_credited_at' => $app->cto_credited_at?->toIso8601String(),
+            'cto_expires_on' => $app->cto_credited_at?->copy()->addYearNoOverflow()->toDateString(),
             'dateFiled' => $app->created_at?->toDateString(),
             'date_filed' => $app->created_at?->toDateString(),
             'filedAt' => $app->created_at?->toIso8601String(),
