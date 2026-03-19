@@ -81,6 +81,10 @@ class LeaveApplicationController extends Controller
             return $leaveTypeBalanceAccess;
         }
 
+        if ($this->isCtoLeaveType($leaveType, (int) $leaveType->id)) {
+            $this->syncEmployeeCtoBalance((string) $employee->control_no);
+        }
+
         $balance = LeaveBalance::query()
             ->with('accrualHistories')
             ->where('employee_id', $employee->control_no)
@@ -144,6 +148,10 @@ class LeaveApplicationController extends Controller
             return $leaveTypeBalanceAccess;
         }
 
+        if ($this->isCtoLeaveType($leaveType, (int) $leaveType->id)) {
+            $this->syncEmployeeCtoBalance((string) $employee->control_no);
+        }
+
         $balance = LeaveBalance::query()
             ->with('accrualHistories')
             ->where('employee_id', $employee->control_no)
@@ -186,6 +194,8 @@ class LeaveApplicationController extends Controller
         $typesByName = $types
             ->keyBy(fn(LeaveType $type) => strtolower(trim((string) $type->name)))
             ->all();
+
+        $this->syncEmployeeCtoBalance((string) $employee->control_no);
 
         $balanceRecordsByType = LeaveBalance::query()
             ->with('accrualHistories')
@@ -309,6 +319,12 @@ class LeaveApplicationController extends Controller
             'selected_date_coverage.*' => ['nullable', 'string', 'in:whole,half'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
+            'medical_certificate' => ['nullable', 'file', 'max:10240'],
+            'medical_certificate_submitted' => ['nullable', 'boolean'],
+            'medical_certificate_attached' => ['nullable', 'boolean'],
+            'has_medical_certificate' => ['nullable', 'boolean'],
+            'with_medical_certificate' => ['nullable', 'boolean'],
+            'medical_certificate_reference' => ['nullable', 'string', 'max:500'],
         ]);
 
         $requestedPayMode = $this->resolveRequestedPayMode(
@@ -342,14 +358,42 @@ class LeaveApplicationController extends Controller
             $selectedDateCoverage,
             $resolvedSelectedDates
         );
-        $deductibleDays = $this->computeDeductibleDays(
+        $leaveType = LeaveType::find((int) $validated['leave_type_id']);
+        if (!$leaveType) {
+            return response()->json([
+                'message' => 'Selected leave type is not available.',
+                'errors' => [
+                    'leave_type_id' => ['Selected leave type is not available.'],
+                ],
+            ], 422);
+        }
+
+        $medicalCertificateState = $this->resolveMedicalCertificateStateFromRequest($request, $validated);
+        $policyResolution = $this->applyRegularLeavePolicy(
+            $leaveType,
             (float) $validated['total_days'],
             $resolvedSelectedDates,
-            $selectedDatePayStatus,
             $selectedDateCoverage,
+            $selectedDatePayStatus,
+            $requestedPayMode,
             false,
-            $requestedPayMode
+            (bool) ($medicalCertificateState['medical_certificate_submitted'] ?? false),
+            $medicalCertificateState['medical_certificate_reference'] ?? null,
+            true,
+            $request->input('date_filed') ?? $request->input('dateOfFiling') ?? now(),
+            (string) $validated['start_date'],
+            (string) $validated['end_date']
         );
+        if ($policyResolution instanceof JsonResponse) {
+            return $policyResolution;
+        }
+
+        $requestedPayMode = $policyResolution['pay_mode'];
+        $selectedDatePayStatus = $policyResolution['selected_date_pay_status'];
+        $deductibleDays = (float) ($policyResolution['deductible_days'] ?? 0);
+        $medicalCertificateRequired = (bool) ($policyResolution['medical_certificate_required'] ?? false);
+        $medicalCertificateSubmitted = (bool) ($policyResolution['medical_certificate_submitted'] ?? false);
+        $medicalCertificateReference = $policyResolution['medical_certificate_reference'] ?? null;
 
         $duplicateDateValidation = $this->validateNoDuplicateLeaveDates(
             (string) $employee->control_no,
@@ -372,6 +416,18 @@ class LeaveApplicationController extends Controller
         if ($eligibility instanceof JsonResponse) {
             return $eligibility;
         }
+        if (($eligibility['insufficient_balance'] ?? false) === true) {
+            $allocation = $this->resolveCreditBasedPayAllocation(
+                $resolvedSelectedDates,
+                $selectedDateCoverage,
+                (float) $validated['total_days'],
+                (float) ($eligibility['available_balance'] ?? 0.0),
+                $selectedDatePayStatus
+            );
+            $requestedPayMode = $allocation['pay_mode'];
+            $selectedDatePayStatus = $allocation['selected_date_pay_status'];
+            $deductibleDays = (float) ($allocation['deductible_days'] ?? 0.0);
+        }
 
         $app = DB::transaction(function () use (
             $validated,
@@ -381,7 +437,10 @@ class LeaveApplicationController extends Controller
             $selectedDatePayStatus,
             $selectedDateCoverage,
             $resolvedSelectedDates,
-            $deductibleDays
+            $deductibleDays,
+            $medicalCertificateRequired,
+            $medicalCertificateSubmitted,
+            $medicalCertificateReference
         ) {
             $application = LeaveApplication::create([
                 'erms_control_no' => (string) $employee->control_no,
@@ -396,6 +455,9 @@ class LeaveApplicationController extends Controller
                 'selected_date_coverage' => $selectedDateCoverage,
                 'commutation' => $validated['commutation'] ?? 'Not Requested',
                 'pay_mode' => $requestedPayMode,
+                'medical_certificate_required' => $medicalCertificateRequired,
+                'medical_certificate_submitted' => $medicalCertificateSubmitted,
+                'medical_certificate_reference' => $medicalCertificateReference,
                 'status' => LeaveApplication::STATUS_PENDING_ADMIN,
             ]);
 
@@ -607,6 +669,12 @@ class LeaveApplicationController extends Controller
             'total_days' => ['nullable', 'numeric', 'min:0.5', 'max:365'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
+            'medical_certificate' => ['nullable', 'file', 'max:10240'],
+            'medical_certificate_submitted' => ['nullable', 'boolean'],
+            'medical_certificate_attached' => ['nullable', 'boolean'],
+            'has_medical_certificate' => ['nullable', 'boolean'],
+            'with_medical_certificate' => ['nullable', 'boolean'],
+            'medical_certificate_reference' => ['nullable', 'string', 'max:500'],
             'is_monetization' => ['nullable', 'boolean'],
         ]);
 
@@ -871,6 +939,12 @@ class LeaveApplicationController extends Controller
             'selected_date_coverage.*' => ['nullable', 'string', 'in:whole,half'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
+            'medical_certificate' => ['nullable', 'file', 'max:10240'],
+            'medical_certificate_submitted' => ['nullable', 'boolean'],
+            'medical_certificate_attached' => ['nullable', 'boolean'],
+            'has_medical_certificate' => ['nullable', 'boolean'],
+            'with_medical_certificate' => ['nullable', 'boolean'],
+            'medical_certificate_reference' => ['nullable', 'string', 'max:500'],
         ]);
 
         $requestedPayMode = $this->resolveRequestedPayMode(
@@ -904,14 +978,42 @@ class LeaveApplicationController extends Controller
             $selectedDateCoverage,
             $resolvedSelectedDates
         );
-        $deductibleDays = $this->computeDeductibleDays(
+        $leaveType = LeaveType::find((int) $validated['leave_type_id']);
+        if (!$leaveType) {
+            return response()->json([
+                'message' => 'Selected leave type is not available.',
+                'errors' => [
+                    'leave_type_id' => ['Selected leave type is not available.'],
+                ],
+            ], 422);
+        }
+
+        $medicalCertificateState = $this->resolveMedicalCertificateStateFromRequest($request, $validated);
+        $policyResolution = $this->applyRegularLeavePolicy(
+            $leaveType,
             (float) $validated['total_days'],
             $resolvedSelectedDates,
-            $selectedDatePayStatus,
             $selectedDateCoverage,
+            $selectedDatePayStatus,
+            $requestedPayMode,
             false,
-            $requestedPayMode
+            (bool) ($medicalCertificateState['medical_certificate_submitted'] ?? false),
+            $medicalCertificateState['medical_certificate_reference'] ?? null,
+            true,
+            $request->input('date_filed') ?? $request->input('dateOfFiling') ?? now(),
+            (string) $validated['start_date'],
+            (string) $validated['end_date']
         );
+        if ($policyResolution instanceof JsonResponse) {
+            return $policyResolution;
+        }
+
+        $requestedPayMode = $policyResolution['pay_mode'];
+        $selectedDatePayStatus = $policyResolution['selected_date_pay_status'];
+        $deductibleDays = (float) ($policyResolution['deductible_days'] ?? 0);
+        $medicalCertificateRequired = (bool) ($policyResolution['medical_certificate_required'] ?? false);
+        $medicalCertificateSubmitted = (bool) ($policyResolution['medical_certificate_submitted'] ?? false);
+        $medicalCertificateReference = $policyResolution['medical_certificate_reference'] ?? null;
 
         $duplicateDateValidation = $this->validateNoDuplicateLeaveDates(
             (string) $employee->control_no,
@@ -934,6 +1036,18 @@ class LeaveApplicationController extends Controller
         if ($eligibility instanceof JsonResponse) {
             return $eligibility;
         }
+        if (($eligibility['insufficient_balance'] ?? false) === true) {
+            $allocation = $this->resolveCreditBasedPayAllocation(
+                $resolvedSelectedDates,
+                $selectedDateCoverage,
+                (float) $validated['total_days'],
+                (float) ($eligibility['available_balance'] ?? 0.0),
+                $selectedDatePayStatus
+            );
+            $requestedPayMode = $allocation['pay_mode'];
+            $selectedDatePayStatus = $allocation['selected_date_pay_status'];
+            $deductibleDays = (float) ($allocation['deductible_days'] ?? 0.0);
+        }
 
         $app = DB::transaction(function () use (
             $validated,
@@ -943,7 +1057,10 @@ class LeaveApplicationController extends Controller
             $selectedDatePayStatus,
             $selectedDateCoverage,
             $resolvedSelectedDates,
-            $deductibleDays
+            $deductibleDays,
+            $medicalCertificateRequired,
+            $medicalCertificateSubmitted,
+            $medicalCertificateReference
         ) {
             $application = LeaveApplication::create([
                 'erms_control_no' => (string) $employee->control_no,
@@ -958,6 +1075,9 @@ class LeaveApplicationController extends Controller
                 'selected_date_coverage' => $selectedDateCoverage,
                 'commutation' => $validated['commutation'] ?? 'Not Requested',
                 'pay_mode' => $requestedPayMode,
+                'medical_certificate_required' => $medicalCertificateRequired,
+                'medical_certificate_submitted' => $medicalCertificateSubmitted,
+                'medical_certificate_reference' => $medicalCertificateReference,
                 'status' => LeaveApplication::STATUS_PENDING_ADMIN,
             ]);
 
@@ -1349,17 +1469,54 @@ class LeaveApplicationController extends Controller
             return $this->hrApprovePendingUpdateRequest($request, $app, $hr);
         }
 
+        $leaveType = $app->leaveType ?? LeaveType::find((int) $app->leave_type_id);
+        if (!$leaveType) {
+            return response()->json([
+                'message' => 'Selected leave type is no longer available.',
+            ], 422);
+        }
+        $app->setRelation('leaveType', $leaveType);
+
+        $policyResolution = $this->applyRegularLeavePolicy(
+            $leaveType,
+            (float) $app->total_days,
+            $app->resolvedSelectedDates(),
+            is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
+            is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null,
+            $app->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY,
+            (bool) $app->is_monetization,
+            (bool) ($app->medical_certificate_submitted ?? false),
+            $this->trimNullableString($app->medical_certificate_reference ?? null),
+            true,
+            $app->created_at ?? null,
+            $app->start_date?->toDateString(),
+            $app->end_date?->toDateString()
+        );
+        if ($policyResolution instanceof JsonResponse) {
+            return $policyResolution;
+        }
+
+        $normalizedPayMode = $policyResolution['pay_mode'];
+        $resolvedSelectedDatePayStatus = $policyResolution['selected_date_pay_status'];
+        $daysToDeduct = (float) ($policyResolution['deductible_days'] ?? 0);
+        $medicalCertificateRequired = (bool) ($policyResolution['medical_certificate_required'] ?? false);
+        $medicalCertificateSubmitted = (bool) ($policyResolution['medical_certificate_submitted'] ?? false);
+        $medicalCertificateReference = $policyResolution['medical_certificate_reference'] ?? null;
+
         $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
         $shouldDeductForcedLeave = $this->shouldDeductForcedLeaveWithVacation($app, $forcedLeaveTypeId);
-        $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
-        $daysToDeduct = $this->resolveApplicationDeductibleDays($app);
 
         // Determine if balance deduction is needed
         $needsDeduction = $this->applicationDeductsEmployeeBalance(
             (bool) $app->is_monetization,
-            $app->leaveType,
+            $leaveType,
             $normalizedPayMode
         ) && $daysToDeduct > 0;
+        $isCtoDeduction = $this->isCtoLeaveType($leaveType, (int) $app->leave_type_id);
+
+        if ($needsDeduction && $app->erms_control_no && $isCtoDeduction) {
+            $this->syncEmployeeCtoBalance((string) $app->erms_control_no);
+        }
 
         if ($needsDeduction) {
             if ($app->erms_control_no) {
@@ -1402,11 +1559,30 @@ class LeaveApplicationController extends Controller
         $balanceConflictError = 'HR_APPROVAL_BALANCE_CONFLICT';
 
         try {
-            DB::transaction(function () use ($app, $hr, $request, $needsDeduction, $balanceConflictError, $forcedLeaveTypeId, $shouldDeductForcedLeave, $daysToDeduct) {
+            DB::transaction(function () use (
+                $app,
+                $hr,
+                $request,
+                $needsDeduction,
+                $balanceConflictError,
+                $forcedLeaveTypeId,
+                $shouldDeductForcedLeave,
+                $daysToDeduct,
+                $isCtoDeduction,
+                $normalizedPayMode,
+                $resolvedSelectedDatePayStatus,
+                $medicalCertificateRequired,
+                $medicalCertificateSubmitted,
+                $medicalCertificateReference
+            ) {
                 // Deduct balance for credit-based leave types and monetization.
                 // Locking the exact target row avoids race conditions and cross-row side effects.
                 if ($needsDeduction) {
                     if ($app->erms_control_no) {
+                        if ($isCtoDeduction) {
+                            $this->syncEmployeeCtoBalance((string) $app->erms_control_no, true);
+                        }
+
                         $lockedBalance = LeaveBalance::query()
                             ->where('employee_id', $app->erms_control_no)
                             ->where('leave_type_id', $app->leave_type_id)
@@ -1455,6 +1631,12 @@ class LeaveApplicationController extends Controller
                     'hr_id' => $hr->id,
                     'hr_approved_at' => now(),
                     'remarks' => $request->input('remarks'),
+                    'pay_mode' => $normalizedPayMode,
+                    'selected_date_pay_status' => $resolvedSelectedDatePayStatus,
+                    'deductible_days' => $daysToDeduct,
+                    'medical_certificate_required' => $medicalCertificateRequired,
+                    'medical_certificate_submitted' => $medicalCertificateSubmitted,
+                    'medical_certificate_reference' => $medicalCertificateReference,
                 ]);
 
                 LeaveApplicationLog::create([
@@ -1472,6 +1654,10 @@ class LeaveApplicationController extends Controller
             }
 
             if ($app->erms_control_no) {
+                if ($isCtoDeduction) {
+                    $this->syncEmployeeCtoBalance((string) $app->erms_control_no);
+                }
+
                 $currentBalance = (float) (LeaveBalance::query()
                     ->where('employee_id', $app->erms_control_no)
                     ->where('leave_type_id', $app->leave_type_id)
@@ -1667,6 +1853,12 @@ class LeaveApplicationController extends Controller
             'selected_date_coverage.*' => ['nullable', 'string', 'in:whole,half'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
+            'medical_certificate' => ['nullable', 'file', 'max:10240'],
+            'medical_certificate_submitted' => ['nullable', 'boolean'],
+            'medical_certificate_attached' => ['nullable', 'boolean'],
+            'has_medical_certificate' => ['nullable', 'boolean'],
+            'with_medical_certificate' => ['nullable', 'boolean'],
+            'medical_certificate_reference' => ['nullable', 'string', 'max:500'],
         ]);
 
         $requestedPayMode = $this->resolveRequestedPayMode(
@@ -1700,14 +1892,42 @@ class LeaveApplicationController extends Controller
             $selectedDateCoverage,
             $resolvedSelectedDates
         );
-        $deductibleDays = $this->computeDeductibleDays(
+        $leaveType = LeaveType::find((int) $validated['leave_type_id']);
+        if (!$leaveType) {
+            return response()->json([
+                'message' => 'Selected leave type is not available.',
+                'errors' => [
+                    'leave_type_id' => ['Selected leave type is not available.'],
+                ],
+            ], 422);
+        }
+
+        $medicalCertificateState = $this->resolveMedicalCertificateStateFromRequest($request, $validated);
+        $policyResolution = $this->applyRegularLeavePolicy(
+            $leaveType,
             (float) $validated['total_days'],
             $resolvedSelectedDates,
-            $selectedDatePayStatus,
             $selectedDateCoverage,
+            $selectedDatePayStatus,
+            $requestedPayMode,
             false,
-            $requestedPayMode
+            (bool) ($medicalCertificateState['medical_certificate_submitted'] ?? false),
+            $medicalCertificateState['medical_certificate_reference'] ?? null,
+            true,
+            $request->input('date_filed') ?? now(),
+            (string) $validated['start_date'],
+            (string) $validated['end_date']
         );
+        if ($policyResolution instanceof JsonResponse) {
+            return $policyResolution;
+        }
+
+        $requestedPayMode = $policyResolution['pay_mode'];
+        $selectedDatePayStatus = $policyResolution['selected_date_pay_status'];
+        $deductibleDays = (float) ($policyResolution['deductible_days'] ?? 0);
+        $medicalCertificateRequired = (bool) ($policyResolution['medical_certificate_required'] ?? false);
+        $medicalCertificateSubmitted = (bool) ($policyResolution['medical_certificate_submitted'] ?? false);
+        $medicalCertificateReference = $policyResolution['medical_certificate_reference'] ?? null;
 
         // Verify the employee belongs to the admin's department (by office name)
         $admin->loadMissing('department');
@@ -1737,6 +1957,18 @@ class LeaveApplicationController extends Controller
         if ($eligibility instanceof JsonResponse) {
             return $eligibility;
         }
+        if (($eligibility['insufficient_balance'] ?? false) === true) {
+            $allocation = $this->resolveCreditBasedPayAllocation(
+                $resolvedSelectedDates,
+                $selectedDateCoverage,
+                (float) $validated['total_days'],
+                (float) ($eligibility['available_balance'] ?? 0.0),
+                $selectedDatePayStatus
+            );
+            $requestedPayMode = $allocation['pay_mode'];
+            $selectedDatePayStatus = $allocation['selected_date_pay_status'];
+            $deductibleDays = (float) ($allocation['deductible_days'] ?? 0.0);
+        }
 
         $app = DB::transaction(function () use (
             $validated,
@@ -1746,7 +1978,10 @@ class LeaveApplicationController extends Controller
             $selectedDatePayStatus,
             $selectedDateCoverage,
             $resolvedSelectedDates,
-            $deductibleDays
+            $deductibleDays,
+            $medicalCertificateRequired,
+            $medicalCertificateSubmitted,
+            $medicalCertificateReference
         ) {
             $application = LeaveApplication::create([
                 'erms_control_no' => (string) $employee->control_no,
@@ -1761,6 +1996,9 @@ class LeaveApplicationController extends Controller
                 'selected_date_coverage' => $selectedDateCoverage,
                 'commutation' => $validated['commutation'] ?? 'Not Requested',
                 'pay_mode' => $requestedPayMode,
+                'medical_certificate_required' => $medicalCertificateRequired,
+                'medical_certificate_submitted' => $medicalCertificateSubmitted,
+                'medical_certificate_reference' => $medicalCertificateReference,
                 'status' => LeaveApplication::STATUS_PENDING_HR,
                 'admin_id' => $admin->id,
                 'admin_approved_at' => now(),
@@ -2484,6 +2722,8 @@ class LeaveApplicationController extends Controller
                 'transaction_type' => 'CREDIT',
                 'label' => 'COC converted to CTO',
                 'description' => 'Approved COC application converted to CTO credits',
+                'expires_on' => $creditedAt->copy()->addYearNoOverflow()->toDateString(),
+                'is_expired' => $creditedAt->copy()->addYearNoOverflow()->lt(\Carbon\CarbonImmutable::today()),
                 'application_id' => 'COC-' . (int) $application->id,
                 'coc_application_id' => (int) $application->id,
                 'source' => 'COC_APPLICATION',
@@ -2849,6 +3089,9 @@ class LeaveApplicationController extends Controller
             'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
             'without_pay' => $withoutPay,
             'with_pay' => !$withoutPay,
+            'medical_certificate_required' => (bool) ($app->medical_certificate_required ?? false),
+            'medical_certificate_submitted' => (bool) ($app->medical_certificate_submitted ?? false),
+            'medical_certificate_reference' => $this->trimNullableString($app->medical_certificate_reference ?? null),
             'date_filed' => $app->created_at?->toDateString(),
             'filed_at' => $app->created_at?->toIso8601String(),
             'created_at' => $app->created_at?->toIso8601String(),
@@ -2959,17 +3202,53 @@ class LeaveApplicationController extends Controller
                 $requestedSelectedDateCoverage,
                 $resolvedSelectedDates
             );
-        $resolvedDeductibleDays = $this->computeDeductibleDays(
-            $resolvedTotalDays,
-            is_array($resolvedSelectedDates) ? $resolvedSelectedDates : null,
-            $requestedSelectedDatePayStatus,
-            $requestedSelectedDateCoverage,
-            $requestedIsMonetization,
-            $resolvedPayMode
+
+        $targetLeaveTypeId = (int) ($validated['leave_type_id'] ?? $app->leave_type_id);
+        $targetLeaveType = LeaveType::find($targetLeaveTypeId);
+        if (!$targetLeaveType) {
+            return response()->json([
+                'message' => 'Selected leave type is not available.',
+                'errors' => [
+                    'leave_type_id' => ['Selected leave type is not available.'],
+                ],
+            ], 422);
+        }
+
+        $medicalCertificateState = $this->resolveMedicalCertificateStateFromRequest(
+            $request,
+            $validated,
+            (bool) ($app->medical_certificate_submitted ?? false),
+            $this->trimNullableString($app->medical_certificate_reference ?? null)
         );
 
+        $policyResolution = $this->applyRegularLeavePolicy(
+            $targetLeaveType,
+            $resolvedTotalDays,
+            is_array($resolvedSelectedDates) ? $resolvedSelectedDates : null,
+            $requestedSelectedDateCoverage,
+            $requestedSelectedDatePayStatus,
+            $resolvedPayMode,
+            $requestedIsMonetization,
+            (bool) ($medicalCertificateState['medical_certificate_submitted'] ?? false),
+            $medicalCertificateState['medical_certificate_reference'] ?? null,
+            true,
+            $app->created_at ?? null,
+            $resolvedStartDate,
+            $resolvedEndDate
+        );
+        if ($policyResolution instanceof JsonResponse) {
+            return $policyResolution;
+        }
+
+        $resolvedPayMode = $policyResolution['pay_mode'];
+        $requestedSelectedDatePayStatus = $policyResolution['selected_date_pay_status'];
+        $resolvedDeductibleDays = (float) ($policyResolution['deductible_days'] ?? 0);
+        $medicalCertificateRequired = (bool) ($policyResolution['medical_certificate_required'] ?? false);
+        $medicalCertificateSubmitted = (bool) ($policyResolution['medical_certificate_submitted'] ?? false);
+        $medicalCertificateReference = $policyResolution['medical_certificate_reference'] ?? null;
+
         $rawPayload = [
-            'leave_type_id' => (int) ($validated['leave_type_id'] ?? $app->leave_type_id),
+            'leave_type_id' => $targetLeaveTypeId,
             'start_date' => $resolvedStartDate,
             'end_date' => $resolvedEndDate,
             'selected_dates' => $resolvedSelectedDates,
@@ -2983,6 +3262,9 @@ class LeaveApplicationController extends Controller
                 : ($app->commutation ?? 'Not Requested'),
             'pay_mode' => $resolvedPayMode,
             'is_monetization' => $requestedIsMonetization,
+            'medical_certificate_required' => $medicalCertificateRequired,
+            'medical_certificate_submitted' => $medicalCertificateSubmitted,
+            'medical_certificate_reference' => $medicalCertificateReference,
         ];
 
         $payload = $this->normalizePendingUpdatePayload($rawPayload);
@@ -3030,6 +3312,9 @@ class LeaveApplicationController extends Controller
             'commutation' => $app->commutation ?? 'Not Requested',
             'pay_mode' => $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization),
             'is_monetization' => (bool) $app->is_monetization,
+            'medical_certificate_required' => (bool) ($app->medical_certificate_required ?? false),
+            'medical_certificate_submitted' => (bool) ($app->medical_certificate_submitted ?? false),
+            'medical_certificate_reference' => $this->trimNullableString($app->medical_certificate_reference ?? null),
         ]);
 
         $normalizedRequestedPayload = $this->normalizePendingUpdatePayload($requestedPayload);
@@ -3079,6 +3364,21 @@ class LeaveApplicationController extends Controller
         }
 
         if (($currentPayload['pay_mode'] ?? LeaveApplication::PAY_MODE_WITH_PAY) !== ($normalizedRequestedPayload['pay_mode'] ?? LeaveApplication::PAY_MODE_WITH_PAY)) {
+            return true;
+        }
+
+        if ((bool) ($currentPayload['medical_certificate_required'] ?? false) !== (bool) ($normalizedRequestedPayload['medical_certificate_required'] ?? false)) {
+            return true;
+        }
+
+        if ((bool) ($currentPayload['medical_certificate_submitted'] ?? false) !== (bool) ($normalizedRequestedPayload['medical_certificate_submitted'] ?? false)) {
+            return true;
+        }
+
+        if (
+            $this->trimNullableString($currentPayload['medical_certificate_reference'] ?? null)
+            !== $this->trimNullableString($normalizedRequestedPayload['medical_certificate_reference'] ?? null)
+        ) {
             return true;
         }
 
@@ -3154,14 +3454,37 @@ class LeaveApplicationController extends Controller
                 $this->normalizeSelectedDateCoverageMap($payload['selected_date_coverage'] ?? null),
                 $targetSelectedDates
             );
-        $targetDeductibleDays = $this->computeDeductibleDays(
+
+        $targetMedicalCertificateState = $this->resolveMedicalCertificateStateFromPayload(
+            is_array($payload) ? $payload : [],
+            (bool) ($app->medical_certificate_submitted ?? false),
+            $this->trimNullableString($app->medical_certificate_reference ?? null)
+        );
+        $policyResolution = $this->applyRegularLeavePolicy(
+            $targetLeaveType,
             $targetTotalDays,
             is_array($targetSelectedDates) ? $targetSelectedDates : null,
-            $targetSelectedDatePayStatus,
             $targetSelectedDateCoverage,
+            $targetSelectedDatePayStatus,
+            $targetPayMode,
             $targetIsMonetization,
-            $targetPayMode
+            (bool) ($targetMedicalCertificateState['medical_certificate_submitted'] ?? false),
+            $targetMedicalCertificateState['medical_certificate_reference'] ?? null,
+            true,
+            $app->created_at ?? null,
+            $targetStartDate,
+            $targetEndDate
         );
+        if ($policyResolution instanceof JsonResponse) {
+            return $policyResolution;
+        }
+
+        $targetPayMode = $policyResolution['pay_mode'];
+        $targetSelectedDatePayStatus = $policyResolution['selected_date_pay_status'];
+        $targetDeductibleDays = (float) ($policyResolution['deductible_days'] ?? 0);
+        $targetMedicalCertificateRequired = (bool) ($policyResolution['medical_certificate_required'] ?? false);
+        $targetMedicalCertificateSubmitted = (bool) ($policyResolution['medical_certificate_submitted'] ?? false);
+        $targetMedicalCertificateReference = $policyResolution['medical_certificate_reference'] ?? null;
 
         if (!$targetIsMonetization && ($targetStartDate === null || $targetEndDate === null)) {
             return response()->json([
@@ -3214,6 +3537,10 @@ class LeaveApplicationController extends Controller
             $targetPayMode
         );
 
+        if ($app->erms_control_no) {
+            $this->syncEmployeeCtoBalance((string) $app->erms_control_no);
+        }
+
         $balanceConflictError = 'HR_UPDATE_BALANCE_CONFLICT';
 
         try {
@@ -3233,6 +3560,9 @@ class LeaveApplicationController extends Controller
                 $targetDeductibleDays,
                 $targetIsMonetization,
                 $targetPayMode,
+                $targetMedicalCertificateRequired,
+                $targetMedicalCertificateSubmitted,
+                $targetMedicalCertificateReference,
                 $balanceAdjustments,
                 $balanceConflictError
             ): void {
@@ -3259,12 +3589,19 @@ class LeaveApplicationController extends Controller
                     'selected_date_coverage' => $targetIsMonetization ? null : $targetSelectedDateCoverage,
                     'commutation' => (string) ($payload['commutation'] ?? 'Not Requested'),
                     'pay_mode' => $targetPayMode,
+                    'medical_certificate_required' => $targetMedicalCertificateRequired,
+                    'medical_certificate_submitted' => $targetMedicalCertificateSubmitted,
+                    'medical_certificate_reference' => $targetMedicalCertificateReference,
                     'is_monetization' => $targetIsMonetization,
                     'status' => LeaveApplication::STATUS_APPROVED,
                     'hr_id' => $hr->id,
                     'hr_approved_at' => now(),
                     'remarks' => $request->input('remarks'),
                 ]);
+
+                if ($app->erms_control_no) {
+                    $this->syncEmployeeCtoBalance((string) $app->erms_control_no, true);
+                }
 
                 if ($pendingUpdateRequest instanceof LeaveApplicationUpdateRequest) {
                     $pendingUpdateRequest->update([
@@ -3517,18 +3854,18 @@ class LeaveApplicationController extends Controller
                 $selectedDateCoverage,
                 $selectedDates
             );
-        $deductibleDays = $this->computeDeductibleDays(
-            $totalDays,
-            is_array($selectedDates) ? $selectedDates : null,
-            $selectedDatePayStatus,
-            $selectedDateCoverage,
-            $isMonetization,
-            $payMode
+        $medicalCertificateState = $this->resolveMedicalCertificateStateFromPayload(
+            is_array($payload) ? $payload : [],
+            (bool) ($payload['medical_certificate_submitted'] ?? false),
+            $this->trimNullableString($payload['medical_certificate_reference'] ?? null)
         );
-        $withoutPay = $payMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
+        $medicalCertificateRequired = (bool) ($payload['medical_certificate_required'] ?? false);
+        $medicalCertificateSubmitted = (bool) ($medicalCertificateState['medical_certificate_submitted'] ?? false);
+        $medicalCertificateReference = $medicalCertificateState['medical_certificate_reference'] ?? null;
 
         static $leaveTypeNameCache = [];
         $leaveTypeName = null;
+        $leaveType = null;
         if ($leaveTypeId > 0) {
             if (!array_key_exists($leaveTypeId, $leaveTypeNameCache)) {
                 $leaveTypeNameCache[$leaveTypeId] = LeaveType::query()
@@ -3538,7 +3875,55 @@ class LeaveApplicationController extends Controller
 
             $resolvedLeaveTypeName = $leaveTypeNameCache[$leaveTypeId];
             $leaveTypeName = is_string($resolvedLeaveTypeName) ? trim($resolvedLeaveTypeName) : null;
+            $leaveType = LeaveType::find($leaveTypeId);
         }
+
+        if ($leaveType instanceof LeaveType) {
+            $policyResolution = $this->applyRegularLeavePolicy(
+                $leaveType,
+                $totalDays,
+                is_array($selectedDates) ? $selectedDates : null,
+                $selectedDateCoverage,
+                $selectedDatePayStatus,
+                $payMode,
+                $isMonetization,
+                $medicalCertificateSubmitted,
+                $medicalCertificateReference,
+                false,
+                $payload['date_filed'] ?? null,
+                $startDate,
+                $endDate
+            );
+
+            if (!($policyResolution instanceof JsonResponse)) {
+                $payMode = $policyResolution['pay_mode'];
+                $selectedDatePayStatus = $policyResolution['selected_date_pay_status'];
+                $deductibleDays = (float) ($policyResolution['deductible_days'] ?? 0);
+                $medicalCertificateRequired = (bool) ($policyResolution['medical_certificate_required'] ?? false);
+                $medicalCertificateSubmitted = (bool) ($policyResolution['medical_certificate_submitted'] ?? false);
+                $medicalCertificateReference = $policyResolution['medical_certificate_reference'] ?? null;
+            } else {
+                $deductibleDays = $this->computeDeductibleDays(
+                    $totalDays,
+                    is_array($selectedDates) ? $selectedDates : null,
+                    $selectedDatePayStatus,
+                    $selectedDateCoverage,
+                    $isMonetization,
+                    $payMode
+                );
+            }
+        } else {
+            $deductibleDays = $this->computeDeductibleDays(
+                $totalDays,
+                is_array($selectedDates) ? $selectedDates : null,
+                $selectedDatePayStatus,
+                $selectedDateCoverage,
+                $isMonetization,
+                $payMode
+            );
+        }
+
+        $withoutPay = $payMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
 
         return [
             'leave_type_id' => $leaveTypeId,
@@ -3557,6 +3942,9 @@ class LeaveApplicationController extends Controller
             'without_pay' => $withoutPay,
             'with_pay' => !$withoutPay,
             'is_monetization' => $isMonetization,
+            'medical_certificate_required' => $medicalCertificateRequired,
+            'medical_certificate_submitted' => $medicalCertificateSubmitted,
+            'medical_certificate_reference' => $this->trimNullableString($medicalCertificateReference),
         ];
     }
 
@@ -3658,6 +4046,247 @@ class LeaveApplicationController extends Controller
         return true;
     }
 
+    private function resolveCtoLeaveTypeId(): ?int
+    {
+        static $resolved = false;
+        static $cachedValue = null;
+
+        if ($resolved) {
+            return $cachedValue;
+        }
+
+        $value = LeaveType::query()
+            ->whereRaw('LOWER(LTRIM(RTRIM(name))) = ?', ['cto leave'])
+            ->value('id');
+
+        $cachedValue = $value !== null ? (int) $value : null;
+        $resolved = true;
+
+        return $cachedValue;
+    }
+
+    private function isCtoLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
+    {
+        $ctoLeaveTypeId = $this->resolveCtoLeaveTypeId();
+        if ($ctoLeaveTypeId === null) {
+            return false;
+        }
+
+        if ($leaveType instanceof LeaveType && (int) $leaveType->id === $ctoLeaveTypeId) {
+            return true;
+        }
+
+        if ($leaveTypeId !== null && (int) $leaveTypeId === $ctoLeaveTypeId) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private function syncEmployeeCtoBalance(
+        string $employeeControlNo,
+        bool $lockForUpdate = false,
+        ?\Carbon\CarbonImmutable $asOfDate = null
+    ): ?float {
+        $ctoLeaveTypeId = $this->resolveCtoLeaveTypeId();
+        if ($ctoLeaveTypeId === null) {
+            return null;
+        }
+
+        $controlNoCandidates = $this->controlNoCandidates($employeeControlNo);
+        if ($controlNoCandidates === []) {
+            return null;
+        }
+
+        $effectiveBalance = $this->computeEmployeeCtoAvailableBalance($employeeControlNo, $ctoLeaveTypeId, $asOfDate);
+        $effectiveBalance = round(max($effectiveBalance, 0.0), 2);
+
+        $query = LeaveBalance::query()
+            ->whereIn('employee_id', $controlNoCandidates)
+            ->where('leave_type_id', $ctoLeaveTypeId);
+
+        if ($lockForUpdate) {
+            $query->lockForUpdate();
+        }
+
+        $balance = $query->first();
+
+        if (!$balance && $effectiveBalance <= 0) {
+            return 0.0;
+        }
+
+        if (!$balance) {
+            $canonicalControlNo = trim((string) ($this->findEmployeeByControlNo($employeeControlNo)?->control_no ?? $employeeControlNo));
+            if ($canonicalControlNo === '') {
+                return $effectiveBalance;
+            }
+
+            $balance = LeaveBalance::query()->create([
+                'employee_id' => $canonicalControlNo,
+                'leave_type_id' => $ctoLeaveTypeId,
+                'balance' => $effectiveBalance,
+                'initialized_at' => now(),
+                'year' => (int) now()->year,
+            ]);
+
+            return (float) $balance->balance;
+        }
+
+        if (round((float) $balance->balance, 2) !== $effectiveBalance) {
+            $balance->balance = $effectiveBalance;
+            if (!$balance->year) {
+                $balance->year = (int) now()->year;
+            }
+            $balance->save();
+        }
+
+        return $effectiveBalance;
+    }
+
+    private function computeEmployeeCtoAvailableBalance(
+        string $employeeControlNo,
+        int $ctoLeaveTypeId,
+        ?\Carbon\CarbonImmutable $asOfDate = null
+    ): float {
+        if ($ctoLeaveTypeId <= 0) {
+            return 0.0;
+        }
+
+        $controlNoCandidates = $this->controlNoCandidates($employeeControlNo);
+        if ($controlNoCandidates === []) {
+            return 0.0;
+        }
+
+        $asOf = ($asOfDate ?? \Carbon\CarbonImmutable::now())->startOfDay();
+
+        $creditApplications = COCApplication::query()
+            ->where('status', COCApplication::STATUS_APPROVED)
+            ->whereIn('erms_control_no', $controlNoCandidates)
+            ->where('cto_leave_type_id', $ctoLeaveTypeId)
+            ->whereNotNull('cto_credited_days')
+            ->where('cto_credited_days', '>', 0)
+            ->orderBy('cto_credited_at')
+            ->orderBy('reviewed_at')
+            ->orderBy('id')
+            ->get([
+                'id',
+                'cto_credited_days',
+                'cto_credited_at',
+                'reviewed_at',
+                'created_at',
+            ]);
+
+        $creditBuckets = [];
+        foreach ($creditApplications as $application) {
+            if (!$application instanceof COCApplication) {
+                continue;
+            }
+
+            $creditedDays = round((float) ($application->cto_credited_days ?? 0), 2);
+            if ($creditedDays <= 0) {
+                continue;
+            }
+
+            $creditedAtRaw = $application->cto_credited_at ?? $application->reviewed_at ?? $application->created_at;
+            if ($creditedAtRaw === null) {
+                continue;
+            }
+
+            $creditedOn = \Carbon\CarbonImmutable::parse($creditedAtRaw)->startOfDay();
+            $creditBuckets[] = [
+                'credited_on' => $creditedOn,
+                'expires_on' => $creditedOn->addYearNoOverflow(),
+                'remaining' => $creditedDays,
+            ];
+        }
+
+        if ($creditBuckets === []) {
+            return 0.0;
+        }
+
+        $deductionApplications = LeaveApplication::query()
+            ->where('status', LeaveApplication::STATUS_APPROVED)
+            ->whereIn('erms_control_no', $controlNoCandidates)
+            ->where('leave_type_id', $ctoLeaveTypeId)
+            ->where(function ($query): void {
+                $query->where('is_monetization', true)
+                    ->orWhereRaw(
+                        'UPPER(LTRIM(RTRIM(COALESCE(pay_mode, ?)))) <> ?',
+                        [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY]
+                    );
+            })
+            ->orderBy('hr_approved_at')
+            ->orderBy('created_at')
+            ->orderBy('id')
+            ->get([
+                'id',
+                'total_days',
+                'deductible_days',
+                'hr_approved_at',
+                'created_at',
+                'is_monetization',
+                'pay_mode',
+            ]);
+
+        foreach ($deductionApplications as $application) {
+            if (!$application instanceof LeaveApplication) {
+                continue;
+            }
+
+            $creditsToDeduct = round((float) ($application->deductible_days ?? $application->total_days ?? 0), 2);
+            if ($creditsToDeduct <= 0) {
+                continue;
+            }
+
+            $deductedAtRaw = $application->hr_approved_at ?? $application->created_at;
+            if ($deductedAtRaw === null) {
+                continue;
+            }
+            $deductedOn = \Carbon\CarbonImmutable::parse($deductedAtRaw)->startOfDay();
+
+            // Credits remain usable through their expiration date.
+            $creditBuckets = array_values(array_filter(
+                $creditBuckets,
+                static fn(array $bucket): bool => $bucket['remaining'] > 0 && $bucket['expires_on']->gte($deductedOn)
+            ));
+
+            if ($creditBuckets === []) {
+                continue;
+            }
+
+            $remainingToDeduct = $creditsToDeduct;
+            foreach ($creditBuckets as &$bucket) {
+                if ($remainingToDeduct <= 0) {
+                    break;
+                }
+                if ($bucket['remaining'] <= 0) {
+                    continue;
+                }
+
+                $consumed = min((float) $bucket['remaining'], $remainingToDeduct);
+                $bucket['remaining'] = round((float) $bucket['remaining'] - $consumed, 2);
+                $remainingToDeduct = round($remainingToDeduct - $consumed, 2);
+            }
+            unset($bucket);
+        }
+
+        $available = 0.0;
+        foreach ($creditBuckets as $bucket) {
+            $remaining = round((float) ($bucket['remaining'] ?? 0), 2);
+            if ($remaining <= 0) {
+                continue;
+            }
+
+            if (($bucket['expires_on'] ?? null) instanceof \Carbon\CarbonImmutable && $bucket['expires_on']->lt($asOf)) {
+                continue;
+            }
+
+            $available += $remaining;
+        }
+
+        return round(max($available, 0.0), 2);
+    }
+
     private function resolveForcedLeaveTypeId(): ?int
     {
         $value = LeaveType::query()
@@ -3683,6 +4312,602 @@ class LeaveApplicationController extends Controller
 
         $leaveTypeName = trim((string) ($app->leaveType?->name ?? ''));
         return strcasecmp($leaveTypeName, 'Vacation Leave') === 0;
+    }
+
+    private function isSickLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
+    {
+        static $leaveTypeNameCache = [];
+
+        $leaveTypeName = null;
+        if ($leaveType instanceof LeaveType) {
+            $leaveTypeName = trim((string) ($leaveType->name ?? ''));
+        } elseif ($leaveTypeId !== null && $leaveTypeId > 0) {
+            if (!array_key_exists($leaveTypeId, $leaveTypeNameCache)) {
+                $leaveTypeNameCache[$leaveTypeId] = LeaveType::query()
+                    ->whereKey((int) $leaveTypeId)
+                    ->value('name');
+            }
+
+            $resolvedName = $leaveTypeNameCache[$leaveTypeId];
+            $leaveTypeName = is_string($resolvedName) ? trim($resolvedName) : null;
+        }
+
+        return strcasecmp((string) ($leaveTypeName ?? ''), 'Sick Leave') === 0;
+    }
+
+    private function resolveMedicalCertificateStateFromRequest(
+        Request $request,
+        array $validated,
+        ?bool $fallbackSubmitted = null,
+        ?string $fallbackReference = null
+    ): array {
+        $submitted = $fallbackSubmitted === true;
+        $reference = $this->trimNullableString($fallbackReference);
+
+        $booleanKeys = [
+            'medical_certificate_submitted',
+            'medical_certificate_attached',
+            'has_medical_certificate',
+            'with_medical_certificate',
+        ];
+        foreach ($booleanKeys as $key) {
+            if (!array_key_exists($key, $validated) && $request->input($key) === null) {
+                continue;
+            }
+
+            $flag = $this->normalizeBooleanFlag(
+                array_key_exists($key, $validated)
+                    ? $validated[$key]
+                    : $request->input($key)
+            );
+
+            if ($flag !== null) {
+                $submitted = $flag;
+            }
+        }
+
+        $referenceKeys = [
+            'medical_certificate_reference',
+        ];
+        foreach ($referenceKeys as $key) {
+            $candidate = $this->trimNullableString(
+                array_key_exists($key, $validated)
+                    ? $validated[$key]
+                    : $request->input($key)
+            );
+
+            if ($candidate !== null) {
+                $reference = $candidate;
+                $submitted = true;
+                break;
+            }
+        }
+
+        if ($request->hasFile('medical_certificate')) {
+            $uploadedFile = $request->file('medical_certificate');
+            if ($uploadedFile && $uploadedFile->isValid()) {
+                $reference = $uploadedFile->store('leave-medical-certificates');
+                $submitted = true;
+            }
+        }
+
+        if (!$submitted) {
+            $reference = null;
+        }
+
+        return [
+            'medical_certificate_submitted' => $submitted,
+            'medical_certificate_reference' => $reference,
+        ];
+    }
+
+    private function resolveMedicalCertificateStateFromPayload(
+        array $payload,
+        ?bool $fallbackSubmitted = null,
+        ?string $fallbackReference = null
+    ): array {
+        $submitted = $fallbackSubmitted === true;
+        $reference = $this->trimNullableString($fallbackReference);
+
+        $booleanKeys = [
+            'medical_certificate_submitted',
+            'medical_certificate_attached',
+            'has_medical_certificate',
+            'with_medical_certificate',
+        ];
+        foreach ($booleanKeys as $key) {
+            if (!array_key_exists($key, $payload)) {
+                continue;
+            }
+
+            $flag = $this->normalizeBooleanFlag($payload[$key]);
+            if ($flag !== null) {
+                $submitted = $flag;
+            }
+        }
+
+        $referenceKeys = [
+            'medical_certificate_reference',
+        ];
+        foreach ($referenceKeys as $key) {
+            if (!array_key_exists($key, $payload)) {
+                continue;
+            }
+
+            $candidate = $this->trimNullableString($payload[$key]);
+            if ($candidate !== null) {
+                $reference = $candidate;
+                $submitted = true;
+                break;
+            }
+        }
+
+        if (!$submitted) {
+            $reference = null;
+        }
+
+        return [
+            'medical_certificate_submitted' => $submitted,
+            'medical_certificate_reference' => $reference,
+        ];
+    }
+
+    private function applyRegularLeavePolicy(
+        LeaveType $leaveType,
+        float $totalDays,
+        ?array $selectedDates,
+        ?array $selectedDateCoverage,
+        ?array $selectedDatePayStatus,
+        string $payMode,
+        bool $isMonetization,
+        bool $medicalCertificateSubmitted = false,
+        ?string $medicalCertificateReference = null,
+        bool $enforceMedicalCertificate = true,
+        mixed $filedAt = null,
+        ?string $absenceStartDate = null,
+        ?string $absenceEndDate = null
+    ): array|JsonResponse {
+        $normalizedTotalDays = round(max((float) $totalDays, 0.0), 2);
+
+        if ($isMonetization) {
+            return [
+                'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
+                'selected_date_pay_status' => null,
+                'deductible_days' => $normalizedTotalDays,
+                'medical_certificate_required' => false,
+                'medical_certificate_submitted' => false,
+                'medical_certificate_reference' => null,
+            ];
+        }
+
+        $normalizedPayMode = $this->normalizePayMode($payMode, false);
+        $normalizedSelectedDatePayStatus = is_array($selectedDatePayStatus)
+            ? $selectedDatePayStatus
+            : null;
+        $normalizedSelectedDateCoverage = is_array($selectedDateCoverage)
+            ? $selectedDateCoverage
+            : null;
+
+        $isSickLeave = $this->isSickLeaveType($leaveType, (int) $leaveType->id);
+        $medicalCertificateRequired = $isSickLeave && $normalizedTotalDays >= 5.0;
+
+        if ($enforceMedicalCertificate && $medicalCertificateRequired && !$medicalCertificateSubmitted) {
+            return response()->json([
+                'message' => 'Medical certificate is required for Sick Leave applications of 5 days or more.',
+                'errors' => [
+                    'medical_certificate' => ['Medical certificate is required for Sick Leave applications of 5 days or more.'],
+                ],
+            ], 422);
+        }
+
+        if ($isSickLeave) {
+            $graceWindowPayMode = $this->resolveSickLeavePayModeFromFilingWindow(
+                $selectedDates,
+                $filedAt,
+                $absenceStartDate,
+                $absenceEndDate
+            );
+
+            if ($graceWindowPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
+                $normalizedPayMode = LeaveApplication::PAY_MODE_WITHOUT_PAY;
+                $normalizedSelectedDatePayStatus = null;
+            } else {
+                $normalizedSelectedDatePayStatus = $this->compactSelectedDatePayStatusMap(
+                    $normalizedSelectedDatePayStatus,
+                    $selectedDates,
+                    $normalizedPayMode
+                );
+            }
+
+            $deductibleDays = $this->computeDeductibleDays(
+                $normalizedTotalDays,
+                $selectedDates,
+                $normalizedSelectedDatePayStatus,
+                $normalizedSelectedDateCoverage,
+                false,
+                $normalizedPayMode
+            );
+        } else {
+            $normalizedSelectedDatePayStatus = $this->compactSelectedDatePayStatusMap(
+                $normalizedSelectedDatePayStatus,
+                $selectedDates,
+                $normalizedPayMode
+            );
+
+            $deductibleDays = $this->computeDeductibleDays(
+                $normalizedTotalDays,
+                $selectedDates,
+                $normalizedSelectedDatePayStatus,
+                $normalizedSelectedDateCoverage,
+                false,
+                $normalizedPayMode
+            );
+
+            $medicalCertificateSubmitted = false;
+            $medicalCertificateReference = null;
+            $medicalCertificateRequired = false;
+        }
+
+        if (!$medicalCertificateSubmitted) {
+            $medicalCertificateReference = null;
+        }
+
+        return [
+            'pay_mode' => $normalizedPayMode,
+            'selected_date_pay_status' => $normalizedSelectedDatePayStatus,
+            'deductible_days' => round(max((float) $deductibleDays, 0.0), 2),
+            'medical_certificate_required' => $medicalCertificateRequired,
+            'medical_certificate_submitted' => $medicalCertificateSubmitted,
+            'medical_certificate_reference' => $this->trimNullableString($medicalCertificateReference),
+        ];
+    }
+
+    private function resolveSickLeavePayModeFromFilingWindow(
+        ?array $selectedDates,
+        mixed $filedAt = null,
+        ?string $absenceStartDate = null,
+        ?string $absenceEndDate = null
+    ): string {
+        [$startDate, $lastAbsentDate] = $this->resolveSickLeaveAbsenceDateRange($selectedDates);
+        if ($absenceStartDate !== null) {
+            $startDate = $this->resolveIsoDate($absenceStartDate) ?? $startDate;
+        }
+        if ($absenceEndDate !== null) {
+            $lastAbsentDate = $this->resolveIsoDate($absenceEndDate) ?? $lastAbsentDate;
+        }
+        if (!$startDate || !$lastAbsentDate) {
+            return LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+
+        $filedDate = $this->resolvePolicyFilingDate($filedAt);
+        if ($filedDate->lt($startDate)) {
+            return LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+
+        $workingDaysElapsed = $this->countWorkingDaysFromNextDay($lastAbsentDate, $filedDate);
+        return $workingDaysElapsed <= 5
+            ? LeaveApplication::PAY_MODE_WITH_PAY
+            : LeaveApplication::PAY_MODE_WITHOUT_PAY;
+    }
+
+    private function resolveSickLeaveAbsenceDateRange(?array $selectedDates): array
+    {
+        if (!is_array($selectedDates) || $selectedDates === []) {
+            return [null, null];
+        }
+
+        $earliest = null;
+        $latest = null;
+
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = trim((string) $rawDate);
+            if ($dateKey === '') {
+                continue;
+            }
+
+            try {
+                $parsed = \Carbon\CarbonImmutable::parse($dateKey)->startOfDay();
+            } catch (\Throwable) {
+                continue;
+            }
+
+            if ($earliest === null || $parsed->lt($earliest)) {
+                $earliest = $parsed;
+            }
+
+            if ($latest === null || $parsed->gt($latest)) {
+                $latest = $parsed;
+            }
+        }
+
+        return [$earliest, $latest];
+    }
+
+    private function resolveIsoDate(?string $rawDate): ?\Carbon\CarbonImmutable
+    {
+        $raw = trim((string) ($rawDate ?? ''));
+        if ($raw === '') {
+            return null;
+        }
+
+        try {
+            return \Carbon\CarbonImmutable::parse($raw)->startOfDay();
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function resolvePolicyFilingDate(mixed $filedAt = null): \Carbon\CarbonImmutable
+    {
+        if ($filedAt instanceof \DateTimeInterface) {
+            return \Carbon\CarbonImmutable::instance($filedAt)->startOfDay();
+        }
+
+        $raw = trim((string) ($filedAt ?? ''));
+        if ($raw !== '') {
+            try {
+                return \Carbon\CarbonImmutable::parse($raw)->startOfDay();
+            } catch (\Throwable) {
+                // Fall back to now() when parsing fails.
+            }
+        }
+
+        return \Carbon\CarbonImmutable::now()->startOfDay();
+    }
+
+    private function countWorkingDaysFromNextDay(
+        \Carbon\CarbonImmutable $lastAbsentDate,
+        \Carbon\CarbonImmutable $filedDate
+    ): int {
+        if ($filedDate->lte($lastAbsentDate)) {
+            return 0;
+        }
+
+        $count = 0;
+        $cursor = $lastAbsentDate->addDay()->startOfDay();
+        $end = $filedDate->startOfDay();
+
+        while ($cursor->lte($end)) {
+            if ($cursor->isWeekday()) {
+                $count++;
+            }
+
+            $cursor = $cursor->addDay();
+        }
+
+        return $count;
+    }
+
+    private function buildSickLeavePayStatusOverrides(
+        ?array $selectedDates,
+        ?array $selectedDateCoverage,
+        float $totalDays,
+        float $withPayCap = 5.0
+    ): ?array {
+        if (!is_array($selectedDates) || $selectedDates === []) {
+            return null;
+        }
+
+        $resolvedDates = [];
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = trim((string) $rawDate);
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $resolvedDates[$dateKey] = true;
+        }
+
+        $resolvedDates = array_keys($resolvedDates);
+        sort($resolvedDates);
+
+        if ($resolvedDates === []) {
+            return null;
+        }
+
+        $coverageWeights = $this->resolveDateCoverageWeights(
+            $resolvedDates,
+            $selectedDateCoverage,
+            $totalDays
+        );
+
+        $remainingWithPay = round(max($withPayCap, 0.0), 2);
+        $statusOverrides = [];
+
+        foreach ($resolvedDates as $dateKey) {
+            $weight = round(max((float) ($coverageWeights[$dateKey] ?? 1.0), 0.0), 2);
+            if ($weight <= 0) {
+                $statusOverrides[$dateKey] = LeaveApplication::PAY_MODE_WITHOUT_PAY;
+                continue;
+            }
+
+            if ($remainingWithPay <= 0.0) {
+                $statusOverrides[$dateKey] = LeaveApplication::PAY_MODE_WITHOUT_PAY;
+                continue;
+            }
+
+            if ($remainingWithPay + 1e-9 < $weight) {
+                $statusOverrides[$dateKey] = LeaveApplication::PAY_MODE_WITHOUT_PAY;
+                continue;
+            }
+
+            $statusOverrides[$dateKey] = LeaveApplication::PAY_MODE_WITH_PAY;
+            $remainingWithPay = round(max($remainingWithPay - $weight, 0.0), 2);
+        }
+
+        return $statusOverrides;
+    }
+
+    private function resolveCreditBasedPayAllocation(
+        ?array $selectedDates,
+        ?array $selectedDateCoverage,
+        float $totalDays,
+        float $availableCredits,
+        ?array $preferredSelectedDatePayStatus = null
+    ): array {
+        $normalizedTotalDays = round(max($totalDays, 0.0), 2);
+        $normalizedAvailableCredits = round(max($availableCredits, 0.0), 2);
+
+        if ($normalizedTotalDays <= 0.0 || $normalizedAvailableCredits <= 0.0) {
+            return [
+                'pay_mode' => LeaveApplication::PAY_MODE_WITHOUT_PAY,
+                'selected_date_pay_status' => null,
+                'deductible_days' => 0.0,
+            ];
+        }
+
+        if ($normalizedAvailableCredits + 1e-9 >= $normalizedTotalDays) {
+            return [
+                'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
+                'selected_date_pay_status' => $this->compactSelectedDatePayStatusMap(
+                    $preferredSelectedDatePayStatus,
+                    $selectedDates,
+                    LeaveApplication::PAY_MODE_WITH_PAY
+                ),
+                'deductible_days' => $normalizedTotalDays,
+            ];
+        }
+
+        $preferredCompactedPayStatus = $this->compactSelectedDatePayStatusMap(
+            $preferredSelectedDatePayStatus,
+            $selectedDates,
+            LeaveApplication::PAY_MODE_WITH_PAY
+        );
+        if ($preferredCompactedPayStatus !== null) {
+            $preferredDeductibleDays = $this->computeDeductibleDays(
+                $normalizedTotalDays,
+                $selectedDates,
+                $preferredCompactedPayStatus,
+                $selectedDateCoverage,
+                false,
+                LeaveApplication::PAY_MODE_WITH_PAY
+            );
+
+            if ($preferredDeductibleDays <= $normalizedAvailableCredits + 1e-9) {
+                if ($preferredDeductibleDays <= 0.0) {
+                    return [
+                        'pay_mode' => LeaveApplication::PAY_MODE_WITHOUT_PAY,
+                        'selected_date_pay_status' => null,
+                        'deductible_days' => 0.0,
+                    ];
+                }
+
+                return [
+                    'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
+                    'selected_date_pay_status' => $preferredCompactedPayStatus,
+                    'deductible_days' => round(min($preferredDeductibleDays, $normalizedTotalDays), 2),
+                ];
+            }
+        }
+
+        if (!is_array($selectedDates) || $selectedDates === []) {
+            return [
+                'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
+                'selected_date_pay_status' => null,
+                'deductible_days' => $normalizedAvailableCredits,
+            ];
+        }
+
+        $payStatusOverrides = $this->buildSickLeavePayStatusOverrides(
+            $selectedDates,
+            $selectedDateCoverage,
+            $normalizedTotalDays,
+            $normalizedAvailableCredits
+        );
+        $compactedPayStatusOverrides = $this->compactSelectedDatePayStatusMap(
+            $payStatusOverrides,
+            $selectedDates,
+            LeaveApplication::PAY_MODE_WITH_PAY
+        );
+
+        $deductibleDays = $this->computeDeductibleDays(
+            $normalizedTotalDays,
+            $selectedDates,
+            $compactedPayStatusOverrides,
+            $selectedDateCoverage,
+            false,
+            LeaveApplication::PAY_MODE_WITH_PAY
+        );
+
+        if ($deductibleDays > $normalizedAvailableCredits) {
+            $deductibleDays = $normalizedAvailableCredits;
+        }
+
+        if ($deductibleDays <= 0.0) {
+            return [
+                'pay_mode' => LeaveApplication::PAY_MODE_WITHOUT_PAY,
+                'selected_date_pay_status' => null,
+                'deductible_days' => 0.0,
+            ];
+        }
+
+        return [
+            'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
+            'selected_date_pay_status' => $compactedPayStatusOverrides,
+            'deductible_days' => round(min($deductibleDays, $normalizedTotalDays), 2),
+        ];
+    }
+
+    private function resolveDateCoverageWeights(
+        array $selectedDates,
+        ?array $selectedDateCoverage,
+        float $totalDays
+    ): array {
+        $resolvedDates = [];
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = trim((string) $rawDate);
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $resolvedDates[$dateKey] = true;
+        }
+
+        $resolvedDates = array_keys($resolvedDates);
+        sort($resolvedDates);
+
+        if ($resolvedDates === []) {
+            return [];
+        }
+
+        $coverageMap = is_array($selectedDateCoverage) ? $selectedDateCoverage : [];
+        $hasCoverageOverrides = $coverageMap !== [];
+
+        $defaultCoverageWeight = 1.0;
+        $dateCount = count($resolvedDates);
+        if ($dateCount > 0) {
+            $halfMatch = abs(($dateCount * 0.5) - $totalDays) < 0.00001;
+            $wholeMatch = abs(((float) $dateCount) - $totalDays) < 0.00001;
+            if ($halfMatch) {
+                $defaultCoverageWeight = 0.5;
+            } elseif (!$wholeMatch) {
+                $defaultCoverageWeight = max(min($totalDays / $dateCount, 1.0), 0.5);
+            }
+        }
+
+        $weights = [];
+        foreach ($resolvedDates as $dateKey) {
+            $hasCoverageValue = array_key_exists($dateKey, $coverageMap);
+            $coverage = strtolower(trim((string) ($coverageMap[$dateKey] ?? '')));
+            if ($coverage === 'half') {
+                $weights[$dateKey] = 0.5;
+                continue;
+            }
+
+            if ($coverage === 'whole') {
+                $weights[$dateKey] = 1.0;
+                continue;
+            }
+
+            if ($hasCoverageOverrides && !$hasCoverageValue) {
+                $weights[$dateKey] = 1.0;
+                continue;
+            }
+
+            $weights[$dateKey] = $defaultCoverageWeight;
+        }
+
+        return $weights;
     }
 
     private function normalizePayMode(mixed $payMode, bool $isMonetization = false): string
@@ -4267,24 +5492,25 @@ class LeaveApplicationController extends Controller
             || $requiredBalanceDays <= 0
             || $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
         ) {
-            return ['leave_type' => $leaveType, 'balance' => null];
+            return [
+                'leave_type' => $leaveType,
+                'balance' => null,
+                'available_balance' => null,
+                'pending_reserved_days' => 0.0,
+                'required_balance_days' => $requiredBalanceDays,
+                'insufficient_balance' => false,
+            ];
+        }
+
+        if ($this->isCtoLeaveType($leaveType, (int) $leaveTypeId)) {
+            $this->syncEmployeeCtoBalance($employeeControlNo);
         }
 
         $balance = LeaveBalance::query()
             ->where('leave_type_id', $leaveTypeId)
             ->whereIn('employee_id', $this->controlNoCandidates($employeeControlNo))
             ->first();
-
-        if (!$balance) {
-            return response()->json([
-                'message' => "{$leaveType->name} is not available for this employee.",
-                'errors' => [
-                    'leave_type_id' => ["{$leaveType->name} is not available for this employee."],
-                ],
-            ], 422);
-        }
-
-        $currentBalance = (float) $balance->balance;
+        $currentBalance = $balance ? (float) $balance->balance : 0.0;
         $pendingReservedDays = (float) LeaveApplication::query()
             ->where('leave_type_id', $leaveTypeId)
             ->whereIn('status', [
@@ -4302,26 +5528,15 @@ class LeaveApplicationController extends Controller
             ->sum(DB::raw('COALESCE(deductible_days, total_days)'));
 
         $availableBalance = max(round($currentBalance - $pendingReservedDays, 2), 0.0);
-
-        if ($availableBalance < $requiredBalanceDays) {
-            $fmtAvail = self::formatDays($availableBalance);
-            $fmtReq = self::formatDays($requiredBalanceDays);
-            $fmtCurrent = self::formatDays($currentBalance);
-            $fmtPending = self::formatDays($pendingReservedDays);
-
-            return response()->json([
-                'message' => "Insufficient leave balance. You have {$fmtAvail} available (current {$fmtCurrent}, pending {$fmtPending}) but requested {$fmtReq}.",
-                'errors' => [
-                    'total_days' => ["Insufficient leave balance. Available: {$fmtAvail}."],
-                ],
-            ], 422);
-        }
+        $insufficientBalance = $availableBalance + 1e-9 < $requiredBalanceDays;
 
         return [
             'leave_type' => $leaveType,
             'balance' => $currentBalance,
             'available_balance' => $availableBalance,
             'pending_reserved_days' => $pendingReservedDays,
+            'required_balance_days' => $requiredBalanceDays,
+            'insufficient_balance' => $insufficientBalance,
         ];
     }
 
@@ -4388,6 +5603,9 @@ class LeaveApplicationController extends Controller
             'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
             'without_pay' => $withoutPay,
             'with_pay' => !$withoutPay,
+            'medical_certificate_required' => (bool) ($app->medical_certificate_required ?? false),
+            'medical_certificate_submitted' => (bool) ($app->medical_certificate_submitted ?? false),
+            'medical_certificate_reference' => $this->trimNullableString($app->medical_certificate_reference ?? null),
             'is_monetization' => (bool) $app->is_monetization,
             'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
             'deductible_days' => $deductibleDays,
@@ -4424,10 +5642,16 @@ class LeaveApplicationController extends Controller
     private function getApplicationLeaveBalanceSnapshot(LeaveApplication $app): array
     {
         static $balanceSnapshotCache = [];
+        static $ctoSyncedControlNos = [];
 
         $lookupControlNo = $this->resolveApplicationBalanceLookupControlNo($app);
         if ($lookupControlNo === null) {
             return [];
+        }
+
+        if (!array_key_exists($lookupControlNo, $ctoSyncedControlNos)) {
+            $this->syncEmployeeCtoBalance($lookupControlNo);
+            $ctoSyncedControlNos[$lookupControlNo] = true;
         }
 
         if (array_key_exists($lookupControlNo, $balanceSnapshotCache)) {

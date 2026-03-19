@@ -66,11 +66,11 @@ class LeaveTypeSeeder extends Seeder
                 'category' => 'RESETTABLE',
                 'accrual_rate' => null,
                 'accrual_day_of_month' => null,
-                'max_days' => 3,
+                'max_days' => 5,
                 'is_credit_based' => true,
                 'resets_yearly' => true,
                 'requires_documents' => false,
-                'description' => '3 days per year. Resets every January 1.',
+                'description' => '5 days per year. Resets every January 1.',
             ],
             [
                 'name' => 'Solo Parent Leave',

@@ -27,7 +27,6 @@ class AuthController extends Controller
             : null;
 
         $token = DB::transaction(function () use ($account, $tokenExpiresAt) {
-            $account->tokens()->delete();
             return $account->createToken('auth-token', ['*'], $tokenExpiresAt)->plainTextToken;
         });
 
