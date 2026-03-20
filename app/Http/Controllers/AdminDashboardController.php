@@ -118,6 +118,7 @@ class AdminDashboardController extends Controller
         }
 
         $leaveInitialized = $this->resolveLeaveInitializedState($admin);
+        $adminSalary = $this->resolveAdminEmployeeSalary($admin);
 
         $balances = $this->queryAdminEmployeeBalances($admin)
             ->with('leaveType')
@@ -163,6 +164,7 @@ class AdminDashboardController extends Controller
 
         return response()->json([
             'leave_initialized' => $leaveInitialized,
+            'salary' => $adminSalary,
             'accrued' => $accrued,
             'resettable' => $resettable,
             'event_based' => $eventBased,
@@ -266,7 +268,6 @@ class AdminDashboardController extends Controller
                     ],
                     [
                         'balance' => (float) $value,
-                        'initialized_at' => $now,
                         'year' => $now->year,
                     ]
                 );
@@ -299,6 +300,7 @@ class AdminDashboardController extends Controller
             'leave_type_id' => $leaveType->id,
             'leave_type_name' => $leaveType->name,
             'balance' => $balance ? (float) $balance->balance : 0,
+            'salary' => $this->resolveAdminEmployeeSalary($admin),
         ]);
     }
 
@@ -344,6 +346,7 @@ class AdminDashboardController extends Controller
     public function storeSelfLeave(Request $request): JsonResponse
     {
         $this->normalizeSelectedDatesInput($request);
+        $this->normalizeSelectedDatePolicyInput($request);
 
         $admin = $request->user();
         if (!$admin instanceof DepartmentAdmin) {
@@ -362,9 +365,14 @@ class AdminDashboardController extends Controller
             'start_date' => 'required|date',
             'end_date' => 'required|date|after_or_equal:start_date',
             'total_days' => 'required|numeric|min:0.5',
-            'reason' => 'required|string',
+            'reason' => ['nullable', 'string', 'max:2000'],
             'selected_dates' => ['nullable', 'array'],
             'selected_dates.*' => ['date'],
+            'selected_date_pay_status' => ['nullable', 'array'],
+            'selected_date_pay_status.*' => ['nullable', 'string', 'in:WP,WOP'],
+            'selected_date_coverage' => ['nullable', 'array'],
+            'selected_date_coverage.*' => ['nullable', 'string', 'in:whole,half'],
+            'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
             'medical_certificate' => ['nullable', 'file', 'max:10240'],
             'medical_certificate_submitted' => ['nullable', 'boolean'],
@@ -375,6 +383,29 @@ class AdminDashboardController extends Controller
         ]);
 
         $requestedPayMode = $this->normalizePayMode($validated['pay_mode'] ?? null);
+        $requestedTotalDays = round((float) $validated['total_days'], 2);
+        $resolvedSelectedDates = LeaveApplication::resolveSelectedDates(
+            $validated['start_date'],
+            $validated['end_date'],
+            is_array($validated['selected_dates'] ?? null) ? $validated['selected_dates'] : null,
+            $requestedTotalDays
+        );
+        $selectedDatePayStatus = $this->compactSelectedDatePayStatusMap(
+            $this->normalizeSelectedDatePayStatusMap($validated['selected_date_pay_status'] ?? null),
+            $resolvedSelectedDates,
+            $requestedPayMode
+        );
+        $selectedDateCoverage = $this->compactSelectedDateCoverageMap(
+            $this->normalizeSelectedDateCoverageMap($validated['selected_date_coverage'] ?? null),
+            $resolvedSelectedDates
+        );
+        $requestedDeductibleDays = $this->resolveRequestedDeductibleDays(
+            $resolvedSelectedDates,
+            $selectedDateCoverage,
+            $selectedDatePayStatus,
+            $requestedPayMode,
+            $requestedTotalDays
+        );
 
         $leaveType = LeaveType::find($validated['leave_type_id']);
 
@@ -396,12 +427,36 @@ class AdminDashboardController extends Controller
             ], 422);
         }
 
+        $isForcedLeave = strcasecmp(trim((string) $leaveType->name), 'Mandatory / Forced Leave') === 0;
+        if ($isForcedLeave) {
+            $vacationLeaveTypeId = LeaveType::query()
+                ->whereRaw('LOWER(name) = ?', ['vacation leave'])
+                ->value('id');
+            if ($vacationLeaveTypeId !== null) {
+                $vacationBalance = $this->findAdminEmployeeBalanceByLeaveType($admin, (int) $vacationLeaveTypeId);
+                $availableVacationBalance = $vacationBalance ? (float) $vacationBalance->balance : 0.0;
+                if ($availableVacationBalance + 1e-9 < $requestedTotalDays) {
+                    return response()->json([
+                        'message' => 'Insufficient Vacation Leave balance to apply Mandatory / Forced Leave.',
+                        'errors' => [
+                            'leave_type_id' => ['Mandatory / Forced Leave requires enough Vacation Leave balance.'],
+                            'vacation_leave_balance' => [
+                                'Available Vacation Leave is '
+                                . self::formatDays($availableVacationBalance)
+                                . ', but '
+                                . self::formatDays($requestedTotalDays)
+                                . ' is required.',
+                            ],
+                        ],
+                        'available_vacation_leave_days' => $availableVacationBalance,
+                        'required_vacation_leave_days' => $requestedTotalDays,
+                    ], 422);
+                }
+            }
+        }
+
         $medicalCertificateState = $this->resolveMedicalCertificateStateFromRequest($request, $validated);
-        $requestedTotalDays = round((float) $validated['total_days'], 2);
         $isSickLeave = $this->isSickLeaveType($leaveType);
-        $selectedDates = is_array($validated['selected_dates'] ?? null)
-            ? $validated['selected_dates']
-            : (is_array($request->input('selected_dates')) ? $request->input('selected_dates') : null);
         $medicalCertificateRequired = $isSickLeave && $requestedTotalDays >= 5.0;
         if ($medicalCertificateRequired && !(bool) ($medicalCertificateState['medical_certificate_submitted'] ?? false)) {
             return response()->json([
@@ -414,7 +469,7 @@ class AdminDashboardController extends Controller
 
         if ($isSickLeave) {
             $graceWindowPayMode = $this->resolveSickLeavePayModeFromFilingWindow(
-                $selectedDates,
+                $resolvedSelectedDates,
                 $request->input('date_filed') ?? now(),
                 (string) $validated['start_date'],
                 (string) $validated['end_date']
@@ -422,12 +477,17 @@ class AdminDashboardController extends Controller
 
             if ($graceWindowPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
                 $requestedPayMode = LeaveApplication::PAY_MODE_WITHOUT_PAY;
+                $requestedDeductibleDays = 0.0;
+                $selectedDatePayStatus = $this->applyUniformSelectedDatePayStatus(
+                    $resolvedSelectedDates,
+                    LeaveApplication::PAY_MODE_WITHOUT_PAY
+                );
             }
         }
 
         $deductibleDays = $requestedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
             ? 0.0
-            : $requestedTotalDays;
+            : $requestedDeductibleDays;
         $autoConvertedToWop = false;
         $autoWithoutPayDays = 0.0;
 
@@ -440,16 +500,48 @@ class AdminDashboardController extends Controller
             $currentBalance = $balance ? (float) $balance->balance : 0.0;
 
             if ($currentBalance + 1e-9 < $deductibleDays) {
-                $deductibleDays = round(min($requestedTotalDays, max($currentBalance, 0.0)), 2);
-                $requestedPayMode = $deductibleDays <= 0
-                    ? LeaveApplication::PAY_MODE_WITHOUT_PAY
-                    : LeaveApplication::PAY_MODE_WITH_PAY;
-                $autoWithoutPayDays = round(max($requestedTotalDays - $deductibleDays, 0.0), 2);
+                $targetDeductibleDays = round(min($deductibleDays, max($currentBalance, 0.0)), 2);
+                $autoWithoutPayDays = round(max($deductibleDays - $targetDeductibleDays, 0.0), 2);
                 $autoConvertedToWop = $autoWithoutPayDays > 0;
+                $deductibleDays = $targetDeductibleDays;
+
+                if (is_array($resolvedSelectedDates) && $resolvedSelectedDates !== []) {
+                    $selectedDatePayStatus = $this->rebalanceSelectedDatePayStatusToDeductibleDays(
+                        $resolvedSelectedDates,
+                        $selectedDateCoverage,
+                        $selectedDatePayStatus,
+                        $deductibleDays
+                    );
+                }
             }
         }
 
+        $requestedPayMode = $this->resolvePayModeFromSelectedDatePayStatus(
+            $resolvedSelectedDates,
+            $selectedDatePayStatus,
+            $deductibleDays
+        );
+        if ($requestedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
+            $deductibleDays = 0.0;
+        }
+
         $adminEmployeeControlNo = $this->resolveAdminEmployeeControlNo($admin);
+        if (!$adminEmployeeControlNo) {
+            return response()->json([
+                'message' => 'Admin employee record not found.',
+            ], 422);
+        }
+
+        $duplicateDateValidation = $this->validateNoDuplicateLeaveDates(
+            $adminEmployeeControlNo,
+            (string) $validated['start_date'],
+            (string) $validated['end_date'],
+            $resolvedSelectedDates,
+            $requestedTotalDays
+        );
+        if ($duplicateDateValidation instanceof JsonResponse) {
+            return $duplicateDateValidation;
+        }
 
         // 3. Create the application
         $application = DB::transaction(function () use (
@@ -459,6 +551,9 @@ class AdminDashboardController extends Controller
             $adminEmployeeControlNo,
             $requestedPayMode,
             $deductibleDays,
+            $resolvedSelectedDates,
+            $selectedDatePayStatus,
+            $selectedDateCoverage,
             $medicalCertificateRequired,
             $medicalCertificateState
         ) {
@@ -470,8 +565,11 @@ class AdminDashboardController extends Controller
                 'end_date' => $validated['end_date'],
                 'total_days' => $validated['total_days'],
                 'deductible_days' => $deductibleDays,
-                'reason' => $validated['reason'],
-                'selected_dates' => $validated['selected_dates'] ?? null,
+                'reason' => $validated['reason'] ?? null,
+                'selected_dates' => $resolvedSelectedDates,
+                'selected_date_pay_status' => $selectedDatePayStatus !== [] ? $selectedDatePayStatus : null,
+                'selected_date_coverage' => $selectedDateCoverage !== [] ? $selectedDateCoverage : null,
+                'commutation' => $validated['commutation'] ?? 'Not Requested',
                 'pay_mode' => $requestedPayMode,
                 'medical_certificate_required' => $medicalCertificateRequired,
                 'medical_certificate_submitted' => (bool) ($medicalCertificateState['medical_certificate_submitted'] ?? false),
@@ -564,7 +662,10 @@ class AdminDashboardController extends Controller
 
         $equivalentAmount = null;
         $salary = $request->input('salary');
-        if ($salary && is_numeric($salary) && (float) $salary > 0) {
+        if (!is_numeric($salary) || (float) $salary <= 0) {
+            $salary = $this->resolveAdminEmployeeSalary($admin);
+        }
+        if (is_numeric($salary) && (float) $salary > 0) {
             $dailyRate = (float) $salary / 22;
             $equivalentAmount = round($requestedDays * $dailyRate, 2);
         }
@@ -1460,6 +1561,28 @@ class AdminDashboardController extends Controller
         return $rawControlNo;
     }
 
+    private function resolveAdminEmployee(DepartmentAdmin $admin): ?Employee
+    {
+        $employeeControlNo = $this->resolveAdminEmployeeControlNo($admin);
+        if ($employeeControlNo === null) {
+            return null;
+        }
+
+        return Employee::query()
+            ->matchingControlNo($employeeControlNo)
+            ->first();
+    }
+
+    private function resolveAdminEmployeeSalary(DepartmentAdmin $admin): ?float
+    {
+        $employee = $this->resolveAdminEmployee($admin);
+        if (!$employee || $employee->rate_mon === null) {
+            return null;
+        }
+
+        return round((float) $employee->rate_mon, 2);
+    }
+
     private function buildControlNoCandidates(?string $controlNo): array
     {
         $controlNo = trim((string) $controlNo);
@@ -1506,5 +1629,387 @@ class AdminDashboardController extends Controller
         if ($selectedDates !== null && $selectedDates !== '') {
             $request->merge(['selected_dates' => $selectedDates]);
         }
+    }
+
+    private function normalizeSelectedDatePolicyInput(Request $request): void
+    {
+        $selectedDatePayStatus = $request->input('selected_date_pay_status');
+        if ($selectedDatePayStatus === null || $selectedDatePayStatus === '') {
+            $selectedDatePayStatus = $request->input('selected_date_pay_status_codes');
+        }
+        if ($selectedDatePayStatus === null || $selectedDatePayStatus === '') {
+            $selectedDatePayStatus = $request->input('selected_date_pay_statuses');
+        }
+        if (is_string($selectedDatePayStatus)) {
+            $decoded = json_decode($selectedDatePayStatus, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                $selectedDatePayStatus = $decoded;
+            }
+        }
+        $normalizedPayStatus = $this->normalizeSelectedDatePayStatusMap($selectedDatePayStatus);
+        if ($normalizedPayStatus !== []) {
+            $request->merge(['selected_date_pay_status' => $normalizedPayStatus]);
+        }
+
+        $selectedDateCoverage = $request->input('selected_date_coverage');
+        if ($selectedDateCoverage === null || $selectedDateCoverage === '') {
+            $selectedDateCoverage = $request->input('selected_date_coverages');
+        }
+        if (is_string($selectedDateCoverage)) {
+            $decoded = json_decode($selectedDateCoverage, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                $selectedDateCoverage = $decoded;
+            }
+        }
+
+        if (($selectedDateCoverage === null || $selectedDateCoverage === '') && is_array($request->input('selected_date_durations'))) {
+            $selectedDateCoverage = [];
+            foreach ($request->input('selected_date_durations') as $date => $duration) {
+                $selectedDateCoverage[$date] = strtolower(trim((string) $duration)) === 'half_day' ? 'half' : 'whole';
+            }
+        }
+
+        $normalizedCoverage = $this->normalizeSelectedDateCoverageMap($selectedDateCoverage);
+        if ($normalizedCoverage !== []) {
+            $request->merge(['selected_date_coverage' => $normalizedCoverage]);
+        }
+    }
+
+    private function normalizeSelectedDateMapKey(mixed $value): ?string
+    {
+        $raw = trim((string) $value);
+        if ($raw === '') {
+            return null;
+        }
+
+        try {
+            return CarbonImmutable::parse($raw)->toDateString();
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function normalizeSelectedDatePayStatusValue(mixed $value): ?string
+    {
+        $token = strtoupper(str_replace([' ', '-'], '_', trim((string) $value)));
+
+        return match ($token) {
+            LeaveApplication::PAY_MODE_WITH_PAY,
+            'WITH_PAY',
+            'WITHPAY' => LeaveApplication::PAY_MODE_WITH_PAY,
+            LeaveApplication::PAY_MODE_WITHOUT_PAY,
+            'WITHOUT_PAY',
+            'WITHOUTPAY' => LeaveApplication::PAY_MODE_WITHOUT_PAY,
+            default => null,
+        };
+    }
+
+    private function normalizeSelectedDateCoverageValue(mixed $value): ?string
+    {
+        $token = strtolower(str_replace([' ', '-'], '_', trim((string) $value)));
+
+        return match ($token) {
+            'whole',
+            'whole_day',
+            'wholeday' => 'whole',
+            'half',
+            'half_day',
+            'halfday' => 'half',
+            default => null,
+        };
+    }
+
+    private function normalizeSelectedDatePayStatusMap(mixed $value): array
+    {
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                $value = $decoded;
+            }
+        }
+
+        if (!is_array($value)) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach ($value as $rawDate => $rawStatus) {
+            $dateKey = $this->normalizeSelectedDateMapKey($rawDate);
+            $status = $this->normalizeSelectedDatePayStatusValue($rawStatus);
+            if ($dateKey === null || $status === null) {
+                continue;
+            }
+
+            $normalized[$dateKey] = $status;
+        }
+
+        ksort($normalized);
+        return $normalized;
+    }
+
+    private function normalizeSelectedDateCoverageMap(mixed $value): array
+    {
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                $value = $decoded;
+            }
+        }
+
+        if (!is_array($value)) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach ($value as $rawDate => $rawCoverage) {
+            $dateKey = $this->normalizeSelectedDateMapKey($rawDate);
+            $coverage = $this->normalizeSelectedDateCoverageValue($rawCoverage);
+            if ($dateKey === null || $coverage === null) {
+                continue;
+            }
+
+            $normalized[$dateKey] = $coverage;
+        }
+
+        ksort($normalized);
+        return $normalized;
+    }
+
+    private function compactSelectedDatePayStatusMap(
+        array $selectedDatePayStatus,
+        ?array $selectedDates,
+        string $fallbackPayMode = LeaveApplication::PAY_MODE_WITH_PAY
+    ): array {
+        if (!is_array($selectedDates) || $selectedDates === []) {
+            return [];
+        }
+
+        $defaultStatus = $this->normalizePayMode($fallbackPayMode) === LeaveApplication::PAY_MODE_WITHOUT_PAY
+            ? LeaveApplication::PAY_MODE_WITHOUT_PAY
+            : LeaveApplication::PAY_MODE_WITH_PAY;
+
+        $resolved = [];
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeSelectedDateMapKey($rawDate);
+            if ($dateKey === null) {
+                continue;
+            }
+
+            $resolved[$dateKey] = $selectedDatePayStatus[$dateKey] ?? $defaultStatus;
+        }
+
+        ksort($resolved);
+        return $resolved;
+    }
+
+    private function compactSelectedDateCoverageMap(array $selectedDateCoverage, ?array $selectedDates): array
+    {
+        if (!is_array($selectedDates) || $selectedDates === []) {
+            return [];
+        }
+
+        $resolved = [];
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeSelectedDateMapKey($rawDate);
+            if ($dateKey === null) {
+                continue;
+            }
+
+            $resolved[$dateKey] = $selectedDateCoverage[$dateKey] ?? 'whole';
+        }
+
+        ksort($resolved);
+        return $resolved;
+    }
+
+    private function resolveCoverageDurationDays(mixed $coverage): float
+    {
+        return $this->normalizeSelectedDateCoverageValue($coverage) === 'half' ? 0.5 : 1.0;
+    }
+
+    private function resolveRequestedDeductibleDays(
+        ?array $selectedDates,
+        array $selectedDateCoverage,
+        array $selectedDatePayStatus,
+        string $requestedPayMode,
+        float $requestedTotalDays
+    ): float {
+        if ($this->normalizePayMode($requestedPayMode) === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
+            return 0.0;
+        }
+
+        if (!is_array($selectedDates) || $selectedDates === []) {
+            return round(max($requestedTotalDays, 0.0), 2);
+        }
+
+        $deductible = 0.0;
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeSelectedDateMapKey($rawDate);
+            if ($dateKey === null) {
+                continue;
+            }
+
+            $payStatus = $selectedDatePayStatus[$dateKey] ?? LeaveApplication::PAY_MODE_WITH_PAY;
+            if ($payStatus === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
+                continue;
+            }
+
+            $deductible += $this->resolveCoverageDurationDays($selectedDateCoverage[$dateKey] ?? 'whole');
+        }
+
+        $deductible = round(max($deductible, 0.0), 2);
+        if ($requestedTotalDays > 0 && $deductible > $requestedTotalDays) {
+            $deductible = $requestedTotalDays;
+        }
+
+        return $deductible;
+    }
+
+    private function applyUniformSelectedDatePayStatus(?array $selectedDates, string $payMode): array
+    {
+        if (!is_array($selectedDates) || $selectedDates === []) {
+            return [];
+        }
+
+        $normalizedPayMode = $this->normalizePayMode($payMode);
+        $resolved = [];
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeSelectedDateMapKey($rawDate);
+            if ($dateKey === null) {
+                continue;
+            }
+
+            $resolved[$dateKey] = $normalizedPayMode;
+        }
+
+        ksort($resolved);
+        return $resolved;
+    }
+
+    private function rebalanceSelectedDatePayStatusToDeductibleDays(
+        array $selectedDates,
+        array $selectedDateCoverage,
+        array $selectedDatePayStatus,
+        float $targetDeductibleDays
+    ): array {
+        if ($selectedDates === []) {
+            return [];
+        }
+
+        $remainingDeductible = round(max($targetDeductibleDays, 0.0), 2);
+        $adjusted = [];
+
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeSelectedDateMapKey($rawDate);
+            if ($dateKey === null) {
+                continue;
+            }
+
+            $currentStatus = $selectedDatePayStatus[$dateKey] ?? LeaveApplication::PAY_MODE_WITH_PAY;
+            if ($currentStatus === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
+                $adjusted[$dateKey] = LeaveApplication::PAY_MODE_WITHOUT_PAY;
+                continue;
+            }
+
+            $durationDays = $this->resolveCoverageDurationDays($selectedDateCoverage[$dateKey] ?? 'whole');
+            if ($remainingDeductible + 1e-9 >= $durationDays) {
+                $adjusted[$dateKey] = LeaveApplication::PAY_MODE_WITH_PAY;
+                $remainingDeductible = round(max($remainingDeductible - $durationDays, 0.0), 2);
+            } else {
+                $adjusted[$dateKey] = LeaveApplication::PAY_MODE_WITHOUT_PAY;
+            }
+        }
+
+        ksort($adjusted);
+        return $adjusted;
+    }
+
+    private function resolvePayModeFromSelectedDatePayStatus(
+        ?array $selectedDates,
+        array $selectedDatePayStatus,
+        float $deductibleDays
+    ): string {
+        if ($deductibleDays <= 0) {
+            return LeaveApplication::PAY_MODE_WITHOUT_PAY;
+        }
+
+        if (!is_array($selectedDates) || $selectedDates === []) {
+            return LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeSelectedDateMapKey($rawDate);
+            if ($dateKey === null) {
+                continue;
+            }
+
+            if (($selectedDatePayStatus[$dateKey] ?? LeaveApplication::PAY_MODE_WITH_PAY) !== LeaveApplication::PAY_MODE_WITHOUT_PAY) {
+                return LeaveApplication::PAY_MODE_WITH_PAY;
+            }
+        }
+
+        return LeaveApplication::PAY_MODE_WITHOUT_PAY;
+    }
+
+    private function validateNoDuplicateLeaveDates(
+        string $employeeControlNo,
+        string $startDate,
+        string $endDate,
+        ?array $selectedDates = null,
+        mixed $totalDays = null
+    ): ?JsonResponse {
+        $requestedDates = LeaveApplication::resolveDateSet($startDate, $endDate, $selectedDates, $totalDays);
+        if ($requestedDates === []) {
+            return null;
+        }
+
+        $existingApplications = LeaveApplication::query()
+            ->select(['id', 'start_date', 'end_date', 'selected_dates', 'total_days'])
+            ->whereIn('status', [
+                LeaveApplication::STATUS_PENDING_ADMIN,
+                LeaveApplication::STATUS_PENDING_HR,
+                LeaveApplication::STATUS_APPROVED,
+            ])
+            ->whereIn('erms_control_no', $this->buildControlNoCandidates($employeeControlNo))
+            ->get();
+
+        $duplicateDateMap = [];
+        foreach ($existingApplications as $existingApplication) {
+            $existingDates = LeaveApplication::resolveDateSet(
+                $existingApplication->start_date?->toDateString(),
+                $existingApplication->end_date?->toDateString(),
+                is_array($existingApplication->selected_dates) ? $existingApplication->selected_dates : null,
+                $existingApplication->total_days
+            );
+
+            foreach (array_intersect($requestedDates, $existingDates) as $duplicateDate) {
+                $duplicateDateMap[$duplicateDate] = true;
+            }
+        }
+
+        if ($duplicateDateMap === []) {
+            return null;
+        }
+
+        $duplicateDates = array_keys($duplicateDateMap);
+        sort($duplicateDates);
+
+        $previewDates = array_slice($duplicateDates, 0, 3);
+        $formattedPreview = implode(', ', array_map(
+            static fn(string $date): string => CarbonImmutable::parse($date)->format('M j, Y'),
+            $previewDates
+        ));
+        if (count($duplicateDates) > count($previewDates)) {
+            $remainingCount = count($duplicateDates) - count($previewDates);
+            $formattedPreview .= " and {$remainingCount} more";
+        }
+
+        return response()->json([
+            'message' => "Duplicate leave date detected. You already have a leave application for {$formattedPreview}.",
+            'errors' => [
+                'selected_dates' => ['Duplicate leave dates are not allowed for the same employee.'],
+            ],
+            'duplicate_dates' => $duplicateDates,
+        ], 422);
     }
 }
