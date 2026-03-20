@@ -34,7 +34,7 @@ class LeaveTypeSeeder extends Seeder
                 'max_days' => null,
                 'is_credit_based' => true,
                 'resets_yearly' => false,
-                'requires_documents' => false,
+                'requires_documents' => true,
                 'description' => 'Monthly accrual of 1.25 days. Accumulates over time.',
             ],
 

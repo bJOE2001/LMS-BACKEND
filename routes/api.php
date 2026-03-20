@@ -100,6 +100,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
 
         // Leave application review
         Route::get('/leave-applications', [LeaveApplicationController::class, 'adminIndex']);
+        Route::get('/leave-applications/{id}/attachment', [LeaveApplicationController::class, 'adminViewAttachment']);
         Route::post('/leave-applications/{id}/approve', [LeaveApplicationController::class, 'adminApprove']);
         Route::post('/leave-applications/{id}/reject', [LeaveApplicationController::class, 'adminReject']);
         Route::get('/coc-applications', [COCApplicationController::class, 'adminIndex']);
@@ -140,6 +141,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
 
         // Leave application review
         Route::get('/leave-applications', [LeaveApplicationController::class, 'hrIndex']);
+        Route::get('/leave-applications/{id}/attachment', [LeaveApplicationController::class, 'hrViewAttachment']);
         Route::post('/leave-applications/{id}/approve', [LeaveApplicationController::class, 'hrApprove']);
         Route::post('/leave-applications/{id}/reject', [LeaveApplicationController::class, 'hrReject']);
         Route::get('/coc-applications', [COCApplicationController::class, 'hrIndex']);

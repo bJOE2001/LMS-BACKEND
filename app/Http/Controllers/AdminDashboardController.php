@@ -136,6 +136,7 @@ class AdminDashboardController extends Controller
                 'balance' => $bal ? (float) $bal->balance : 0,
                 'accrual_rate' => (float) $type->accrual_rate,
                 'is_credit_based' => $type->is_credit_based,
+                'requires_documents' => (bool) $type->requires_documents,
             ];
         }
 
@@ -148,6 +149,7 @@ class AdminDashboardController extends Controller
                 'name' => $type->name,
                 'balance' => $bal ? (float) $bal->balance : 0,
                 'max_days' => $type->max_days,
+                'requires_documents' => (bool) $type->requires_documents,
                 'description' => $type->description,
             ];
         })->values();
@@ -374,12 +376,12 @@ class AdminDashboardController extends Controller
             'selected_date_coverage.*' => ['nullable', 'string', 'in:whole,half'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
-            'medical_certificate' => ['nullable', 'file', 'max:10240'],
-            'medical_certificate_submitted' => ['nullable', 'boolean'],
-            'medical_certificate_attached' => ['nullable', 'boolean'],
-            'has_medical_certificate' => ['nullable', 'boolean'],
-            'with_medical_certificate' => ['nullable', 'boolean'],
-            'medical_certificate_reference' => ['nullable', 'string', 'max:500'],
+            'attachment' => ['nullable', 'file', 'max:10240'],
+            'attachment_submitted' => ['nullable', 'boolean'],
+            'attachment_attached' => ['nullable', 'boolean'],
+            'has_attachment' => ['nullable', 'boolean'],
+            'with_attachment' => ['nullable', 'boolean'],
+            'attachment_reference' => ['nullable', 'string', 'max:500'],
         ]);
 
         $requestedPayMode = $this->normalizePayMode($validated['pay_mode'] ?? null);
@@ -455,14 +457,19 @@ class AdminDashboardController extends Controller
             }
         }
 
-        $medicalCertificateState = $this->resolveMedicalCertificateStateFromRequest($request, $validated);
+        $attachmentState = $this->resolveAttachmentStateFromRequest($request, $validated);
         $isSickLeave = $this->isSickLeaveType($leaveType);
-        $medicalCertificateRequired = $isSickLeave && $requestedTotalDays >= 5.0;
-        if ($medicalCertificateRequired && !(bool) ($medicalCertificateState['medical_certificate_submitted'] ?? false)) {
+        $attachmentRequired = $isSickLeave
+            ? $requestedTotalDays >= 5.0
+            : (bool) ($leaveType->requires_documents ?? false);
+        if ($attachmentRequired && !(bool) ($attachmentState['attachment_submitted'] ?? false)) {
+            $requiredDocumentMessage = $isSickLeave
+                ? 'Medical certificate is required for Sick Leave applications of 5 days or more.'
+                : 'Supporting document is required for the selected leave type.';
             return response()->json([
-                'message' => 'Medical certificate is required for Sick Leave applications of 5 days or more.',
+                'message' => $requiredDocumentMessage,
                 'errors' => [
-                    'medical_certificate' => ['Medical certificate is required for Sick Leave applications of 5 days or more.'],
+                    'attachment' => [$requiredDocumentMessage],
                 ],
             ], 422);
         }
@@ -554,8 +561,8 @@ class AdminDashboardController extends Controller
             $resolvedSelectedDates,
             $selectedDatePayStatus,
             $selectedDateCoverage,
-            $medicalCertificateRequired,
-            $medicalCertificateState
+            $attachmentRequired,
+            $attachmentState
         ) {
             $app = LeaveApplication::create([
                 'applicant_admin_id' => $admin->id,
@@ -571,9 +578,9 @@ class AdminDashboardController extends Controller
                 'selected_date_coverage' => $selectedDateCoverage !== [] ? $selectedDateCoverage : null,
                 'commutation' => $validated['commutation'] ?? 'Not Requested',
                 'pay_mode' => $requestedPayMode,
-                'medical_certificate_required' => $medicalCertificateRequired,
-                'medical_certificate_submitted' => (bool) ($medicalCertificateState['medical_certificate_submitted'] ?? false),
-                'medical_certificate_reference' => $medicalCertificateState['medical_certificate_reference'] ?? null,
+                'attachment_required' => $attachmentRequired,
+                'attachment_submitted' => (bool) ($attachmentState['attachment_submitted'] ?? false),
+                'attachment_reference' => $attachmentState['attachment_reference'] ?? null,
                 'status' => LeaveApplication::STATUS_PENDING_HR,
                 'admin_id' => $admin->id,
                 'admin_approved_at' => now(),
@@ -947,16 +954,16 @@ class AdminDashboardController extends Controller
         return $count;
     }
 
-    private function resolveMedicalCertificateStateFromRequest(Request $request, array $validated): array
+    private function resolveAttachmentStateFromRequest(Request $request, array $validated): array
     {
         $submitted = false;
         $reference = null;
 
         $booleanKeys = [
-            'medical_certificate_submitted',
-            'medical_certificate_attached',
-            'has_medical_certificate',
-            'with_medical_certificate',
+            'attachment_submitted',
+            'attachment_attached',
+            'has_attachment',
+            'with_attachment',
         ];
         foreach ($booleanKeys as $key) {
             if (!array_key_exists($key, $validated) && $request->input($key) === null) {
@@ -974,16 +981,16 @@ class AdminDashboardController extends Controller
             }
         }
 
-        $candidateReference = trim((string) ($validated['medical_certificate_reference'] ?? $request->input('medical_certificate_reference') ?? ''));
+        $candidateReference = trim((string) ($validated['attachment_reference'] ?? $request->input('attachment_reference') ?? ''));
         if ($candidateReference !== '') {
             $reference = $candidateReference;
             $submitted = true;
         }
 
-        if ($request->hasFile('medical_certificate')) {
-            $uploadedFile = $request->file('medical_certificate');
+        if ($request->hasFile('attachment')) {
+            $uploadedFile = $request->file('attachment');
             if ($uploadedFile && $uploadedFile->isValid()) {
-                $reference = $uploadedFile->store('leave-medical-certificates');
+                $reference = $uploadedFile->store('leave-attachments');
                 $submitted = true;
             }
         }
@@ -993,8 +1000,8 @@ class AdminDashboardController extends Controller
         }
 
         return [
-            'medical_certificate_submitted' => $submitted,
-            'medical_certificate_reference' => $reference,
+            'attachment_submitted' => $submitted,
+            'attachment_reference' => $reference,
         ];
     }
 
@@ -1187,6 +1194,19 @@ class AdminDashboardController extends Controller
 
         $currentLeaveBalances = $this->getCurrentLeaveBalancesForApp($app, $leaveBalanceDirectory);
         $durationDays = (float) $app->total_days;
+        $selectedDates = $app->resolvedSelectedDates();
+        $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
+        $withoutPay = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
+        $selectedDatePayStatus = is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null;
+        $selectedDateCoverage = is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null;
+        $deductibleDays = $app->deductible_days !== null
+            ? round((float) $app->deductible_days, 2)
+            : ($withoutPay ? 0.0 : round(max($durationDays, 0.0), 2));
+        if ($durationDays > 0 && $deductibleDays > $durationDays) {
+            $deductibleDays = $durationDays;
+        }
+        $deductibleDays = round(max($deductibleDays, 0.0), 2);
+        $withoutPayDays = round(max($durationDays - $deductibleDays, 0.0), 2);
 
         return [
             'id' => $app->id,
@@ -1214,12 +1234,20 @@ class AdminDashboardController extends Controller
             'createdAt' => $app->created_at?->toIso8601String(),
             'created_at' => $app->created_at?->toIso8601String(),
             'remarks' => $app->remarks,
-            'selected_dates' => $app->resolvedSelectedDates(),
+            'selected_dates' => $selectedDates,
+            'selected_date_pay_status' => $selectedDatePayStatus,
+            'selected_date_coverage' => $selectedDateCoverage,
             'commutation' => $app->commutation ?? 'Not Requested',
-            'pay_mode' => $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization),
-            'medical_certificate_required' => (bool) ($app->medical_certificate_required ?? false),
-            'medical_certificate_submitted' => (bool) ($app->medical_certificate_submitted ?? false),
-            'medical_certificate_reference' => $app->medical_certificate_reference ? (string) $app->medical_certificate_reference : null,
+            'pay_mode' => $normalizedPayMode,
+            'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
+            'without_pay' => $withoutPay,
+            'with_pay' => !$withoutPay,
+            'deductible_days' => $deductibleDays,
+            'with_pay_days' => $deductibleDays,
+            'without_pay_days' => $withoutPayDays,
+            'attachment_required' => (bool) ($app->attachment_required ?? false),
+            'attachment_submitted' => (bool) ($app->attachment_submitted ?? false),
+            'attachment_reference' => $app->attachment_reference ? (string) $app->attachment_reference : null,
             'is_monetization' => (bool) $app->is_monetization,
             'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
             'admin_id' => $app->admin_id,
@@ -2013,3 +2041,5 @@ class AdminDashboardController extends Controller
         ], 422);
     }
 }
+
+

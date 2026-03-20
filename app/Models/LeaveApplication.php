@@ -83,9 +83,10 @@ class LeaveApplication extends Model
         'selected_date_coverage',
         'commutation',
         'pay_mode',
-        'medical_certificate_required',
-        'medical_certificate_submitted',
-        'medical_certificate_reference',
+        'requires_documents',
+        'attachment_required',
+        'attachment_submitted',
+        'attachment_reference',
         'is_monetization',
         'equivalent_amount',
     ];
@@ -104,9 +105,10 @@ class LeaveApplication extends Model
             'selected_date_pay_status' => 'array',
             'selected_date_coverage' => 'array',
             'pay_mode' => 'string',
-            'medical_certificate_required' => 'boolean',
-            'medical_certificate_submitted' => 'boolean',
-            'medical_certificate_reference' => 'string',
+            'requires_documents' => 'boolean',
+            'attachment_required' => 'boolean',
+            'attachment_submitted' => 'boolean',
+            'attachment_reference' => 'string',
             'is_monetization' => 'boolean',
             'equivalent_amount' => 'decimal:2',
         ];
@@ -267,3 +269,4 @@ class LeaveApplication extends Model
         return (int) $roundedTotalDays === count($rangeDates);
     }
 }
+
