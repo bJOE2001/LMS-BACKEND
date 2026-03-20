@@ -1504,7 +1504,13 @@ class LeaveApplicationController extends Controller
         $medicalCertificateReference = $policyResolution['medical_certificate_reference'] ?? null;
 
         $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
+        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
         $shouldDeductForcedLeave = $this->shouldDeductForcedLeaveWithVacation($app, $forcedLeaveTypeId);
+        $shouldDeductVacationLeave = $this->shouldDeductVacationLeaveWithForced(
+            $app,
+            $forcedLeaveTypeId,
+            $vacationLeaveTypeId
+        );
 
         // Determine if balance deduction is needed
         $needsDeduction = $this->applicationDeductsEmployeeBalance(
@@ -1541,6 +1547,22 @@ class LeaveApplicationController extends Controller
                         'message' => 'Minimum of 10 leave credits required for monetization.',
                     ], 422);
                 }
+
+                // Business rule: approving Forced Leave also consumes Vacation Leave credits.
+                if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null) {
+                    $vacationBalance = LeaveBalance::query()
+                        ->where('employee_id', $app->erms_control_no)
+                        ->where('leave_type_id', $vacationLeaveTypeId)
+                        ->first();
+                    $currentVacationBalance = $vacationBalance ? (float) $vacationBalance->balance : 0.0;
+                    if ($currentVacationBalance + 1e-9 < $daysToDeduct) {
+                        return response()->json([
+                            'message' => 'Insufficient Vacation Leave balance for Mandatory / Forced Leave approval.'
+                                . ' Current: ' . self::formatDays($currentVacationBalance)
+                                . ', Required: ' . self::formatDays($daysToDeduct) . '.',
+                        ], 422);
+                    }
+                }
             } elseif ($app->applicant_admin_id) {
                 $balance = $this->findAdminEmployeeLeaveBalance(
                     (int) $app->applicant_admin_id,
@@ -1552,6 +1574,21 @@ class LeaveApplicationController extends Controller
                     return response()->json([
                         'message' => "Insufficient leave balance. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($daysToDeduct) . ".",
                     ], 422);
+                }
+
+                if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null) {
+                    $vacationBalance = $this->findAdminEmployeeLeaveBalance(
+                        (int) $app->applicant_admin_id,
+                        $vacationLeaveTypeId
+                    );
+                    $currentVacationBalance = $vacationBalance ? (float) $vacationBalance->balance : 0.0;
+                    if ($currentVacationBalance + 1e-9 < $daysToDeduct) {
+                        return response()->json([
+                            'message' => 'Insufficient Vacation Leave balance for Mandatory / Forced Leave approval.'
+                                . ' Current: ' . self::formatDays($currentVacationBalance)
+                                . ', Required: ' . self::formatDays($daysToDeduct) . '.',
+                        ], 422);
+                    }
                 }
             }
         }
@@ -1566,7 +1603,9 @@ class LeaveApplicationController extends Controller
                 $needsDeduction,
                 $balanceConflictError,
                 $forcedLeaveTypeId,
+                $vacationLeaveTypeId,
                 $shouldDeductForcedLeave,
+                $shouldDeductVacationLeave,
                 $daysToDeduct,
                 $isCtoDeduction,
                 $normalizedPayMode,
@@ -1611,6 +1650,21 @@ class LeaveApplicationController extends Controller
                                 $forcedBalance->decrement('balance', $forcedToDeduct);
                             }
                         }
+
+                        // Business rule: approving Forced Leave also consumes Vacation Leave credits.
+                        if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null) {
+                            $vacationBalance = LeaveBalance::query()
+                                ->where('employee_id', $app->erms_control_no)
+                                ->where('leave_type_id', $vacationLeaveTypeId)
+                                ->lockForUpdate()
+                                ->first();
+
+                            if (!$vacationBalance || (float) $vacationBalance->balance < $daysToDeduct) {
+                                throw new \RuntimeException($balanceConflictError);
+                            }
+
+                            $vacationBalance->decrement('balance', $daysToDeduct);
+                        }
                     } elseif ($app->applicant_admin_id) {
                         $lockedBalance = $this->findAdminEmployeeLeaveBalance(
                             (int) $app->applicant_admin_id,
@@ -1623,6 +1677,20 @@ class LeaveApplicationController extends Controller
                         }
 
                         $lockedBalance->decrement('balance', $daysToDeduct);
+
+                        if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null) {
+                            $vacationBalance = $this->findAdminEmployeeLeaveBalance(
+                                (int) $app->applicant_admin_id,
+                                $vacationLeaveTypeId,
+                                true
+                            );
+
+                            if (!$vacationBalance || (float) $vacationBalance->balance < $daysToDeduct) {
+                                throw new \RuntimeException($balanceConflictError);
+                            }
+
+                            $vacationBalance->decrement('balance', $daysToDeduct);
+                        }
                     }
                 }
 
@@ -1669,6 +1737,20 @@ class LeaveApplicationController extends Controller
                     ], 422);
                 }
 
+                if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null) {
+                    $currentVacationBalance = (float) (LeaveBalance::query()
+                        ->where('employee_id', $app->erms_control_no)
+                        ->where('leave_type_id', $vacationLeaveTypeId)
+                        ->value('balance') ?? 0.0);
+                    if ($currentVacationBalance + 1e-9 < $daysToDeduct) {
+                        return response()->json([
+                            'message' => 'Insufficient Vacation Leave balance for Mandatory / Forced Leave approval.'
+                                . ' Current: ' . self::formatDays($currentVacationBalance)
+                                . ', Required: ' . self::formatDays($daysToDeduct) . '.',
+                        ], 422);
+                    }
+                }
+
                 $label = $app->is_monetization ? 'monetization' : 'leave';
                 return response()->json([
                     'message' => "Insufficient leave balance for {$label}. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($daysToDeduct) . ".",
@@ -1681,6 +1763,22 @@ class LeaveApplicationController extends Controller
                     (int) $app->leave_type_id
                 )?->balance ?? 0
             );
+
+            if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null) {
+                $currentVacationBalance = (float) (
+                    $this->findAdminEmployeeLeaveBalance(
+                        (int) $app->applicant_admin_id,
+                        $vacationLeaveTypeId
+                    )?->balance ?? 0.0
+                );
+                if ($currentVacationBalance + 1e-9 < $daysToDeduct) {
+                    return response()->json([
+                        'message' => 'Insufficient Vacation Leave balance for Mandatory / Forced Leave approval.'
+                            . ' Current: ' . self::formatDays($currentVacationBalance)
+                            . ', Required: ' . self::formatDays($daysToDeduct) . '.',
+                    ], 422);
+                }
+            }
 
             return response()->json([
                 'message' => "Insufficient leave balance. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($daysToDeduct) . ".",
@@ -1786,7 +1884,7 @@ class LeaveApplicationController extends Controller
         $deptName = $admin->department?->name;
 
         $employees = Employee::where('office', $deptName)
-            ->with('leaveBalances')
+            ->with(['leaveBalances.leaveType'])
             ->orderBy('surname')
             ->get()
             ->map(fn($emp) => [
@@ -1799,6 +1897,7 @@ class LeaveApplicationController extends Controller
                 'salary' => $emp->rate_mon !== null ? (float) $emp->rate_mon : null,
                 'leave_balances' => $emp->leaveBalances->map(fn($lb) => [
                     'leave_type_id' => $lb->leave_type_id,
+                    'leave_type_name' => trim((string) ($lb->leave_type_name ?? $lb->leaveType?->name ?? '')),
                     'balance' => (float) $lb->balance,
                 ]),
             ]);
@@ -4035,7 +4134,6 @@ class LeaveApplicationController extends Controller
                     'employee_id' => $canonicalControlNo,
                     'leave_type_id' => $normalizedLeaveTypeId,
                     'balance' => 0,
-                    'initialized_at' => now(),
                     'year' => (int) now()->year,
                 ]);
             }
@@ -4125,7 +4223,6 @@ class LeaveApplicationController extends Controller
                 'employee_id' => $canonicalControlNo,
                 'leave_type_id' => $ctoLeaveTypeId,
                 'balance' => $effectiveBalance,
-                'initialized_at' => now(),
                 'year' => (int) now()->year,
             ]);
 
@@ -4296,6 +4393,15 @@ class LeaveApplicationController extends Controller
         return $value !== null ? (int) $value : null;
     }
 
+    private function resolveVacationLeaveTypeId(): ?int
+    {
+        $value = LeaveType::query()
+            ->whereRaw('LOWER(name) = ?', ['vacation leave'])
+            ->value('id');
+
+        return $value !== null ? (int) $value : null;
+    }
+
     private function shouldDeductForcedLeaveWithVacation(LeaveApplication $app, ?int $forcedLeaveTypeId): bool
     {
         if ($forcedLeaveTypeId === null) {
@@ -4312,6 +4418,22 @@ class LeaveApplicationController extends Controller
 
         $leaveTypeName = trim((string) ($app->leaveType?->name ?? ''));
         return strcasecmp($leaveTypeName, 'Vacation Leave') === 0;
+    }
+
+    private function shouldDeductVacationLeaveWithForced(
+        LeaveApplication $app,
+        ?int $forcedLeaveTypeId,
+        ?int $vacationLeaveTypeId
+    ): bool {
+        if ($forcedLeaveTypeId === null || $vacationLeaveTypeId === null) {
+            return false;
+        }
+
+        if ($app->is_monetization) {
+            return false;
+        }
+
+        return (int) $app->leave_type_id === $forcedLeaveTypeId;
     }
 
     private function isSickLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
@@ -5485,6 +5607,38 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
+        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
+        if ($forcedLeaveTypeId !== null && (int) $leaveTypeId === $forcedLeaveTypeId) {
+            $requiredVacationLeaveDays = round(max($requestedDays, 0.0), 2);
+            if ($requiredVacationLeaveDays > 0) {
+                $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+                if ($vacationLeaveTypeId !== null) {
+                    $vacationBalanceSnapshot = $this->resolveEmployeeLeaveBalanceSnapshot(
+                        $employeeControlNo,
+                        $vacationLeaveTypeId
+                    );
+                    $availableVacationBalance = (float) ($vacationBalanceSnapshot['available_balance'] ?? 0.0);
+                    if ($availableVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
+                        return response()->json([
+                            'message' => 'Insufficient Vacation Leave balance to apply Mandatory / Forced Leave.',
+                            'errors' => [
+                                'leave_type_id' => ['Mandatory / Forced Leave requires enough Vacation Leave balance.'],
+                                'vacation_leave_balance' => [
+                                    'Available Vacation Leave is '
+                                    . self::formatDays($availableVacationBalance)
+                                    . ', but '
+                                    . self::formatDays($requiredVacationLeaveDays)
+                                    . ' is required.',
+                                ],
+                            ],
+                            'available_vacation_leave_days' => $availableVacationBalance,
+                            'required_vacation_leave_days' => $requiredVacationLeaveDays,
+                        ], 422);
+                    }
+                }
+            }
+        }
+
         $normalizedPayMode = $this->normalizePayMode($payMode);
         $requiredBalanceDays = round(max((float) ($requestedDeductibleDays ?? $requestedDays), 0.0), 2);
         if (
@@ -5506,11 +5660,32 @@ class LeaveApplicationController extends Controller
             $this->syncEmployeeCtoBalance($employeeControlNo);
         }
 
+        $balanceSnapshot = $this->resolveEmployeeLeaveBalanceSnapshot($employeeControlNo, $leaveTypeId);
+        $currentBalance = (float) ($balanceSnapshot['current_balance'] ?? 0.0);
+        $pendingReservedDays = (float) ($balanceSnapshot['pending_reserved_days'] ?? 0.0);
+        $availableBalance = (float) ($balanceSnapshot['available_balance'] ?? 0.0);
+        $insufficientBalance = $availableBalance + 1e-9 < $requiredBalanceDays;
+
+        return [
+            'leave_type' => $leaveType,
+            'balance' => $currentBalance,
+            'available_balance' => $availableBalance,
+            'pending_reserved_days' => $pendingReservedDays,
+            'required_balance_days' => $requiredBalanceDays,
+            'insufficient_balance' => $insufficientBalance,
+        ];
+    }
+
+    private function resolveEmployeeLeaveBalanceSnapshot(string $employeeControlNo, int $leaveTypeId): array
+    {
+        $controlNoCandidates = $this->controlNoCandidates($employeeControlNo);
+
         $balance = LeaveBalance::query()
             ->where('leave_type_id', $leaveTypeId)
-            ->whereIn('employee_id', $this->controlNoCandidates($employeeControlNo))
+            ->whereIn('employee_id', $controlNoCandidates)
             ->first();
         $currentBalance = $balance ? (float) $balance->balance : 0.0;
+
         $pendingReservedDays = (float) LeaveApplication::query()
             ->where('leave_type_id', $leaveTypeId)
             ->whereIn('status', [
@@ -5524,19 +5699,15 @@ class LeaveApplicationController extends Controller
                         [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY]
                     );
             })
-            ->whereIn('erms_control_no', $this->controlNoCandidates($employeeControlNo))
+            ->whereIn('erms_control_no', $controlNoCandidates)
             ->sum(DB::raw('COALESCE(deductible_days, total_days)'));
 
         $availableBalance = max(round($currentBalance - $pendingReservedDays, 2), 0.0);
-        $insufficientBalance = $availableBalance + 1e-9 < $requiredBalanceDays;
 
         return [
-            'leave_type' => $leaveType,
-            'balance' => $currentBalance,
-            'available_balance' => $availableBalance,
+            'current_balance' => $currentBalance,
             'pending_reserved_days' => $pendingReservedDays,
-            'required_balance_days' => $requiredBalanceDays,
-            'insufficient_balance' => $insufficientBalance,
+            'available_balance' => $availableBalance,
         ];
     }
 

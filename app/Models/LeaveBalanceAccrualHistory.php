@@ -10,10 +10,12 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  */
 class LeaveBalanceAccrualHistory extends Model
 {
-    protected $table = 'tblLeaveBalanceAccrualHistories';
+    protected $table = 'tblLeaveBalanceCreditHistories';
 
     protected $fillable = [
         'leave_balance_id',
+        'employee_name',
+        'leave_type_name',
         'credits_added',
         'accrual_date',
         'source',

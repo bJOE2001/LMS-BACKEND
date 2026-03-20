@@ -16,9 +16,10 @@ class LeaveBalance extends Model
 
     protected $fillable = [
         'employee_id',
+        'employee_name',
         'leave_type_id',
+        'leave_type_name',
         'balance',
-        'initialized_at',
         'last_accrual_date',
         'year',
     ];
@@ -27,7 +28,6 @@ class LeaveBalance extends Model
     {
         return [
             'balance'           => 'decimal:2',
-            'initialized_at'    => 'datetime',
             'last_accrual_date' => 'date',
             'year'              => 'integer',
         ];

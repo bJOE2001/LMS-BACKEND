@@ -123,7 +123,6 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
 
         // Leave balance management
         Route::post('/leave-balances', [HRLeaveBalanceImportController::class, 'store']);
-        Route::post('/leave-balances/import', [HRLeaveBalanceImportController::class, 'import']);
 
         // User management
         Route::get('/user-management/department-admins', [HRUserManagementController::class, 'index']);

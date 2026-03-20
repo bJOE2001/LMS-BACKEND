@@ -8,6 +8,9 @@ use App\Models\DepartmentHead;
 use App\Models\Employee;
 use App\Models\HRAccount;
 use App\Models\LeaveApplication;
+use App\Models\LeaveBalance;
+use App\Models\LeaveBalanceAccrualHistory;
+use App\Models\LeaveType;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Pagination\LengthAwarePaginator;
@@ -416,6 +419,383 @@ class EmployeeController extends Controller
         ]);
     }
 
+    /**
+     * Return leave credits ledger (Vacation/Sick) for one employee (HR only).
+     */
+    public function leaveCreditsLedger(Request $request, string $controlNo): JsonResponse
+    {
+        $account = $request->user();
+        if (!$account instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $employee = Employee::findByControlNo($controlNo);
+        if (!$employee) {
+            return response()->json(['message' => 'Employee not found.'], 404);
+        }
+
+        $controlNoCandidates = $this->buildLedgerControlNoCandidates($controlNo, $employee);
+        $trackedTypeIdsByKey = $this->resolveLedgerTrackedLeaveTypeIds();
+        $typeIdToKey = [];
+        foreach (['vacation', 'sick'] as $typeKey) {
+            $typeId = $trackedTypeIdsByKey[$typeKey] ?? null;
+            if (is_int($typeId) && $typeId > 0) {
+                $typeIdToKey[$typeId] = $typeKey;
+            }
+        }
+
+        $trackedTypeIds = array_keys($typeIdToKey);
+        $vacationLeaveTypeId = $trackedTypeIdsByKey['vacation'] ?? null;
+        $sickLeaveTypeId = $trackedTypeIdsByKey['sick'] ?? null;
+        $queryTrackedTypeIds = $trackedTypeIds;
+        $forcedLeaveTypeId = $trackedTypeIdsByKey['forced'] ?? null;
+        if (is_int($forcedLeaveTypeId) && $forcedLeaveTypeId > 0) {
+            $queryTrackedTypeIds[] = $forcedLeaveTypeId;
+            $queryTrackedTypeIds = array_values(array_unique($queryTrackedTypeIds));
+        }
+        $balancesByType = $this->loadPreferredLedgerBalancesByType($controlNoCandidates, $trackedTypeIds);
+        $runningBalances = [
+            'vacation' => $this->resolveLedgerBalance($balancesByType, $trackedTypeIdsByKey['vacation'] ?? null),
+            'sick' => $this->resolveLedgerBalance($balancesByType, $trackedTypeIdsByKey['sick'] ?? null),
+        ];
+
+        $transactions = [];
+        if ($trackedTypeIds !== []) {
+            $balanceIds = array_values(array_map(
+                static fn(LeaveBalance $balance): int => (int) $balance->id,
+                $balancesByType
+            ));
+            $balanceTypeLookup = [];
+            foreach ($balancesByType as $balance) {
+                if (!$balance instanceof LeaveBalance) {
+                    continue;
+                }
+
+                $balanceTypeLookup[(int) $balance->id] = (int) $balance->leave_type_id;
+            }
+
+            if ($balanceIds !== []) {
+                $accrualEntries = LeaveBalanceAccrualHistory::query()
+                    ->whereIn('leave_balance_id', $balanceIds)
+                    ->orderByDesc('accrual_date')
+                    ->orderByDesc('id')
+                    ->get();
+
+                foreach ($accrualEntries as $entry) {
+                    $balanceId = (int) $entry->leave_balance_id;
+                    $typeId = $balanceTypeLookup[$balanceId] ?? null;
+                    $typeKey = $typeId !== null ? ($typeIdToKey[(int) $typeId] ?? null) : null;
+                    if ($typeKey === null) {
+                        continue;
+                    }
+
+                    $accrualDate = $entry->accrual_date?->toDateString();
+                    if ($accrualDate === null) {
+                        continue;
+                    }
+
+                    $creditsAdded = round((float) $entry->credits_added, 2);
+                    if ($creditsAdded <= 0) {
+                        continue;
+                    }
+
+                    $source = strtoupper(trim((string) ($entry->source ?? '')));
+                    $isManualAddSource = $source === 'HR_ADD' || str_starts_with($source, 'HR_ADD:');
+                    $particulars = match (true) {
+                        $isManualAddSource => 'Leave credits added',
+                        default => 'Monthly accrual',
+                    };
+
+                    $transactions[] = [
+                        'row_id' => 'accrual-' . (int) $entry->id,
+                        'type_key' => $typeKey,
+                        'transaction_date' => $accrualDate,
+                        'sort_date' => $accrualDate,
+                        'sort_timestamp' => (string) ($entry->created_at?->toIso8601String() ?? $accrualDate),
+                        'particulars' => $particulars,
+                        'action_taken' => $particulars,
+                        'category' => 'earned',
+                        'amount' => $creditsAdded,
+                        'balance_delta' => $creditsAdded,
+                    ];
+                }
+            }
+
+            $approvedApplications = LeaveApplication::query()
+                ->where('status', LeaveApplication::STATUS_APPROVED)
+                ->whereIn('erms_control_no', $controlNoCandidates)
+                ->whereIn('leave_type_id', $queryTrackedTypeIds)
+                ->orderByDesc('hr_approved_at')
+                ->orderByDesc('created_at')
+                ->orderByDesc('id')
+                ->get([
+                    'id',
+                    'leave_type_id',
+                    'total_days',
+                    'deductible_days',
+                    'pay_mode',
+                    'is_monetization',
+                    'start_date',
+                    'end_date',
+                    'selected_dates',
+                    'hr_approved_at',
+                    'created_at',
+                ]);
+
+            foreach ($approvedApplications as $application) {
+                $typeId = (int) $application->leave_type_id;
+                $typeKey = $typeIdToKey[$typeId] ?? null;
+                $isForcedLeave = is_int($forcedLeaveTypeId)
+                    && $forcedLeaveTypeId > 0
+                    && $typeId === $forcedLeaveTypeId;
+                if ($isForcedLeave && $typeKey === null) {
+                    // FL now deducts VL, so show it in the Vacation column.
+                    $typeKey = 'vacation';
+                }
+                if ($typeKey === null) {
+                    continue;
+                }
+
+                $transactionDate = $application->hr_approved_at?->toDateString()
+                    ?? $application->created_at?->toDateString();
+                if ($transactionDate === null) {
+                    continue;
+                }
+
+                $totalDays = round((float) ($application->total_days ?? 0), 2);
+                $deductibleDays = round((float) ($application->deductible_days ?? $totalDays), 2);
+                $payMode = strtoupper(trim((string) ($application->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY)));
+                if (!in_array($payMode, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
+                    $payMode = LeaveApplication::PAY_MODE_WITH_PAY;
+                }
+
+                $isMonetization = (bool) $application->is_monetization;
+                $withPayAmount = $isMonetization
+                    ? $deductibleDays
+                    : ($payMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $deductibleDays);
+                if ($totalDays > 0 && $withPayAmount > $totalDays) {
+                    $withPayAmount = $totalDays;
+                }
+                $withPayAmount = round(max($withPayAmount, 0.0), 2);
+
+                $withoutPayAmount = $isMonetization
+                    ? 0.0
+                    : round(max($totalDays - $withPayAmount, 0.0), 2);
+
+                if ($withPayAmount <= 0 && $withoutPayAmount <= 0) {
+                    continue;
+                }
+
+                $particulars = $isMonetization
+                    ? 'Monetization'
+                    : match (true) {
+                        $isForcedLeave => 'Forced Leave',
+                        is_int($vacationLeaveTypeId) && $typeId === $vacationLeaveTypeId => 'Vacation Leave',
+                        is_int($sickLeaveTypeId) && $typeId === $sickLeaveTypeId => 'Sick Leave',
+                        default => 'Leave application',
+                    };
+                $applicationId = (int) $application->id;
+                $actionTaken = sprintf(
+                    'Application #%d%s',
+                    $applicationId,
+                    $isMonetization ? ' (Monetization)' : ''
+                );
+                $inclusiveStartDate = $application->start_date?->toDateString();
+                $inclusiveEndDate = $application->end_date?->toDateString();
+                $inclusiveDates = $this->resolveLedgerInclusiveDates(
+                    $application->selected_dates,
+                    $inclusiveStartDate,
+                    $inclusiveEndDate
+                );
+                $mergeKey = 'app-' . $applicationId;
+
+                if ($withPayAmount > 0) {
+                    $transactions[] = [
+                        'row_id' => $mergeKey . '-wp',
+                        'merge_key' => $mergeKey,
+                        'type_key' => $typeKey,
+                        'transaction_date' => $transactionDate,
+                        'sort_date' => $transactionDate,
+                        'sort_timestamp' => (string) (
+                            $application->hr_approved_at?->toIso8601String()
+                            ?? $application->created_at?->toIso8601String()
+                            ?? $transactionDate
+                        ),
+                        'particulars' => $particulars,
+                        'action_taken' => $actionTaken,
+                        'inclusive_start_date' => $inclusiveStartDate,
+                        'inclusive_end_date' => $inclusiveEndDate,
+                        'inclusive_dates' => $inclusiveDates,
+                        'category' => 'deduction_with_pay',
+                        'amount' => $withPayAmount,
+                        'balance_delta' => -$withPayAmount,
+                    ];
+                }
+
+                if ($withoutPayAmount > 0) {
+                    $transactions[] = [
+                        'row_id' => $mergeKey . '-wop',
+                        'merge_key' => $mergeKey,
+                        'type_key' => $typeKey,
+                        'transaction_date' => $transactionDate,
+                        'sort_date' => $transactionDate,
+                        'sort_timestamp' => (string) (
+                            $application->hr_approved_at?->toIso8601String()
+                            ?? $application->created_at?->toIso8601String()
+                            ?? $transactionDate
+                        ),
+                        'particulars' => $particulars,
+                        'action_taken' => $actionTaken,
+                        'inclusive_start_date' => $inclusiveStartDate,
+                        'inclusive_end_date' => $inclusiveEndDate,
+                        'inclusive_dates' => $inclusiveDates,
+                        'category' => 'deduction_without_pay',
+                        'amount' => $withoutPayAmount,
+                        'balance_delta' => 0.0,
+                    ];
+                }
+            }
+        }
+
+        usort($transactions, function (array $left, array $right): int {
+            $leftDate = (string) ($left['sort_date'] ?? '');
+            $rightDate = (string) ($right['sort_date'] ?? '');
+            if ($leftDate !== $rightDate) {
+                return $leftDate < $rightDate ? 1 : -1;
+            }
+
+            $leftTimestamp = (string) ($left['sort_timestamp'] ?? '');
+            $rightTimestamp = (string) ($right['sort_timestamp'] ?? '');
+            if ($leftTimestamp !== $rightTimestamp) {
+                return $leftTimestamp < $rightTimestamp ? 1 : -1;
+            }
+
+            $leftId = (string) ($left['row_id'] ?? '');
+            $rightId = (string) ($right['row_id'] ?? '');
+            return $rightId <=> $leftId;
+        });
+
+        $ledgerRows = [];
+        $rowIndexByMergeKey = [];
+        foreach ($transactions as $transaction) {
+            $typeKey = $transaction['type_key'] ?? null;
+            if (!is_string($typeKey) || !array_key_exists($typeKey, $runningBalances)) {
+                continue;
+            }
+
+            $category = (string) ($transaction['category'] ?? '');
+            $amount = round((float) ($transaction['amount'] ?? 0), 2);
+            if ($amount <= 0) {
+                continue;
+            }
+
+            $currentBalance = round((float) $runningBalances[$typeKey], 2);
+            $runningBalances[$typeKey] = round(
+                $currentBalance - (float) ($transaction['balance_delta'] ?? 0),
+                2
+            );
+
+            $actionDate = (string) ($transaction['transaction_date'] ?? '');
+            $particulars = trim((string) ($transaction['particulars'] ?? ''));
+            $actionTaken = trim((string) ($transaction['action_taken'] ?? ''));
+            $inclusiveStartDate = trim((string) ($transaction['inclusive_start_date'] ?? ''));
+            $inclusiveEndDate = trim((string) ($transaction['inclusive_end_date'] ?? ''));
+            $inclusiveDates = $transaction['inclusive_dates'] ?? null;
+            if (!is_array($inclusiveDates)) {
+                $inclusiveDates = [];
+            }
+            $period = $this->formatLedgerPeriodLabel($actionDate);
+
+            $mergeKey = null;
+            if ($category === 'earned') {
+                $mergeKey = 'earned|' . mb_strtolower($actionDate . '|' . $particulars . '|' . $actionTaken);
+            }
+
+            $explicitMergeKey = trim((string) ($transaction['merge_key'] ?? ''));
+            if ($explicitMergeKey !== '') {
+                $mergeKey = 'tx|' . mb_strtolower($explicitMergeKey);
+            }
+
+            if ($mergeKey !== null && array_key_exists($mergeKey, $rowIndexByMergeKey)) {
+                $rowIndex = $rowIndexByMergeKey[$mergeKey];
+            } else {
+                $rowIndex = count($ledgerRows);
+                $ledgerRows[] = [
+                    'id' => $transaction['row_id'] ?? null,
+                    'period' => $period,
+                    'particulars' => $particulars,
+                    'action_date' => $actionDate,
+                    'action_taken' => $actionTaken,
+                    'inclusive_start_date' => $inclusiveStartDate !== '' ? $inclusiveStartDate : null,
+                    'inclusive_end_date' => $inclusiveEndDate !== '' ? $inclusiveEndDate : null,
+                    'inclusive_dates' => $inclusiveDates,
+                ];
+
+                if ($mergeKey !== null) {
+                    $rowIndexByMergeKey[$mergeKey] = $rowIndex;
+                }
+            }
+
+            if ($typeKey === 'vacation') {
+                if (!array_key_exists('vacation_balance', $ledgerRows[$rowIndex])) {
+                    $ledgerRows[$rowIndex]['vacation_balance'] = $currentBalance;
+                }
+                if ($category === 'earned') {
+                    $ledgerRows[$rowIndex]['vacation_earned'] = round(
+                        (float) ($ledgerRows[$rowIndex]['vacation_earned'] ?? 0) + $amount,
+                        2
+                    );
+                } elseif ($category === 'deduction_with_pay') {
+                    $ledgerRows[$rowIndex]['vacation_abs_und_wp'] = round(
+                        (float) ($ledgerRows[$rowIndex]['vacation_abs_und_wp'] ?? 0) + $amount,
+                        2
+                    );
+                } elseif ($category === 'deduction_without_pay') {
+                    $ledgerRows[$rowIndex]['vacation_abs_und_wop'] = round(
+                        (float) ($ledgerRows[$rowIndex]['vacation_abs_und_wop'] ?? 0) + $amount,
+                        2
+                    );
+                }
+            } elseif ($typeKey === 'sick') {
+                if (!array_key_exists('sick_balance', $ledgerRows[$rowIndex])) {
+                    $ledgerRows[$rowIndex]['sick_balance'] = $currentBalance;
+                }
+                if ($category === 'earned') {
+                    $ledgerRows[$rowIndex]['sick_earned'] = round(
+                        (float) ($ledgerRows[$rowIndex]['sick_earned'] ?? 0) + $amount,
+                        2
+                    );
+                } elseif ($category === 'deduction_with_pay') {
+                    $ledgerRows[$rowIndex]['sick_abs_und'] = round(
+                        (float) ($ledgerRows[$rowIndex]['sick_abs_und'] ?? 0) + $amount,
+                        2
+                    );
+                } elseif ($category === 'deduction_without_pay') {
+                    $ledgerRows[$rowIndex]['sick_abs_und_wop'] = round(
+                        (float) ($ledgerRows[$rowIndex]['sick_abs_und_wop'] ?? 0) + $amount,
+                        2
+                    );
+                }
+            }
+        }
+
+        return response()->json([
+            'employee' => [
+                'control_no' => $employee->control_no,
+                'firstname' => $employee->firstname,
+                'surname' => $employee->surname,
+                'middlename' => $employee->middlename,
+                'office' => $employee->office,
+                'designation' => $employee->designation,
+                'status' => $employee->status,
+            ],
+            'ledger' => $ledgerRows,
+            'leave_balance_ledger' => $ledgerRows,
+            'leave_credits_ledger' => $ledgerRows,
+            'leaveCreditsLedger' => $ledgerRows,
+        ]);
+    }
+
     private function statusLabel(?string $status): string
     {
         return match ($status) {
@@ -622,6 +1002,12 @@ class EmployeeController extends Controller
                         ->orWhere('surname', 'LIKE', "%{$term}%");
                 });
             })
+            ->whereNotIn('control_no', function ($query) {
+                $query->select('employee_control_no')
+                    ->from('tblDepartmentAdmins')
+                    ->whereNotNull('employee_control_no')
+                    ->whereRaw("LTRIM(RTRIM(employee_control_no)) <> ''");
+            })
             ->orderBy('surname')
             ->orderBy('firstname')
             ->paginate($perPage, ['*'], 'page', $page);
@@ -649,6 +1035,12 @@ class EmployeeController extends Controller
                     ->orWhere('surname', 'LIKE', "%{$searchTerm}%");
             });
         }
+        $statusCountsQuery->whereNotIn('control_no', function ($query) {
+            $query->select('employee_control_no')
+                ->from('tblDepartmentAdmins')
+                ->whereNotNull('employee_control_no')
+                ->whereRaw("LTRIM(RTRIM(employee_control_no)) <> ''");
+        });
 
         return $statusCountsQuery
             ->selectRaw('status, COUNT(*) as count')
@@ -897,5 +1289,218 @@ class EmployeeController extends Controller
 
         $text = trim((string) $value);
         return $text === '' ? null : $text;
+    }
+
+    private function buildLedgerControlNoCandidates(string $controlNo, ?Employee $employee = null): array
+    {
+        $rawControlNo = trim($controlNo);
+        if ($rawControlNo === '') {
+            return [];
+        }
+
+        $candidates = [];
+        $employeeControlNo = trim((string) ($employee?->control_no ?? ''));
+        if ($employeeControlNo !== '') {
+            $candidates[] = $employeeControlNo;
+        }
+
+        $candidates[] = $rawControlNo;
+
+        $normalizedControlNo = $this->normalizeLedgerControlNo($rawControlNo);
+        if ($normalizedControlNo !== null) {
+            $candidates[] = $normalizedControlNo;
+        }
+
+        return array_values(array_unique(array_filter(
+            $candidates,
+            static fn(string $value): bool => trim($value) !== ''
+        )));
+    }
+
+    private function normalizeLedgerControlNo(mixed $value): ?string
+    {
+        $raw = trim((string) ($value ?? ''));
+        if ($raw === '') {
+            return null;
+        }
+
+        if (!preg_match('/^\d+$/', $raw)) {
+            return null;
+        }
+
+        $normalized = ltrim($raw, '0');
+        return $normalized === '' ? '0' : $normalized;
+    }
+
+    private function resolveLedgerTrackedLeaveTypeIds(): array
+    {
+        $typeIds = [
+            'vacation' => null,
+            'sick' => null,
+            'forced' => null,
+        ];
+
+        $leaveTypes = LeaveType::query()
+            ->select(['id', 'name'])
+            ->get();
+
+        foreach ($leaveTypes as $leaveType) {
+            $normalizedName = strtolower(trim((string) ($leaveType->name ?? '')));
+            $typeId = (int) $leaveType->id;
+            if ($typeId <= 0) {
+                continue;
+            }
+
+            if (
+                $typeIds['vacation'] === null
+                && in_array($normalizedName, ['vacation leave', 'vacation'], true)
+            ) {
+                $typeIds['vacation'] = $typeId;
+            }
+
+            if (
+                $typeIds['sick'] === null
+                && in_array($normalizedName, ['sick leave', 'sick'], true)
+            ) {
+                $typeIds['sick'] = $typeId;
+            }
+
+            if (
+                $typeIds['forced'] === null
+                && in_array($normalizedName, ['mandatory / forced leave', 'mandatory forced leave', 'forced leave'], true)
+            ) {
+                $typeIds['forced'] = $typeId;
+            }
+        }
+
+        return $typeIds;
+    }
+
+    private function loadPreferredLedgerBalancesByType(array $controlNoCandidates, array $trackedTypeIds): array
+    {
+        if ($controlNoCandidates === [] || $trackedTypeIds === []) {
+            return [];
+        }
+
+        $priorityByControlNo = array_flip($controlNoCandidates);
+        $preferredBalancesByType = [];
+
+        $balances = LeaveBalance::query()
+            ->whereIn('employee_id', $controlNoCandidates)
+            ->whereIn('leave_type_id', $trackedTypeIds)
+            ->orderByDesc('updated_at')
+            ->orderByDesc('id')
+            ->get();
+
+        foreach ($balances as $balance) {
+            $typeId = (int) $balance->leave_type_id;
+            if ($typeId <= 0) {
+                continue;
+            }
+
+            if (!array_key_exists($typeId, $preferredBalancesByType)) {
+                $preferredBalancesByType[$typeId] = $balance;
+                continue;
+            }
+
+            $current = $preferredBalancesByType[$typeId];
+            $currentControlNo = trim((string) $current->employee_id);
+            $incomingControlNo = trim((string) $balance->employee_id);
+
+            $currentPriority = $priorityByControlNo[$currentControlNo] ?? PHP_INT_MAX;
+            $incomingPriority = $priorityByControlNo[$incomingControlNo] ?? PHP_INT_MAX;
+            if ($incomingPriority < $currentPriority) {
+                $preferredBalancesByType[$typeId] = $balance;
+            }
+        }
+
+        return $preferredBalancesByType;
+    }
+
+    private function resolveLedgerBalance(array $balancesByType, ?int $leaveTypeId): float
+    {
+        if ($leaveTypeId === null || !isset($balancesByType[$leaveTypeId])) {
+            return 0.0;
+        }
+
+        return round((float) ($balancesByType[$leaveTypeId]->balance ?? 0), 2);
+    }
+
+    private function formatLedgerPeriodLabel(mixed $date): string
+    {
+        $normalizedDate = trim((string) ($date ?? ''));
+        if ($normalizedDate === '') {
+            return '';
+        }
+
+        try {
+            return Carbon::parse($normalizedDate)->format('M Y');
+        } catch (\Throwable) {
+            return '';
+        }
+    }
+
+    private function resolveLedgerInclusiveDates(
+        mixed $selectedDates,
+        ?string $startDate,
+        ?string $endDate
+    ): array {
+        $normalized = [];
+
+        if (is_iterable($selectedDates)) {
+            foreach ($selectedDates as $selectedDate) {
+                $date = $this->normalizeLedgerDateString($selectedDate);
+                if ($date !== null) {
+                    $normalized[] = $date;
+                }
+            }
+        }
+
+        $normalized = array_values(array_unique($normalized));
+        sort($normalized);
+        if ($normalized !== []) {
+            return $normalized;
+        }
+
+        $start = $this->normalizeLedgerDateString($startDate);
+        $end = $this->normalizeLedgerDateString($endDate);
+        if ($start === null || $end === null) {
+            return [];
+        }
+
+        try {
+            $cursor = Carbon::parse($start)->startOfDay();
+            $last = Carbon::parse($end)->startOfDay();
+        } catch (\Throwable) {
+            return [];
+        }
+
+        if ($cursor->gt($last)) {
+            return [];
+        }
+
+        $dates = [];
+        $safetyLimit = 370;
+        while ($cursor->lte($last) && $safetyLimit > 0) {
+            $dates[] = $cursor->toDateString();
+            $cursor = $cursor->copy()->addDay();
+            $safetyLimit--;
+        }
+
+        return $dates;
+    }
+
+    private function normalizeLedgerDateString(mixed $value): ?string
+    {
+        $raw = trim((string) ($value ?? ''));
+        if ($raw === '') {
+            return null;
+        }
+
+        try {
+            return Carbon::parse($raw)->toDateString();
+        } catch (\Throwable) {
+            return null;
+        }
     }
 }

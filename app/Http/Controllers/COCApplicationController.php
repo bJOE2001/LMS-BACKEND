@@ -306,7 +306,6 @@ class COCApplicationController extends Controller
                         'leave_type_id' => (int) $ctoLeaveType->id,
                         'balance' => $creditedDays,
                         'year' => (int) now()->year,
-                        'initialized_at' => now(),
                     ]);
                 }
 
