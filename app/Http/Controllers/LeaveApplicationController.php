@@ -17,6 +17,7 @@ use App\Models\Notification;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
 
 /**
  * Leave Application Workflow Controller.
@@ -319,12 +320,12 @@ class LeaveApplicationController extends Controller
             'selected_date_coverage.*' => ['nullable', 'string', 'in:whole,half'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
-            'medical_certificate' => ['nullable', 'file', 'max:10240'],
-            'medical_certificate_submitted' => ['nullable', 'boolean'],
-            'medical_certificate_attached' => ['nullable', 'boolean'],
-            'has_medical_certificate' => ['nullable', 'boolean'],
-            'with_medical_certificate' => ['nullable', 'boolean'],
-            'medical_certificate_reference' => ['nullable', 'string', 'max:500'],
+            'attachment' => ['nullable', 'file', 'max:10240'],
+            'attachment_submitted' => ['nullable', 'boolean'],
+            'attachment_attached' => ['nullable', 'boolean'],
+            'has_attachment' => ['nullable', 'boolean'],
+            'with_attachment' => ['nullable', 'boolean'],
+            'attachment_reference' => ['nullable', 'string', 'max:500'],
         ]);
 
         $requestedPayMode = $this->resolveRequestedPayMode(
@@ -368,7 +369,7 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
-        $medicalCertificateState = $this->resolveMedicalCertificateStateFromRequest($request, $validated);
+        $attachmentState = $this->resolveAttachmentStateFromRequest($request, $validated);
         $policyResolution = $this->applyRegularLeavePolicy(
             $leaveType,
             (float) $validated['total_days'],
@@ -377,8 +378,8 @@ class LeaveApplicationController extends Controller
             $selectedDatePayStatus,
             $requestedPayMode,
             false,
-            (bool) ($medicalCertificateState['medical_certificate_submitted'] ?? false),
-            $medicalCertificateState['medical_certificate_reference'] ?? null,
+            (bool) ($attachmentState['attachment_submitted'] ?? false),
+            $attachmentState['attachment_reference'] ?? null,
             true,
             $request->input('date_filed') ?? $request->input('dateOfFiling') ?? now(),
             (string) $validated['start_date'],
@@ -391,9 +392,9 @@ class LeaveApplicationController extends Controller
         $requestedPayMode = $policyResolution['pay_mode'];
         $selectedDatePayStatus = $policyResolution['selected_date_pay_status'];
         $deductibleDays = (float) ($policyResolution['deductible_days'] ?? 0);
-        $medicalCertificateRequired = (bool) ($policyResolution['medical_certificate_required'] ?? false);
-        $medicalCertificateSubmitted = (bool) ($policyResolution['medical_certificate_submitted'] ?? false);
-        $medicalCertificateReference = $policyResolution['medical_certificate_reference'] ?? null;
+        $attachmentRequired = (bool) ($policyResolution['attachment_required'] ?? false);
+        $attachmentSubmitted = (bool) ($policyResolution['attachment_submitted'] ?? false);
+        $attachmentReference = $policyResolution['attachment_reference'] ?? null;
 
         $duplicateDateValidation = $this->validateNoDuplicateLeaveDates(
             (string) $employee->control_no,
@@ -438,9 +439,9 @@ class LeaveApplicationController extends Controller
             $selectedDateCoverage,
             $resolvedSelectedDates,
             $deductibleDays,
-            $medicalCertificateRequired,
-            $medicalCertificateSubmitted,
-            $medicalCertificateReference
+            $attachmentRequired,
+            $attachmentSubmitted,
+            $attachmentReference
         ) {
             $application = LeaveApplication::create([
                 'erms_control_no' => (string) $employee->control_no,
@@ -455,9 +456,9 @@ class LeaveApplicationController extends Controller
                 'selected_date_coverage' => $selectedDateCoverage,
                 'commutation' => $validated['commutation'] ?? 'Not Requested',
                 'pay_mode' => $requestedPayMode,
-                'medical_certificate_required' => $medicalCertificateRequired,
-                'medical_certificate_submitted' => $medicalCertificateSubmitted,
-                'medical_certificate_reference' => $medicalCertificateReference,
+                'attachment_required' => $attachmentRequired,
+                'attachment_submitted' => $attachmentSubmitted,
+                'attachment_reference' => $attachmentReference,
                 'status' => LeaveApplication::STATUS_PENDING_ADMIN,
             ]);
 
@@ -669,12 +670,12 @@ class LeaveApplicationController extends Controller
             'total_days' => ['nullable', 'numeric', 'min:0.5', 'max:365'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
-            'medical_certificate' => ['nullable', 'file', 'max:10240'],
-            'medical_certificate_submitted' => ['nullable', 'boolean'],
-            'medical_certificate_attached' => ['nullable', 'boolean'],
-            'has_medical_certificate' => ['nullable', 'boolean'],
-            'with_medical_certificate' => ['nullable', 'boolean'],
-            'medical_certificate_reference' => ['nullable', 'string', 'max:500'],
+            'attachment' => ['nullable', 'file', 'max:10240'],
+            'attachment_submitted' => ['nullable', 'boolean'],
+            'attachment_attached' => ['nullable', 'boolean'],
+            'has_attachment' => ['nullable', 'boolean'],
+            'with_attachment' => ['nullable', 'boolean'],
+            'attachment_reference' => ['nullable', 'string', 'max:500'],
             'is_monetization' => ['nullable', 'boolean'],
         ]);
 
@@ -939,12 +940,12 @@ class LeaveApplicationController extends Controller
             'selected_date_coverage.*' => ['nullable', 'string', 'in:whole,half'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
-            'medical_certificate' => ['nullable', 'file', 'max:10240'],
-            'medical_certificate_submitted' => ['nullable', 'boolean'],
-            'medical_certificate_attached' => ['nullable', 'boolean'],
-            'has_medical_certificate' => ['nullable', 'boolean'],
-            'with_medical_certificate' => ['nullable', 'boolean'],
-            'medical_certificate_reference' => ['nullable', 'string', 'max:500'],
+            'attachment' => ['nullable', 'file', 'max:10240'],
+            'attachment_submitted' => ['nullable', 'boolean'],
+            'attachment_attached' => ['nullable', 'boolean'],
+            'has_attachment' => ['nullable', 'boolean'],
+            'with_attachment' => ['nullable', 'boolean'],
+            'attachment_reference' => ['nullable', 'string', 'max:500'],
         ]);
 
         $requestedPayMode = $this->resolveRequestedPayMode(
@@ -988,7 +989,7 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
-        $medicalCertificateState = $this->resolveMedicalCertificateStateFromRequest($request, $validated);
+        $attachmentState = $this->resolveAttachmentStateFromRequest($request, $validated);
         $policyResolution = $this->applyRegularLeavePolicy(
             $leaveType,
             (float) $validated['total_days'],
@@ -997,8 +998,8 @@ class LeaveApplicationController extends Controller
             $selectedDatePayStatus,
             $requestedPayMode,
             false,
-            (bool) ($medicalCertificateState['medical_certificate_submitted'] ?? false),
-            $medicalCertificateState['medical_certificate_reference'] ?? null,
+            (bool) ($attachmentState['attachment_submitted'] ?? false),
+            $attachmentState['attachment_reference'] ?? null,
             true,
             $request->input('date_filed') ?? $request->input('dateOfFiling') ?? now(),
             (string) $validated['start_date'],
@@ -1011,9 +1012,9 @@ class LeaveApplicationController extends Controller
         $requestedPayMode = $policyResolution['pay_mode'];
         $selectedDatePayStatus = $policyResolution['selected_date_pay_status'];
         $deductibleDays = (float) ($policyResolution['deductible_days'] ?? 0);
-        $medicalCertificateRequired = (bool) ($policyResolution['medical_certificate_required'] ?? false);
-        $medicalCertificateSubmitted = (bool) ($policyResolution['medical_certificate_submitted'] ?? false);
-        $medicalCertificateReference = $policyResolution['medical_certificate_reference'] ?? null;
+        $attachmentRequired = (bool) ($policyResolution['attachment_required'] ?? false);
+        $attachmentSubmitted = (bool) ($policyResolution['attachment_submitted'] ?? false);
+        $attachmentReference = $policyResolution['attachment_reference'] ?? null;
 
         $duplicateDateValidation = $this->validateNoDuplicateLeaveDates(
             (string) $employee->control_no,
@@ -1058,9 +1059,9 @@ class LeaveApplicationController extends Controller
             $selectedDateCoverage,
             $resolvedSelectedDates,
             $deductibleDays,
-            $medicalCertificateRequired,
-            $medicalCertificateSubmitted,
-            $medicalCertificateReference
+            $attachmentRequired,
+            $attachmentSubmitted,
+            $attachmentReference
         ) {
             $application = LeaveApplication::create([
                 'erms_control_no' => (string) $employee->control_no,
@@ -1075,9 +1076,9 @@ class LeaveApplicationController extends Controller
                 'selected_date_coverage' => $selectedDateCoverage,
                 'commutation' => $validated['commutation'] ?? 'Not Requested',
                 'pay_mode' => $requestedPayMode,
-                'medical_certificate_required' => $medicalCertificateRequired,
-                'medical_certificate_submitted' => $medicalCertificateSubmitted,
-                'medical_certificate_reference' => $medicalCertificateReference,
+                'attachment_required' => $attachmentRequired,
+                'attachment_submitted' => $attachmentSubmitted,
+                'attachment_reference' => $attachmentReference,
                 'status' => LeaveApplication::STATUS_PENDING_ADMIN,
             ]);
 
@@ -1280,6 +1281,27 @@ class LeaveApplicationController extends Controller
         ]);
     }
 
+    public function adminViewAttachment(Request $request, int $id)
+    {
+        $admin = $request->user();
+        if (!$admin instanceof DepartmentAdmin) {
+            return response()->json(['message' => 'Only department admins can access this endpoint.'], 403);
+        }
+
+        $admin->loadMissing('department');
+        $application = LeaveApplication::find($id);
+        if (!$application) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $applicationEmployee = $this->resolveApplicationEmployee($application);
+        if (($applicationEmployee?->office ?? null) !== $admin->department?->name) {
+            return response()->json(['message' => 'You can only view attachments from your department.'], 403);
+        }
+
+        return $this->streamApplicationAttachment($application);
+    }
+
     /**
      * Admin approves → status becomes PENDING_HR.
      */
@@ -1441,6 +1463,21 @@ class LeaveApplicationController extends Controller
         ]);
     }
 
+    public function hrViewAttachment(Request $request, int $id)
+    {
+        $hr = $request->user();
+        if (!$hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $application = LeaveApplication::find($id);
+        if (!$application) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        return $this->streamApplicationAttachment($application);
+    }
+
     /**
      * HR approves → status becomes APPROVED.
      * If leave type is credit-based OR is monetization, deduct from leave_balances inside a transaction.
@@ -1485,8 +1522,8 @@ class LeaveApplicationController extends Controller
             is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null,
             $app->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY,
             (bool) $app->is_monetization,
-            (bool) ($app->medical_certificate_submitted ?? false),
-            $this->trimNullableString($app->medical_certificate_reference ?? null),
+            (bool) ($app->attachment_submitted ?? false),
+            $this->trimNullableString($app->attachment_reference ?? null),
             true,
             $app->created_at ?? null,
             $app->start_date?->toDateString(),
@@ -1499,9 +1536,9 @@ class LeaveApplicationController extends Controller
         $normalizedPayMode = $policyResolution['pay_mode'];
         $resolvedSelectedDatePayStatus = $policyResolution['selected_date_pay_status'];
         $daysToDeduct = (float) ($policyResolution['deductible_days'] ?? 0);
-        $medicalCertificateRequired = (bool) ($policyResolution['medical_certificate_required'] ?? false);
-        $medicalCertificateSubmitted = (bool) ($policyResolution['medical_certificate_submitted'] ?? false);
-        $medicalCertificateReference = $policyResolution['medical_certificate_reference'] ?? null;
+        $attachmentRequired = (bool) ($policyResolution['attachment_required'] ?? false);
+        $attachmentSubmitted = (bool) ($policyResolution['attachment_submitted'] ?? false);
+        $attachmentReference = $policyResolution['attachment_reference'] ?? null;
 
         $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
         $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
@@ -1610,9 +1647,9 @@ class LeaveApplicationController extends Controller
                 $isCtoDeduction,
                 $normalizedPayMode,
                 $resolvedSelectedDatePayStatus,
-                $medicalCertificateRequired,
-                $medicalCertificateSubmitted,
-                $medicalCertificateReference
+                $attachmentRequired,
+                $attachmentSubmitted,
+                $attachmentReference
             ) {
                 // Deduct balance for credit-based leave types and monetization.
                 // Locking the exact target row avoids race conditions and cross-row side effects.
@@ -1702,9 +1739,9 @@ class LeaveApplicationController extends Controller
                     'pay_mode' => $normalizedPayMode,
                     'selected_date_pay_status' => $resolvedSelectedDatePayStatus,
                     'deductible_days' => $daysToDeduct,
-                    'medical_certificate_required' => $medicalCertificateRequired,
-                    'medical_certificate_submitted' => $medicalCertificateSubmitted,
-                    'medical_certificate_reference' => $medicalCertificateReference,
+                    'attachment_required' => $attachmentRequired,
+                    'attachment_submitted' => $attachmentSubmitted,
+                    'attachment_reference' => $attachmentReference,
                 ]);
 
                 LeaveApplicationLog::create([
@@ -1907,6 +1944,7 @@ class LeaveApplicationController extends Controller
             'name' => $lt->name,
             'is_credit_based' => $lt->is_credit_based,
             'max_days' => $lt->max_days,
+            'requires_documents' => (bool) $lt->requires_documents,
         ]);
 
         return response()->json([
@@ -1952,12 +1990,12 @@ class LeaveApplicationController extends Controller
             'selected_date_coverage.*' => ['nullable', 'string', 'in:whole,half'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
-            'medical_certificate' => ['nullable', 'file', 'max:10240'],
-            'medical_certificate_submitted' => ['nullable', 'boolean'],
-            'medical_certificate_attached' => ['nullable', 'boolean'],
-            'has_medical_certificate' => ['nullable', 'boolean'],
-            'with_medical_certificate' => ['nullable', 'boolean'],
-            'medical_certificate_reference' => ['nullable', 'string', 'max:500'],
+            'attachment' => ['nullable', 'file', 'max:10240'],
+            'attachment_submitted' => ['nullable', 'boolean'],
+            'attachment_attached' => ['nullable', 'boolean'],
+            'has_attachment' => ['nullable', 'boolean'],
+            'with_attachment' => ['nullable', 'boolean'],
+            'attachment_reference' => ['nullable', 'string', 'max:500'],
         ]);
 
         $requestedPayMode = $this->resolveRequestedPayMode(
@@ -2001,7 +2039,7 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
-        $medicalCertificateState = $this->resolveMedicalCertificateStateFromRequest($request, $validated);
+        $attachmentState = $this->resolveAttachmentStateFromRequest($request, $validated);
         $policyResolution = $this->applyRegularLeavePolicy(
             $leaveType,
             (float) $validated['total_days'],
@@ -2010,8 +2048,8 @@ class LeaveApplicationController extends Controller
             $selectedDatePayStatus,
             $requestedPayMode,
             false,
-            (bool) ($medicalCertificateState['medical_certificate_submitted'] ?? false),
-            $medicalCertificateState['medical_certificate_reference'] ?? null,
+            (bool) ($attachmentState['attachment_submitted'] ?? false),
+            $attachmentState['attachment_reference'] ?? null,
             true,
             $request->input('date_filed') ?? now(),
             (string) $validated['start_date'],
@@ -2024,9 +2062,9 @@ class LeaveApplicationController extends Controller
         $requestedPayMode = $policyResolution['pay_mode'];
         $selectedDatePayStatus = $policyResolution['selected_date_pay_status'];
         $deductibleDays = (float) ($policyResolution['deductible_days'] ?? 0);
-        $medicalCertificateRequired = (bool) ($policyResolution['medical_certificate_required'] ?? false);
-        $medicalCertificateSubmitted = (bool) ($policyResolution['medical_certificate_submitted'] ?? false);
-        $medicalCertificateReference = $policyResolution['medical_certificate_reference'] ?? null;
+        $attachmentRequired = (bool) ($policyResolution['attachment_required'] ?? false);
+        $attachmentSubmitted = (bool) ($policyResolution['attachment_submitted'] ?? false);
+        $attachmentReference = $policyResolution['attachment_reference'] ?? null;
 
         // Verify the employee belongs to the admin's department (by office name)
         $admin->loadMissing('department');
@@ -2078,9 +2116,9 @@ class LeaveApplicationController extends Controller
             $selectedDateCoverage,
             $resolvedSelectedDates,
             $deductibleDays,
-            $medicalCertificateRequired,
-            $medicalCertificateSubmitted,
-            $medicalCertificateReference
+            $attachmentRequired,
+            $attachmentSubmitted,
+            $attachmentReference
         ) {
             $application = LeaveApplication::create([
                 'erms_control_no' => (string) $employee->control_no,
@@ -2095,9 +2133,9 @@ class LeaveApplicationController extends Controller
                 'selected_date_coverage' => $selectedDateCoverage,
                 'commutation' => $validated['commutation'] ?? 'Not Requested',
                 'pay_mode' => $requestedPayMode,
-                'medical_certificate_required' => $medicalCertificateRequired,
-                'medical_certificate_submitted' => $medicalCertificateSubmitted,
-                'medical_certificate_reference' => $medicalCertificateReference,
+                'attachment_required' => $attachmentRequired,
+                'attachment_submitted' => $attachmentSubmitted,
+                'attachment_reference' => $attachmentReference,
                 'status' => LeaveApplication::STATUS_PENDING_HR,
                 'admin_id' => $admin->id,
                 'admin_approved_at' => now(),
@@ -2445,7 +2483,7 @@ class LeaveApplicationController extends Controller
     {
         return $this->getAllowedErmsLeaveTypesQuery($employee)
             ->orderBy('name')
-            ->get(['id', 'name', 'category', 'max_days', 'is_credit_based']);
+            ->get(['id', 'name', 'category', 'max_days', 'is_credit_based', 'requires_documents']);
     }
 
     private function assertEmployeeCanApplyForLeaveType(object $employee, LeaveType $leaveType): ?JsonResponse
@@ -3188,9 +3226,9 @@ class LeaveApplicationController extends Controller
             'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
             'without_pay' => $withoutPay,
             'with_pay' => !$withoutPay,
-            'medical_certificate_required' => (bool) ($app->medical_certificate_required ?? false),
-            'medical_certificate_submitted' => (bool) ($app->medical_certificate_submitted ?? false),
-            'medical_certificate_reference' => $this->trimNullableString($app->medical_certificate_reference ?? null),
+            'attachment_required' => (bool) ($app->attachment_required ?? false),
+            'attachment_submitted' => (bool) ($app->attachment_submitted ?? false),
+            'attachment_reference' => $this->trimNullableString($app->attachment_reference ?? null),
             'date_filed' => $app->created_at?->toDateString(),
             'filed_at' => $app->created_at?->toIso8601String(),
             'created_at' => $app->created_at?->toIso8601String(),
@@ -3313,11 +3351,11 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
-        $medicalCertificateState = $this->resolveMedicalCertificateStateFromRequest(
+        $attachmentState = $this->resolveAttachmentStateFromRequest(
             $request,
             $validated,
-            (bool) ($app->medical_certificate_submitted ?? false),
-            $this->trimNullableString($app->medical_certificate_reference ?? null)
+            (bool) ($app->attachment_submitted ?? false),
+            $this->trimNullableString($app->attachment_reference ?? null)
         );
 
         $policyResolution = $this->applyRegularLeavePolicy(
@@ -3328,8 +3366,8 @@ class LeaveApplicationController extends Controller
             $requestedSelectedDatePayStatus,
             $resolvedPayMode,
             $requestedIsMonetization,
-            (bool) ($medicalCertificateState['medical_certificate_submitted'] ?? false),
-            $medicalCertificateState['medical_certificate_reference'] ?? null,
+            (bool) ($attachmentState['attachment_submitted'] ?? false),
+            $attachmentState['attachment_reference'] ?? null,
             true,
             $app->created_at ?? null,
             $resolvedStartDate,
@@ -3342,9 +3380,9 @@ class LeaveApplicationController extends Controller
         $resolvedPayMode = $policyResolution['pay_mode'];
         $requestedSelectedDatePayStatus = $policyResolution['selected_date_pay_status'];
         $resolvedDeductibleDays = (float) ($policyResolution['deductible_days'] ?? 0);
-        $medicalCertificateRequired = (bool) ($policyResolution['medical_certificate_required'] ?? false);
-        $medicalCertificateSubmitted = (bool) ($policyResolution['medical_certificate_submitted'] ?? false);
-        $medicalCertificateReference = $policyResolution['medical_certificate_reference'] ?? null;
+        $attachmentRequired = (bool) ($policyResolution['attachment_required'] ?? false);
+        $attachmentSubmitted = (bool) ($policyResolution['attachment_submitted'] ?? false);
+        $attachmentReference = $policyResolution['attachment_reference'] ?? null;
 
         $rawPayload = [
             'leave_type_id' => $targetLeaveTypeId,
@@ -3361,9 +3399,9 @@ class LeaveApplicationController extends Controller
                 : ($app->commutation ?? 'Not Requested'),
             'pay_mode' => $resolvedPayMode,
             'is_monetization' => $requestedIsMonetization,
-            'medical_certificate_required' => $medicalCertificateRequired,
-            'medical_certificate_submitted' => $medicalCertificateSubmitted,
-            'medical_certificate_reference' => $medicalCertificateReference,
+            'attachment_required' => $attachmentRequired,
+            'attachment_submitted' => $attachmentSubmitted,
+            'attachment_reference' => $attachmentReference,
         ];
 
         $payload = $this->normalizePendingUpdatePayload($rawPayload);
@@ -3411,9 +3449,9 @@ class LeaveApplicationController extends Controller
             'commutation' => $app->commutation ?? 'Not Requested',
             'pay_mode' => $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization),
             'is_monetization' => (bool) $app->is_monetization,
-            'medical_certificate_required' => (bool) ($app->medical_certificate_required ?? false),
-            'medical_certificate_submitted' => (bool) ($app->medical_certificate_submitted ?? false),
-            'medical_certificate_reference' => $this->trimNullableString($app->medical_certificate_reference ?? null),
+            'attachment_required' => (bool) ($app->attachment_required ?? false),
+            'attachment_submitted' => (bool) ($app->attachment_submitted ?? false),
+            'attachment_reference' => $this->trimNullableString($app->attachment_reference ?? null),
         ]);
 
         $normalizedRequestedPayload = $this->normalizePendingUpdatePayload($requestedPayload);
@@ -3466,17 +3504,17 @@ class LeaveApplicationController extends Controller
             return true;
         }
 
-        if ((bool) ($currentPayload['medical_certificate_required'] ?? false) !== (bool) ($normalizedRequestedPayload['medical_certificate_required'] ?? false)) {
+        if ((bool) ($currentPayload['attachment_required'] ?? false) !== (bool) ($normalizedRequestedPayload['attachment_required'] ?? false)) {
             return true;
         }
 
-        if ((bool) ($currentPayload['medical_certificate_submitted'] ?? false) !== (bool) ($normalizedRequestedPayload['medical_certificate_submitted'] ?? false)) {
+        if ((bool) ($currentPayload['attachment_submitted'] ?? false) !== (bool) ($normalizedRequestedPayload['attachment_submitted'] ?? false)) {
             return true;
         }
 
         if (
-            $this->trimNullableString($currentPayload['medical_certificate_reference'] ?? null)
-            !== $this->trimNullableString($normalizedRequestedPayload['medical_certificate_reference'] ?? null)
+            $this->trimNullableString($currentPayload['attachment_reference'] ?? null)
+            !== $this->trimNullableString($normalizedRequestedPayload['attachment_reference'] ?? null)
         ) {
             return true;
         }
@@ -3554,10 +3592,10 @@ class LeaveApplicationController extends Controller
                 $targetSelectedDates
             );
 
-        $targetMedicalCertificateState = $this->resolveMedicalCertificateStateFromPayload(
+        $targetAttachmentState = $this->resolveAttachmentStateFromPayload(
             is_array($payload) ? $payload : [],
-            (bool) ($app->medical_certificate_submitted ?? false),
-            $this->trimNullableString($app->medical_certificate_reference ?? null)
+            (bool) ($app->attachment_submitted ?? false),
+            $this->trimNullableString($app->attachment_reference ?? null)
         );
         $policyResolution = $this->applyRegularLeavePolicy(
             $targetLeaveType,
@@ -3567,8 +3605,8 @@ class LeaveApplicationController extends Controller
             $targetSelectedDatePayStatus,
             $targetPayMode,
             $targetIsMonetization,
-            (bool) ($targetMedicalCertificateState['medical_certificate_submitted'] ?? false),
-            $targetMedicalCertificateState['medical_certificate_reference'] ?? null,
+            (bool) ($targetAttachmentState['attachment_submitted'] ?? false),
+            $targetAttachmentState['attachment_reference'] ?? null,
             true,
             $app->created_at ?? null,
             $targetStartDate,
@@ -3581,9 +3619,9 @@ class LeaveApplicationController extends Controller
         $targetPayMode = $policyResolution['pay_mode'];
         $targetSelectedDatePayStatus = $policyResolution['selected_date_pay_status'];
         $targetDeductibleDays = (float) ($policyResolution['deductible_days'] ?? 0);
-        $targetMedicalCertificateRequired = (bool) ($policyResolution['medical_certificate_required'] ?? false);
-        $targetMedicalCertificateSubmitted = (bool) ($policyResolution['medical_certificate_submitted'] ?? false);
-        $targetMedicalCertificateReference = $policyResolution['medical_certificate_reference'] ?? null;
+        $targetAttachmentRequired = (bool) ($policyResolution['attachment_required'] ?? false);
+        $targetAttachmentSubmitted = (bool) ($policyResolution['attachment_submitted'] ?? false);
+        $targetAttachmentReference = $policyResolution['attachment_reference'] ?? null;
 
         if (!$targetIsMonetization && ($targetStartDate === null || $targetEndDate === null)) {
             return response()->json([
@@ -3659,9 +3697,9 @@ class LeaveApplicationController extends Controller
                 $targetDeductibleDays,
                 $targetIsMonetization,
                 $targetPayMode,
-                $targetMedicalCertificateRequired,
-                $targetMedicalCertificateSubmitted,
-                $targetMedicalCertificateReference,
+                $targetAttachmentRequired,
+                $targetAttachmentSubmitted,
+                $targetAttachmentReference,
                 $balanceAdjustments,
                 $balanceConflictError
             ): void {
@@ -3688,9 +3726,9 @@ class LeaveApplicationController extends Controller
                     'selected_date_coverage' => $targetIsMonetization ? null : $targetSelectedDateCoverage,
                     'commutation' => (string) ($payload['commutation'] ?? 'Not Requested'),
                     'pay_mode' => $targetPayMode,
-                    'medical_certificate_required' => $targetMedicalCertificateRequired,
-                    'medical_certificate_submitted' => $targetMedicalCertificateSubmitted,
-                    'medical_certificate_reference' => $targetMedicalCertificateReference,
+                    'attachment_required' => $targetAttachmentRequired,
+                    'attachment_submitted' => $targetAttachmentSubmitted,
+                    'attachment_reference' => $targetAttachmentReference,
                     'is_monetization' => $targetIsMonetization,
                     'status' => LeaveApplication::STATUS_APPROVED,
                     'hr_id' => $hr->id,
@@ -3953,14 +3991,14 @@ class LeaveApplicationController extends Controller
                 $selectedDateCoverage,
                 $selectedDates
             );
-        $medicalCertificateState = $this->resolveMedicalCertificateStateFromPayload(
+        $attachmentState = $this->resolveAttachmentStateFromPayload(
             is_array($payload) ? $payload : [],
-            (bool) ($payload['medical_certificate_submitted'] ?? false),
-            $this->trimNullableString($payload['medical_certificate_reference'] ?? null)
+            (bool) ($payload['attachment_submitted'] ?? false),
+            $this->trimNullableString($payload['attachment_reference'] ?? null)
         );
-        $medicalCertificateRequired = (bool) ($payload['medical_certificate_required'] ?? false);
-        $medicalCertificateSubmitted = (bool) ($medicalCertificateState['medical_certificate_submitted'] ?? false);
-        $medicalCertificateReference = $medicalCertificateState['medical_certificate_reference'] ?? null;
+        $attachmentRequired = (bool) ($payload['attachment_required'] ?? false);
+        $attachmentSubmitted = (bool) ($attachmentState['attachment_submitted'] ?? false);
+        $attachmentReference = $attachmentState['attachment_reference'] ?? null;
 
         static $leaveTypeNameCache = [];
         $leaveTypeName = null;
@@ -3986,8 +4024,8 @@ class LeaveApplicationController extends Controller
                 $selectedDatePayStatus,
                 $payMode,
                 $isMonetization,
-                $medicalCertificateSubmitted,
-                $medicalCertificateReference,
+                $attachmentSubmitted,
+                $attachmentReference,
                 false,
                 $payload['date_filed'] ?? null,
                 $startDate,
@@ -3998,9 +4036,9 @@ class LeaveApplicationController extends Controller
                 $payMode = $policyResolution['pay_mode'];
                 $selectedDatePayStatus = $policyResolution['selected_date_pay_status'];
                 $deductibleDays = (float) ($policyResolution['deductible_days'] ?? 0);
-                $medicalCertificateRequired = (bool) ($policyResolution['medical_certificate_required'] ?? false);
-                $medicalCertificateSubmitted = (bool) ($policyResolution['medical_certificate_submitted'] ?? false);
-                $medicalCertificateReference = $policyResolution['medical_certificate_reference'] ?? null;
+                $attachmentRequired = (bool) ($policyResolution['attachment_required'] ?? false);
+                $attachmentSubmitted = (bool) ($policyResolution['attachment_submitted'] ?? false);
+                $attachmentReference = $policyResolution['attachment_reference'] ?? null;
             } else {
                 $deductibleDays = $this->computeDeductibleDays(
                     $totalDays,
@@ -4041,9 +4079,9 @@ class LeaveApplicationController extends Controller
             'without_pay' => $withoutPay,
             'with_pay' => !$withoutPay,
             'is_monetization' => $isMonetization,
-            'medical_certificate_required' => $medicalCertificateRequired,
-            'medical_certificate_submitted' => $medicalCertificateSubmitted,
-            'medical_certificate_reference' => $this->trimNullableString($medicalCertificateReference),
+            'attachment_required' => $attachmentRequired,
+            'attachment_submitted' => $attachmentSubmitted,
+            'attachment_reference' => $this->trimNullableString($attachmentReference),
         ];
     }
 
@@ -4457,7 +4495,7 @@ class LeaveApplicationController extends Controller
         return strcasecmp((string) ($leaveTypeName ?? ''), 'Sick Leave') === 0;
     }
 
-    private function resolveMedicalCertificateStateFromRequest(
+    private function resolveAttachmentStateFromRequest(
         Request $request,
         array $validated,
         ?bool $fallbackSubmitted = null,
@@ -4467,10 +4505,10 @@ class LeaveApplicationController extends Controller
         $reference = $this->trimNullableString($fallbackReference);
 
         $booleanKeys = [
-            'medical_certificate_submitted',
-            'medical_certificate_attached',
-            'has_medical_certificate',
-            'with_medical_certificate',
+            'attachment_submitted',
+            'attachment_attached',
+            'has_attachment',
+            'with_attachment',
         ];
         foreach ($booleanKeys as $key) {
             if (!array_key_exists($key, $validated) && $request->input($key) === null) {
@@ -4489,7 +4527,7 @@ class LeaveApplicationController extends Controller
         }
 
         $referenceKeys = [
-            'medical_certificate_reference',
+            'attachment_reference',
         ];
         foreach ($referenceKeys as $key) {
             $candidate = $this->trimNullableString(
@@ -4505,10 +4543,10 @@ class LeaveApplicationController extends Controller
             }
         }
 
-        if ($request->hasFile('medical_certificate')) {
-            $uploadedFile = $request->file('medical_certificate');
+        if ($request->hasFile('attachment')) {
+            $uploadedFile = $request->file('attachment');
             if ($uploadedFile && $uploadedFile->isValid()) {
-                $reference = $uploadedFile->store('leave-medical-certificates');
+                $reference = $uploadedFile->store('leave-attachments');
                 $submitted = true;
             }
         }
@@ -4518,12 +4556,12 @@ class LeaveApplicationController extends Controller
         }
 
         return [
-            'medical_certificate_submitted' => $submitted,
-            'medical_certificate_reference' => $reference,
+            'attachment_submitted' => $submitted,
+            'attachment_reference' => $reference,
         ];
     }
 
-    private function resolveMedicalCertificateStateFromPayload(
+    private function resolveAttachmentStateFromPayload(
         array $payload,
         ?bool $fallbackSubmitted = null,
         ?string $fallbackReference = null
@@ -4532,10 +4570,10 @@ class LeaveApplicationController extends Controller
         $reference = $this->trimNullableString($fallbackReference);
 
         $booleanKeys = [
-            'medical_certificate_submitted',
-            'medical_certificate_attached',
-            'has_medical_certificate',
-            'with_medical_certificate',
+            'attachment_submitted',
+            'attachment_attached',
+            'has_attachment',
+            'with_attachment',
         ];
         foreach ($booleanKeys as $key) {
             if (!array_key_exists($key, $payload)) {
@@ -4549,7 +4587,7 @@ class LeaveApplicationController extends Controller
         }
 
         $referenceKeys = [
-            'medical_certificate_reference',
+            'attachment_reference',
         ];
         foreach ($referenceKeys as $key) {
             if (!array_key_exists($key, $payload)) {
@@ -4569,8 +4607,8 @@ class LeaveApplicationController extends Controller
         }
 
         return [
-            'medical_certificate_submitted' => $submitted,
-            'medical_certificate_reference' => $reference,
+            'attachment_submitted' => $submitted,
+            'attachment_reference' => $reference,
         ];
     }
 
@@ -4582,9 +4620,9 @@ class LeaveApplicationController extends Controller
         ?array $selectedDatePayStatus,
         string $payMode,
         bool $isMonetization,
-        bool $medicalCertificateSubmitted = false,
-        ?string $medicalCertificateReference = null,
-        bool $enforceMedicalCertificate = true,
+        bool $attachmentSubmitted = false,
+        ?string $attachmentReference = null,
+        bool $enforceAttachment = true,
         mixed $filedAt = null,
         ?string $absenceStartDate = null,
         ?string $absenceEndDate = null
@@ -4596,9 +4634,9 @@ class LeaveApplicationController extends Controller
                 'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
                 'selected_date_pay_status' => null,
                 'deductible_days' => $normalizedTotalDays,
-                'medical_certificate_required' => false,
-                'medical_certificate_submitted' => false,
-                'medical_certificate_reference' => null,
+                'attachment_required' => false,
+                'attachment_submitted' => false,
+                'attachment_reference' => null,
             ];
         }
 
@@ -4611,13 +4649,18 @@ class LeaveApplicationController extends Controller
             : null;
 
         $isSickLeave = $this->isSickLeaveType($leaveType, (int) $leaveType->id);
-        $medicalCertificateRequired = $isSickLeave && $normalizedTotalDays >= 5.0;
+        $attachmentRequired = $isSickLeave
+            ? $normalizedTotalDays >= 5.0
+            : (bool) ($leaveType->requires_documents ?? false);
 
-        if ($enforceMedicalCertificate && $medicalCertificateRequired && !$medicalCertificateSubmitted) {
+        if ($enforceAttachment && $attachmentRequired && !$attachmentSubmitted) {
+            $requiredDocumentMessage = $isSickLeave
+                ? 'Medical certificate is required for Sick Leave applications of 5 days or more.'
+                : 'Supporting document is required for the selected leave type.';
             return response()->json([
-                'message' => 'Medical certificate is required for Sick Leave applications of 5 days or more.',
+                'message' => $requiredDocumentMessage,
                 'errors' => [
-                    'medical_certificate' => ['Medical certificate is required for Sick Leave applications of 5 days or more.'],
+                    'attachment' => [$requiredDocumentMessage],
                 ],
             ], 422);
         }
@@ -4665,22 +4708,23 @@ class LeaveApplicationController extends Controller
                 $normalizedPayMode
             );
 
-            $medicalCertificateSubmitted = false;
-            $medicalCertificateReference = null;
-            $medicalCertificateRequired = false;
+            if (!$attachmentRequired) {
+                $attachmentSubmitted = false;
+                $attachmentReference = null;
+            }
         }
 
-        if (!$medicalCertificateSubmitted) {
-            $medicalCertificateReference = null;
+        if (!$attachmentSubmitted) {
+            $attachmentReference = null;
         }
 
         return [
             'pay_mode' => $normalizedPayMode,
             'selected_date_pay_status' => $normalizedSelectedDatePayStatus,
             'deductible_days' => round(max((float) $deductibleDays, 0.0), 2),
-            'medical_certificate_required' => $medicalCertificateRequired,
-            'medical_certificate_submitted' => $medicalCertificateSubmitted,
-            'medical_certificate_reference' => $this->trimNullableString($medicalCertificateReference),
+            'attachment_required' => $attachmentRequired,
+            'attachment_submitted' => $attachmentSubmitted,
+            'attachment_reference' => $this->trimNullableString($attachmentReference),
         ];
     }
 
@@ -4812,7 +4856,10 @@ class LeaveApplicationController extends Controller
 
         $resolvedDates = [];
         foreach ($selectedDates as $rawDate) {
-            $dateKey = trim((string) $rawDate);
+            $dateKey = $this->normalizeDateKey($rawDate);
+            if ($dateKey === null) {
+                $dateKey = trim((string) $rawDate);
+            }
             if ($dateKey === '') {
                 continue;
             }
@@ -4977,7 +5024,10 @@ class LeaveApplicationController extends Controller
     ): array {
         $resolvedDates = [];
         foreach ($selectedDates as $rawDate) {
-            $dateKey = trim((string) $rawDate);
+            $dateKey = $this->normalizeDateKey($rawDate);
+            if ($dateKey === null) {
+                $dateKey = trim((string) $rawDate);
+            }
             if ($dateKey === '') {
                 continue;
             }
@@ -5030,6 +5080,33 @@ class LeaveApplicationController extends Controller
         }
 
         return $weights;
+    }
+
+    private function normalizeDateKey(mixed $rawDate): ?string
+    {
+        if ($rawDate === null || $rawDate === '') {
+            return null;
+        }
+
+        if ($rawDate instanceof \DateTimeInterface) {
+            return \Carbon\CarbonImmutable::instance($rawDate)->toDateString();
+        }
+
+        $raw = trim((string) $rawDate);
+        if ($raw === '') {
+            return null;
+        }
+
+        // Keep short numeric indexes (e.g. "0", "1") available for selected-date lookup mapping.
+        if (preg_match('/^\d+$/', $raw) === 1 && strlen($raw) <= 3) {
+            return null;
+        }
+
+        try {
+            return \Carbon\CarbonImmutable::parse($raw)->toDateString();
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     private function normalizePayMode(mixed $payMode, bool $isMonetization = false): string
@@ -5185,7 +5262,10 @@ class LeaveApplicationController extends Controller
 
         $normalized = [];
         foreach ($value as $rawDate => $rawStatus) {
-            $dateKey = trim((string) $rawDate);
+            $dateKey = $this->normalizeDateKey($rawDate);
+            if ($dateKey === null) {
+                $dateKey = trim((string) $rawDate);
+            }
             if ($dateKey === '') {
                 continue;
             }
@@ -5221,7 +5301,10 @@ class LeaveApplicationController extends Controller
 
         $normalized = [];
         foreach ($value as $rawDate => $rawCoverage) {
-            $dateKey = trim((string) $rawDate);
+            $dateKey = $this->normalizeDateKey($rawDate);
+            if ($dateKey === null) {
+                $dateKey = trim((string) $rawDate);
+            }
             if ($dateKey === '') {
                 continue;
             }
@@ -5256,21 +5339,36 @@ class LeaveApplicationController extends Controller
 
         $defaultMode = $this->normalizePayMode($payMode, false);
         $dateSet = [];
+        $selectedDateLookup = [];
         if (is_array($selectedDates)) {
-            foreach ($selectedDates as $rawDate) {
-                $dateKey = trim((string) $rawDate);
-                if ($dateKey === '') {
+            foreach ($selectedDates as $index => $rawDate) {
+                $rawKey = trim((string) $rawDate);
+                if ($rawKey === '') {
                     continue;
                 }
 
+                $dateKey = $this->normalizeDateKey($rawDate);
+                if ($dateKey === null) {
+                    $dateKey = $rawKey;
+                }
+
                 $dateSet[$dateKey] = true;
+                $selectedDateLookup[(string) $index] = $dateKey;
+                $selectedDateLookup[$rawKey] = $dateKey;
             }
         }
         $restrictToSelectedDates = $dateSet !== [];
 
         $compacted = [];
         foreach ($selectedDatePayStatus as $rawDate => $rawStatus) {
-            $dateKey = trim((string) $rawDate);
+            $rawKey = trim((string) $rawDate);
+            $dateKey = $this->normalizeDateKey($rawDate);
+            if ($dateKey === null && $rawKey !== '' && array_key_exists($rawKey, $selectedDateLookup)) {
+                $dateKey = $selectedDateLookup[$rawKey];
+            }
+            if ($dateKey === null) {
+                $dateKey = $rawKey;
+            }
             if ($dateKey === '') {
                 continue;
             }
@@ -5308,21 +5406,36 @@ class LeaveApplicationController extends Controller
         }
 
         $dateSet = [];
+        $selectedDateLookup = [];
         if (is_array($selectedDates)) {
-            foreach ($selectedDates as $rawDate) {
-                $dateKey = trim((string) $rawDate);
-                if ($dateKey === '') {
+            foreach ($selectedDates as $index => $rawDate) {
+                $rawKey = trim((string) $rawDate);
+                if ($rawKey === '') {
                     continue;
                 }
 
+                $dateKey = $this->normalizeDateKey($rawDate);
+                if ($dateKey === null) {
+                    $dateKey = $rawKey;
+                }
+
                 $dateSet[$dateKey] = true;
+                $selectedDateLookup[(string) $index] = $dateKey;
+                $selectedDateLookup[$rawKey] = $dateKey;
             }
         }
         $restrictToSelectedDates = $dateSet !== [];
 
         $compacted = [];
         foreach ($selectedDateCoverage as $rawDate => $rawCoverage) {
-            $dateKey = trim((string) $rawDate);
+            $rawKey = trim((string) $rawDate);
+            $dateKey = $this->normalizeDateKey($rawDate);
+            if ($dateKey === null && $rawKey !== '' && array_key_exists($rawKey, $selectedDateLookup)) {
+                $dateKey = $selectedDateLookup[$rawKey];
+            }
+            if ($dateKey === null) {
+                $dateKey = $rawKey;
+            }
             if ($dateKey === '') {
                 continue;
             }
@@ -5375,20 +5488,62 @@ class LeaveApplicationController extends Controller
         $normalizedPayMode = $this->normalizePayMode($payMode, false);
 
         $resolvedDates = [];
+        $selectedDateLookup = [];
         if (is_array($selectedDates)) {
-            foreach ($selectedDates as $rawDate) {
-                $dateKey = trim((string) $rawDate);
-                if ($dateKey === '') {
+            foreach ($selectedDates as $index => $rawDate) {
+                $rawKey = trim((string) $rawDate);
+                if ($rawKey === '') {
                     continue;
                 }
+
+                $dateKey = $this->normalizeDateKey($rawDate);
+                if ($dateKey === null) {
+                    $dateKey = $rawKey;
+                }
+
                 $resolvedDates[] = $dateKey;
+                $selectedDateLookup[(string) $index] = $dateKey;
+                $selectedDateLookup[$rawKey] = $dateKey;
             }
         }
         $resolvedDates = array_values(array_unique($resolvedDates));
         sort($resolvedDates);
 
-        $payStatusMap = is_array($selectedDatePayStatus) ? $selectedDatePayStatus : [];
-        $coverageMap = is_array($selectedDateCoverage) ? $selectedDateCoverage : [];
+        $payStatusMap = [];
+        if (is_array($selectedDatePayStatus)) {
+            foreach ($selectedDatePayStatus as $rawDate => $status) {
+                $rawKey = trim((string) $rawDate);
+                $dateKey = $this->normalizeDateKey($rawDate);
+                if ($dateKey === null && $rawKey !== '' && array_key_exists($rawKey, $selectedDateLookup)) {
+                    $dateKey = $selectedDateLookup[$rawKey];
+                }
+                if ($dateKey === null) {
+                    $dateKey = $rawKey;
+                }
+                if ($dateKey === '') {
+                    continue;
+                }
+                $payStatusMap[$dateKey] = $status;
+            }
+        }
+
+        $coverageMap = [];
+        if (is_array($selectedDateCoverage)) {
+            foreach ($selectedDateCoverage as $rawDate => $coverage) {
+                $rawKey = trim((string) $rawDate);
+                $dateKey = $this->normalizeDateKey($rawDate);
+                if ($dateKey === null && $rawKey !== '' && array_key_exists($rawKey, $selectedDateLookup)) {
+                    $dateKey = $selectedDateLookup[$rawKey];
+                }
+                if ($dateKey === null) {
+                    $dateKey = $rawKey;
+                }
+                if ($dateKey === '') {
+                    continue;
+                }
+                $coverageMap[$dateKey] = $coverage;
+            }
+        }
         $hasCoverageOverrides = $coverageMap !== [];
 
         if ($resolvedDates === []) {
@@ -5774,9 +5929,11 @@ class LeaveApplicationController extends Controller
             'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
             'without_pay' => $withoutPay,
             'with_pay' => !$withoutPay,
-            'medical_certificate_required' => (bool) ($app->medical_certificate_required ?? false),
-            'medical_certificate_submitted' => (bool) ($app->medical_certificate_submitted ?? false),
-            'medical_certificate_reference' => $this->trimNullableString($app->medical_certificate_reference ?? null),
+            'attachment_required' => (bool) ($app->attachment_required ?? false),
+            'attachment_submitted' => (bool) ($app->attachment_submitted ?? false),
+            'attachment_reference' => $this->trimNullableString($app->attachment_reference ?? null),
+            'attachment_available' => $this->trimNullableString($app->attachment_reference ?? null) !== null,
+            'has_attachment' => $this->trimNullableString($app->attachment_reference ?? null) !== null,
             'is_monetization' => (bool) $app->is_monetization,
             'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
             'deductible_days' => $deductibleDays,
@@ -5808,6 +5965,62 @@ class LeaveApplicationController extends Controller
         }
 
         return $data;
+    }
+
+    private function streamApplicationAttachment(LeaveApplication $application)
+    {
+        $reference = $this->trimNullableString($application->attachment_reference ?? null);
+        if ($reference === null) {
+            return response()->json(['message' => 'No uploaded attachment found for this leave application.'], 404);
+        }
+
+        if (filter_var($reference, FILTER_VALIDATE_URL)) {
+            return redirect()->away($reference);
+        }
+
+        $normalizedReference = ltrim(str_replace('\\', '/', $reference), '/');
+        if ($normalizedReference === '' || str_contains($normalizedReference, '..')) {
+            return response()->json(['message' => 'Attachment file not found.'], 404);
+        }
+
+        if (str_starts_with($normalizedReference, 'storage/')) {
+            $normalizedReference = ltrim(substr($normalizedReference, strlen('storage/')), '/');
+        }
+
+        $candidatePaths = [$normalizedReference];
+        if (!str_starts_with($normalizedReference, 'public/')) {
+            $candidatePaths[] = 'public/' . $normalizedReference;
+        }
+
+        $candidateDisks = array_values(array_unique(array_filter([
+            (string) config('filesystems.default', 'local'),
+            'public',
+            'local',
+        ])));
+
+        foreach ($candidateDisks as $disk) {
+            $storage = Storage::disk($disk);
+            foreach ($candidatePaths as $path) {
+                if (!$storage->exists($path)) {
+                    continue;
+                }
+
+                $filename = basename($path);
+                $mimeType = $storage->mimeType($path) ?: 'application/octet-stream';
+
+                return $storage->response(
+                    $path,
+                    $filename,
+                    [
+                        'Content-Type' => $mimeType,
+                        'Content-Disposition' => 'inline; filename="' . $filename . '"',
+                        'X-Content-Type-Options' => 'nosniff',
+                    ]
+                );
+            }
+        }
+
+        return response()->json(['message' => 'Attachment file not found.'], 404);
     }
 
     private function getApplicationLeaveBalanceSnapshot(LeaveApplication $app): array
@@ -5899,3 +6112,5 @@ class LeaveApplicationController extends Controller
         }
     }
 }
+
+
