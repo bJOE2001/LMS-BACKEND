@@ -8,10 +8,12 @@ use App\Models\DepartmentHead;
 use App\Models\Employee;
 use App\Models\HRAccount;
 use App\Models\LeaveApplication;
+use App\Models\LeaveApplicationLog;
 use App\Models\LeaveBalance;
 use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveType;
 use Carbon\Carbon;
+use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Collection;
@@ -522,7 +524,16 @@ class EmployeeController extends Controller
             }
 
             $approvedApplications = LeaveApplication::query()
-                ->where('status', LeaveApplication::STATUS_APPROVED)
+                ->with(['logs' => function ($query) {
+                    $query
+                        ->where('action', LeaveApplicationLog::ACTION_HR_RECALLED)
+                        ->orderByDesc('created_at')
+                        ->orderByDesc('id');
+                }])
+                ->whereIn('status', [
+                    LeaveApplication::STATUS_APPROVED,
+                    LeaveApplication::STATUS_RECALLED,
+                ])
                 ->whereIn('erms_control_no', $controlNoCandidates)
                 ->whereIn('leave_type_id', $queryTrackedTypeIds)
                 ->orderByDesc('hr_approved_at')
@@ -535,11 +546,16 @@ class EmployeeController extends Controller
                     'deductible_days',
                     'pay_mode',
                     'is_monetization',
+                    'status',
+                    'remarks',
                     'start_date',
                     'end_date',
                     'selected_dates',
+                    'selected_date_pay_status',
+                    'selected_date_coverage',
                     'hr_approved_at',
                     'created_at',
+                    'updated_at',
                 ]);
 
             foreach ($approvedApplications as $application) {
@@ -653,6 +669,54 @@ class EmployeeController extends Controller
                         'amount' => $withoutPayAmount,
                         'balance_delta' => 0.0,
                     ];
+                }
+
+                if ($application->status === LeaveApplication::STATUS_RECALLED) {
+                    $recallLog = $application->relationLoaded('logs')
+                        ? $application->logs->first(function (LeaveApplicationLog $log): bool {
+                            return $log->action === LeaveApplicationLog::ACTION_HR_RECALLED
+                                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR;
+                        })
+                        : null;
+
+                    $recallOccurredAt = $recallLog?->created_at
+                        ? CarbonImmutable::instance($recallLog->created_at)
+                        : ($application->updated_at ? CarbonImmutable::instance($application->updated_at) : null);
+                    $recallDetails = $this->resolveLedgerRecallRestorableDetails($application, $recallOccurredAt);
+                    $restoredAmount = (float) ($recallDetails['days'] ?? 0.0);
+                    $restoredDates = is_array($recallDetails['dates'] ?? null)
+                        ? $recallDetails['dates']
+                        : [];
+
+                    $restoreTypeKey = $isForcedLeave ? 'vacation' : $typeKey;
+                    if (
+                        $restoreTypeKey !== null
+                        && array_key_exists($restoreTypeKey, $runningBalances)
+                        && $restoredAmount > 0.0
+                    ) {
+                        $recallDate = $recallOccurredAt?->toDateString();
+                        if ($recallDate !== null) {
+                            $transactions[] = [
+                                'row_id' => $mergeKey . '-recall',
+                                'merge_key' => $mergeKey . '-recall',
+                                'type_key' => $restoreTypeKey,
+                                'transaction_date' => $recallDate,
+                                'sort_date' => $recallDate,
+                                'sort_timestamp' => (string) ($recallOccurredAt?->toIso8601String() ?? $recallDate),
+                                'particulars' => match (true) {
+                                    $isForcedLeave => 'Forced Leave recalled',
+                                    $typeKey === 'vacation' => 'Vacation Leave recalled',
+                                    $typeKey === 'sick' => 'Sick Leave recalled',
+                                    default => 'Leave recalled',
+                                },
+                                'action_taken' => 'Recalled by HR',
+                                'inclusive_dates' => $restoredDates,
+                                'category' => 'earned',
+                                'amount' => $restoredAmount,
+                                'balance_delta' => $restoredAmount,
+                            ];
+                        }
+                    }
                 }
             }
         }
@@ -803,6 +867,7 @@ class EmployeeController extends Controller
             LeaveApplication::STATUS_PENDING_HR => 'Pending HR',
             LeaveApplication::STATUS_APPROVED => 'Approved',
             LeaveApplication::STATUS_REJECTED => 'Rejected',
+            LeaveApplication::STATUS_RECALLED => 'Recalled',
             default => (string) $status,
         };
     }
@@ -1502,5 +1567,352 @@ class EmployeeController extends Controller
         } catch (\Throwable) {
             return null;
         }
+    }
+
+    private function resolveLedgerApplicationDeductibleDays(LeaveApplication $application): float
+    {
+        $totalDays = round(max((float) ($application->total_days ?? 0), 0.0), 2);
+        if ($totalDays <= 0.0) {
+            return 0.0;
+        }
+
+        if ($application->deductible_days !== null) {
+            $stored = round((float) $application->deductible_days, 2);
+            if ($stored < 0.0) {
+                return 0.0;
+            }
+
+            return $stored > $totalDays ? $totalDays : $stored;
+        }
+
+        if ((bool) $application->is_monetization) {
+            return $totalDays;
+        }
+
+        return $this->normalizeLedgerPayMode($application->pay_mode ?? null, false) === LeaveApplication::PAY_MODE_WITHOUT_PAY
+            ? 0.0
+            : $totalDays;
+    }
+
+    private function resolveLedgerRecallRestorableDetails(
+        LeaveApplication $application,
+        ?CarbonImmutable $asOfDate = null
+    ): array {
+        $deductibleDays = $this->resolveLedgerApplicationDeductibleDays($application);
+        if ($deductibleDays <= 0.0) {
+            return ['days' => 0.0, 'dates' => []];
+        }
+
+        if ((bool) $application->is_monetization) {
+            return ['days' => $deductibleDays, 'dates' => []];
+        }
+
+        $selectedDates = $application->resolvedSelectedDates();
+        if (!is_array($selectedDates) || $selectedDates === []) {
+            return ['days' => $deductibleDays, 'dates' => []];
+        }
+
+        $normalizedPayMode = $this->normalizeLedgerPayMode($application->pay_mode ?? null, false);
+        $normalizedPayStatus = $this->compactLedgerSelectedDatePayStatusMap(
+            is_array($application->selected_date_pay_status) ? $application->selected_date_pay_status : null,
+            $selectedDates,
+            $normalizedPayMode
+        );
+        $normalizedCoverage = $this->compactLedgerSelectedDateCoverageMap(
+            is_array($application->selected_date_coverage) ? $application->selected_date_coverage : null,
+            $selectedDates
+        );
+        $coverageWeights = $this->resolveLedgerDateCoverageWeights(
+            $selectedDates,
+            $normalizedCoverage,
+            round((float) ($application->total_days ?? 0), 2)
+        );
+
+        $recallDate = ($asOfDate ?? CarbonImmutable::now())->startOfDay()->toDateString();
+        $restorableDays = 0.0;
+        $restorableDates = [];
+
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeLedgerDateKey($rawDate) ?? trim((string) $rawDate);
+            if ($dateKey === '' || strcmp($dateKey, $recallDate) < 0) {
+                continue;
+            }
+
+            $weight = round(max((float) ($coverageWeights[$dateKey] ?? 1.0), 0.0), 2);
+            if ($weight <= 0.0) {
+                continue;
+            }
+
+            $effectiveMode = $normalizedPayStatus[$dateKey] ?? $normalizedPayMode;
+            $resolvedMode = $this->resolveLedgerPayModeFromStatusValue($effectiveMode) ?? $normalizedPayMode;
+            if ($resolvedMode !== LeaveApplication::PAY_MODE_WITH_PAY) {
+                continue;
+            }
+
+            $restorableDays += $weight;
+            $restorableDates[] = $dateKey;
+        }
+
+        $restorableDays = round(max($restorableDays, 0.0), 2);
+        if ($restorableDays > $deductibleDays) {
+            $restorableDays = $deductibleDays;
+        }
+
+        $restorableDates = array_values(array_unique(array_filter($restorableDates)));
+        sort($restorableDates);
+
+        return [
+            'days' => $restorableDays,
+            'dates' => $restorableDates,
+        ];
+    }
+
+    private function normalizeLedgerPayMode(mixed $payMode, bool $isMonetization = false): string
+    {
+        if ($isMonetization) {
+            return LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+
+        $normalized = strtoupper(trim((string) ($payMode ?? LeaveApplication::PAY_MODE_WITH_PAY)));
+        if (in_array($normalized, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
+            return $normalized;
+        }
+
+        return LeaveApplication::PAY_MODE_WITH_PAY;
+    }
+
+    private function resolveLedgerPayModeFromStatusValue(mixed $value): ?string
+    {
+        $normalized = strtolower(trim((string) $value));
+        if ($normalized === '') {
+            return null;
+        }
+
+        $normalized = str_replace(['_', '-'], ' ', $normalized);
+        $normalized = preg_replace('/\s+/', ' ', $normalized) ?? $normalized;
+
+        if (in_array($normalized, ['wop', 'without pay', 'withoutpay', 'unpaid', 'no pay'], true)) {
+            return LeaveApplication::PAY_MODE_WITHOUT_PAY;
+        }
+
+        if (in_array($normalized, ['wp', 'with pay', 'withpay', 'paid'], true)) {
+            return LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+
+        return null;
+    }
+
+    private function normalizeLedgerDateKey(mixed $rawDate): ?string
+    {
+        if ($rawDate === null || $rawDate === '') {
+            return null;
+        }
+
+        if ($rawDate instanceof \DateTimeInterface) {
+            return CarbonImmutable::instance($rawDate)->toDateString();
+        }
+
+        $raw = trim((string) $rawDate);
+        if ($raw === '') {
+            return null;
+        }
+
+        if (preg_match('/^\d+$/', $raw) === 1 && strlen($raw) <= 3) {
+            return null;
+        }
+
+        try {
+            return CarbonImmutable::parse($raw)->toDateString();
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function compactLedgerSelectedDatePayStatusMap(
+        ?array $selectedDatePayStatus,
+        ?array $selectedDates,
+        string $payMode
+    ): ?array {
+        if (!is_array($selectedDatePayStatus) || $selectedDatePayStatus === []) {
+            return null;
+        }
+
+        $defaultMode = $this->normalizeLedgerPayMode($payMode, false);
+        $dateSet = [];
+        $selectedDateLookup = [];
+        if (is_array($selectedDates)) {
+            foreach ($selectedDates as $index => $rawDate) {
+                $rawKey = trim((string) $rawDate);
+                if ($rawKey === '') {
+                    continue;
+                }
+
+                $dateKey = $this->normalizeLedgerDateKey($rawDate) ?? $rawKey;
+                $dateSet[$dateKey] = true;
+                $selectedDateLookup[(string) $index] = $dateKey;
+                $selectedDateLookup[$rawKey] = $dateKey;
+            }
+        }
+        $restrictToSelectedDates = $dateSet !== [];
+
+        $compacted = [];
+        foreach ($selectedDatePayStatus as $rawDate => $rawStatus) {
+            $rawKey = trim((string) $rawDate);
+            $dateKey = $this->normalizeLedgerDateKey($rawDate);
+            if ($dateKey === null && $rawKey !== '' && array_key_exists($rawKey, $selectedDateLookup)) {
+                $dateKey = $selectedDateLookup[$rawKey];
+            }
+            if ($dateKey === null) {
+                $dateKey = $rawKey;
+            }
+            if ($dateKey === '') {
+                continue;
+            }
+
+            if ($restrictToSelectedDates && !array_key_exists($dateKey, $dateSet)) {
+                continue;
+            }
+
+            $resolvedMode = $this->resolveLedgerPayModeFromStatusValue($rawStatus);
+            if ($resolvedMode === null) {
+                continue;
+            }
+
+            if ($restrictToSelectedDates && $resolvedMode === $defaultMode) {
+                continue;
+            }
+
+            $compacted[$dateKey] = $resolvedMode;
+        }
+
+        if ($compacted === []) {
+            return null;
+        }
+
+        ksort($compacted);
+        return $compacted;
+    }
+
+    private function compactLedgerSelectedDateCoverageMap(
+        ?array $selectedDateCoverage,
+        ?array $selectedDates
+    ): ?array {
+        if (!is_array($selectedDateCoverage) || $selectedDateCoverage === []) {
+            return null;
+        }
+
+        $dateSet = [];
+        $selectedDateLookup = [];
+        if (is_array($selectedDates)) {
+            foreach ($selectedDates as $index => $rawDate) {
+                $rawKey = trim((string) $rawDate);
+                if ($rawKey === '') {
+                    continue;
+                }
+
+                $dateKey = $this->normalizeLedgerDateKey($rawDate) ?? $rawKey;
+                $dateSet[$dateKey] = true;
+                $selectedDateLookup[(string) $index] = $dateKey;
+                $selectedDateLookup[$rawKey] = $dateKey;
+            }
+        }
+        $restrictToSelectedDates = $dateSet !== [];
+
+        $compacted = [];
+        foreach ($selectedDateCoverage as $rawDate => $rawCoverage) {
+            $rawKey = trim((string) $rawDate);
+            $dateKey = $this->normalizeLedgerDateKey($rawDate);
+            if ($dateKey === null && $rawKey !== '' && array_key_exists($rawKey, $selectedDateLookup)) {
+                $dateKey = $selectedDateLookup[$rawKey];
+            }
+            if ($dateKey === null) {
+                $dateKey = $rawKey;
+            }
+            if ($dateKey === '') {
+                continue;
+            }
+
+            if ($restrictToSelectedDates && !array_key_exists($dateKey, $dateSet)) {
+                continue;
+            }
+
+            $coverage = strtolower(trim((string) $rawCoverage));
+            if ($coverage === 'half') {
+                $compacted[$dateKey] = 'half';
+                continue;
+            }
+
+            if (!$restrictToSelectedDates && $coverage === 'whole') {
+                $compacted[$dateKey] = 'whole';
+            }
+        }
+
+        if ($compacted === []) {
+            return null;
+        }
+
+        ksort($compacted);
+        return $compacted;
+    }
+
+    private function resolveLedgerDateCoverageWeights(
+        array $selectedDates,
+        ?array $selectedDateCoverage,
+        float $totalDays
+    ): array {
+        $resolvedDates = [];
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeLedgerDateKey($rawDate) ?? trim((string) $rawDate);
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $resolvedDates[$dateKey] = true;
+        }
+
+        $resolvedDates = array_keys($resolvedDates);
+        sort($resolvedDates);
+        if ($resolvedDates === []) {
+            return [];
+        }
+
+        $coverageMap = is_array($selectedDateCoverage) ? $selectedDateCoverage : [];
+        $hasCoverageOverrides = $coverageMap !== [];
+
+        $defaultCoverageWeight = 1.0;
+        $dateCount = count($resolvedDates);
+        if ($dateCount > 0) {
+            $halfMatch = abs(($dateCount * 0.5) - $totalDays) < 0.00001;
+            $wholeMatch = abs(((float) $dateCount) - $totalDays) < 0.00001;
+            if ($halfMatch) {
+                $defaultCoverageWeight = 0.5;
+            } elseif (!$wholeMatch) {
+                $defaultCoverageWeight = max(min($totalDays / $dateCount, 1.0), 0.5);
+            }
+        }
+
+        $weights = [];
+        foreach ($resolvedDates as $dateKey) {
+            $hasCoverageValue = array_key_exists($dateKey, $coverageMap);
+            $coverage = strtolower(trim((string) ($coverageMap[$dateKey] ?? '')));
+            if ($coverage === 'half') {
+                $weights[$dateKey] = 0.5;
+                continue;
+            }
+
+            if ($coverage === 'whole') {
+                $weights[$dateKey] = 1.0;
+                continue;
+            }
+
+            if ($hasCoverageOverrides && !$hasCoverageValue) {
+                $weights[$dateKey] = 1.0;
+                continue;
+            }
+
+            $weights[$dateKey] = $defaultCoverageWeight;
+        }
+
+        return $weights;
     }
 }

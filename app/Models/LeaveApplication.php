@@ -120,6 +120,7 @@ class LeaveApplication extends Model
     public const STATUS_PENDING_HR = 'PENDING_HR';
     public const STATUS_APPROVED = 'APPROVED';
     public const STATUS_REJECTED = 'REJECTED';
+    public const STATUS_RECALLED = 'RECALLED';
 
     // ─── Relationships ───────────────────────────────────────────────
 

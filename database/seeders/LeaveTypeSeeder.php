@@ -13,6 +13,13 @@ class LeaveTypeSeeder extends Seeder
 {
     public function run(): void
     {
+        $generalStatuses = [
+            LeaveType::EMPLOYMENT_STATUS_REGULAR,
+            LeaveType::EMPLOYMENT_STATUS_ELECTIVE,
+            LeaveType::EMPLOYMENT_STATUS_CO_TERMINOUS,
+            LeaveType::EMPLOYMENT_STATUS_CASUAL,
+        ];
+
         $types = [
             // ─── ACCRUED (Monthly Accrual: 1.25 every 1st day) ───────────────
             [
@@ -24,6 +31,7 @@ class LeaveTypeSeeder extends Seeder
                 'is_credit_based' => true,
                 'resets_yearly' => false,
                 'requires_documents' => false,
+                'allowed_status' => $generalStatuses,
                 'description' => 'Monthly accrual of 1.25 days. Accumulates over time.',
             ],
             [
@@ -35,6 +43,7 @@ class LeaveTypeSeeder extends Seeder
                 'is_credit_based' => true,
                 'resets_yearly' => false,
                 'requires_documents' => true,
+                'allowed_status' => $generalStatuses,
                 'description' => 'Monthly accrual of 1.25 days. Accumulates over time.',
             ],
 
@@ -48,6 +57,7 @@ class LeaveTypeSeeder extends Seeder
                 'is_credit_based' => true,
                 'resets_yearly' => true,
                 'requires_documents' => false,
+                'allowed_status' => $generalStatuses,
                 'description' => '5 days per year. Resets every January 1.',
             ],
             [
@@ -59,6 +69,7 @@ class LeaveTypeSeeder extends Seeder
                 'is_credit_based' => true,
                 'resets_yearly' => true,
                 'requires_documents' => false,
+                'allowed_status' => $generalStatuses,
                 'description' => '3 days per year. Resets every January 1.',
             ],
             [
@@ -70,6 +81,7 @@ class LeaveTypeSeeder extends Seeder
                 'is_credit_based' => true,
                 'resets_yearly' => true,
                 'requires_documents' => false,
+                'allowed_status' => null,
                 'description' => '5 days per year. Resets every January 1.',
             ],
             [
@@ -81,6 +93,7 @@ class LeaveTypeSeeder extends Seeder
                 'is_credit_based' => true,
                 'resets_yearly' => true,
                 'requires_documents' => true,
+                'allowed_status' => $generalStatuses,
                 'description' => '7 days per year under Solo Parent Welfare Act. Resets every January 1.',
             ],
             [
@@ -92,6 +105,7 @@ class LeaveTypeSeeder extends Seeder
                 'is_credit_based' => true,
                 'resets_yearly' => true,
                 'requires_documents' => false,
+                'allowed_status' => $generalStatuses,
                 'description' => '5 days per year for calamity situations. Resets every January 1.',
             ],
             [
@@ -103,6 +117,7 @@ class LeaveTypeSeeder extends Seeder
                 'is_credit_based' => true,
                 'resets_yearly' => true,
                 'requires_documents' => false,
+                'allowed_status' => $generalStatuses,
                 'description' => '3 days per year, max 3 consecutive days. Resets every January 1.',
             ],
 
@@ -116,6 +131,7 @@ class LeaveTypeSeeder extends Seeder
                 'is_credit_based' => true,
                 'resets_yearly' => false,
                 'requires_documents' => false,
+                'allowed_status' => $generalStatuses,
                 'description' => 'Compensatory Time Off credits converted from approved COC applications.',
             ],
             [
@@ -127,6 +143,7 @@ class LeaveTypeSeeder extends Seeder
                 'is_credit_based' => false,
                 'resets_yearly' => false,
                 'requires_documents' => true,
+                'allowed_status' => $generalStatuses,
                 'description' => '105 days for live birth. Requires medical documents.',
             ],
             [
@@ -138,6 +155,7 @@ class LeaveTypeSeeder extends Seeder
                 'is_credit_based' => false,
                 'resets_yearly' => false,
                 'requires_documents' => true,
+                'allowed_status' => $generalStatuses,
                 'description' => '7 days per qualifying birth event.',
             ],
             [
@@ -149,6 +167,7 @@ class LeaveTypeSeeder extends Seeder
                 'is_credit_based' => false,
                 'resets_yearly' => false,
                 'requires_documents' => true,
+                'allowed_status' => $generalStatuses,
                 'description' => 'Leave for adoption proceedings. Duration per applicable law.',
             ],
             [
@@ -160,6 +179,7 @@ class LeaveTypeSeeder extends Seeder
                 'is_credit_based' => false,
                 'resets_yearly' => false,
                 'requires_documents' => true,
+                'allowed_status' => $generalStatuses,
                 'description' => '10 days under RA 9262. Requires barangay protection order or court order.',
             ],
             [
@@ -171,6 +191,7 @@ class LeaveTypeSeeder extends Seeder
                 'is_credit_based' => false,
                 'resets_yearly' => false,
                 'requires_documents' => true,
+                'allowed_status' => $generalStatuses,
                 'description' => 'For work-related illness or injury rehabilitation.',
             ],
             [
@@ -182,6 +203,7 @@ class LeaveTypeSeeder extends Seeder
                 'is_credit_based' => false,
                 'resets_yearly' => false,
                 'requires_documents' => true,
+                'allowed_status' => $generalStatuses,
                 'description' => 'For completion of master\'s degree or BAR/Board review.',
             ],
             [
@@ -193,6 +215,7 @@ class LeaveTypeSeeder extends Seeder
                 'is_credit_based' => false,
                 'resets_yearly' => false,
                 'requires_documents' => true,
+                'allowed_status' => $generalStatuses,
                 'description' => 'Up to 60 days for gynecological surgery under RA 9710.',
             ],
             [
@@ -204,6 +227,7 @@ class LeaveTypeSeeder extends Seeder
                 'is_credit_based' => false,
                 'resets_yearly' => false,
                 'requires_documents' => true,
+                'allowed_status' => $generalStatuses,
                 'description' => 'Applied for upon separation from service.',
             ],
             [
@@ -215,6 +239,7 @@ class LeaveTypeSeeder extends Seeder
                 'is_credit_based' => false,
                 'resets_yearly' => false,
                 'requires_documents' => true,
+                'allowed_status' => $generalStatuses,
                 'description' => 'Conversion of accumulated leave credits to cash.',
             ],
         ];
@@ -227,3 +252,4 @@ class LeaveTypeSeeder extends Seeder
         }
     }
 }
+

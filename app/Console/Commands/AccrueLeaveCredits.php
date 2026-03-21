@@ -40,24 +40,28 @@ class AccrueLeaveCredits extends Command
             return self::SUCCESS;
         }
 
-        $employeeControlNos = Employee::query()
-            ->pluck('control_no')
-            ->map(static fn(mixed $controlNo): string => trim((string) $controlNo))
-            ->filter(static fn(string $controlNo): bool => $controlNo !== '')
-            ->values()
-            ->all();
-
-        if ($employeeControlNos === []) {
+        $employeeDirectory = $this->buildEmployeeDirectory();
+        if ($employeeDirectory['employees'] === []) {
             $this->warn('No employee records found. Nothing to accrue.');
             return self::SUCCESS;
         }
 
-        $employeeNameLookup = $this->buildEmployeeNameLookup();
         $totalAccrued = 0;
         $totalProvisioned = 0;
 
         foreach ($accruedTypes as $type) {
-            $provisioned = $this->provisionMissingAccruedBalances($employeeControlNos, $type, $now);
+            $eligibleEmployeeControlNos = $this->eligibleEmployeeControlNosForType($type, $employeeDirectory['employees']);
+            if ($eligibleEmployeeControlNos === []) {
+                $this->line("  {$type->name}: no eligible employee records found for accrual");
+                continue;
+            }
+
+            $provisioned = $this->provisionMissingAccruedBalances(
+                $eligibleEmployeeControlNos,
+                $type,
+                $now,
+                $employeeDirectory['lookup']
+            );
             $totalProvisioned += $provisioned;
             if ($provisioned > 0) {
                 $this->line("  {$type->name}: provisioned {$provisioned} missing balance(s)");
@@ -68,14 +72,25 @@ class AccrueLeaveCredits extends Command
                 ->get();
 
             foreach ($balances as $balance) {
+                if (! $this->balanceIsEligibleForTypeAccrual($balance, $type, $employeeDirectory['lookup'])) {
+                    continue;
+                }
+
                 // Prevent double accrual for same month
                 if ($balance->last_accrual_date && $balance->last_accrual_date->format('Y-m') === $accrualMonth) {
                     continue;
                 }
 
-                DB::transaction(function () use ($balance, $type, $now, $employeeNameLookup): void {
-                    $employeeName = $this->resolveEmployeeNameForBalance($balance, $employeeNameLookup);
+                DB::transaction(function () use ($balance, $type, $now, $employeeDirectory): void {
+                    $employeeName = $this->resolveEmployeeNameForBalance($balance, $employeeDirectory['lookup']);
                     $leaveTypeName = trim((string) ($balance->leave_type_name ?? $type->name ?? ''));
+
+                    if ($employeeName !== null && trim((string) ($balance->employee_name ?? '')) === '') {
+                        $balance->employee_name = $employeeName;
+                    }
+                    if ($leaveTypeName !== '' && trim((string) ($balance->leave_type_name ?? '')) === '') {
+                        $balance->leave_type_name = $leaveTypeName;
+                    }
 
                     $balance->balance = round((float) $balance->balance + (float) $type->accrual_rate, 2);
                     $balance->last_accrual_date = $now->toDateString();
@@ -110,7 +125,102 @@ class AccrueLeaveCredits extends Command
         return self::SUCCESS;
     }
 
-    private function provisionMissingAccruedBalances(array $employeeControlNos, LeaveType $type, Carbon $now): int
+    /**
+     * @return array{
+     *     employees: array<int, array{control_no: string, status: mixed}>,
+     *     lookup: array<string, array{name: string, status: mixed}>
+     * }
+     */
+    private function buildEmployeeDirectory(): array
+    {
+        $employees = [];
+        $lookup = [];
+
+        $records = Employee::query()->get(['control_no', 'status', 'firstname', 'middlename', 'surname']);
+
+        foreach ($records as $employee) {
+            if (! $employee instanceof Employee) {
+                continue;
+            }
+
+            $rawControlNo = trim((string) ($employee->control_no ?? ''));
+            if ($rawControlNo === '') {
+                continue;
+            }
+
+            $name = $this->formatEmployeeNameForStorage($employee);
+            $entry = [
+                'name' => $name,
+                'status' => $employee->status,
+            ];
+
+            $employees[] = [
+                'control_no' => $rawControlNo,
+                'status' => $employee->status,
+            ];
+
+            $lookup[$rawControlNo] = $entry;
+
+            $normalizedControlNo = $this->normalizeControlNo($rawControlNo);
+            if ($normalizedControlNo !== null) {
+                $lookup[$normalizedControlNo] = $entry;
+            }
+        }
+
+        return [
+            'employees' => $employees,
+            'lookup' => $lookup,
+        ];
+    }
+
+    /**
+     * @param array<int, array{control_no: string, status: mixed}> $employees
+     * @return array<int, string>
+     */
+    private function eligibleEmployeeControlNosForType(LeaveType $type, array $employees): array
+    {
+        return collect($employees)
+            ->filter(fn (array $employee): bool => $type->allowsEmploymentStatus($employee['status'] ?? null))
+            ->pluck('control_no')
+            ->filter(fn (mixed $controlNo): bool => trim((string) $controlNo) !== '')
+            ->values()
+            ->all();
+    }
+
+    /**
+     * @param array<string, array{name: string, status: mixed}> $employeeLookup
+     */
+    private function balanceIsEligibleForTypeAccrual(
+        LeaveBalance $balance,
+        LeaveType $type,
+        array $employeeLookup
+    ): bool {
+        $rawControlNo = trim((string) ($balance->employee_id ?? ''));
+        if ($rawControlNo === '') {
+            return false;
+        }
+
+        if (isset($employeeLookup[$rawControlNo])) {
+            return $type->allowsEmploymentStatus($employeeLookup[$rawControlNo]['status'] ?? null);
+        }
+
+        $normalizedControlNo = $this->normalizeControlNo($rawControlNo);
+        if ($normalizedControlNo !== null && isset($employeeLookup[$normalizedControlNo])) {
+            return $type->allowsEmploymentStatus($employeeLookup[$normalizedControlNo]['status'] ?? null);
+        }
+
+        return false;
+    }
+
+    /**
+     * @param array<string, array{name: string, status: mixed}> $employeeLookup
+     */
+    private function provisionMissingAccruedBalances(
+        array $employeeControlNos,
+        LeaveType $type,
+        Carbon $now,
+        array $employeeLookup
+    ): int
     {
         if ($employeeControlNos === []) {
             return 0;
@@ -132,9 +242,13 @@ class AccrueLeaveCredits extends Command
                 continue;
             }
 
+            $employeeName = trim((string) ($employeeLookup[$employeeControlNo]['name'] ?? ''));
+
             $rows[] = [
                 'employee_id' => $employeeControlNo,
+                'employee_name' => $employeeName !== '' ? $employeeName : null,
                 'leave_type_id' => (int) $type->id,
+                'leave_type_name' => trim((string) ($type->name ?? '')) ?: null,
                 'balance' => 0.0,
                 'last_accrual_date' => null,
                 'year' => (int) $now->year,
@@ -156,36 +270,10 @@ class AccrueLeaveCredits extends Command
         return count($rows);
     }
 
-    private function buildEmployeeNameLookup(): array
-    {
-        $lookup = [];
-
-        $employees = Employee::query()->get(['control_no', 'firstname', 'middlename', 'surname']);
-        foreach ($employees as $employee) {
-            if (!$employee instanceof Employee) {
-                continue;
-            }
-
-            $name = $this->formatEmployeeNameForStorage($employee);
-            if ($name === '') {
-                continue;
-            }
-
-            $rawControlNo = trim((string) ($employee->control_no ?? ''));
-            if ($rawControlNo !== '') {
-                $lookup[$rawControlNo] = $name;
-            }
-
-            $normalizedControlNo = $this->normalizeControlNo($rawControlNo);
-            if ($normalizedControlNo !== null) {
-                $lookup[$normalizedControlNo] = $name;
-            }
-        }
-
-        return $lookup;
-    }
-
-    private function resolveEmployeeNameForBalance(LeaveBalance $balance, array $employeeNameLookup): ?string
+    /**
+     * @param array<string, array{name: string, status: mixed}> $employeeLookup
+     */
+    private function resolveEmployeeNameForBalance(LeaveBalance $balance, array $employeeLookup): ?string
     {
         $fromBalance = trim((string) ($balance->employee_name ?? ''));
         if ($fromBalance !== '') {
@@ -193,13 +281,13 @@ class AccrueLeaveCredits extends Command
         }
 
         $rawControlNo = trim((string) ($balance->employee_id ?? ''));
-        if ($rawControlNo !== '' && isset($employeeNameLookup[$rawControlNo])) {
-            return (string) $employeeNameLookup[$rawControlNo];
+        if ($rawControlNo !== '' && isset($employeeLookup[$rawControlNo])) {
+            return trim((string) ($employeeLookup[$rawControlNo]['name'] ?? '')) ?: null;
         }
 
         $normalizedControlNo = $this->normalizeControlNo($rawControlNo);
-        if ($normalizedControlNo !== null && isset($employeeNameLookup[$normalizedControlNo])) {
-            return (string) $employeeNameLookup[$normalizedControlNo];
+        if ($normalizedControlNo !== null && isset($employeeLookup[$normalizedControlNo])) {
+            return trim((string) ($employeeLookup[$normalizedControlNo]['name'] ?? '')) ?: null;
         }
 
         return null;

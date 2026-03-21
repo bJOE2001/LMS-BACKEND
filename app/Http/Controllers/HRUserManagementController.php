@@ -7,8 +7,10 @@ use App\Models\DepartmentAdmin;
 use App\Models\Employee;
 use App\Models\HRAccount;
 use App\Models\LeaveBalance;
+use App\Models\LeaveApplication;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
 
@@ -126,7 +128,7 @@ class HRUserManagementController extends Controller
     public function store(Request $request): JsonResponse
     {
         $validated = $request->validate([
-            'department_id' => ['required', 'integer', 'exists:tblDepartments,id', Rule::unique('tblDepartmentAdmins', 'department_id')],
+            'department_id' => ['required', 'integer', 'exists:tblDepartments,id'],
             'employee_control_no' => ['required', 'string', 'max:50', 'regex:/^\d+$/'],
             'username' => ['required', 'string', 'max:255', Rule::unique('tblDepartmentAdmins', 'username')],
         ]);
@@ -145,14 +147,24 @@ class HRUserManagementController extends Controller
         $this->assertUsernameAvailableForDepartmentAdmin((string) $validated['username']);
         $generatedPassword = $this->buildGeneratedPasswordFromBirthDate($employee);
 
-        $admin = DepartmentAdmin::query()->create([
-            'department_id' => $department->id,
-            'employee_control_no' => trim((string) $employee->control_no),
-            'full_name' => $this->buildEmployeeFullName($employee),
-            'username' => trim((string) $validated['username']),
-            'password' => $generatedPassword,
-            'must_change_password' => true,
-        ]);
+        $existingAdmin = DepartmentAdmin::query()
+            ->where('department_id', $department->id)
+            ->first();
+
+        if ($existingAdmin && $this->isDepartmentAdminAssignmentActive($existingAdmin)) {
+            throw ValidationException::withMessages([
+                'department_id' => ['Selected department already has an assigned admin.'],
+            ]);
+        }
+
+        $admin = $existingAdmin ?? new DepartmentAdmin();
+        $admin->department_id = $department->id;
+        $admin->employee_control_no = trim((string) $employee->control_no);
+        $admin->full_name = $this->buildEmployeeFullName($employee);
+        $admin->username = trim((string) $validated['username']);
+        $admin->password = $generatedPassword;
+        $admin->must_change_password = true;
+        $admin->save();
         $admin->load([
             'department:id,name',
             'employee:control_no,surname,firstname,middlename,birth_date,office,status,designation',
@@ -180,7 +192,6 @@ class HRUserManagementController extends Controller
             'department_id' => ['required', 'integer', 'exists:tblDepartments,id', Rule::unique('tblDepartmentAdmins', 'department_id')->ignore($admin->id)],
             'employee_control_no' => ['required', 'string', 'max:50', 'regex:/^\d+$/'],
             'username' => ['required', 'string', 'max:255', Rule::unique('tblDepartmentAdmins', 'username')->ignore($admin->id)],
-            'password' => ['nullable', 'string', 'min:3', 'max:255'],
         ]);
 
         $department = Department::query()->find((int) $validated['department_id']);
@@ -204,13 +215,8 @@ class HRUserManagementController extends Controller
         $admin->employee_control_no = trim((string) $employee->control_no);
         $admin->full_name = $this->buildEmployeeFullName($employee);
         $admin->username = trim((string) $validated['username']);
-        if (array_key_exists('password', $validated) && trim((string) $validated['password']) !== '') {
-            $admin->password = (string) $validated['password'];
-            $admin->must_change_password = true;
-        } elseif ($employeeChanged) {
-            $admin->password = $this->buildGeneratedPasswordFromBirthDate($employee);
-            $admin->must_change_password = true;
-        }
+        $admin->password = $this->buildGeneratedPasswordFromBirthDate($employee);
+        $admin->must_change_password = true;
         $admin->save();
         $admin->load([
             'department:id,name',
@@ -218,7 +224,9 @@ class HRUserManagementController extends Controller
         ]);
 
         return response()->json([
-            'message' => 'Department admin updated successfully.',
+            'message' => $employeeChanged
+                ? 'Department admin reassigned successfully. Default password is employee birthdate (MMDDYY).'
+                : 'Department admin updated successfully. Default password is employee birthdate (MMDDYY).',
             'department_admin' => $this->serializeDepartmentAdmin($admin),
         ]);
     }
@@ -233,6 +241,14 @@ class HRUserManagementController extends Controller
             return response()->json([
                 'message' => 'Department admin not found.',
             ], 404);
+        }
+
+        if ($this->hasHistoricalLeaveApplications($admin)) {
+            $this->vacateDepartmentAdminAssignment($admin);
+
+            return response()->json([
+                'message' => 'Department admin removed successfully. Historical leave applications were preserved.',
+            ]);
         }
 
         $admin->delete();
@@ -345,8 +361,54 @@ class HRUserManagementController extends Controller
         return [
             'id' => $department->id,
             'name' => $department->name,
-            'department_admin' => $admin ? $this->serializeDepartmentAdmin($admin) : null,
+            'department_admin' => $admin && $this->isDepartmentAdminAssignmentActive($admin)
+                ? $this->serializeDepartmentAdmin($admin)
+                : null,
         ];
+    }
+
+    private function isDepartmentAdminAssignmentActive(?DepartmentAdmin $admin): bool
+    {
+        if (!$admin) {
+            return false;
+        }
+
+        return trim((string) ($admin->employee_control_no ?? '')) !== '';
+    }
+
+    private function hasHistoricalLeaveApplications(DepartmentAdmin $admin): bool
+    {
+        return LeaveApplication::query()
+            ->where('applicant_admin_id', $admin->id)
+            ->exists();
+    }
+
+    private function vacateDepartmentAdminAssignment(DepartmentAdmin $admin): void
+    {
+        $archivedUsername = $this->buildArchivedDepartmentAdminUsername($admin);
+
+        $admin->employee_control_no = null;
+        $admin->username = $archivedUsername;
+        $admin->password = Str::random(40);
+        $admin->must_change_password = false;
+        $admin->save();
+    }
+
+    private function buildArchivedDepartmentAdminUsername(DepartmentAdmin $admin): string
+    {
+        $base = 'archived_admin_' . $admin->id;
+        $candidate = $base;
+
+        while (
+            DepartmentAdmin::query()
+                ->where('username', $candidate)
+                ->where('id', '!=', $admin->id)
+                ->exists()
+        ) {
+            $candidate = $base . '_' . Str::lower(Str::random(6));
+        }
+
+        return $candidate;
     }
 
     private function serializeDepartmentAdmin(DepartmentAdmin $admin): array

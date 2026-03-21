@@ -82,25 +82,50 @@ class AuthController extends Controller
                     'name' => $account->full_name,
                     'username' => $account->username,
                     'role' => 'hr',
+                    'position' => trim((string) ($account->position ?? '')) !== '' ? $account->position : 'HR',
                     'must_change_password' => (bool) $account->must_change_password,
                 ],
                 self::DASHBOARD_HR,
             ];
         }
 
-        $account->loadMissing('department');
+        $account->loadMissing(['department', 'employee']);
         return [
             [
                 'id' => $account->id,
-                'name' => $account->full_name,
+                'name' => $this->resolveDepartmentAdminDisplayName($account),
                 'username' => $account->username,
                 'role' => 'department_admin',
                 'department_id' => $account->department_id,
                 'department' => $account->department ? ['id' => $account->department->id, 'name' => $account->department->name] : null,
-                'position' => 'Admin',
+                'position' => $this->resolveDepartmentAdminPosition($account),
                 'must_change_password' => (bool) $account->must_change_password,
             ],
             self::DASHBOARD_DEPARTMENT_ADMIN,
         ];
+    }
+
+    private function resolveDepartmentAdminDisplayName(DepartmentAdmin $account): string
+    {
+        $employee = $account->employee;
+        if ($employee) {
+            $parts = array_values(array_filter([
+                trim((string) $employee->firstname),
+                trim((string) $employee->middlename),
+                trim((string) $employee->surname),
+            ], fn (string $part): bool => $part !== ''));
+
+            if ($parts !== []) {
+                return implode(' ', $parts);
+            }
+        }
+
+        return trim((string) $account->full_name);
+    }
+
+    private function resolveDepartmentAdminPosition(DepartmentAdmin $account): string
+    {
+        $designation = trim((string) ($account->employee?->designation ?? ''));
+        return $designation !== '' ? $designation : 'Department Admin';
     }
 }

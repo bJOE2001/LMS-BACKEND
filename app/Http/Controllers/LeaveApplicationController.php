@@ -1904,6 +1904,140 @@ class LeaveApplicationController extends Controller
         ]);
     }
 
+    /**
+     * HR recalls an already approved leave application.
+     * Tagum policy: restore VL only for FL-related recalls.
+     */
+    public function hrRecall(Request $request, int $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (!$hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can recall applications.'], 403);
+        }
+
+        $validated = $request->validate([
+            'recall_reason' => ['required', 'string', 'max:2000'],
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $app = LeaveApplication::with('leaveType')->find($id);
+        if (!$app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        if ($app->status !== LeaveApplication::STATUS_APPROVED) {
+            return response()->json([
+                'message' => "Cannot recall: application status is '{$app->status}', expected 'APPROVED'.",
+            ], 422);
+        }
+
+        if ($this->isPendingApprovedUpdateRequest($app)) {
+            return response()->json([
+                'message' => 'Cannot recall while there is a pending approved update request for this application.',
+            ], 422);
+        }
+
+        $leaveType = $app->leaveType ?? LeaveType::find((int) $app->leave_type_id);
+        if (!$leaveType) {
+            return response()->json([
+                'message' => 'Selected leave type is no longer available.',
+            ], 422);
+        }
+        $app->setRelation('leaveType', $leaveType);
+
+        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
+        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+        $normalizedLeaveTypeName = strtolower(trim((string) $leaveType->name));
+        $isRecallableLeaveType = ($forcedLeaveTypeId !== null && (int) $app->leave_type_id === $forcedLeaveTypeId)
+            || ($vacationLeaveTypeId !== null && (int) $app->leave_type_id === $vacationLeaveTypeId)
+            || in_array($normalizedLeaveTypeName, ['mandatory / forced leave', 'vacation leave'], true);
+
+        if (!$isRecallableLeaveType) {
+            return response()->json([
+                'message' => 'Only Vacation Leave and Mandatory / Forced Leave applications can be recalled.',
+            ], 422);
+        }
+
+        $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
+        $deductsBalance = $this->applicationDeductsEmployeeBalance(
+            (bool) $app->is_monetization,
+            $leaveType,
+            $normalizedPayMode
+        );
+        $daysToRestore = $deductsBalance ? $this->resolveRecallRestorableDays($app) : 0.0;
+
+        $restoreLeaveTypeId = (int) $app->leave_type_id;
+        if ($forcedLeaveTypeId !== null && (int) $app->leave_type_id === $forcedLeaveTypeId) {
+            if ($vacationLeaveTypeId === null) {
+                return response()->json([
+                    'message' => 'Cannot recall Mandatory / Forced Leave because Vacation Leave type is not configured.',
+                ], 422);
+            }
+            // Tagum policy: FL is not restored; restore VL only.
+            $restoreLeaveTypeId = $vacationLeaveTypeId;
+        }
+
+        $reason = trim((string) ($validated['recall_reason'] ?? $validated['remarks'] ?? ''));
+        $recallRemarks = $reason !== ''
+            ? "Recalled by HR: {$reason}"
+            : 'Recalled by HR';
+
+        $balanceConflictError = 'HR_RECALL_BALANCE_CONFLICT';
+
+        try {
+            DB::transaction(function () use (
+                $app,
+                $hr,
+                $daysToRestore,
+                $restoreLeaveTypeId,
+                $recallRemarks
+            ): void {
+                if ($daysToRestore > 0.0) {
+                    $this->restoreApplicationBalance($app, $restoreLeaveTypeId, $daysToRestore);
+                }
+
+                $app->update([
+                    'status' => LeaveApplication::STATUS_RECALLED,
+                    'hr_id' => $hr->id,
+                    'remarks' => $recallRemarks,
+                ]);
+
+                LeaveApplicationLog::create([
+                    'leave_application_id' => $app->id,
+                    'action' => LeaveApplicationLog::ACTION_HR_RECALLED,
+                    'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
+                    'performed_by_id' => $hr->id,
+                    'remarks' => $recallRemarks,
+                    'created_at' => now(),
+                ]);
+            });
+        } catch (\RuntimeException $exception) {
+            if ($exception->getMessage() !== $balanceConflictError) {
+                throw $exception;
+            }
+
+            return response()->json([
+                'message' => 'Unable to recall the application due to leave balance mismatch. Please refresh and try again.',
+            ], 409);
+        }
+
+        $app->loadMissing('applicantAdmin', 'leaveType');
+        if ($app->applicant_admin_id && $app->applicantAdmin) {
+            Notification::send(
+                $app->applicantAdmin,
+                Notification::TYPE_LEAVE_CANCELLED,
+                'Leave Recalled by HR',
+                "Your {$app->leaveType->name} application was recalled by HR." . ($reason !== '' ? " Reason: {$reason}" : ''),
+                $app->id
+            );
+        }
+
+        return response()->json([
+            'message' => 'Application recalled by HR.',
+            'application' => $this->formatApplication($app->fresh(['leaveType', 'employee', 'applicantAdmin'])),
+        ]);
+    }
+
     // ─── Admin: List department employees for apply-leave form ────────
 
     /**
@@ -1929,6 +2063,9 @@ class LeaveApplicationController extends Controller
                 'full_name' => $emp->full_name,
                 'firstname' => $emp->firstname,
                 'surname' => $emp->surname,
+                'status' => $this->formatEmploymentStatusLabel($emp->status),
+                'raw_status' => $this->trimNullableString($emp->status),
+                'employment_status_key' => $this->resolveEmploymentStatusKey($emp->status),
                 'designation' => $emp->designation,
                 'office' => $emp->office,
                 'salary' => $emp->rate_mon !== null ? (float) $emp->rate_mon : null,
@@ -1945,6 +2082,8 @@ class LeaveApplicationController extends Controller
             'is_credit_based' => $lt->is_credit_based,
             'max_days' => $lt->max_days,
             'requires_documents' => (bool) $lt->requires_documents,
+            'allowed_status' => $lt->normalizedAllowedStatuses(),
+            'allowed_status_labels' => $lt->allowedStatusLabels(),
         ]);
 
         return response()->json([
@@ -2325,6 +2464,7 @@ class LeaveApplicationController extends Controller
             LeaveApplication::STATUS_PENDING_HR => 'Pending HR',
             LeaveApplication::STATUS_APPROVED => 'Approved',
             LeaveApplication::STATUS_REJECTED => 'Rejected',
+            LeaveApplication::STATUS_RECALLED => 'Recalled',
             default => $status,
         };
     }
@@ -2451,6 +2591,46 @@ class LeaveApplicationController extends Controller
         return $query->first();
     }
 
+    private function restoreApplicationBalance(
+        LeaveApplication $app,
+        int $restoreLeaveTypeId,
+        float $daysToRestore
+    ): void {
+        $restoreAmount = round(max($daysToRestore, 0.0), 2);
+        if ($restoreLeaveTypeId <= 0 || $restoreAmount <= 0.0) {
+            return;
+        }
+
+        if ($app->erms_control_no) {
+            $balance = LeaveBalance::query()
+                ->where('leave_type_id', $restoreLeaveTypeId)
+                ->whereIn('employee_id', $this->controlNoCandidates((string) $app->erms_control_no))
+                ->lockForUpdate()
+                ->first();
+
+            if (!$balance) {
+                throw new \RuntimeException('HR_RECALL_BALANCE_CONFLICT');
+            }
+
+            $balance->increment('balance', $restoreAmount);
+            return;
+        }
+
+        if ($app->applicant_admin_id) {
+            $balance = $this->findAdminEmployeeLeaveBalance(
+                (int) $app->applicant_admin_id,
+                $restoreLeaveTypeId,
+                true
+            );
+
+            if (!$balance) {
+                throw new \RuntimeException('HR_RECALL_BALANCE_CONFLICT');
+            }
+
+            $balance->increment('balance', $restoreAmount);
+        }
+    }
+
     private function formatErmsEmployeeContext(object $employee): array
     {
         $statusKey = $this->resolveEmploymentStatusKey($employee->status ?? null);
@@ -2465,52 +2645,82 @@ class LeaveApplicationController extends Controller
             'status' => $this->formatEmploymentStatusLabel($employee->status ?? null),
             'raw_status' => $this->trimNullableString($employee->status ?? null),
             'employment_status_key' => $statusKey,
-            'ui_variant' => $statusKey === 'contractual' ? 'contractual' : 'default',
-            'allowed_leave_scope' => $statusKey === 'contractual' ? 'wellness_only' : 'all',
-            'is_contractual' => $statusKey === 'contractual',
+            'ui_variant' => $statusKey === LeaveType::EMPLOYMENT_STATUS_CONTRACTUAL ? 'contractual' : 'default',
+            'allowed_leave_scope' => 'configured',
+            'is_contractual' => $statusKey === LeaveType::EMPLOYMENT_STATUS_CONTRACTUAL,
         ];
-    }
-
-    private function getAllowedErmsLeaveTypesQuery(object $employee)
-    {
-        return LeaveType::query()
-            ->when($this->isContractualEmployee($employee), function ($query): void {
-                $query->whereRaw('LOWER(LTRIM(RTRIM(name))) = ?', ['wellness leave']);
-            });
     }
 
     private function getAllowedErmsLeaveTypesForEmployee(object $employee)
     {
-        return $this->getAllowedErmsLeaveTypesQuery($employee)
+        return LeaveType::query()
             ->orderBy('name')
-            ->get(['id', 'name', 'category', 'max_days', 'is_credit_based', 'requires_documents']);
+            ->get([
+                'id',
+                'name',
+                'category',
+                'max_days',
+                'is_credit_based',
+                'requires_documents',
+                'allowed_status',
+            ])
+            ->filter(fn(LeaveType $leaveType): bool => $leaveType->allowsEmploymentStatus($employee->status ?? null))
+            ->map(fn(LeaveType $leaveType): array => [
+                'id' => (int) $leaveType->id,
+                'name' => $leaveType->name,
+                'category' => $leaveType->category,
+                'max_days' => $leaveType->max_days !== null ? (int) $leaveType->max_days : null,
+                'is_credit_based' => (bool) $leaveType->is_credit_based,
+                'requires_documents' => (bool) $leaveType->requires_documents,
+                'allowed_status' => $leaveType->normalizedAllowedStatuses(),
+                'allowed_status_labels' => $leaveType->allowedStatusLabels(),
+            ])
+            ->values();
     }
 
     private function assertEmployeeCanApplyForLeaveType(object $employee, LeaveType $leaveType): ?JsonResponse
     {
-        return $this->assertEmployeeCanUseWellnessOnlyRule(
+        return $this->assertEmployeeCanUseConfiguredLeaveTypeRule(
             $employee,
             $leaveType,
-            'Contractual employees can only apply for Wellness Leave.'
+            'This leave type is not available for the selected employee status.'
         );
     }
 
     private function assertEmployeeCanAccessLeaveTypeBalance(object $employee, LeaveType $leaveType): ?JsonResponse
     {
-        return $this->assertEmployeeCanUseWellnessOnlyRule(
+        return $this->assertEmployeeCanUseConfiguredLeaveTypeRule(
             $employee,
             $leaveType,
-            'Contractual employees can only access Wellness Leave balances.'
+            'This leave type balance is not available for the selected employee status.'
         );
     }
 
-    private function assertEmployeeCanUseWellnessOnlyRule(
+    private function assertEmployeeCanUseConfiguredLeaveTypeRule(
         object $employee,
         LeaveType $leaveType,
-        string $message
+        string $fallbackMessage
     ): ?JsonResponse {
-        if (!$this->isContractualEmployee($employee) || $this->isWellnessLeaveType($leaveType)) {
+        if ($leaveType->allowsEmploymentStatus($employee->status ?? null)) {
             return null;
+        }
+
+        $statusLabel = $this->formatEmploymentStatusLabel($employee->status ?? null) ?? 'selected';
+        $allowedStatusLabels = $leaveType->allowedStatusLabels();
+        $message = $allowedStatusLabels !== []
+            ? sprintf(
+                '%s is only available for %s.',
+                $leaveType->name,
+                implode(', ', $allowedStatusLabels)
+            )
+            : sprintf(
+                '%s is not available for %s employees.',
+                $leaveType->name,
+                $statusLabel
+            );
+
+        if (trim($message) === '') {
+            $message = $fallbackMessage;
         }
 
         return response()->json([
@@ -2521,44 +2731,14 @@ class LeaveApplicationController extends Controller
         ], 422);
     }
 
-    private function isContractualEmployee(object $employee): bool
-    {
-        return $this->resolveEmploymentStatusKey($employee->status ?? null) === 'contractual';
-    }
-
-    private function isWellnessLeaveType(LeaveType $leaveType): bool
-    {
-        return strtolower(trim((string) $leaveType->name)) === 'wellness leave';
-    }
-
     private function resolveEmploymentStatusKey(?string $status): ?string
     {
-        $normalizedStatus = strtoupper(trim((string) ($status ?? '')));
-
-        return match ($normalizedStatus) {
-            '' => null,
-            'REGULAR' => 'regular',
-            'ELECTIVE' => 'elective',
-            'CO-TERMINOUS', 'CO TERMINOUS', 'COTERMINOUS' => 'co_terminous',
-            'CASUAL' => 'casual',
-            'CONTRACTUAL' => 'contractual',
-            default => strtolower(str_replace([' ', '-'], '_', $normalizedStatus)),
-        };
+        return LeaveType::normalizeEmploymentStatusKey($status);
     }
 
     private function formatEmploymentStatusLabel(?string $status): ?string
     {
-        $statusKey = $this->resolveEmploymentStatusKey($status);
-
-        return match ($statusKey) {
-            null => null,
-            'regular' => 'Regular',
-            'elective' => 'Elective',
-            'co_terminous' => 'Co-Terminous',
-            'casual' => 'Casual',
-            'contractual' => 'Contractual',
-            default => $this->trimNullableString($status),
-        };
+        return LeaveType::formatEmploymentStatusLabel($status) ?? $this->trimNullableString($status);
     }
 
     private function trimNullableString(mixed $value): ?string
@@ -2877,6 +3057,7 @@ class LeaveApplicationController extends Controller
             LeaveApplication::STATUS_PENDING_ADMIN, LeaveApplication::STATUS_PENDING_HR => 'Pending',
             LeaveApplication::STATUS_APPROVED => 'Approved',
             LeaveApplication::STATUS_REJECTED => 'Rejected',
+            LeaveApplication::STATUS_RECALLED => 'Recalled',
             default => 'Pending',
         };
     }
@@ -3078,6 +3259,7 @@ class LeaveApplicationController extends Controller
             LeaveApplicationLog::ACTION_ADMIN_REJECTED => 'department admin rejected',
             LeaveApplicationLog::ACTION_HR_APPROVED => 'hr approved',
             LeaveApplicationLog::ACTION_HR_REJECTED => 'hr rejected',
+            LeaveApplicationLog::ACTION_HR_RECALLED => 'hr recalled',
             default => strtolower(str_replace('_', ' ', (string) $log->action)),
         };
     }
@@ -3105,6 +3287,11 @@ class LeaveApplicationController extends Controller
         $hrApprovedLog = $logs->first(
             fn(LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_APPROVED
         );
+        $hrRecalledLog = $logs->first(
+            fn(LeaveApplicationLog $log) =>
+                $log->action === LeaveApplicationLog::ACTION_HR_RECALLED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
         $adminRejectedLog = $logs->first(
             fn(LeaveApplicationLog $log) =>
                 $log->action === LeaveApplicationLog::ACTION_ADMIN_REJECTED
@@ -3126,9 +3313,14 @@ class LeaveApplicationController extends Controller
         $adminActionBy = ($app->admin_id && isset($actorDirectory['admin'][(int) $app->admin_id]))
             ? $actorDirectory['admin'][(int) $app->admin_id]
             : $this->resolveWorkflowPerformerName($adminApprovedLog ?? $adminRejectedLog, $actorDirectory, $employeeName);
-        $hrActionBy = ($app->hr_id && isset($actorDirectory['hr'][(int) $app->hr_id]))
-            ? $actorDirectory['hr'][(int) $app->hr_id]
-            : $this->resolveWorkflowPerformerName($hrApprovedLog ?? $hrRejectedLog, $actorDirectory, $employeeName);
+        $hrActionBy = $this->resolveWorkflowPerformerName($hrApprovedLog ?? $hrRejectedLog, $actorDirectory, $employeeName);
+        if ($hrActionBy === null && $app->status !== LeaveApplication::STATUS_RECALLED && $app->hr_id && isset($actorDirectory['hr'][(int) $app->hr_id])) {
+            $hrActionBy = $actorDirectory['hr'][(int) $app->hr_id];
+        }
+        $recallActionBy = $this->resolveWorkflowPerformerName($hrRecalledLog, $actorDirectory, $employeeName);
+        if ($recallActionBy === null && $app->status === LeaveApplication::STATUS_RECALLED && $app->hr_id && isset($actorDirectory['hr'][(int) $app->hr_id])) {
+            $recallActionBy = $actorDirectory['hr'][(int) $app->hr_id];
+        }
 
         $isCancelled = $cancelledLog !== null || $this->isCancelledRemark($app->remarks);
         $displayStatus = $isCancelled ? 'Cancelled' : $this->ermsStatusLabel($app->status);
@@ -3156,6 +3348,8 @@ class LeaveApplicationController extends Controller
         $hrActionAt = $hrApprovedLog?->created_at
             ?? $hrRejectedLog?->created_at
             ?? $app->hr_approved_at;
+        $recallActionAt = $hrRecalledLog?->created_at
+            ?? ($app->status === LeaveApplication::STATUS_RECALLED ? $app->updated_at : null);
         $cancelledAt = $cancelledLog?->created_at ?? ($isCancelled ? $app->updated_at : null);
 
         $disapprovedAt = null;
@@ -3181,6 +3375,9 @@ class LeaveApplicationController extends Controller
         } elseif ($app->status === LeaveApplication::STATUS_APPROVED) {
             $processedBy = $hrActionBy ?? $adminActionBy;
             $reviewedAt = $hrActionAt ?? $adminActionAt;
+        } elseif ($app->status === LeaveApplication::STATUS_RECALLED) {
+            $processedBy = $recallActionBy ?? $hrActionBy ?? $adminActionBy;
+            $reviewedAt = $recallActionAt ?? $hrActionAt ?? $adminActionAt;
         } elseif ($app->status === LeaveApplication::STATUS_REJECTED) {
             $processedBy = $disapprovedBy;
             $reviewedAt = $disapprovedAt ?? $hrActionAt ?? $adminActionAt;
@@ -3255,6 +3452,7 @@ class LeaveApplicationController extends Controller
             'approver_name' => $approverName,
             'admin_action_by' => $adminActionBy,
             'hr_action_by' => $hrActionBy,
+            'recall_action_by' => $recallActionBy,
             'processed_by' => $processedBy,
             'disapproved_by' => $disapprovedBy,
             'cancelled_by' => $cancelledBy,
@@ -3263,6 +3461,7 @@ class LeaveApplicationController extends Controller
             'reviewed_at' => $reviewedAt?->toIso8601String(),
             'admin_action_at' => $adminActionAt?->toIso8601String(),
             'hr_action_at' => $hrActionAt?->toIso8601String(),
+            'recall_action_at' => $recallActionAt?->toIso8601String(),
             'disapproved_at' => $disapprovedAt?->toIso8601String(),
             'cancelled_at' => $cancelledAt?->toIso8601String(),
             'status_history' => $statusHistory,
@@ -5636,6 +5835,74 @@ class LeaveApplicationController extends Controller
             : $totalDays;
     }
 
+    private function resolveRecallRestorableDays(
+        LeaveApplication $app,
+        ?\Carbon\CarbonImmutable $asOfDate = null
+    ): float {
+        $deductibleDays = $this->resolveApplicationDeductibleDays($app);
+        if ($deductibleDays <= 0.0) {
+            return 0.0;
+        }
+
+        if ((bool) $app->is_monetization) {
+            return $deductibleDays;
+        }
+
+        $selectedDates = $app->resolvedSelectedDates();
+        if (!is_array($selectedDates) || $selectedDates === []) {
+            return $deductibleDays;
+        }
+
+        $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, false);
+        $normalizedPayStatus = $this->compactSelectedDatePayStatusMap(
+            is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null,
+            $selectedDates,
+            $normalizedPayMode
+        );
+        $normalizedCoverage = $this->compactSelectedDateCoverageMap(
+            is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
+            $selectedDates
+        );
+        $coverageWeights = $this->resolveDateCoverageWeights(
+            $selectedDates,
+            $normalizedCoverage,
+            round((float) ($app->total_days ?? 0), 2)
+        );
+
+        $recallDate = ($asOfDate ?? \Carbon\CarbonImmutable::now())->startOfDay()->toDateString();
+        $restorableDays = 0.0;
+
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeDateKey($rawDate);
+            if ($dateKey === null) {
+                $dateKey = trim((string) $rawDate);
+            }
+            if ($dateKey === '' || strcmp($dateKey, $recallDate) < 0) {
+                continue;
+            }
+
+            $weight = round(max((float) ($coverageWeights[$dateKey] ?? 1.0), 0.0), 2);
+            if ($weight <= 0.0) {
+                continue;
+            }
+
+            $effectiveMode = $normalizedPayStatus[$dateKey] ?? $normalizedPayMode;
+            $resolvedMode = $this->resolvePayModeFromStatusValue($effectiveMode) ?? $normalizedPayMode;
+            if ($resolvedMode !== LeaveApplication::PAY_MODE_WITH_PAY) {
+                continue;
+            }
+
+            $restorableDays += $weight;
+        }
+
+        $restorableDays = round(max($restorableDays, 0.0), 2);
+        if ($restorableDays > $deductibleDays) {
+            return $deductibleDays;
+        }
+
+        return $restorableDays;
+    }
+
     private function applicationDeductsEmployeeBalance(
         bool $isMonetization,
         ?LeaveType $leaveType,
@@ -6112,5 +6379,6 @@ class LeaveApplicationController extends Controller
         }
     }
 }
+
 
 

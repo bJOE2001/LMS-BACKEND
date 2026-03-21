@@ -163,6 +163,7 @@ class NotificationController extends Controller
             LeaveApplication::STATUS_PENDING_HR => 'Pending HR',
             LeaveApplication::STATUS_APPROVED => 'Approved',
             LeaveApplication::STATUS_REJECTED => 'Rejected',
+            LeaveApplication::STATUS_RECALLED => 'Recalled',
             default => (string) $status,
         };
     }

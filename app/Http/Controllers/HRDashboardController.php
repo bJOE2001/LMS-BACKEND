@@ -69,6 +69,7 @@ class HRDashboardController extends Controller
             LeaveApplication::STATUS_PENDING_HR => 'Pending HR',
             LeaveApplication::STATUS_APPROVED => 'Approved',
             LeaveApplication::STATUS_REJECTED => 'Rejected',
+            LeaveApplication::STATUS_RECALLED => 'Recalled',
         ];
 
         // Determine applicant name & office
@@ -80,6 +81,15 @@ class HRDashboardController extends Controller
         $durationDays = (float) $app->total_days;
         $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
         $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
+        $selectedDatePayStatus = is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null;
+        $selectedDateCoverage = is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null;
+        $normalizedPayMode = strtoupper(trim((string) ($app->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY)));
+        if (!in_array($normalizedPayMode, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
+            $normalizedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+        $deductibleDays = $app->deductible_days !== null
+            ? round((float) $app->deductible_days, 2)
+            : ($normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $durationDays);
 
         return [
             'id' => $app->id,
@@ -115,6 +125,13 @@ class HRDashboardController extends Controller
             'latest_update_review_remarks' => $latestUpdateMeta['review_remarks'],
             'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
             'selected_dates' => $app->resolvedSelectedDates(),
+            'selected_date_pay_status' => $selectedDatePayStatus,
+            'selected_date_coverage' => $selectedDateCoverage,
+            'pay_mode' => $normalizedPayMode,
+            'pay_status' => $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 'Without Pay' : 'With Pay',
+            'without_pay' => $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY,
+            'with_pay' => $normalizedPayMode !== LeaveApplication::PAY_MODE_WITHOUT_PAY,
+            'deductible_days' => $deductibleDays,
             'is_monetization' => (bool) $app->is_monetization,
             'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
             'leaveBalance' => $this->getBalanceForApp($app),

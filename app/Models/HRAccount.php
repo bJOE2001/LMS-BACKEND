@@ -18,6 +18,7 @@ class HRAccount extends Model implements AuthenticatableContract
 
     protected $fillable = [
         'full_name',
+        'position',
         'username',
         'password',
         'must_change_password',
