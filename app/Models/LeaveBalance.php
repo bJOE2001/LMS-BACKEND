@@ -15,7 +15,7 @@ class LeaveBalance extends Model
     protected $table = 'tblLeaveBalances';
 
     protected $fillable = [
-        'employee_id',
+        'employee_control_no',
         'employee_name',
         'leave_type_id',
         'leave_type_name',
@@ -37,7 +37,7 @@ class LeaveBalance extends Model
 
     public function employee(): BelongsTo
     {
-        return $this->belongsTo(Employee::class, 'employee_id', 'control_no');
+        return $this->belongsTo(Employee::class, 'employee_control_no', 'control_no');
     }
 
     public function leaveType(): BelongsTo

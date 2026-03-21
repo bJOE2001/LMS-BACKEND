@@ -43,7 +43,7 @@ class AdminDashboardController extends Controller
         $applications = LeaveApplication::with(['leaveType', 'applicantAdmin', 'employee', 'logs'])
             ->where(function ($query) use ($deptName, $admin) {
                 // Include employee leaves for this department (matched by office)
-                $query->whereIn('erms_control_no', function ($q) use ($deptName) {
+                $query->whereIn('employee_control_no', function ($q) use ($deptName) {
                     $q->select('control_no')->from('tblEmployees')->where('office', $deptName);
                 })
                     // OR admin self-apply leaves for this department
@@ -119,6 +119,7 @@ class AdminDashboardController extends Controller
 
         $leaveInitialized = $this->resolveLeaveInitializedState($admin);
         $adminSalary = $this->resolveAdminEmployeeSalary($admin);
+        $adminEmploymentStatus = $this->resolveAdminEmployee($admin)?->status;
 
         $balances = $this->queryAdminEmployeeBalances($admin)
             ->with('leaveType')
@@ -126,7 +127,10 @@ class AdminDashboardController extends Controller
             ->keyBy('leave_type_id');
 
         // ACCRUED (Vacation Leave, Sick Leave)
-        $accruedTypes = LeaveType::accrued()->orderBy('name')->get();
+        $accruedTypes = $this->filterLeaveTypesForEmploymentStatus(
+            LeaveType::accrued()->orderBy('name')->get(),
+            $adminEmploymentStatus
+        );
         $accrued = [];
         foreach ($accruedTypes as $type) {
             $bal = $balances->get($type->id);
@@ -137,11 +141,15 @@ class AdminDashboardController extends Controller
                 'accrual_rate' => (float) $type->accrual_rate,
                 'is_credit_based' => $type->is_credit_based,
                 'requires_documents' => (bool) $type->requires_documents,
+                'allowed_status' => $type->normalizedAllowedStatuses(),
             ];
         }
 
         // RESETTABLE
-        $resettableTypes = LeaveType::resettable()->orderBy('name')->get();
+        $resettableTypes = $this->filterLeaveTypesForEmploymentStatus(
+            LeaveType::resettable()->orderBy('name')->get(),
+            $adminEmploymentStatus
+        );
         $resettable = $resettableTypes->map(function (LeaveType $type) use ($balances) {
             $bal = $balances->get($type->id);
             return [
@@ -149,18 +157,25 @@ class AdminDashboardController extends Controller
                 'name' => $type->name,
                 'balance' => $bal ? (float) $bal->balance : 0,
                 'max_days' => $type->max_days,
+                'is_credit_based' => (bool) $type->is_credit_based,
                 'requires_documents' => (bool) $type->requires_documents,
+                'allowed_status' => $type->normalizedAllowedStatuses(),
                 'description' => $type->description,
             ];
         })->values();
 
         // EVENT-BASED
-        $eventTypes = LeaveType::eventBased()->orderBy('name')->get();
+        $eventTypes = $this->filterLeaveTypesForEmploymentStatus(
+            LeaveType::eventBased()->orderBy('name')->get(),
+            $adminEmploymentStatus
+        );
         $eventBased = $eventTypes->map(fn(LeaveType $type) => [
             'id' => $type->id,
             'name' => $type->name,
             'max_days' => $type->max_days,
-            'requires_documents' => $type->requires_documents,
+            'is_credit_based' => (bool) $type->is_credit_based,
+            'requires_documents' => (bool) $type->requires_documents,
+            'allowed_status' => $type->normalizedAllowedStatuses(),
             'description' => $type->description,
         ])->values();
 
@@ -190,17 +205,28 @@ class AdminDashboardController extends Controller
             ]);
         }
 
-        $types = LeaveType::whereIn('category', [
-            LeaveType::CATEGORY_ACCRUED,
-            LeaveType::CATEGORY_RESETTABLE,
-        ])
-            ->orderBy('category')
-            ->orderBy('name')
-            ->get(['id', 'name', 'category', 'accrual_rate', 'max_days', 'description']);
+        $types = $this->filterLeaveTypesForEmploymentStatus(
+            LeaveType::whereIn('category', [
+                LeaveType::CATEGORY_ACCRUED,
+                LeaveType::CATEGORY_RESETTABLE,
+            ])
+                ->orderBy('category')
+                ->orderBy('name')
+                ->get(['id', 'name', 'category', 'accrual_rate', 'max_days', 'description', 'allowed_status']),
+            $this->resolveAdminEmployee($admin)?->status
+        );
 
         return response()->json([
             'leave_initialized' => false,
-            'leave_types' => $types,
+            'leave_types' => $types->map(fn(LeaveType $type) => [
+                'id' => (int) $type->id,
+                'name' => $type->name,
+                'category' => $type->category,
+                'accrual_rate' => $type->accrual_rate !== null ? (float) $type->accrual_rate : null,
+                'max_days' => $type->max_days !== null ? (int) $type->max_days : null,
+                'description' => $type->description,
+                'allowed_status' => $type->normalizedAllowedStatuses(),
+            ])->values(),
         ]);
     }
 
@@ -225,10 +251,13 @@ class AdminDashboardController extends Controller
             ], 422);
         }
 
-        $allowedTypeIds = LeaveType::whereIn('category', [
-            LeaveType::CATEGORY_ACCRUED,
-            LeaveType::CATEGORY_RESETTABLE,
-        ])->pluck('id')->toArray();
+        $allowedTypeIds = $this->filterLeaveTypesForEmploymentStatus(
+            LeaveType::whereIn('category', [
+                LeaveType::CATEGORY_ACCRUED,
+                LeaveType::CATEGORY_RESETTABLE,
+            ])->get(['id', 'allowed_status']),
+            $this->resolveAdminEmployee($admin)?->status
+        )->pluck('id')->map(fn($id) => (int) $id)->all();
 
         $request->validate(['balances' => ['required', 'array', 'min:1']]);
 
@@ -265,7 +294,7 @@ class AdminDashboardController extends Controller
             foreach ($balances as $typeId => $value) {
                 LeaveBalance::query()->updateOrCreate(
                     [
-                        'employee_id' => $adminEmployeeControlNo,
+                        'employee_control_no' => $adminEmployeeControlNo,
                         'leave_type_id' => (int) $typeId,
                     ],
                     [
@@ -296,6 +325,15 @@ class AdminDashboardController extends Controller
             return response()->json(['message' => 'Leave type not found.'], 404);
         }
 
+        if (!$leaveType->allowsEmploymentStatus($this->resolveAdminEmployee($admin)?->status)) {
+            return response()->json([
+                'message' => "{$leaveType->name} is not available for your employment status.",
+                'errors' => [
+                    'leave_type_id' => ["{$leaveType->name} is not available for your employment status."],
+                ],
+            ], 422);
+        }
+
         $balance = $this->findAdminEmployeeBalanceByLeaveType($admin, $leaveTypeId);
 
         return response()->json([
@@ -307,11 +345,11 @@ class AdminDashboardController extends Controller
     }
 
     /**
-     * GET /admin/employee-leave-balance/{employeeId}/{leaveTypeId}
+     * GET /admin/employee-leave-balance/{employeeControlNo}/{leaveTypeId}
      * Return a department employee's balance for a specific leave type.
      * Used by the admin on-behalf monetization form.
      */
-    public function employeeLeaveBalance(Request $request, string $employeeId, int $leaveTypeId): JsonResponse
+    public function employeeLeaveBalance(Request $request, string $employeeControlNo, int $leaveTypeId): JsonResponse
     {
         $admin = $request->user();
         if (!$admin instanceof DepartmentAdmin) {
@@ -319,7 +357,7 @@ class AdminDashboardController extends Controller
         }
 
         $admin->loadMissing('department');
-        $employee = Employee::findByControlNo($employeeId);
+        $employee = Employee::findByControlNo($employeeControlNo);
         if (!$employee || $employee->office !== $admin->department?->name) {
             return response()->json(['message' => 'Employee not found in your department.'], 404);
         }
@@ -329,10 +367,19 @@ class AdminDashboardController extends Controller
             return response()->json(['message' => 'Leave type not found.'], 404);
         }
 
+        if (!$leaveType->allowsEmploymentStatus($employee->status)) {
+            return response()->json([
+                'message' => "{$leaveType->name} is not available for {$employee->full_name}.",
+                'errors' => [
+                    'leave_type_id' => ["{$leaveType->name} is not available for {$employee->full_name}."],
+                ],
+            ], 422);
+        }
+
         $employeeControlNo = trim((string) $employee->control_no);
         $balance = LeaveBalance::query()
             ->where('leave_type_id', $leaveTypeId)
-            ->whereIn('employee_id', $this->buildControlNoCandidates($employeeControlNo))
+            ->whereIn('employee_control_no', $this->buildControlNoCandidates($employeeControlNo))
             ->first();
 
         return response()->json([
@@ -416,6 +463,15 @@ class AdminDashboardController extends Controller
                 'message' => 'Selected leave type is not available.',
                 'errors' => [
                     'leave_type_id' => ['Selected leave type is not available.'],
+                ],
+            ], 422);
+        }
+
+        if (!$leaveType->allowsEmploymentStatus($this->resolveAdminEmployee($admin)?->status)) {
+            return response()->json([
+                'message' => "{$leaveType->name} is not available for your employment status.",
+                'errors' => [
+                    'leave_type_id' => ["{$leaveType->name} is not available for your employment status."],
                 ],
             ], 422);
         }
@@ -566,7 +622,7 @@ class AdminDashboardController extends Controller
         ) {
             $app = LeaveApplication::create([
                 'applicant_admin_id' => $admin->id,
-                'erms_control_no' => $this->canonicalizeControlNo($adminEmployeeControlNo),
+                'employee_control_no' => $this->canonicalizeControlNo($adminEmployeeControlNo),
                 'leave_type_id' => $leaveType->id,
                 'start_date' => $validated['start_date'],
                 'end_date' => $validated['end_date'],
@@ -648,6 +704,15 @@ class AdminDashboardController extends Controller
             ], 422);
         }
 
+        if (!$leaveType->allowsEmploymentStatus($this->resolveAdminEmployee($admin)?->status)) {
+            return response()->json([
+                'message' => "{$leaveType->name} is not available for your employment status.",
+                'errors' => [
+                    'leave_type_id' => ["{$leaveType->name} is not available for your employment status."],
+                ],
+            ], 422);
+        }
+
         $balance = $this->findAdminEmployeeBalanceByLeaveType($admin, (int) $validated['leave_type_id']);
 
         $currentBalance = $balance ? (float) $balance->balance : 0;
@@ -682,7 +747,7 @@ class AdminDashboardController extends Controller
         $application = DB::transaction(function () use ($validated, $admin, $equivalentAmount, $adminEmployeeControlNo) {
             $app = LeaveApplication::create([
                 'applicant_admin_id' => $admin->id,
-                'erms_control_no' => $this->canonicalizeControlNo($adminEmployeeControlNo),
+                'employee_control_no' => $this->canonicalizeControlNo($adminEmployeeControlNo),
                 'leave_type_id' => $validated['leave_type_id'],
                 'start_date' => null,
                 'end_date' => null,
@@ -1038,7 +1103,7 @@ class AdminDashboardController extends Controller
         $employeeStatus = $application->employee?->status;
 
         if ($employeeStatus === null) {
-            $rawControlNo = $application->getRawOriginal('erms_control_no') ?: $application->erms_control_no;
+            $rawControlNo = $application->employee_control_no;
             $normalizedControlNo = $this->normalizeControlNo($rawControlNo);
             $employeeStatus = $employeeStatusByControlNo[$normalizedControlNo] ?? null;
         }
@@ -1075,16 +1140,20 @@ class AdminDashboardController extends Controller
             LeaveApplication::STATUS_PENDING_HR => 'Pending HR',
             LeaveApplication::STATUS_APPROVED => 'Approved',
             LeaveApplication::STATUS_REJECTED => 'Rejected',
+            LeaveApplication::STATUS_RECALLED => 'Recalled',
         ];
 
         $employee = $app->employee;
         if (!$employee) {
-            $rawControlNo = $app->getRawOriginal('erms_control_no') ?: $app->erms_control_no;
+            $rawControlNo = $app->employee_control_no;
             $employee = $employeesByControlNo[$this->normalizeControlNo($rawControlNo)] ?? null;
         }
 
         // Determine employee name & office (could be admin self-apply)
-        $employeeFullName = $employee ? $this->formatEmployeeFullName($employee) : '';
+        $employeeFullName = trim((string) ($app->employee_name ?? ''));
+        if ($employeeFullName === '') {
+            $employeeFullName = $employee ? $this->formatEmployeeFullName($employee) : '';
+        }
         $employeeName = $employeeFullName !== ''
             ? $employeeFullName
             : ($app->applicantAdmin ? $app->applicantAdmin->full_name : 'Unknown');
@@ -1111,6 +1180,11 @@ class AdminDashboardController extends Controller
         $hrApprovedLog = $logs->first(
             fn(LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_APPROVED
         );
+        $hrRecalledLog = $logs->first(
+            fn(LeaveApplicationLog $log) =>
+                $log->action === LeaveApplicationLog::ACTION_HR_RECALLED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
         $adminRejectedLog = $logs->first(
             fn(LeaveApplicationLog $log) =>
             $log->action === LeaveApplicationLog::ACTION_ADMIN_REJECTED
@@ -1134,9 +1208,14 @@ class AdminDashboardController extends Controller
         $adminActionBy = ($app->admin_id && isset($actorDirectory['admin'][(int) $app->admin_id]))
             ? $actorDirectory['admin'][(int) $app->admin_id]
             : $this->resolvePerformerName($adminApprovedLog ?? $adminRejectedLog, $actorDirectory, $employeeName);
-        $hrActionBy = ($app->hr_id && isset($actorDirectory['hr'][(int) $app->hr_id]))
-            ? $actorDirectory['hr'][(int) $app->hr_id]
-            : $this->resolvePerformerName($hrApprovedLog ?? $hrRejectedLog, $actorDirectory, $employeeName);
+        $hrActionBy = $this->resolvePerformerName($hrApprovedLog ?? $hrRejectedLog, $actorDirectory, $employeeName);
+        if ($hrActionBy === null && $app->status !== LeaveApplication::STATUS_RECALLED && $app->hr_id && isset($actorDirectory['hr'][(int) $app->hr_id])) {
+            $hrActionBy = $actorDirectory['hr'][(int) $app->hr_id];
+        }
+        $recallActionBy = $this->resolvePerformerName($hrRecalledLog, $actorDirectory, $employeeName);
+        if ($recallActionBy === null && $app->status === LeaveApplication::STATUS_RECALLED && $app->hr_id && isset($actorDirectory['hr'][(int) $app->hr_id])) {
+            $recallActionBy = $actorDirectory['hr'][(int) $app->hr_id];
+        }
 
         $isCancelled = $this->isCancelledRemark($app->remarks);
         $cancelledBy = $cancelledLog
@@ -1162,6 +1241,8 @@ class AdminDashboardController extends Controller
         $hrActionAt = $hrApprovedLog?->created_at
             ?? $hrRejectedLog?->created_at
             ?? $app->hr_approved_at;
+        $recallActionAt = $hrRecalledLog?->created_at
+            ?? ($app->status === LeaveApplication::STATUS_RECALLED ? $app->updated_at : null);
         $cancelledAt = $cancelledLog?->created_at;
 
         $disapprovedAt = null;
@@ -1187,6 +1268,9 @@ class AdminDashboardController extends Controller
         } elseif ($app->status === LeaveApplication::STATUS_APPROVED) {
             $processedBy = $hrActionBy ?? $adminActionBy;
             $reviewedAt = $hrActionAt ?? $adminActionAt;
+        } elseif ($app->status === LeaveApplication::STATUS_RECALLED) {
+            $processedBy = $recallActionBy ?? $hrActionBy ?? $adminActionBy;
+            $reviewedAt = $recallActionAt ?? $hrActionAt ?? $adminActionAt;
         } elseif ($app->status === LeaveApplication::STATUS_REJECTED) {
             $processedBy = $disapprovedBy;
             $reviewedAt = $disapprovedAt ?? $hrActionAt ?? $adminActionAt;
@@ -1210,7 +1294,7 @@ class AdminDashboardController extends Controller
 
         return [
             'id' => $app->id,
-            'employee_id' => $app->erms_control_no,
+            'employee_control_no' => $app->employee_control_no,
             'employeeName' => $employeeName,
             'office' => $office,
             'position' => $position,
@@ -1255,12 +1339,16 @@ class AdminDashboardController extends Controller
             'filedBy' => $filedBy,
             'adminActionBy' => $adminActionBy,
             'hrActionBy' => $hrActionBy,
+            'recallActionBy' => $recallActionBy,
+            'recall_action_by' => $recallActionBy,
             'disapprovedBy' => $disapprovedBy,
             'cancelledBy' => $cancelledBy,
             'processedBy' => $processedBy,
             'reviewedAt' => $reviewedAt?->toIso8601String(),
             'adminActionAt' => $adminActionAt?->toIso8601String(),
             'hrActionAt' => $hrActionAt?->toIso8601String(),
+            'recallActionAt' => $recallActionAt?->toIso8601String(),
+            'recall_action_at' => $recallActionAt?->toIso8601String(),
             'disapprovedAt' => $disapprovedAt?->toIso8601String(),
             'cancelledAt' => $cancelledAt?->toIso8601String(),
             'leaveBalance' => $this->getBalanceForApp($app, $leaveBalanceDirectory),
@@ -1360,9 +1448,9 @@ class AdminDashboardController extends Controller
             ? []
             : LeaveBalance::query()
                 ->with('leaveType:id,name')
-                ->whereIn('employee_id', $employeeControlNos->all())
+                ->whereIn('employee_control_no', $employeeControlNos->all())
                 ->get()
-                ->groupBy(fn(LeaveBalance $balance) => $this->normalizeControlNo($balance->employee_id))
+                ->groupBy(fn(LeaveBalance $balance) => $this->normalizeControlNo($balance->employee_control_no))
                 ->map(fn(Collection $balances) => $this->formatLeaveBalanceSnapshot($balances))
                 ->all();
 
@@ -1401,9 +1489,9 @@ class AdminDashboardController extends Controller
                 ? []
                 : LeaveBalance::query()
                     ->with('leaveType:id,name')
-                    ->whereIn('employee_id', $adminEmployeeControlNoCandidates)
+                    ->whereIn('employee_control_no', $adminEmployeeControlNoCandidates)
                     ->get()
-                    ->groupBy(fn(LeaveBalance $balance) => $this->normalizeControlNo($balance->employee_id))
+                    ->groupBy(fn(LeaveBalance $balance) => $this->normalizeControlNo($balance->employee_control_no))
                     ->all();
 
             foreach ($adminEmployeeControlNoById as $adminId => $employeeControlNo) {
@@ -1513,8 +1601,8 @@ class AdminDashboardController extends Controller
 
     private function getCurrentLeaveBalancesForApp(LeaveApplication $app, array $leaveBalanceDirectory = []): array
     {
-        if ($app->erms_control_no) {
-            $employeeKey = $this->normalizeControlNo($app->erms_control_no);
+        if ($app->employee_control_no) {
+            $employeeKey = $this->normalizeControlNo($app->employee_control_no);
             return $leaveBalanceDirectory['employee'][$employeeKey] ?? [];
         }
 
@@ -1555,14 +1643,14 @@ class AdminDashboardController extends Controller
     private function queryAdminEmployeeBalances(DepartmentAdmin $admin)
     {
         $employeeControlNo = $this->resolveAdminEmployeeControlNo($admin);
-        $candidateEmployeeIds = $this->buildControlNoCandidates($employeeControlNo);
+        $candidateEmployeeControlNos = $this->buildControlNoCandidates($employeeControlNo);
 
         $query = LeaveBalance::query();
-        if ($candidateEmployeeIds === []) {
+        if ($candidateEmployeeControlNos === []) {
             return $query->whereRaw('1 = 0');
         }
 
-        return $query->whereIn('employee_id', $candidateEmployeeIds);
+        return $query->whereIn('employee_control_no', $candidateEmployeeControlNos);
     }
 
     private function findAdminEmployeeBalanceByLeaveType(DepartmentAdmin $admin, int $leaveTypeId): ?LeaveBalance
@@ -1599,6 +1687,16 @@ class AdminDashboardController extends Controller
         return Employee::query()
             ->matchingControlNo($employeeControlNo)
             ->first();
+    }
+
+    /**
+     * @param iterable<int,LeaveType> $leaveTypes
+     */
+    private function filterLeaveTypesForEmploymentStatus(iterable $leaveTypes, mixed $employmentStatus): Collection
+    {
+        return collect($leaveTypes)
+            ->filter(fn(LeaveType $leaveType): bool => $leaveType->allowsEmploymentStatus($employmentStatus))
+            ->values();
     }
 
     private function resolveAdminEmployeeSalary(DepartmentAdmin $admin): ?float
@@ -1998,7 +2096,7 @@ class AdminDashboardController extends Controller
                 LeaveApplication::STATUS_PENDING_HR,
                 LeaveApplication::STATUS_APPROVED,
             ])
-            ->whereIn('erms_control_no', $this->buildControlNoCandidates($employeeControlNo))
+            ->whereIn('employee_control_no', $this->buildControlNoCandidates($employeeControlNo))
             ->get();
 
         $duplicateDateMap = [];
@@ -2041,5 +2139,3 @@ class AdminDashboardController extends Controller
         ], 422);
     }
 }
-
-

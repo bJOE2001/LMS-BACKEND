@@ -11,8 +11,18 @@ class COCApplication extends Model
 {
     protected $table = 'tblCOCApplications';
 
+    protected static function booted(): void
+    {
+        static::saving(function (self $application): void {
+            if (trim((string) ($application->employee_name ?? '')) === '') {
+                $application->employee_name = self::resolveSnapshotEmployeeName($application);
+            }
+        });
+    }
+
     protected $fillable = [
-        'erms_control_no',
+        'employee_control_no',
+        'employee_name',
         'status',
         'reviewed_by_admin_id',
         'admin_reviewed_at',
@@ -45,9 +55,57 @@ class COCApplication extends Model
     public const STATUS_APPROVED = 'APPROVED';
     public const STATUS_REJECTED = 'REJECTED';
 
+    public function getErmsControlNoAttribute(): ?string
+    {
+        $value = $this->attributes['employee_control_no']
+            ?? $this->attributes['erms_control_no']
+            ?? null;
+
+        return $value !== null ? (string) $value : null;
+    }
+
+    public function setErmsControlNoAttribute($value): void
+    {
+        $this->attributes['employee_control_no'] = $value;
+    }
+
+    public static function resolveSnapshotEmployeeName(self $application): ?string
+    {
+        $employee = $application->employee;
+        if ($employee instanceof Employee) {
+            $employeeName = trim(implode(' ', array_filter([
+                trim((string) ($employee->firstname ?? '')),
+                trim((string) ($employee->middlename ?? '')),
+                trim((string) ($employee->surname ?? '')),
+            ])));
+
+            if ($employeeName !== '') {
+                return $employeeName;
+            }
+        }
+
+        $rawControlNo = trim((string) ($application->employee_control_no ?? ''));
+        if ($rawControlNo === '') {
+            return null;
+        }
+
+        $resolvedEmployee = Employee::findByControlNo($rawControlNo);
+        if (!$resolvedEmployee instanceof Employee) {
+            return null;
+        }
+
+        $employeeName = trim(implode(' ', array_filter([
+            trim((string) ($resolvedEmployee->firstname ?? '')),
+            trim((string) ($resolvedEmployee->middlename ?? '')),
+            trim((string) ($resolvedEmployee->surname ?? '')),
+        ])));
+
+        return $employeeName !== '' ? $employeeName : null;
+    }
+
     public function employee(): BelongsTo
     {
-        return $this->belongsTo(Employee::class, 'erms_control_no', 'control_no');
+        return $this->belongsTo(Employee::class, 'employee_control_no', 'control_no');
     }
 
     public function rows(): HasMany
@@ -80,10 +138,10 @@ class COCApplication extends Model
         $normalizedControlNo = self::normalizeControlNoInt($rawControlNo);
 
         return $query->where(function (Builder $nestedQuery) use ($rawControlNo, $normalizedControlNo): void {
-            $nestedQuery->where('erms_control_no', $rawControlNo);
+            $nestedQuery->where('employee_control_no', $rawControlNo);
 
             if ($normalizedControlNo !== null && $normalizedControlNo !== $rawControlNo) {
-                $nestedQuery->orWhere('erms_control_no', $normalizedControlNo);
+                $nestedQuery->orWhere('employee_control_no', $normalizedControlNo);
             }
         });
     }

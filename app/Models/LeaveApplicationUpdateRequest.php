@@ -18,6 +18,8 @@ class LeaveApplicationUpdateRequest extends Model
 
     protected $fillable = [
         'leave_application_id',
+        'employee_control_no',
+        'employee_name',
         'requested_payload',
         'requested_reason',
         'previous_status',
@@ -33,6 +35,8 @@ class LeaveApplicationUpdateRequest extends Model
     {
         return [
             'leave_application_id' => 'integer',
+            'employee_control_no' => 'string',
+            'employee_name' => 'string',
             'requested_payload' => 'array',
             'requested_at' => 'datetime',
             'reviewed_by_hr_id' => 'integer',

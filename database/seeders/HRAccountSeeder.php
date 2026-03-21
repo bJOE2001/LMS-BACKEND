@@ -41,10 +41,12 @@ class HRAccountSeeder extends Seeder
                 [
                     'username' => 'hr',
                     'full_name' => 'Jake Baranda',
+                    'position' => 'HR',
                 ],
                 [
                     'username' => 'hr2',
                     'full_name' => 'Kenneth Andallaza',
+                    'position' => 'HR',
                 ],
             ];
 
@@ -57,6 +59,7 @@ class HRAccountSeeder extends Seeder
                     $payload = [
                         'username' => $account['username'],
                         'full_name' => $account['full_name'],
+                        'position' => $account['position'],
                         'must_change_password' => true,
                     ];
 
@@ -72,6 +75,7 @@ class HRAccountSeeder extends Seeder
                 HRAccount::query()->create([
                     'username' => $account['username'],
                     'full_name' => $account['full_name'],
+                    'position' => $account['position'],
                     'password' => Hash::make($seedPassword),
                     'must_change_password' => true,
                 ]);

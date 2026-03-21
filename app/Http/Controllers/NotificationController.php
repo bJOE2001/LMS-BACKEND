@@ -133,7 +133,7 @@ class NotificationController extends Controller
 
         return [
             'id' => $application->id,
-            'employee_id' => $application->erms_control_no,
+            'employee_control_no' => $application->employee_control_no,
             'applicant_admin_id' => $application->applicant_admin_id,
             'applicant_name' => $employeeName,
             'office' => $application->employee?->office ?? $application->applicantAdmin?->department?->name,
@@ -163,6 +163,7 @@ class NotificationController extends Controller
             LeaveApplication::STATUS_PENDING_HR => 'Pending HR',
             LeaveApplication::STATUS_APPROVED => 'Approved',
             LeaveApplication::STATUS_REJECTED => 'Rejected',
+            LeaveApplication::STATUS_RECALLED => 'Recalled',
             default => (string) $status,
         };
     }

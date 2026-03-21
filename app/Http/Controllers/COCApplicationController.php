@@ -11,6 +11,7 @@ use App\Models\LeaveBalance;
 use App\Models\LeaveType;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
 
@@ -20,18 +21,27 @@ class COCApplicationController extends Controller
 
     public function ermsIndex(Request $request): JsonResponse
     {
+        $this->mergeEmployeeControlNoInput($request);
+
         $validated = $request->validate([
-            'erms_control_no' => ['nullable', 'string', 'regex:/^\d+$/'],
+            'employee_control_no' => ['nullable', 'string', 'regex:/^\d+$/'],
         ]);
 
-        $controlNo = trim((string) ($validated['erms_control_no'] ?? ''));
+        $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
         if ($controlNo === '') {
-            return response()->json(['message' => 'The erms_control_no query parameter is required.'], 422);
+            return response()->json(['message' => 'The employee_control_no query parameter is required.'], 422);
         }
 
         $employee = Employee::findByControlNo($controlNo);
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+
+        if ($this->isCocRestrictedEmployeeStatus($employee->status)) {
+            return response()->json([
+                ...$this->employeeControlNoResponse((string) $employee->control_no),
+                'applications' => [],
+            ]);
         }
 
         $applications = COCApplication::query()
@@ -40,16 +50,22 @@ class COCApplicationController extends Controller
             ->orderByDesc('created_at')
             ->get();
 
+        $leaveBalanceDirectory = $this->buildLeaveBalanceDirectory($applications);
+
         return response()->json([
-            'erms_control_no' => (string) $employee->control_no,
-            'applications' => $applications->map(fn(COCApplication $app) => $this->formatApplication($app))->values(),
+            ...$this->employeeControlNoResponse((string) $employee->control_no),
+            'applications' => $applications
+                ->map(fn(COCApplication $app) => $this->formatApplication($app, $leaveBalanceDirectory))
+                ->values(),
         ]);
     }
 
     public function ermsStore(Request $request): JsonResponse
     {
+        $this->mergeEmployeeControlNoInput($request);
+
         $validated = $request->validate([
-            'erms_control_no' => ['required', 'string', 'regex:/^\d+$/'],
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'rows' => ['required', 'array', 'min:1', 'max:100'],
             'rows.*.date' => ['required', 'date'],
             'rows.*.nature_of_overtime' => ['required', 'string', 'max:2000'],
@@ -58,9 +74,15 @@ class COCApplicationController extends Controller
             'total_no_of_coc_applied_minutes' => ['nullable', 'integer', 'min:1', 'max:144000'],
         ]);
 
-        $employee = Employee::findByControlNo((string) $validated['erms_control_no']);
+        $employee = Employee::findByControlNo($this->resolveValidatedEmployeeControlNo($validated));
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+
+        if ($this->isCocRestrictedEmployeeStatus($employee->status)) {
+            return response()->json([
+                'message' => 'COC application is not available for contractual employees.',
+            ], 422);
         }
 
         $runningMinutes = 0;
@@ -97,14 +119,23 @@ class COCApplicationController extends Controller
 
         $application = DB::transaction(function () use ($employee, $rows, $runningMinutes): COCApplication {
             $app = COCApplication::create([
-                'erms_control_no' => (string) $employee->control_no,
+                'employee_control_no' => (string) $employee->control_no,
+                'employee_name' => trim(implode(' ', array_filter([
+                    trim((string) ($employee->firstname ?? '')),
+                    trim((string) ($employee->middlename ?? '')),
+                    trim((string) ($employee->surname ?? '')),
+                ]))) ?: null,
                 'status' => COCApplication::STATUS_PENDING,
                 'total_minutes' => $runningMinutes,
                 'submitted_at' => now(),
             ]);
 
             foreach ($rows as $row) {
-                $app->rows()->create($row);
+                $app->rows()->create([
+                    ...$row,
+                    'employee_control_no' => (string) $app->employee_control_no,
+                    'employee_name' => $app->employee_name,
+                ]);
             }
 
             return $app;
@@ -127,7 +158,7 @@ class COCApplicationController extends Controller
 
         $validated = $request->validate([
             'status' => ['nullable', 'string', 'max:50'],
-            'erms_control_no' => ['nullable', 'string', 'regex:/^\d+$/'],
+            'employee_control_no' => ['nullable', 'string', 'regex:/^\d+$/'],
         ]);
 
         $statusFilter = $this->normalizeStatusFilter($validated['status'] ?? null);
@@ -135,18 +166,23 @@ class COCApplicationController extends Controller
             return response()->json(['message' => 'Invalid status filter.'], 422);
         }
 
+        $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
+
         $applications = $this->departmentScope($admin)
             ->with(['rows', 'employee', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
-            ->when(trim((string) ($validated['erms_control_no'] ?? '')) !== '', function ($q) use ($validated): void {
-                $q->matchingControlNo((string) $validated['erms_control_no']);
+            ->when($controlNo !== '', function ($q) use ($controlNo): void {
+                $q->matchingControlNo($controlNo);
             })
             ->orderByDesc('created_at')
             ->get();
 
         $applications = $this->filterByRawStatus($applications, $statusFilter);
+        $leaveBalanceDirectory = $this->buildLeaveBalanceDirectory($applications);
 
         return response()->json([
-            'applications' => $applications->map(fn(COCApplication $app) => $this->formatApplication($app))->values(),
+            'applications' => $applications
+                ->map(fn(COCApplication $app) => $this->formatApplication($app, $leaveBalanceDirectory))
+                ->values(),
         ]);
     }
 
@@ -242,7 +278,7 @@ class COCApplicationController extends Controller
 
         $validated = $request->validate([
             'status' => ['nullable', 'string', 'max:50'],
-            'erms_control_no' => ['nullable', 'string', 'regex:/^\d+$/'],
+            'employee_control_no' => ['nullable', 'string', 'regex:/^\d+$/'],
         ]);
 
         $statusFilter = $this->normalizeStatusFilter($validated['status'] ?? null);
@@ -250,18 +286,23 @@ class COCApplicationController extends Controller
             return response()->json(['message' => 'Invalid status filter.'], 422);
         }
 
+        $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
+
         $applications = COCApplication::query()
             ->with(['rows', 'employee', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
-            ->when(trim((string) ($validated['erms_control_no'] ?? '')) !== '', function ($q) use ($validated): void {
-                $q->matchingControlNo((string) $validated['erms_control_no']);
+            ->when($controlNo !== '', function ($q) use ($controlNo): void {
+                $q->matchingControlNo($controlNo);
             })
             ->orderByDesc('created_at')
             ->get();
 
         $applications = $this->filterByRawStatus($applications, $statusFilter);
+        $leaveBalanceDirectory = $this->buildLeaveBalanceDirectory($applications);
 
         return response()->json([
-            'applications' => $applications->map(fn(COCApplication $app) => $this->formatApplication($app))->values(),
+            'applications' => $applications
+                ->map(fn(COCApplication $app) => $this->formatApplication($app, $leaveBalanceDirectory))
+                ->values(),
         ]);
     }
 
@@ -281,7 +322,7 @@ class COCApplicationController extends Controller
                 if ($app->status !== COCApplication::STATUS_PENDING) throw new RuntimeException('ALREADY_REVIEWED');
                 if ($app->admin_reviewed_at === null) throw new RuntimeException('PENDING_ADMIN_REVIEW');
 
-                $employee = Employee::findByControlNo($app->erms_control_no);
+                $employee = Employee::findByControlNo((string) $app->employee_control_no);
                 if (!$employee) throw new RuntimeException('EMPLOYEE_NOT_FOUND');
 
                 $ctoLeaveType = $this->resolveCTOLeaveType();
@@ -291,7 +332,7 @@ class COCApplicationController extends Controller
                 if ($creditedDays <= 0) throw new RuntimeException('INVALID_CREDIT');
 
                 $balance = LeaveBalance::query()
-                    ->where('employee_id', (string) $employee->control_no)
+                    ->where('employee_control_no', (string) $employee->control_no)
                     ->where('leave_type_id', (int) $ctoLeaveType->id)
                     ->lockForUpdate()
                     ->first();
@@ -302,7 +343,7 @@ class COCApplicationController extends Controller
                     $balance->save();
                 } else {
                     $balance = LeaveBalance::query()->create([
-                        'employee_id' => (string) $employee->control_no,
+                        'employee_control_no' => (string) $employee->control_no,
                         'leave_type_id' => (int) $ctoLeaveType->id,
                         'balance' => $creditedDays,
                         'year' => (int) now()->year,
@@ -405,7 +446,7 @@ class COCApplicationController extends Controller
         $query = COCApplication::query();
         if ($departmentName === '') return $query->whereRaw('1 = 0');
 
-        return $query->whereIn('erms_control_no', function ($q) use ($departmentName): void {
+        return $query->whereIn('employee_control_no', function ($q) use ($departmentName): void {
             $q->select('control_no')->from('tblEmployees')->where('office', $departmentName);
         });
     }
@@ -473,7 +514,50 @@ class COCApplicationController extends Controller
         };
     }
 
-    private function formatApplication(COCApplication $app): array
+    private function mergeEmployeeControlNoInput(Request $request): void
+    {
+        $employeeControlNo = trim((string) $request->input('employee_control_no', ''));
+        if ($employeeControlNo === '') {
+            return;
+        }
+
+        $request->merge([
+            'employee_control_no' => $employeeControlNo,
+        ]);
+    }
+
+    private function resolveValidatedEmployeeControlNo(array $validated): string
+    {
+        return trim((string) ($validated['employee_control_no'] ?? ''));
+    }
+
+    private function employeeControlNoResponse(?string $controlNo): array
+    {
+        $normalized = trim((string) ($controlNo ?? ''));
+        if ($normalized === '') {
+            return [
+                'employee_control_no' => null,
+            ];
+        }
+
+        return [
+            'employee_control_no' => $normalized,
+        ];
+    }
+
+    private function isCocRestrictedEmployeeStatus(mixed $status): bool
+    {
+        $normalized = strtoupper(trim((string) ($status ?? '')));
+        if ($normalized === '') {
+            return false;
+        }
+
+        return str_contains($normalized, 'CONTRACTUAL')
+            || str_contains($normalized, 'HONORARIUM')
+            || str_contains($normalized, 'JOB ORDER');
+    }
+
+    private function formatApplication(COCApplication $app, array $leaveBalanceDirectory = []): array
     {
         $rows = $app->relationLoaded('rows') ? $app->rows->values() : collect();
         $rowDates = $rows
@@ -493,7 +577,7 @@ class COCApplicationController extends Controller
             default => $rawStatus,
         };
 
-        $employeeName = trim(implode(' ', array_filter([
+        $employeeName = trim((string) ($app->employee_name ?? '')) ?: trim(implode(' ', array_filter([
             trim((string) ($app->employee?->firstname ?? '')),
             trim((string) ($app->employee?->middlename ?? '')),
             trim((string) ($app->employee?->surname ?? '')),
@@ -502,12 +586,12 @@ class COCApplicationController extends Controller
         $remarks = trim((string) ($app->remarks ?? ''));
         $isCancelled = (bool) preg_match('/^cancelled\b/i', $remarks);
         $durationHours = $this->minutesToHours((int) $app->total_minutes);
+        $currentLeaveBalances = $this->getCurrentLeaveBalancesForApp($app, $leaveBalanceDirectory);
 
         return [
             'id' => $app->id,
             'application_type' => 'COC',
-            'employee_id' => (string) $app->erms_control_no,
-            'erms_control_no' => (string) $app->erms_control_no,
+            'employee_control_no' => (string) $app->employee_control_no,
             'employeeName' => $employeeName,
             'employee_name' => $employeeName,
             'office' => $app->employee?->office,
@@ -569,7 +653,11 @@ class COCApplicationController extends Controller
             'created_at' => $app->created_at?->toIso8601String(),
             'submittedAt' => $app->submitted_at?->toIso8601String(),
             'submitted_at' => $app->submitted_at?->toIso8601String(),
+            'leaveBalances' => $currentLeaveBalances,
+            'employee_leave_balances' => $currentLeaveBalances,
             'rows' => $rows->map(fn(COCApplicationRow $row) => [
+                'employee_control_no' => (string) $row->employee_control_no,
+                'employee_name' => $row->employee_name,
                 'line_no' => (int) $row->line_no,
                 'date' => $row->overtime_date?->toDateString(),
                 'nature_of_overtime' => $row->nature_of_overtime,
@@ -579,5 +667,67 @@ class COCApplicationController extends Controller
                 'total_no_of_hours_and_minutes' => (int) $row->cumulative_minutes,
             ])->values(),
         ];
+    }
+
+    private function buildLeaveBalanceDirectory(Collection $applications): array
+    {
+        $employeeControlNos = $applications
+            ->map(fn(COCApplication $application) => trim((string) $application->employee_control_no))
+            ->filter(fn(string $controlNo) => $controlNo !== '')
+            ->unique()
+            ->values();
+
+        if ($employeeControlNos->isEmpty()) {
+            return [];
+        }
+
+        return LeaveBalance::query()
+            ->with('leaveType:id,name')
+            ->whereIn('employee_control_no', $employeeControlNos->all())
+            ->get()
+            ->groupBy(fn(LeaveBalance $balance) => $this->normalizeControlNo($balance->employee_control_no))
+            ->map(fn(Collection $balances) => $this->formatLeaveBalanceSnapshot($balances))
+            ->all();
+    }
+
+    private function getCurrentLeaveBalancesForApp(COCApplication $app, array $leaveBalanceDirectory = []): array
+    {
+        $employeeKey = $this->normalizeControlNo($app->employee_control_no);
+        if ($employeeKey === '') {
+            return [];
+        }
+
+        if (array_key_exists($employeeKey, $leaveBalanceDirectory)) {
+            return $leaveBalanceDirectory[$employeeKey];
+        }
+
+        return $this->formatLeaveBalanceSnapshot(
+            LeaveBalance::query()
+                ->with('leaveType:id,name')
+                ->where('employee_control_no', trim((string) $app->employee_control_no))
+                ->get()
+        );
+    }
+
+    private function formatLeaveBalanceSnapshot(Collection $balances): array
+    {
+        return $balances
+            ->sortByDesc(fn(LeaveBalance $balance) => $balance->updated_at?->timestamp ?? 0)
+            ->unique(fn(LeaveBalance $balance) => (int) $balance->leave_type_id)
+            ->sortBy(fn(LeaveBalance $balance) => strtolower(trim((string) ($balance->leaveType?->name ?? ''))))
+            ->values()
+            ->map(fn(LeaveBalance $balance) => [
+                'leave_type_id' => (int) $balance->leave_type_id,
+                'leave_type_name' => $balance->leaveType?->name ?? 'Unknown',
+                'balance' => (float) $balance->balance,
+                'year' => $balance->year !== null ? (int) $balance->year : null,
+                'updated_at' => $balance->updated_at?->toIso8601String(),
+            ])
+            ->all();
+    }
+
+    private function normalizeControlNo(mixed $value): string
+    {
+        return trim((string) ($value ?? ''));
     }
 }

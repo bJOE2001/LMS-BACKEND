@@ -11,6 +11,8 @@ class COCApplicationRow extends Model
 
     protected $fillable = [
         'coc_application_id',
+        'employee_control_no',
+        'employee_name',
         'line_no',
         'overtime_date',
         'nature_of_overtime',
@@ -23,6 +25,8 @@ class COCApplicationRow extends Model
     protected function casts(): array
     {
         return [
+            'employee_control_no' => 'string',
+            'employee_name' => 'string',
             'line_no' => 'integer',
             'overtime_date' => 'date',
             'minutes' => 'integer',

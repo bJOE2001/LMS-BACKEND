@@ -96,7 +96,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::post('/leave-balances/initialize', [AdminDashboardController::class, 'initializeBalance']);
         Route::post('/leave-applications/self', [AdminDashboardController::class, 'storeSelfLeave']);
         Route::get('/self-leave-balance/{leaveTypeId}', [AdminDashboardController::class, 'selfLeaveBalance']);
-        Route::get('/employee-leave-balance/{employeeId}/{leaveTypeId}', [AdminDashboardController::class, 'employeeLeaveBalance']);
+        Route::get('/employee-leave-balance/{employeeControlNo}/{leaveTypeId}', [AdminDashboardController::class, 'employeeLeaveBalance']);
 
         // Leave application review
         Route::get('/leave-applications', [LeaveApplicationController::class, 'adminIndex']);
@@ -144,6 +144,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::get('/leave-applications/{id}/attachment', [LeaveApplicationController::class, 'hrViewAttachment']);
         Route::post('/leave-applications/{id}/approve', [LeaveApplicationController::class, 'hrApprove']);
         Route::post('/leave-applications/{id}/reject', [LeaveApplicationController::class, 'hrReject']);
+        Route::post('/leave-applications/{id}/recall', [LeaveApplicationController::class, 'hrRecall']);
         Route::get('/coc-applications', [COCApplicationController::class, 'hrIndex']);
         Route::post('/coc-applications/{id}/approve', [COCApplicationController::class, 'hrApprove']);
         Route::post('/coc-applications/{id}/reject', [COCApplicationController::class, 'hrReject']);

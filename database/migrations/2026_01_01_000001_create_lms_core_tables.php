@@ -21,6 +21,7 @@ return new class extends Migration {
         Schema::create('tblHRAccounts', function (Blueprint $table) {
             $table->id();
             $table->string('full_name');
+            $table->string('position')->nullable();
             $table->string('username')->unique();
             $table->string('password');
             $table->boolean('must_change_password')->default(false);
@@ -73,6 +74,7 @@ return new class extends Migration {
             $table->boolean('is_credit_based')->default(false);
             $table->boolean('resets_yearly')->default(false);
             $table->boolean('requires_documents')->default(false);
+            $table->json('allowed_status')->nullable();
             $table->text('description')->nullable();
             $table->timestamps();
         });
@@ -90,3 +92,4 @@ return new class extends Migration {
         Schema::dropIfExists('tblDepartments');
     }
 };
+

@@ -22,6 +22,10 @@ class LeaveApplication extends Model
     protected static function booted(): void
     {
         static::saving(function (self $application): void {
+            if (trim((string) ($application->employee_name ?? '')) === '') {
+                $application->employee_name = self::resolveSnapshotEmployeeName($application);
+            }
+
             $rawPayMode = strtoupper(trim((string) ($application->pay_mode ?? self::PAY_MODE_WITH_PAY)));
             $application->pay_mode = in_array($rawPayMode, [self::PAY_MODE_WITH_PAY, self::PAY_MODE_WITHOUT_PAY], true)
                 ? $rawPayMode
@@ -65,7 +69,9 @@ class LeaveApplication extends Model
     // Employee master records are stored and managed in LMS tblEmployees.
     protected $fillable = [
         'applicant_admin_id',
+        'employee_control_no',
         'erms_control_no',
+        'employee_name',
         'leave_type_id',
         'start_date',
         'end_date',
@@ -83,6 +89,8 @@ class LeaveApplication extends Model
         'selected_date_coverage',
         'commutation',
         'pay_mode',
+        'linked_forced_leave_deducted_days',
+        'linked_vacation_leave_deducted_days',
         'requires_documents',
         'attachment_required',
         'attachment_submitted',
@@ -94,7 +102,7 @@ class LeaveApplication extends Model
     protected function casts(): array
     {
         return [
-            'erms_control_no' => 'string',
+            'employee_control_no' => 'string',
             'start_date' => 'date',
             'end_date' => 'date',
             'total_days' => 'decimal:2',
@@ -105,6 +113,8 @@ class LeaveApplication extends Model
             'selected_date_pay_status' => 'array',
             'selected_date_coverage' => 'array',
             'pay_mode' => 'string',
+            'linked_forced_leave_deducted_days' => 'decimal:2',
+            'linked_vacation_leave_deducted_days' => 'decimal:2',
             'requires_documents' => 'boolean',
             'attachment_required' => 'boolean',
             'attachment_submitted' => 'boolean',
@@ -120,6 +130,7 @@ class LeaveApplication extends Model
     public const STATUS_PENDING_HR = 'PENDING_HR';
     public const STATUS_APPROVED = 'APPROVED';
     public const STATUS_REJECTED = 'REJECTED';
+    public const STATUS_RECALLED = 'RECALLED';
 
     // ─── Relationships ───────────────────────────────────────────────
 
@@ -145,7 +156,34 @@ class LeaveApplication extends Model
 
     public function employee(): BelongsTo
     {
-        return $this->belongsTo(Employee::class, 'erms_control_no', 'control_no');
+        return $this->belongsTo(Employee::class, 'employee_control_no', 'control_no');
+    }
+
+    protected $hidden = [
+        'employee_control_no',
+    ];
+
+    protected $appends = [
+        'erms_control_no',
+    ];
+
+    public function getErmsControlNoAttribute(): ?string
+    {
+        $rawControlNo = $this->attributes['employee_control_no']
+            ?? $this->attributes['erms_control_no']
+            ?? null;
+
+        if ($rawControlNo === null) {
+            return null;
+        }
+
+        $controlNo = trim((string) $rawControlNo);
+        return $controlNo !== '' ? $controlNo : null;
+    }
+
+    public function setErmsControlNoAttribute(mixed $value): void
+    {
+        $this->attributes['employee_control_no'] = $value;
     }
 
     public static function resolveSelectedDates(
@@ -267,6 +305,47 @@ class LeaveApplication extends Model
         }
 
         return (int) $roundedTotalDays === count($rangeDates);
+    }
+
+    private static function resolveSnapshotEmployeeName(self $application): ?string
+    {
+        $controlNo = trim((string) ($application->employee_control_no ?? $application->erms_control_no ?? ''));
+        if ($controlNo !== '') {
+            $employee = Employee::findByControlNo($controlNo);
+            $employeeName = self::formatSnapshotEmployeeName($employee);
+            if ($employeeName !== null) {
+                return $employeeName;
+            }
+        }
+
+        $applicantAdminId = (int) ($application->applicant_admin_id ?? 0);
+        if ($applicantAdminId > 0) {
+            $admin = DepartmentAdmin::query()->with('employee')->find($applicantAdminId);
+            $employeeName = self::formatSnapshotEmployeeName($admin?->employee);
+            if ($employeeName !== null) {
+                return $employeeName;
+            }
+
+            $adminName = trim((string) ($admin?->full_name ?? ''));
+            return $adminName !== '' ? $adminName : null;
+        }
+
+        return null;
+    }
+
+    private static function formatSnapshotEmployeeName(?Employee $employee): ?string
+    {
+        if (!$employee) {
+            return null;
+        }
+
+        $fullName = trim(implode(' ', array_filter([
+            trim((string) ($employee->firstname ?? '')),
+            trim((string) ($employee->middlename ?? '')),
+            trim((string) ($employee->surname ?? '')),
+        ], static fn (string $part): bool => $part !== '')));
+
+        return $fullName !== '' ? $fullName : null;
     }
 }
 

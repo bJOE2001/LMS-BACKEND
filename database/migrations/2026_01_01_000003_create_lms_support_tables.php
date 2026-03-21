@@ -35,8 +35,9 @@ return new class extends Migration {
         // COC applications
         Schema::create('tblCOCApplications', function (Blueprint $table): void {
             $table->id();
-            $table->string('erms_control_no');
-            $table->foreign('erms_control_no')
+            $table->string('employee_control_no');
+            $table->string('employee_name')->nullable();
+            $table->foreign('employee_control_no')
                 ->references('control_no')
                 ->on('tblEmployees')
                 ->noActionOnDelete();
@@ -62,8 +63,8 @@ return new class extends Migration {
             $table->timestamp('submitted_at')->useCurrent();
             $table->timestamps();
 
-            $table->index(['erms_control_no', 'status']);
-            $table->index(['erms_control_no', 'created_at']);
+            $table->index(['employee_control_no', 'status'], 'IX_tblCOCApplications_employee_control_no_status');
+            $table->index(['employee_control_no', 'created_at'], 'IX_tblCOCApplications_employee_control_no_created_at');
             $table->index(['status', 'created_at'], 'ix_tblcocapplications_status_created_at');
             $table->index(['reviewed_by_admin_id', 'admin_reviewed_at'], 'ix_tblcocapplications_admin_review');
         });
@@ -73,6 +74,8 @@ return new class extends Migration {
             $table->foreignId('coc_application_id')
                 ->constrained('tblCOCApplications')
                 ->cascadeOnDelete();
+            $table->string('employee_control_no');
+            $table->string('employee_name')->nullable();
             $table->unsignedInteger('line_no');
             $table->date('overtime_date');
             $table->text('nature_of_overtime');
@@ -83,6 +86,7 @@ return new class extends Migration {
             $table->timestamps();
 
             $table->index(['coc_application_id', 'line_no']);
+            $table->index(['employee_control_no', 'overtime_date'], 'IX_tblCOCApplicationRows_employee_control_no_overtime_date');
         });
     }
 

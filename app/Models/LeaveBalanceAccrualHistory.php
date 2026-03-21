@@ -14,6 +14,7 @@ class LeaveBalanceAccrualHistory extends Model
 
     protected $fillable = [
         'leave_balance_id',
+        'employee_control_no',
         'employee_name',
         'leave_type_name',
         'credits_added',
@@ -25,6 +26,7 @@ class LeaveBalanceAccrualHistory extends Model
     {
         return [
             'leave_balance_id' => 'integer',
+            'employee_control_no' => 'string',
             'credits_added' => 'decimal:2',
             'accrual_date' => 'date',
         ];

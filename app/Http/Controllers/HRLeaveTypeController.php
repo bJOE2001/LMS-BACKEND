@@ -39,6 +39,7 @@ class HRLeaveTypeController extends Controller
 
         return response()->json([
             'leave_types' => $leaveTypes,
+            'employment_status_options' => LeaveType::employmentStatusOptions(),
         ]);
     }
 
@@ -127,6 +128,8 @@ class HRLeaveTypeController extends Controller
             'is_credit_based' => ['nullable', 'boolean'],
             'resets_yearly' => ['nullable', 'boolean'],
             'requires_documents' => ['nullable', 'boolean'],
+            'allowed_status' => ['nullable', 'array'],
+            'allowed_status.*' => ['string', Rule::in(array_keys(LeaveType::EMPLOYMENT_STATUS_LABELS))],
             'description' => ['nullable', 'string', 'max:2000'],
         ]);
 
@@ -171,6 +174,7 @@ class HRLeaveTypeController extends Controller
             'is_credit_based' => $isCreditBased,
             'resets_yearly' => $resetsYearly,
             'requires_documents' => (bool) ($validated['requires_documents'] ?? false),
+            'allowed_status' => LeaveType::normalizeAllowedStatusesArray($validated['allowed_status'] ?? null),
             'description' => isset($validated['description']) ? trim((string) $validated['description']) : null,
         ];
     }
@@ -191,6 +195,8 @@ class HRLeaveTypeController extends Controller
             'is_credit_based' => (bool) $type->is_credit_based,
             'resets_yearly' => (bool) $type->resets_yearly,
             'requires_documents' => (bool) $type->requires_documents,
+            'allowed_status' => $type->normalizedAllowedStatuses(),
+            'allowed_status_labels' => $type->allowedStatusLabels(),
             'description' => $type->description,
             'usage' => [
                 'applications' => $applications,
@@ -203,3 +209,4 @@ class HRLeaveTypeController extends Controller
         ];
     }
 }
+
