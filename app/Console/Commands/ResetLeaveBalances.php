@@ -126,8 +126,8 @@ class ResetLeaveBalances extends Command
                         continue;
                     }
 
-                    $employeeId = trim((string) $forcedBalance->employee_id);
-                    if ($employeeId === '') {
+                    $employeeControlNo = trim((string) $forcedBalance->employee_control_no);
+                    if ($employeeControlNo === '') {
                         $summary['total_uncovered'] = round(
                             (float) $summary['total_uncovered'] + $unusedForcedDays,
                             2
@@ -136,13 +136,13 @@ class ResetLeaveBalances extends Command
                     }
 
                     DB::transaction(function () use (
-                        $employeeId,
+                        $employeeControlNo,
                         $vacationLeaveTypeId,
                         $unusedForcedDays,
                         &$summary
                     ): void {
                         $vacationBalance = LeaveBalance::query()
-                            ->where('employee_id', $employeeId)
+                            ->where('employee_control_no', $employeeControlNo)
                             ->where('leave_type_id', $vacationLeaveTypeId)
                             ->lockForUpdate()
                             ->first();

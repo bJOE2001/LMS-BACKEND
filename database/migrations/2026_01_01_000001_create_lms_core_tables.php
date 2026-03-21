@@ -21,6 +21,7 @@ return new class extends Migration {
         Schema::create('tblHRAccounts', function (Blueprint $table) {
             $table->id();
             $table->string('full_name');
+            $table->string('position')->nullable();
             $table->string('username')->unique();
             $table->string('password');
             $table->boolean('must_change_password')->default(false);

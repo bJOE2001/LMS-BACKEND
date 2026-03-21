@@ -491,25 +491,25 @@ class HRUserManagementController extends Controller
             return false;
         }
 
-        $candidateEmployeeIds = [$employeeControlNo];
+        $candidateEmployeeControlNos = [$employeeControlNo];
         $normalizedControlNo = ltrim($employeeControlNo, '0');
         if ($normalizedControlNo === '') {
             $normalizedControlNo = '0';
         }
-        $candidateEmployeeIds[] = $normalizedControlNo;
+        $candidateEmployeeControlNos[] = $normalizedControlNo;
 
         $employee = Employee::findByControlNo($employeeControlNo);
         if ($employee && trim((string) $employee->control_no) !== '') {
-            $candidateEmployeeIds[] = trim((string) $employee->control_no);
+            $candidateEmployeeControlNos[] = trim((string) $employee->control_no);
         }
 
-        $candidateEmployeeIds = array_values(array_unique(array_filter(
-            $candidateEmployeeIds,
+        $candidateEmployeeControlNos = array_values(array_unique(array_filter(
+            $candidateEmployeeControlNos,
             static fn(string $value): bool => $value !== ''
         )));
 
         return LeaveBalance::query()
-            ->whereIn('employee_id', $candidateEmployeeIds)
+            ->whereIn('employee_control_no', $candidateEmployeeControlNos)
             ->exists();
     }
 }

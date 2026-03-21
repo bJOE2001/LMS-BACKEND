@@ -381,7 +381,7 @@ class EmployeeController extends Controller
         }
 
         $applications = LeaveApplication::with(['leaveType'])
-            ->where('erms_control_no', (string) $employee->control_no)
+            ->where('employee_control_no', (string) $employee->control_no)
             ->orderByDesc('created_at')
             ->get()
             ->map(function (LeaveApplication $application) {
@@ -534,7 +534,7 @@ class EmployeeController extends Controller
                     LeaveApplication::STATUS_APPROVED,
                     LeaveApplication::STATUS_RECALLED,
                 ])
-                ->whereIn('erms_control_no', $controlNoCandidates)
+                ->whereIn('employee_control_no', $controlNoCandidates)
                 ->whereIn('leave_type_id', $queryTrackedTypeIds)
                 ->orderByDesc('hr_approved_at')
                 ->orderByDesc('created_at')
@@ -1451,7 +1451,7 @@ class EmployeeController extends Controller
         $preferredBalancesByType = [];
 
         $balances = LeaveBalance::query()
-            ->whereIn('employee_id', $controlNoCandidates)
+            ->whereIn('employee_control_no', $controlNoCandidates)
             ->whereIn('leave_type_id', $trackedTypeIds)
             ->orderByDesc('updated_at')
             ->orderByDesc('id')
@@ -1469,8 +1469,8 @@ class EmployeeController extends Controller
             }
 
             $current = $preferredBalancesByType[$typeId];
-            $currentControlNo = trim((string) $current->employee_id);
-            $incomingControlNo = trim((string) $balance->employee_id);
+            $currentControlNo = trim((string) $current->employee_control_no);
+            $incomingControlNo = trim((string) $balance->employee_control_no);
 
             $currentPriority = $priorityByControlNo[$currentControlNo] ?? PHP_INT_MAX;
             $incomingPriority = $priorityByControlNo[$incomingControlNo] ?? PHP_INT_MAX;

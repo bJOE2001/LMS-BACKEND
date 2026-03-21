@@ -106,6 +106,7 @@ class AccrueLeaveCredits extends Command
                             'source' => 'AUTOMATED',
                         ],
                         [
+                            'employee_control_no' => trim((string) ($balance->employee_control_no ?? '')) ?: null,
                             'employee_name' => $employeeName,
                             'leave_type_name' => $leaveTypeName !== '' ? $leaveTypeName : null,
                             'credits_added' => (float) $type->accrual_rate,
@@ -195,7 +196,7 @@ class AccrueLeaveCredits extends Command
         LeaveType $type,
         array $employeeLookup
     ): bool {
-        $rawControlNo = trim((string) ($balance->employee_id ?? ''));
+        $rawControlNo = trim((string) ($balance->employee_control_no ?? ''));
         if ($rawControlNo === '') {
             return false;
         }
@@ -226,15 +227,15 @@ class AccrueLeaveCredits extends Command
             return 0;
         }
 
-        $existingEmployeeIds = LeaveBalance::query()
+        $existingEmployeeControlNos = LeaveBalance::query()
             ->where('leave_type_id', $type->id)
-            ->pluck('employee_id')
-            ->map(static fn(mixed $employeeId): string => trim((string) $employeeId))
-            ->filter(static fn(string $employeeId): bool => $employeeId !== '')
+            ->pluck('employee_control_no')
+            ->map(static fn(mixed $employeeControlNo): string => trim((string) $employeeControlNo))
+            ->filter(static fn(string $employeeControlNo): bool => $employeeControlNo !== '')
             ->values()
             ->all();
 
-        $existingLookup = array_fill_keys($existingEmployeeIds, true);
+        $existingLookup = array_fill_keys($existingEmployeeControlNos, true);
         $rows = [];
 
         foreach ($employeeControlNos as $employeeControlNo) {
@@ -245,7 +246,7 @@ class AccrueLeaveCredits extends Command
             $employeeName = trim((string) ($employeeLookup[$employeeControlNo]['name'] ?? ''));
 
             $rows[] = [
-                'employee_id' => $employeeControlNo,
+                'employee_control_no' => $employeeControlNo,
                 'employee_name' => $employeeName !== '' ? $employeeName : null,
                 'leave_type_id' => (int) $type->id,
                 'leave_type_name' => trim((string) ($type->name ?? '')) ?: null,
@@ -263,7 +264,7 @@ class AccrueLeaveCredits extends Command
 
         LeaveBalance::query()->upsert(
             $rows,
-            ['employee_id', 'leave_type_id'],
+            ['employee_control_no', 'leave_type_id'],
             ['updated_at']
         );
 
@@ -280,7 +281,7 @@ class AccrueLeaveCredits extends Command
             return $fromBalance;
         }
 
-        $rawControlNo = trim((string) ($balance->employee_id ?? ''));
+        $rawControlNo = trim((string) ($balance->employee_control_no ?? ''));
         if ($rawControlNo !== '' && isset($employeeLookup[$rawControlNo])) {
             return trim((string) ($employeeLookup[$rawControlNo]['name'] ?? '')) ?: null;
         }

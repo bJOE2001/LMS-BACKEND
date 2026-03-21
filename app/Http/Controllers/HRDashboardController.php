@@ -73,9 +73,12 @@ class HRDashboardController extends Controller
         ];
 
         // Determine applicant name & office
-        $employeeName = $app->employee
-            ? trim(($app->employee->firstname ?? '') . ' ' . ($app->employee->surname ?? ''))
-            : null;
+        $employeeName = trim((string) ($app->employee_name ?? ''));
+        if ($employeeName === '') {
+            $employeeName = $app->employee
+                ? trim(($app->employee->firstname ?? '') . ' ' . ($app->employee->surname ?? ''))
+                : null;
+        }
         $applicantName = $employeeName ?: ($app->applicantAdmin ? $app->applicantAdmin->full_name : 'Unknown');
         $office = $app->employee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
         $durationDays = (float) $app->total_days;
@@ -93,7 +96,7 @@ class HRDashboardController extends Controller
 
         return [
             'id' => $app->id,
-            'employee_id' => $app->erms_control_no,
+            'employee_control_no' => $app->employee_control_no,
             'employeeName' => $applicantName,
             'office' => $office,
             'leaveType' => $app->leaveType?->name ?? 'Unknown',
@@ -262,16 +265,16 @@ class HRDashboardController extends Controller
 
     private function getBalanceForApp(LeaveApplication $app): ?float
     {
-        if ($app->erms_control_no) {
-            $employeeControlNo = trim((string) $app->erms_control_no);
-            $candidateEmployeeIds = $this->controlNoCandidates($employeeControlNo);
-            if ($candidateEmployeeIds === []) {
+        if ($app->employee_control_no) {
+            $employeeControlNo = trim((string) $app->employee_control_no);
+            $candidateEmployeeControlNos = $this->controlNoCandidates($employeeControlNo);
+            if ($candidateEmployeeControlNos === []) {
                 return null;
             }
 
             $balance = LeaveBalance::query()
                 ->where('leave_type_id', $app->leave_type_id)
-                ->whereIn('employee_id', $candidateEmployeeIds)
+                ->whereIn('employee_control_no', $candidateEmployeeControlNos)
                 ->first();
             return $balance ? (float) $balance->balance : null;
         }
@@ -282,14 +285,14 @@ class HRDashboardController extends Controller
                 return null;
             }
 
-            $candidateEmployeeIds = $this->controlNoCandidates($adminControlNo);
-            if ($candidateEmployeeIds === []) {
+            $candidateEmployeeControlNos = $this->controlNoCandidates($adminControlNo);
+            if ($candidateEmployeeControlNos === []) {
                 return null;
             }
 
             $balance = LeaveBalance::query()
                 ->where('leave_type_id', $app->leave_type_id)
-                ->whereIn('employee_id', $candidateEmployeeIds)
+                ->whereIn('employee_control_no', $candidateEmployeeControlNos)
                 ->first();
             return $balance ? (float) $balance->balance : null;
         }
@@ -364,7 +367,7 @@ class HRDashboardController extends Controller
 
         if ($dept) {
             $query->where(function ($q) use ($dept) {
-                $q->whereIn('erms_control_no', function ($sq) use ($dept) {
+                $q->whereIn('employee_control_no', function ($sq) use ($dept) {
                     $sq->select('control_no')->from('tblEmployees')->where('office', $dept);
                 })
                     ->orWhereHas('applicantAdmin.department', fn($sq) => $sq->where('name', $dept));
@@ -378,7 +381,7 @@ class HRDashboardController extends Controller
             'employeeName' => $app->employee
                 ? trim(($app->employee->firstname ?? '') . ' ' . ($app->employee->surname ?? ''))
                 : ($app->applicantAdmin ? $app->applicantAdmin->full_name : 'Unknown'),
-            'employee_id' => $app->erms_control_no,
+            'employee_control_no' => $app->employee_control_no,
             'office' => $app->employee?->office ?? ($app->applicantAdmin?->department?->name ?? ''),
             'leaveType' => $app->leaveType?->name ?? 'Unknown',
             'startDate' => $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : '',

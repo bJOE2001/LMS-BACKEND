@@ -82,7 +82,7 @@ class HRReportController extends Controller
                     });
 
                     if ($employeeControlNumbers->isNotEmpty()) {
-                        $query->orWhereIn('erms_control_no', $employeeControlNumbers);
+                        $query->orWhereIn('employee_control_no', $employeeControlNumbers);
                     }
                 });
 

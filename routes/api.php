@@ -96,7 +96,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::post('/leave-balances/initialize', [AdminDashboardController::class, 'initializeBalance']);
         Route::post('/leave-applications/self', [AdminDashboardController::class, 'storeSelfLeave']);
         Route::get('/self-leave-balance/{leaveTypeId}', [AdminDashboardController::class, 'selfLeaveBalance']);
-        Route::get('/employee-leave-balance/{employeeId}/{leaveTypeId}', [AdminDashboardController::class, 'employeeLeaveBalance']);
+        Route::get('/employee-leave-balance/{employeeControlNo}/{leaveTypeId}', [AdminDashboardController::class, 'employeeLeaveBalance']);
 
         // Leave application review
         Route::get('/leave-applications', [LeaveApplicationController::class, 'adminIndex']);

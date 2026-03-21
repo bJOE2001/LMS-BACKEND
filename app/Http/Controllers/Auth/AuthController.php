@@ -96,6 +96,7 @@ class AuthController extends Controller
                 'name' => $this->resolveDepartmentAdminDisplayName($account),
                 'username' => $account->username,
                 'role' => 'department_admin',
+                'employee_control_no' => trim((string) ($account->employee_control_no ?? '')) ?: null,
                 'department_id' => $account->department_id,
                 'department' => $account->department ? ['id' => $account->department->id, 'name' => $account->department->name] : null,
                 'position' => $this->resolveDepartmentAdminPosition($account),

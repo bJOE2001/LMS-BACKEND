@@ -169,9 +169,7 @@ class LeaveType extends Model
 
     public function normalizedAllowedStatuses(): array
     {
-        return self::normalizeAllowedStatusesArray(
-            $this->getAttribute('allowed_status') ?? $this->getAttribute('allowed_statuses')
-        ) ?? [];
+        return self::normalizeAllowedStatusesArray($this->getAttribute('allowed_status')) ?? [];
     }
 
     public function allowedStatusLabels(): array

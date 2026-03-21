@@ -13,8 +13,8 @@ return new class extends Migration {
         // Leave balances
         Schema::create('tblLeaveBalances', function (Blueprint $table) {
             $table->id();
-            $table->string('employee_id');
-            $table->foreign('employee_id')
+            $table->string('employee_control_no');
+            $table->foreign('employee_control_no')
                 ->references('control_no')
                 ->on('tblEmployees')
                 ->cascadeOnDelete();
@@ -28,7 +28,10 @@ return new class extends Migration {
             $table->unsignedSmallInteger('year')->nullable();
             $table->timestamps();
 
-            $table->unique(['employee_id', 'leave_type_id']);
+            $table->unique(
+                ['employee_control_no', 'leave_type_id'],
+                'UX_tblLeaveBalances_employee_control_no_leave_type_id'
+            );
         });
 
         // Leave balance credit histories
@@ -37,6 +40,7 @@ return new class extends Migration {
             $table->foreignId('leave_balance_id')
                 ->constrained('tblLeaveBalances')
                 ->cascadeOnDelete();
+            $table->string('employee_control_no')->nullable();
             $table->string('employee_name')->nullable();
             $table->string('leave_type_name')->nullable();
             $table->decimal('credits_added', 8, 2);
@@ -57,18 +61,29 @@ return new class extends Migration {
                 ->nullable()
                 ->constrained('tblDepartmentAdmins')
                 ->noActionOnDelete();
-            $table->integer('erms_control_no')->nullable();
+            $table->string('employee_control_no', 64)->nullable();
+            $table->string('employee_name')->nullable();
             $table->foreignId('leave_type_id')
                 ->constrained('tblLeaveTypes')
                 ->cascadeOnDelete();
+
             $table->date('start_date')->nullable();
             $table->date('end_date')->nullable();
             $table->longText('selected_dates')->nullable();
+            $table->longText('selected_date_pay_status')->nullable();
+            $table->longText('selected_date_coverage')->nullable();
+
             $table->decimal('total_days', 5, 2);
+            $table->decimal('deductible_days', 5, 2)->nullable();
+            $table->string('pay_mode', 8)->default('WP');
+            $table->decimal('linked_forced_leave_deducted_days', 5, 2)->nullable();
+            $table->decimal('linked_vacation_leave_deducted_days', 5, 2)->nullable();
+
             $table->text('reason')->nullable();
             $table->string('commutation', 32)->nullable();
             $table->boolean('is_monetization')->default(false);
             $table->decimal('equivalent_amount', 12, 2)->nullable();
+
             $table->string('status')->default('PENDING_ADMIN');
             $table->foreignId('admin_id')
                 ->nullable()
@@ -81,21 +96,19 @@ return new class extends Migration {
                 ->nullOnDelete();
             $table->timestamp('hr_approved_at')->nullable();
             $table->text('remarks')->nullable();
-            $table->timestamps();
-            $table->string('pay_mode', 8)->default('WP');
-            $table->longText('selected_date_pay_status')->nullable();
-            $table->longText('selected_date_coverage')->nullable();
-            $table->decimal('deductible_days', 5, 2)->nullable();
+
             $table->boolean('requires_documents')->default(false);
             $table->boolean('attachment_required')->default(false);
             $table->boolean('attachment_submitted')->default(false);
             $table->string('attachment_reference', 500)->nullable();
 
+            $table->timestamps();
+
             $table->index(['applicant_admin_id', 'status']);
             $table->index('status');
-            $table->index(['erms_control_no', 'status'], 'IX_tblLeaveApplications_erms_control_no_status');
+            $table->index(['employee_control_no', 'status'], 'IX_tblLeaveApplications_employee_control_no_status');
             $table->index(['status', 'created_at'], 'IX_tblLeaveApplications_status_created_at');
-            $table->index(['erms_control_no', 'created_at'], 'IX_tblLeaveApplications_erms_control_no_created_at');
+            $table->index(['employee_control_no', 'created_at'], 'IX_tblLeaveApplications_employee_control_no_created_at');
             $table->index(['leave_type_id', 'status'], 'IX_tblLeaveApplications_leave_type_status');
             $table->index(['status', 'hr_approved_at'], 'IX_tblLeaveApplications_status_hr_approved_at');
         });
@@ -134,6 +147,8 @@ return new class extends Migration {
             $table->foreignId('leave_application_id')
                 ->constrained('tblLeaveApplications')
                 ->cascadeOnDelete();
+            $table->string('employee_control_no', 64)->nullable();
+            $table->string('employee_name')->nullable();
             $table->longText('requested_payload');
             $table->text('requested_reason')->nullable();
             $table->string('previous_status', 32)->nullable();
@@ -149,6 +164,7 @@ return new class extends Migration {
                 ['leave_application_id', 'status'],
                 'IX_tblLeaveAppUpdateReq_leave_application_status'
             );
+            $table->index('employee_control_no', 'IX_tblLeaveAppUpdateReq_employee_control_no');
             $table->index('requested_by_control_no', 'IX_tblLeaveAppUpdateReq_requested_by');
         });
     }

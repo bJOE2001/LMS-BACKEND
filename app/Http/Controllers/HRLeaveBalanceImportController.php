@@ -28,7 +28,7 @@ class HRLeaveBalanceImportController extends Controller
         }
 
         $validated = $request->validate([
-            'employee_id' => ['required', 'string', 'max:50', 'regex:/^\d+$/', 'exists:tblEmployees,control_no'],
+            'employee_control_no' => ['required', 'string', 'max:50', 'regex:/^\d+$/', 'exists:tblEmployees,control_no'],
             'leave_type_id' => ['nullable', 'integer', 'exists:tblLeaveTypes,id'],
             'balance' => ['nullable', 'numeric', 'min:0'],
             'balances' => ['required', 'array', 'min:1'],
@@ -36,7 +36,7 @@ class HRLeaveBalanceImportController extends Controller
             'balances.*.balance' => ['required_with:balances', 'numeric', 'min:0'],
         ]);
 
-        $employeeId = trim((string) $validated['employee_id']);
+        $employeeControlNo = trim((string) $validated['employee_control_no']);
         $manualCreditSource = $this->resolveManualCreditSource($user);
         $submittedBalances = is_array($validated['balances'] ?? null) ? $validated['balances'] : [];
         if ($submittedBalances === []) {
@@ -45,16 +45,20 @@ class HRLeaveBalanceImportController extends Controller
             ], 422);
         }
 
-        $creditLeaveTypes = LeaveType::query()
+        $allCreditLeaveTypes = LeaveType::query()
             ->where('is_credit_based', true)
             ->orderBy('name')
             ->get(['id', 'name', 'max_days']);
+        $creditLeaveTypes = $allCreditLeaveTypes
+            ->reject(fn (LeaveType $leaveType) => $this->isManualCreditExcludedLeaveType($leaveType))
+            ->values();
         if ($creditLeaveTypes->isEmpty()) {
             return response()->json([
                 'message' => 'No credit-based leave types are configured.',
             ], 422);
         }
 
+        $allCreditLeaveTypesById = $allCreditLeaveTypes->keyBy('id');
         $creditLeaveTypesById = $creditLeaveTypes->keyBy('id');
         $submittedTypeIds = [];
         $positiveEntryCount = 0;
@@ -77,6 +81,13 @@ class HRLeaveBalanceImportController extends Controller
 
             $leaveType = $creditLeaveTypesById->get($leaveTypeId);
             if (!$leaveType instanceof LeaveType) {
+                $blockedLeaveType = $allCreditLeaveTypesById->get($leaveTypeId);
+                if ($blockedLeaveType instanceof LeaveType && $this->isManualCreditExcludedLeaveType($blockedLeaveType)) {
+                    return response()->json([
+                        'message' => $this->manualCreditExcludedMessage($blockedLeaveType),
+                    ], 422);
+                }
+
                 return response()->json([
                     'message' => 'Only credit-based leave types can have balances.',
                 ], 422);
@@ -131,7 +142,7 @@ class HRLeaveBalanceImportController extends Controller
             ], 422);
         }
 
-        $employee = Employee::findByControlNo($employeeId);
+        $employee = Employee::findByControlNo($employeeControlNo);
         if (!$employee) {
             return response()->json(['message' => 'Employee not found.'], 422);
         }
@@ -148,6 +159,11 @@ class HRLeaveBalanceImportController extends Controller
             }
             if (!(bool) $leaveType->is_credit_based) {
                 return response()->json(['message' => 'Only credit-based leave types can have balances.'], 422);
+            }
+            if ($this->isManualCreditExcludedLeaveType($leaveType)) {
+                return response()->json([
+                    'message' => $this->manualCreditExcludedMessage($leaveType),
+                ], 422);
             }
         }
 
@@ -189,7 +205,7 @@ class HRLeaveBalanceImportController extends Controller
                 $resolvedLeaveTypeName = trim((string) ($leaveType->name ?? ''));
 
                 $existing = LeaveBalance::query()
-                    ->where('employee_id', $canonicalControlNo)
+                    ->where('employee_control_no', $canonicalControlNo)
                     ->where('leave_type_id', $leaveType->id)
                     ->lockForUpdate()
                     ->first();
@@ -210,7 +226,7 @@ class HRLeaveBalanceImportController extends Controller
                     $leaveBalance = $existing->fresh();
                 } else {
                     $leaveBalance = LeaveBalance::query()->create([
-                        'employee_id' => $canonicalControlNo,
+                        'employee_control_no' => $canonicalControlNo,
                         'employee_name' => $resolvedEmployeeName !== '' ? $resolvedEmployeeName : null,
                         'leave_type_id' => $leaveType->id,
                         'leave_type_name' => $resolvedLeaveTypeName !== '' ? $resolvedLeaveTypeName : null,
@@ -229,7 +245,7 @@ class HRLeaveBalanceImportController extends Controller
                 );
                 $savedBalances[] = [
                     'id' => (int) $leaveBalance->id,
-                    'employee_id' => (string) $leaveBalance->employee_id,
+                    'employee_control_no' => (string) $leaveBalance->employee_control_no,
                     'leave_type_id' => (int) $leaveBalance->leave_type_id,
                     'leave_type_name' => $leaveType->name,
                     'added_credits' => (float) $creditsToAdd,
@@ -255,7 +271,7 @@ class HRLeaveBalanceImportController extends Controller
 
         return response()->json([
             'message' => 'Leave credits added successfully.',
-            'employee_id' => (string) $employee->control_no,
+            'employee_control_no' => (string) $employee->control_no,
             'employee_name' => trim("{$employee->firstname} {$employee->surname}"),
             'saved_count' => is_countable($savedBalances) ? count($savedBalances) : 0,
             'leave_balances' => $savedBalances,
@@ -293,6 +309,20 @@ class HRLeaveBalanceImportController extends Controller
         return $entries;
     }
 
+    private function isManualCreditExcludedLeaveType(LeaveType $leaveType): bool
+    {
+        return strcasecmp(trim((string) ($leaveType->name ?? '')), 'CTO Leave') === 0;
+    }
+
+    private function manualCreditExcludedMessage(LeaveType $leaveType): string
+    {
+        if ($this->isManualCreditExcludedLeaveType($leaveType)) {
+            return 'CTO Leave cannot be added manually. Use approved COC conversions instead.';
+        }
+
+        return 'This leave type cannot be added manually.';
+    }
+
     private function hasManualCreditGrantUsage(string $employeeControlNo): bool
     {
         $candidates = $this->buildControlNoCandidates($employeeControlNo);
@@ -302,7 +332,7 @@ class HRLeaveBalanceImportController extends Controller
 
         return LeaveBalanceAccrualHistory::query()
             ->join('tblLeaveBalances as lb', 'lb.id', '=', 'tblLeaveBalanceCreditHistories.leave_balance_id')
-            ->whereIn('lb.employee_id', $candidates)
+            ->whereIn('lb.employee_control_no', $candidates)
             ->where(function ($query): void {
                 $query->whereRaw(
                     "UPPER(LTRIM(RTRIM(COALESCE(tblLeaveBalanceCreditHistories.source, '')))) = ?",
@@ -354,17 +384,18 @@ class HRLeaveBalanceImportController extends Controller
             ->lockForUpdate()
             ->first();
 
-        if ($existingEntry) {
-            $existingEntry->credits_added = round(
-                (float) $existingEntry->credits_added + $normalizedCreditsToAdd,
-                2
-            );
-            $existingEntry->source = $manualSource;
-            if ($employeeName !== '') {
-                $existingEntry->employee_name = $employeeName;
-            }
-            if ($leaveTypeName !== '') {
-                $existingEntry->leave_type_name = $leaveTypeName;
+            if ($existingEntry) {
+                $existingEntry->credits_added = round(
+                    (float) $existingEntry->credits_added + $normalizedCreditsToAdd,
+                    2
+                );
+                $existingEntry->source = $manualSource;
+                $existingEntry->employee_control_no = trim((string) ($leaveBalance->employee_control_no ?? '')) ?: null;
+                if ($employeeName !== '') {
+                    $existingEntry->employee_name = $employeeName;
+                }
+                if ($leaveTypeName !== '') {
+                    $existingEntry->leave_type_name = $leaveTypeName;
             }
             $existingEntry->save();
             return;
@@ -372,6 +403,7 @@ class HRLeaveBalanceImportController extends Controller
 
         LeaveBalanceAccrualHistory::query()->create([
             'leave_balance_id' => (int) $leaveBalance->id,
+            'employee_control_no' => trim((string) ($leaveBalance->employee_control_no ?? '')) ?: null,
             'employee_name' => $employeeName !== '' ? $employeeName : null,
             'leave_type_name' => $leaveTypeName !== '' ? $leaveTypeName : null,
             'credits_added' => $normalizedCreditsToAdd,

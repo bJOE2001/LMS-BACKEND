@@ -62,12 +62,12 @@ class Employee extends Model
 
     public function leaveApplications(): HasMany
     {
-        return $this->hasMany(LeaveApplication::class, 'erms_control_no', 'control_no');
+        return $this->hasMany(LeaveApplication::class, 'employee_control_no', 'control_no');
     }
 
     public function leaveBalances(): HasMany
     {
-        return $this->hasMany(LeaveBalance::class, 'employee_id');
+        return $this->hasMany(LeaveBalance::class, 'employee_control_no');
     }
 
     public function getFullNameAttribute(): string

@@ -37,7 +37,7 @@ class LeaveApplicationController extends Controller
     public function index(Request $request): JsonResponse
     {
         $account = $request->user();
-        $controlNo = $account->erms_control_no ?? $account->employee_id ?? null;
+        $controlNo = $account->employee_control_no ?? $account->erms_control_no ?? $account->employee_id ?? null;
         if (!is_object($account) || $controlNo === null) {
             return response()->json(['message' => 'Only employee accounts can list their leave applications.'], 403);
         }
@@ -62,7 +62,7 @@ class LeaveApplicationController extends Controller
     public function getLeaveBalance(Request $request, int $leaveTypeId): JsonResponse
     {
         $account = $request->user();
-        $controlNo = $account->erms_control_no ?? $account->employee_id ?? null;
+        $controlNo = $account->employee_control_no ?? $account->erms_control_no ?? $account->employee_id ?? null;
         if (!is_object($account) || $controlNo === null) {
             return response()->json(['message' => 'Only employee accounts can access this endpoint.'], 403);
         }
@@ -88,7 +88,7 @@ class LeaveApplicationController extends Controller
 
         $balance = LeaveBalance::query()
             ->with('accrualHistories')
-            ->where('employee_id', $employee->control_no)
+            ->where('employee_control_no', $employee->control_no)
             ->where('leave_type_id', $leaveTypeId)
             ->first();
 
@@ -104,19 +104,21 @@ class LeaveApplicationController extends Controller
      * API-key protected endpoint for ERMS-to-LMS integration.
      *
      * Supports either:
-     * - /erms/leave-balance/{leaveTypeId}?erms_control_no={controlNo}
+     * - /erms/leave-balance/{leaveTypeId}?employee_control_no={controlNo}
      * - /erms/leave-balance/{controlNo}?leave_type_id={leaveTypeId}
      *
      * Includes accrual metadata so ERMS can show the latest Vacation/Sick leave credits.
      */
     public function ermsGetLeaveBalance(Request $request, int $id): JsonResponse
     {
+        $this->mergeEmployeeControlNoInput($request);
+
         $validated = $request->validate([
-            'erms_control_no' => ['nullable', 'string', 'regex:/^\d+$/'],
+            'employee_control_no' => ['nullable', 'string', 'regex:/^\d+$/'],
             'leave_type_id' => ['nullable', 'integer', 'exists:tblLeaveTypes,id'],
         ]);
 
-        $queryControlNo = $validated['erms_control_no'] ?? null;
+        $queryControlNo = $validated['employee_control_no'] ?? null;
         $queryLeaveTypeId = $validated['leave_type_id'] ?? null;
 
         if ($queryControlNo !== null && $queryLeaveTypeId === null) {
@@ -130,7 +132,7 @@ class LeaveApplicationController extends Controller
             $leaveTypeId = (int) $queryLeaveTypeId;
         } else {
             return response()->json([
-                'message' => 'Provide either erms_control_no, or leave_type_id query parameter.',
+                'message' => 'Provide either employee_control_no, or leave_type_id query parameter.',
             ], 422);
         }
 
@@ -155,7 +157,7 @@ class LeaveApplicationController extends Controller
 
         $balance = LeaveBalance::query()
             ->with('accrualHistories')
-            ->where('employee_id', $employee->control_no)
+            ->where('employee_control_no', $employee->control_no)
             ->where('leave_type_id', $leaveTypeId)
             ->first();
 
@@ -166,9 +168,10 @@ class LeaveApplicationController extends Controller
             $cocCreditHistoryByType
         );
 
-        return response()->json(array_merge([
-            'erms_control_no' => (string) $employee->control_no,
-        ], $this->formatErmsLeaveBalancePayload($leaveType, $balance, $creditHistoryByType[(int) $leaveTypeId] ?? [])));
+        return response()->json(array_merge(
+            $this->employeeControlNoResponse((string) $employee->control_no),
+            $this->formatErmsLeaveBalancePayload($leaveType, $balance, $creditHistoryByType[(int) $leaveTypeId] ?? [])
+        ));
     }
 
     /**
@@ -187,10 +190,20 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Employee record not found.'], 404);
         }
 
-        $types = $this->getAllowedErmsLeaveTypesQuery($employee)
-            ->select(['id', 'name', 'category', 'accrual_rate', 'accrual_day_of_month', 'is_credit_based'])
+        $types = LeaveType::query()
+            ->select([
+                'id',
+                'name',
+                'category',
+                'accrual_rate',
+                'accrual_day_of_month',
+                'is_credit_based',
+                'allowed_status',
+            ])
             ->orderBy('name')
-            ->get();
+            ->get()
+            ->filter(fn(LeaveType $leaveType): bool => $leaveType->allowsEmploymentStatus($employee->status ?? null))
+            ->values();
 
         $typesByName = $types
             ->keyBy(fn(LeaveType $type) => strtolower(trim((string) $type->name)))
@@ -200,7 +213,7 @@ class LeaveApplicationController extends Controller
 
         $balanceRecordsByType = LeaveBalance::query()
             ->with('accrualHistories')
-            ->where('employee_id', $employee->control_no)
+            ->where('employee_control_no', $employee->control_no)
             ->get()
             ->keyBy(fn(LeaveBalance $balance) => (int) $balance->leave_type_id)
             ->all();
@@ -221,7 +234,7 @@ class LeaveApplicationController extends Controller
         })->values();
 
         return response()->json([
-            'erms_control_no' => (string) $employee->control_no,
+            ...$this->employeeControlNoResponse((string) $employee->control_no),
             'balances' => $balances,
             'latest_accrued_credits' => $this->buildErmsLatestAccruedCreditsPayload(
                 $employee,
@@ -238,14 +251,16 @@ class LeaveApplicationController extends Controller
      */
     public function ermsIndex(Request $request): JsonResponse
     {
+        $this->mergeEmployeeControlNoInput($request);
+
         $validated = $request->validate([
-            'erms_control_no' => ['nullable', 'string', 'regex:/^\d+$/'],
+            'employee_control_no' => ['nullable', 'string', 'regex:/^\d+$/'],
         ]);
 
-        $controlNo = trim((string) ($validated['erms_control_no'] ?? ''));
+        $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
         if ($controlNo === '') {
             return response()->json([
-                'message' => 'The erms_control_no query parameter is required.',
+                'message' => 'The employee_control_no query parameter is required.',
             ], 422);
         }
 
@@ -266,7 +281,7 @@ class LeaveApplicationController extends Controller
         $leaveTypes = $this->getAllowedErmsLeaveTypesForEmployee($employee);
 
         return response()->json([
-            'erms_control_no' => (string) $employee->control_no,
+            ...$this->employeeControlNoResponse((string) $employee->control_no),
             'employment_status' => $employeeContext['status'],
             'employment_status_key' => $employeeContext['employment_status_key'],
             'ui_variant' => $employeeContext['ui_variant'],
@@ -285,13 +300,14 @@ class LeaveApplicationController extends Controller
     public function ermsStore(Request $request): JsonResponse
     {
         $this->normalizeSelectedDatesInput($request);
+        $this->mergeEmployeeControlNoInput($request);
 
         $baseValidated = $request->validate([
-            'erms_control_no' => ['required', 'string', 'regex:/^\d+$/'],
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'is_monetization' => ['nullable', 'boolean'],
         ]);
 
-        $controlNo = trim((string) $baseValidated['erms_control_no']);
+        $controlNo = $this->resolveValidatedEmployeeControlNo($baseValidated);
 
         $employee = $this->findEmployeeByControlNo($controlNo);
 
@@ -444,7 +460,7 @@ class LeaveApplicationController extends Controller
             $attachmentReference
         ) {
             $application = LeaveApplication::create([
-                'erms_control_no' => (string) $employee->control_no,
+                'employee_control_no' => (string) $employee->control_no,
                 'leave_type_id' => $validated['leave_type_id'],
                 'start_date' => $validated['start_date'],
                 'end_date' => $validated['end_date'],
@@ -508,9 +524,11 @@ class LeaveApplicationController extends Controller
                 ?? $routeId,
         ], static fn($value) => $value !== null && $value !== ''));
 
+        $this->mergeEmployeeControlNoInput($request);
+
         $validated = $request->validate([
             'leave_application_id' => ['required', 'integer'],
-            'erms_control_no' => ['required', 'string', 'regex:/^\d+$/'],
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'cancellation_reason' => ['nullable', 'string', 'max:2000'],
         ]);
 
@@ -521,7 +539,7 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
-        $controlNo = trim((string) $validated['erms_control_no']);
+        $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
         $employee = $this->findEmployeeByControlNo($controlNo);
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
@@ -556,7 +574,7 @@ class LeaveApplicationController extends Controller
 
         $performedById = (int) ltrim((string) $employee->control_no, '0');
         if ($performedById <= 0) {
-            $performedById = (int) ($app->erms_control_no ?: 1);
+            $performedById = (int) ($app->employee_control_no ?: 1);
         }
 
         DB::transaction(function () use ($app, $remarks, $performedById): void {
@@ -649,9 +667,11 @@ class LeaveApplicationController extends Controller
                 ?? $routeId,
         ], static fn($value) => $value !== null && $value !== ''));
 
+        $this->mergeEmployeeControlNoInput($request);
+
         $validated = $request->validate([
             'leave_application_id' => ['required', 'integer'],
-            'erms_control_no' => ['required', 'string', 'regex:/^\d+$/'],
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'request_update' => ['nullable', 'boolean'],
             'edit_reason' => ['nullable', 'string', 'max:2000'],
             'update_reason' => ['nullable', 'string', 'max:2000'],
@@ -686,7 +706,7 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
-        $controlNo = trim((string) $validated['erms_control_no']);
+        $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
         $employee = $this->findEmployeeByControlNo($controlNo);
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
@@ -696,7 +716,7 @@ class LeaveApplicationController extends Controller
             ->with('leaveType')
             ->where('id', $applicationId)
             ->where(function ($query) use ($controlNo): void {
-                $query->whereIn('erms_control_no', $this->controlNoCandidates($controlNo));
+                $query->whereIn('employee_control_no', $this->controlNoCandidates($controlNo));
             })
             ->first();
 
@@ -780,7 +800,7 @@ class LeaveApplicationController extends Controller
 
         $performedById = (int) ltrim((string) $employee->control_no, '0');
         if ($performedById <= 0) {
-            $performedById = (int) ($app->erms_control_no ?: 1);
+            $performedById = (int) ($app->employee_control_no ?: 1);
         }
 
         DB::transaction(function () use (
@@ -810,10 +830,12 @@ class LeaveApplicationController extends Controller
                     ->first();
 
                 $requestPayload = [
+                    'employee_control_no' => $this->resolveLeaveApplicationUpdateEmployeeControlNo($app),
+                    'employee_name' => $this->resolveLeaveApplicationUpdateEmployeeName($app),
                     'requested_payload' => $requestedUpdatePayload,
                     'requested_reason' => $requestReason !== '' ? $requestReason : null,
                     'previous_status' => LeaveApplication::STATUS_APPROVED,
-                    'requested_by_control_no' => (string) ($app->erms_control_no ?? ''),
+                    'requested_by_control_no' => (string) ($app->employee_control_no ?? ''),
                     'requested_at' => now(),
                 ];
 
@@ -905,14 +927,16 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Only employee accounts can submit leave applications.'], 403);
         }
 
+        $this->mergeEmployeeControlNoInput($request);
+
         $baseValidated = $request->validate([
-            'erms_control_no' => ['required', 'string', 'regex:/^\d+$/'],
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'is_monetization' => ['nullable', 'boolean'],
         ]);
 
         // This system uses ERMS ControlNo as the authoritative employee identifier.
         // Employee records are resolved from LMS tblEmployees.
-        $employee = $this->findEmployeeByControlNo((string) $baseValidated['erms_control_no']);
+        $employee = $this->findEmployeeByControlNo($this->resolveValidatedEmployeeControlNo($baseValidated));
 
         if (!$employee) {
             return response()->json(['error' => 'Employee not found'], 404);
@@ -926,7 +950,7 @@ class LeaveApplicationController extends Controller
         }
 
         $validated = $request->validate([
-            'erms_control_no' => ['required', 'string', 'regex:/^\d+$/'],
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
             'start_date' => ['required', 'date'],
             'end_date' => ['required', 'date', 'after_or_equal:start_date'],
@@ -1064,7 +1088,7 @@ class LeaveApplicationController extends Controller
             $attachmentReference
         ) {
             $application = LeaveApplication::create([
-                'erms_control_no' => (string) $employee->control_no,
+                'employee_control_no' => (string) $employee->control_no,
                 'leave_type_id' => $validated['leave_type_id'],
                 'start_date' => $validated['start_date'],
                 'end_date' => $validated['end_date'],
@@ -1120,8 +1144,10 @@ class LeaveApplicationController extends Controller
      */
     private function storeMonetization(Request $request, object $employee, object $account): JsonResponse
     {
+        $this->mergeEmployeeControlNoInput($request);
+
         $validated = $request->validate([
-            'erms_control_no' => ['required', 'string', 'regex:/^\d+$/'],
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
             'total_days' => ['required', 'numeric', 'min:1', 'max:999'],
             'reason' => ['nullable', 'string', 'max:2000'],
@@ -1147,7 +1173,7 @@ class LeaveApplicationController extends Controller
         }
 
         // Retrieve current balance (always re-check in backend)
-        $balance = LeaveBalance::where('employee_id', $employee->control_no)
+        $balance = LeaveBalance::where('employee_control_no', $employee->control_no)
             ->where('leave_type_id', $validated['leave_type_id'])
             ->first();
 
@@ -1185,7 +1211,7 @@ class LeaveApplicationController extends Controller
 
         $app = DB::transaction(function () use ($validated, $employee, $account, $equivalentAmount) {
             $application = LeaveApplication::create([
-                'erms_control_no' => (string) $employee->control_no,
+                'employee_control_no' => (string) $employee->control_no,
                 'leave_type_id' => $validated['leave_type_id'],
                 'start_date' => null,
                 'end_date' => null,
@@ -1234,13 +1260,13 @@ class LeaveApplicationController extends Controller
     public function show(Request $request, LeaveApplication $leaveApplication): JsonResponse
     {
         $account = $request->user();
-        $controlNo = $account->erms_control_no ?? $account->employee_id ?? null;
+        $controlNo = $account->employee_control_no ?? $account->erms_control_no ?? $account->employee_id ?? null;
         if (!is_object($account) || $controlNo === null) {
             return response()->json(['message' => 'Only employee accounts can view leave applications.'], 403);
         }
 
         $allowedControlNos = $this->controlNoCandidates((string) $controlNo);
-        if (!in_array((string) $leaveApplication->erms_control_no, $allowedControlNos, true)) {
+        if (!in_array((string) ($leaveApplication->employee_control_no ?? ''), $allowedControlNos, true)) {
             return response()->json(['message' => 'Leave application not found.'], 404);
         }
 
@@ -1268,7 +1294,7 @@ class LeaveApplicationController extends Controller
         $deptName = $admin->department?->name;
         $applications = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin.department', 'updateRequests'])
             ->where('status', LeaveApplication::STATUS_PENDING_ADMIN)
-            ->whereIn('erms_control_no', function ($query) use ($deptName) {
+            ->whereIn('employee_control_no', function ($query) use ($deptName) {
                 $query->select('control_no')
                 ->from('tblEmployees')
                 ->where('office', $deptName);
@@ -1557,16 +1583,16 @@ class LeaveApplicationController extends Controller
         ) && $daysToDeduct > 0;
         $isCtoDeduction = $this->isCtoLeaveType($leaveType, (int) $app->leave_type_id);
 
-        if ($needsDeduction && $app->erms_control_no && $isCtoDeduction) {
-            $this->syncEmployeeCtoBalance((string) $app->erms_control_no);
+        if ($needsDeduction && $app->employee_control_no && $isCtoDeduction) {
+            $this->syncEmployeeCtoBalance((string) $app->employee_control_no);
         }
 
         if ($needsDeduction) {
-            if ($app->erms_control_no) {
+            if ($app->employee_control_no) {
                 // For monetization, deduct from the selected leave type (VL or SL)
                 $deductTypeId = $app->leave_type_id;
 
-                $balance = LeaveBalance::where('employee_id', $app->erms_control_no)
+                $balance = LeaveBalance::where('employee_control_no', $app->employee_control_no)
                     ->where('leave_type_id', $deductTypeId)
                     ->first();
 
@@ -1588,7 +1614,7 @@ class LeaveApplicationController extends Controller
                 // Business rule: approving Forced Leave also consumes Vacation Leave credits.
                 if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null) {
                     $vacationBalance = LeaveBalance::query()
-                        ->where('employee_id', $app->erms_control_no)
+                        ->where('employee_control_no', $app->employee_control_no)
                         ->where('leave_type_id', $vacationLeaveTypeId)
                         ->first();
                     $currentVacationBalance = $vacationBalance ? (float) $vacationBalance->balance : 0.0;
@@ -1631,6 +1657,8 @@ class LeaveApplicationController extends Controller
         }
 
         $balanceConflictError = 'HR_APPROVAL_BALANCE_CONFLICT';
+        $linkedForcedLeaveDeductedDays = 0.0;
+        $linkedVacationLeaveDeductedDays = 0.0;
 
         try {
             DB::transaction(function () use (
@@ -1649,86 +1677,26 @@ class LeaveApplicationController extends Controller
                 $resolvedSelectedDatePayStatus,
                 $attachmentRequired,
                 $attachmentSubmitted,
-                $attachmentReference
+                $attachmentReference,
+                &$linkedForcedLeaveDeductedDays,
+                &$linkedVacationLeaveDeductedDays
             ) {
                 // Deduct balance for credit-based leave types and monetization.
                 // Locking the exact target row avoids race conditions and cross-row side effects.
                 if ($needsDeduction) {
-                    if ($app->erms_control_no) {
-                        if ($isCtoDeduction) {
-                            $this->syncEmployeeCtoBalance((string) $app->erms_control_no, true);
-                        }
-
-                        $lockedBalance = LeaveBalance::query()
-                            ->where('employee_id', $app->erms_control_no)
-                            ->where('leave_type_id', $app->leave_type_id)
-                            ->lockForUpdate()
-                            ->first();
-
-                        if (!$lockedBalance || (float) $lockedBalance->balance < $daysToDeduct) {
-                            throw new \RuntimeException($balanceConflictError);
-                        }
-
-                        $lockedBalance->decrement('balance', $daysToDeduct);
-
-                        // Business rule: approving Vacation Leave also consumes Forced Leave credits.
-                        // If Forced Leave is zero/missing, no extra deduction is applied.
-                        if ($shouldDeductForcedLeave && $forcedLeaveTypeId !== null) {
-                            $forcedBalance = LeaveBalance::query()
-                                ->where('employee_id', $app->erms_control_no)
-                                ->where('leave_type_id', $forcedLeaveTypeId)
-                                ->lockForUpdate()
-                                ->first();
-
-                            $forcedAvailable = $forcedBalance ? (float) $forcedBalance->balance : 0.0;
-                            $forcedToDeduct = min($daysToDeduct, max($forcedAvailable, 0.0));
-
-                            if ($forcedBalance && $forcedToDeduct > 0.0) {
-                                $forcedBalance->decrement('balance', $forcedToDeduct);
-                            }
-                        }
-
-                        // Business rule: approving Forced Leave also consumes Vacation Leave credits.
-                        if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null) {
-                            $vacationBalance = LeaveBalance::query()
-                                ->where('employee_id', $app->erms_control_no)
-                                ->where('leave_type_id', $vacationLeaveTypeId)
-                                ->lockForUpdate()
-                                ->first();
-
-                            if (!$vacationBalance || (float) $vacationBalance->balance < $daysToDeduct) {
-                                throw new \RuntimeException($balanceConflictError);
-                            }
-
-                            $vacationBalance->decrement('balance', $daysToDeduct);
-                        }
-                    } elseif ($app->applicant_admin_id) {
-                        $lockedBalance = $this->findAdminEmployeeLeaveBalance(
-                            (int) $app->applicant_admin_id,
-                            (int) $app->leave_type_id,
-                            true
-                        );
-
-                        if (!$lockedBalance || (float) $lockedBalance->balance < $daysToDeduct) {
-                            throw new \RuntimeException($balanceConflictError);
-                        }
-
-                        $lockedBalance->decrement('balance', $daysToDeduct);
-
-                        if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null) {
-                            $vacationBalance = $this->findAdminEmployeeLeaveBalance(
-                                (int) $app->applicant_admin_id,
-                                $vacationLeaveTypeId,
-                                true
-                            );
-
-                            if (!$vacationBalance || (float) $vacationBalance->balance < $daysToDeduct) {
-                                throw new \RuntimeException($balanceConflictError);
-                            }
-
-                            $vacationBalance->decrement('balance', $daysToDeduct);
-                        }
-                    }
+                    $linkedDeductions = $this->deductApplicationTrackedBalances(
+                        $app,
+                        (int) $app->leave_type_id,
+                        $daysToDeduct,
+                        $isCtoDeduction,
+                        $shouldDeductForcedLeave,
+                        $forcedLeaveTypeId,
+                        $shouldDeductVacationLeave,
+                        $vacationLeaveTypeId,
+                        $balanceConflictError
+                    );
+                    $linkedForcedLeaveDeductedDays = (float) ($linkedDeductions['linked_forced_leave_deducted_days'] ?? 0.0);
+                    $linkedVacationLeaveDeductedDays = (float) ($linkedDeductions['linked_vacation_leave_deducted_days'] ?? 0.0);
                 }
 
                 $app->update([
@@ -1739,6 +1707,8 @@ class LeaveApplicationController extends Controller
                     'pay_mode' => $normalizedPayMode,
                     'selected_date_pay_status' => $resolvedSelectedDatePayStatus,
                     'deductible_days' => $daysToDeduct,
+                    'linked_forced_leave_deducted_days' => $linkedForcedLeaveDeductedDays,
+                    'linked_vacation_leave_deducted_days' => $linkedVacationLeaveDeductedDays,
                     'attachment_required' => $attachmentRequired,
                     'attachment_submitted' => $attachmentSubmitted,
                     'attachment_reference' => $attachmentReference,
@@ -1758,13 +1728,13 @@ class LeaveApplicationController extends Controller
                 throw $exception;
             }
 
-            if ($app->erms_control_no) {
+            if ($app->employee_control_no) {
                 if ($isCtoDeduction) {
-                    $this->syncEmployeeCtoBalance((string) $app->erms_control_no);
+                    $this->syncEmployeeCtoBalance((string) $app->employee_control_no);
                 }
 
                 $currentBalance = (float) (LeaveBalance::query()
-                    ->where('employee_id', $app->erms_control_no)
+                    ->where('employee_control_no', $app->employee_control_no)
                     ->where('leave_type_id', $app->leave_type_id)
                     ->value('balance') ?? 0);
 
@@ -1776,7 +1746,7 @@ class LeaveApplicationController extends Controller
 
                 if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null) {
                     $currentVacationBalance = (float) (LeaveBalance::query()
-                        ->where('employee_id', $app->erms_control_no)
+                        ->where('employee_control_no', $app->employee_control_no)
                         ->where('leave_type_id', $vacationLeaveTypeId)
                         ->value('balance') ?? 0.0);
                     if ($currentVacationBalance + 1e-9 < $daysToDeduct) {
@@ -1906,7 +1876,7 @@ class LeaveApplicationController extends Controller
 
     /**
      * HR recalls an already approved leave application.
-     * Tagum policy: restore VL only for FL-related recalls.
+     * Tagum policy: restore VL only and never restore FL.
      */
     public function hrRecall(Request $request, int $id): JsonResponse
     {
@@ -1976,7 +1946,13 @@ class LeaveApplicationController extends Controller
             // Tagum policy: FL is not restored; restore VL only.
             $restoreLeaveTypeId = $vacationLeaveTypeId;
         }
-
+        $mainRestoreDays = $daysToRestore;
+        if ($forcedLeaveTypeId !== null && (int) $app->leave_type_id === $forcedLeaveTypeId) {
+            $mainRestoreDays = min(
+                $daysToRestore,
+                $this->resolveStoredLinkedVacationLeaveDeduction($app, $leaveType, $this->resolveApplicationDeductibleDays($app))
+            );
+        }
         $reason = trim((string) ($validated['recall_reason'] ?? $validated['remarks'] ?? ''));
         $recallRemarks = $reason !== ''
             ? "Recalled by HR: {$reason}"
@@ -1988,12 +1964,12 @@ class LeaveApplicationController extends Controller
             DB::transaction(function () use (
                 $app,
                 $hr,
-                $daysToRestore,
+                $mainRestoreDays,
                 $restoreLeaveTypeId,
                 $recallRemarks
             ): void {
-                if ($daysToRestore > 0.0) {
-                    $this->restoreApplicationBalance($app, $restoreLeaveTypeId, $daysToRestore);
+                if ($mainRestoreDays > 0.0) {
+                    $this->restoreApplicationBalance($app, $restoreLeaveTypeId, $mainRestoreDays);
                 }
 
                 $app->update([
@@ -2115,7 +2091,7 @@ class LeaveApplicationController extends Controller
         }
 
         $validated = $request->validate([
-            'employee_id' => ['required', 'string', 'exists:tblEmployees,control_no'],
+            'employee_control_no' => ['required', 'string', 'exists:tblEmployees,control_no'],
             'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
             'start_date' => ['required', 'date'],
             'end_date' => ['required', 'date', 'after_or_equal:start_date'],
@@ -2207,7 +2183,7 @@ class LeaveApplicationController extends Controller
 
         // Verify the employee belongs to the admin's department (by office name)
         $admin->loadMissing('department');
-        $employee = Employee::findByControlNo($validated['employee_id']);
+        $employee = Employee::findByControlNo($validated['employee_control_no']);
         if (!$employee || $employee->office !== $admin->department?->name) {
             return response()->json(['message' => 'You can only file leave for employees in your department.'], 403);
         }
@@ -2260,7 +2236,7 @@ class LeaveApplicationController extends Controller
             $attachmentReference
         ) {
             $application = LeaveApplication::create([
-                'erms_control_no' => (string) $employee->control_no,
+                'employee_control_no' => (string) $employee->control_no,
                 'leave_type_id' => $validated['leave_type_id'],
                 'start_date' => $validated['start_date'],
                 'end_date' => $validated['end_date'],
@@ -2331,7 +2307,7 @@ class LeaveApplicationController extends Controller
     private function adminStoreMonetization(Request $request, DepartmentAdmin $admin): JsonResponse
     {
         $validated = $request->validate([
-            'employee_id' => ['required', 'string', 'exists:tblEmployees,control_no'],
+            'employee_control_no' => ['required', 'string', 'exists:tblEmployees,control_no'],
             'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
             'total_days' => ['required', 'numeric', 'min:1', 'max:999'],
             'reason' => ['nullable', 'string', 'max:2000'],
@@ -2339,7 +2315,7 @@ class LeaveApplicationController extends Controller
         ]);
 
         $admin->loadMissing('department');
-        $employee = Employee::findByControlNo($validated['employee_id']);
+        $employee = Employee::findByControlNo($validated['employee_control_no']);
         if (!$employee || $employee->office !== $admin->department?->name) {
             return response()->json(['message' => 'You can only file for employees in your department.'], 403);
         }
@@ -2359,7 +2335,7 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
-        $balance = LeaveBalance::where('employee_id', $employee->control_no)
+        $balance = LeaveBalance::where('employee_control_no', $employee->control_no)
             ->where('leave_type_id', $validated['leave_type_id'])
             ->first();
 
@@ -2389,7 +2365,7 @@ class LeaveApplicationController extends Controller
 
         $app = DB::transaction(function () use ($validated, $employee, $admin, $equivalentAmount) {
             $application = LeaveApplication::create([
-                'erms_control_no' => (string) $employee->control_no,
+                'employee_control_no' => (string) $employee->control_no,
                 'leave_type_id' => $validated['leave_type_id'],
                 'start_date' => null,
                 'end_date' => null,
@@ -2520,11 +2496,11 @@ class LeaveApplicationController extends Controller
             return $app->employee;
         }
 
-        if ($app->erms_control_no === null) {
+        if ($app->employee_control_no === null) {
             return null;
         }
 
-        return $this->findEmployeeByControlNo((string) $app->erms_control_no);
+        return $this->findEmployeeByControlNo((string) $app->employee_control_no);
     }
 
     private function applyApplicationOwnershipFilter($query, string $controlNo): void
@@ -2536,7 +2512,7 @@ class LeaveApplicationController extends Controller
         }
 
         $query->where(function ($nestedQuery) use ($controlNoCandidates): void {
-            $nestedQuery->whereIn('erms_control_no', $controlNoCandidates)
+            $nestedQuery->whereIn('employee_control_no', $controlNoCandidates)
                 ->orWhereHas('applicantAdmin', function ($adminQuery) use ($controlNoCandidates): void {
                     $adminQuery->whereIn('employee_control_no', $controlNoCandidates);
                 });
@@ -2571,7 +2547,7 @@ class LeaveApplicationController extends Controller
         }
 
         return LeaveBalance::query()
-            ->whereIn('employee_id', $candidateEmployeeIds);
+            ->whereIn('employee_control_no', $candidateEmployeeIds);
     }
 
     private function findAdminEmployeeLeaveBalance(int $adminId, int $leaveTypeId, bool $lockForUpdate = false): ?LeaveBalance
@@ -2601,10 +2577,10 @@ class LeaveApplicationController extends Controller
             return;
         }
 
-        if ($app->erms_control_no) {
+        if ($app->employee_control_no) {
             $balance = LeaveBalance::query()
                 ->where('leave_type_id', $restoreLeaveTypeId)
-                ->whereIn('employee_id', $this->controlNoCandidates((string) $app->erms_control_no))
+                ->whereIn('employee_control_no', $this->controlNoCandidates((string) $app->employee_control_no))
                 ->lockForUpdate()
                 ->first();
 
@@ -2839,7 +2815,10 @@ class LeaveApplicationController extends Controller
         array $balanceRecordsByType,
         array $deductionHistoryByType
     ): array {
-        if ($this->isContractualEmployee($employee)) {
+        if (
+            $this->resolveEmploymentStatusKey($employee->status ?? null)
+            === LeaveType::EMPLOYMENT_STATUS_CONTRACTUAL
+        ) {
             return [
                 'vacation' => $this->emptyErmsLeaveBalancePayload('Vacation Leave'),
                 'sick' => $this->emptyErmsLeaveBalancePayload('Sick Leave'),
@@ -2920,7 +2899,7 @@ class LeaveApplicationController extends Controller
         $applications = LeaveApplication::query()
             ->with(['leaveType:id,name,is_credit_based'])
             ->where('status', LeaveApplication::STATUS_APPROVED)
-            ->whereIn('erms_control_no', $this->controlNoCandidates($controlNo))
+            ->whereIn('employee_control_no', $this->controlNoCandidates($controlNo))
             ->when($leaveTypeId !== null, function ($query) use ($leaveTypeId): void {
                 $query->where('leave_type_id', $leaveTypeId);
             })
@@ -2928,7 +2907,7 @@ class LeaveApplicationController extends Controller
             ->orderByDesc('id')
             ->get([
                 'id',
-                'erms_control_no',
+                'employee_control_no',
                 'leave_type_id',
                 'total_days',
                 'deductible_days',
@@ -2990,7 +2969,7 @@ class LeaveApplicationController extends Controller
     {
         $applications = COCApplication::query()
             ->where('status', COCApplication::STATUS_APPROVED)
-            ->whereIn('erms_control_no', $this->controlNoCandidates($controlNo))
+            ->whereIn('employee_control_no', $this->controlNoCandidates($controlNo))
             ->whereNotNull('cto_leave_type_id')
             ->whereNotNull('cto_credited_days')
             ->where('cto_credited_days', '>', 0)
@@ -3075,11 +3054,39 @@ class LeaveApplicationController extends Controller
             return $adminFallback;
         }
 
-        if ($app->erms_control_no !== null) {
-            return 'Employee ' . $this->normalizeControlNo((string) $app->erms_control_no);
+        if ($app->employee_control_no !== null) {
+            return 'Employee ' . $this->normalizeControlNo((string) $app->employee_control_no);
         }
 
         return 'Employee';
+    }
+
+    private function resolveLeaveApplicationUpdateEmployeeControlNo(LeaveApplication $app): ?string
+    {
+        $controlNo = $this->resolveApplicationBalanceLookupControlNo($app);
+        if ($controlNo !== null) {
+            $controlNo = trim($controlNo);
+            return $controlNo !== '' ? $controlNo : null;
+        }
+
+        $fallbackControlNo = trim((string) ($app->employee_control_no ?? ''));
+        return $fallbackControlNo !== '' ? $fallbackControlNo : null;
+    }
+
+    private function resolveLeaveApplicationUpdateEmployeeName(LeaveApplication $app): ?string
+    {
+        $storedEmployeeName = trim((string) ($app->employee_name ?? ''));
+        if ($storedEmployeeName !== '') {
+            return $storedEmployeeName;
+        }
+
+        $employeeName = trim($this->formatEmployeeFullName($this->resolveApplicationEmployee($app)));
+        if ($employeeName !== '') {
+            return $employeeName;
+        }
+
+        $adminFallback = trim((string) ($app->applicantAdmin?->full_name ?? ''));
+        return $adminFallback !== '' ? $adminFallback : null;
     }
 
     private function normalizeControlNo(mixed $value): string
@@ -3130,7 +3137,7 @@ class LeaveApplicationController extends Controller
                 $hrIds[] = (int) $application->hr_id;
             }
 
-            $employeeControlNo = $this->normalizeControlNo($application->erms_control_no);
+            $employeeControlNo = $this->normalizeControlNo($application->employee_control_no);
             if ($employeeControlNo !== '') {
                 $employeeName = $this->formatEmployeeFullName($this->resolveApplicationEmployee($application));
                 if ($employeeName === '') {
@@ -3266,7 +3273,10 @@ class LeaveApplicationController extends Controller
 
     private function formatErmsApplication(LeaveApplication $app, array $actorDirectory): array
     {
-        $employeeName = $this->formatEmployeeFullName($this->resolveApplicationEmployee($app));
+        $employeeName = trim((string) ($app->employee_name ?? ''));
+        if ($employeeName === '') {
+            $employeeName = $this->formatEmployeeFullName($this->resolveApplicationEmployee($app));
+        }
         if ($employeeName === '') {
             $employeeName = trim((string) ($app->applicantAdmin?->full_name ?? ''));
         }
@@ -3409,7 +3419,7 @@ class LeaveApplicationController extends Controller
 
         return [
             'id' => $app->id,
-            'erms_control_no' => $app->erms_control_no ? (string) $app->erms_control_no : null,
+            'employee_control_no' => $app->employee_control_no ? (string) $app->employee_control_no : null,
             'leave_type_id' => $app->leave_type_id,
             'leave_type_name' => $app->leaveType?->name,
             'start_date' => $app->start_date?->toDateString(),
@@ -3830,7 +3840,7 @@ class LeaveApplicationController extends Controller
 
         if (!$targetIsMonetization) {
             $duplicateDateValidation = $this->validateNoDuplicateLeaveDates(
-                (string) ($app->erms_control_no ?? ''),
+                (string) ($app->employee_control_no ?? ''),
                 (string) $targetStartDate,
                 (string) $targetEndDate,
                 is_array($targetSelectedDates) ? $targetSelectedDates : null,
@@ -3860,24 +3870,41 @@ class LeaveApplicationController extends Controller
         }
 
         $sourceLeaveType = LeaveType::find((int) $app->leave_type_id);
-        $balanceAdjustments = $this->buildLeaveBalanceAdjustments(
+        $sourceDeductibleDays = $this->resolveApplicationDeductibleDays($app);
+        $sourceDeductsBalance = $this->applicationDeductsEmployeeBalance(
             (bool) $app->is_monetization,
             $sourceLeaveType,
-            (int) $app->leave_type_id,
-            $this->resolveApplicationDeductibleDays($app),
-            $app->pay_mode,
+            $app->pay_mode
+        );
+        $targetDeductsBalance = $this->applicationDeductsEmployeeBalance(
             $targetIsMonetization,
             $targetLeaveType,
-            $targetLeaveTypeId,
-            $targetDeductibleDays,
             $targetPayMode
         );
+        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
+        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+        $targetShouldDeductForcedLeave = $this->shouldLeaveTypeDeductForcedLeave(
+            $targetLeaveType,
+            $targetLeaveTypeId,
+            $targetIsMonetization,
+            $forcedLeaveTypeId
+        );
+        $targetShouldDeductVacationLeave = $this->shouldLeaveTypeDeductVacationLeave(
+            $targetLeaveType,
+            $targetLeaveTypeId,
+            $targetIsMonetization,
+            $forcedLeaveTypeId,
+            $vacationLeaveTypeId
+        );
+        $targetIsCtoDeduction = $this->isCtoLeaveType($targetLeaveType, $targetLeaveTypeId);
 
-        if ($app->erms_control_no) {
-            $this->syncEmployeeCtoBalance((string) $app->erms_control_no);
+        if ($app->employee_control_no) {
+            $this->syncEmployeeCtoBalance((string) $app->employee_control_no);
         }
 
         $balanceConflictError = 'HR_UPDATE_BALANCE_CONFLICT';
+        $linkedForcedLeaveDeductedDays = 0.0;
+        $linkedVacationLeaveDeductedDays = 0.0;
 
         try {
             DB::transaction(function () use (
@@ -3899,18 +3926,43 @@ class LeaveApplicationController extends Controller
                 $targetAttachmentRequired,
                 $targetAttachmentSubmitted,
                 $targetAttachmentReference,
-                $balanceAdjustments,
-                $balanceConflictError
+                $sourceLeaveType,
+                $sourceDeductibleDays,
+                $sourceDeductsBalance,
+                $targetLeaveType,
+                $targetDeductsBalance,
+                $forcedLeaveTypeId,
+                $vacationLeaveTypeId,
+                $targetShouldDeductForcedLeave,
+                $targetShouldDeductVacationLeave,
+                $targetIsCtoDeduction,
+                $balanceConflictError,
+                &$linkedForcedLeaveDeductedDays,
+                &$linkedVacationLeaveDeductedDays
             ): void {
-                if ($app->erms_control_no && $balanceAdjustments !== []) {
-                    $adjusted = $this->applyEmployeeLeaveBalanceAdjustments(
-                        (string) $app->erms_control_no,
-                        $balanceAdjustments
+                if ($sourceDeductsBalance && $sourceDeductibleDays > 0.0) {
+                    $this->refundApplicationTrackedDeductions(
+                        $app,
+                        $sourceLeaveType,
+                        $sourceDeductibleDays,
+                        $balanceConflictError
                     );
+                }
 
-                    if (!$adjusted) {
-                        throw new \RuntimeException($balanceConflictError);
-                    }
+                if ($targetDeductsBalance && $targetDeductibleDays > 0.0) {
+                    $linkedDeductions = $this->deductApplicationTrackedBalances(
+                        $app,
+                        $targetLeaveTypeId,
+                        $targetDeductibleDays,
+                        $targetIsCtoDeduction,
+                        $targetShouldDeductForcedLeave,
+                        $forcedLeaveTypeId,
+                        $targetShouldDeductVacationLeave,
+                        $vacationLeaveTypeId,
+                        $balanceConflictError
+                    );
+                    $linkedForcedLeaveDeductedDays = (float) ($linkedDeductions['linked_forced_leave_deducted_days'] ?? 0.0);
+                    $linkedVacationLeaveDeductedDays = (float) ($linkedDeductions['linked_vacation_leave_deducted_days'] ?? 0.0);
                 }
 
                 $app->update([
@@ -3925,6 +3977,8 @@ class LeaveApplicationController extends Controller
                     'selected_date_coverage' => $targetIsMonetization ? null : $targetSelectedDateCoverage,
                     'commutation' => (string) ($payload['commutation'] ?? 'Not Requested'),
                     'pay_mode' => $targetPayMode,
+                    'linked_forced_leave_deducted_days' => $linkedForcedLeaveDeductedDays,
+                    'linked_vacation_leave_deducted_days' => $linkedVacationLeaveDeductedDays,
                     'attachment_required' => $targetAttachmentRequired,
                     'attachment_submitted' => $targetAttachmentSubmitted,
                     'attachment_reference' => $targetAttachmentReference,
@@ -3935,8 +3989,8 @@ class LeaveApplicationController extends Controller
                     'remarks' => $request->input('remarks'),
                 ]);
 
-                if ($app->erms_control_no) {
-                    $this->syncEmployeeCtoBalance((string) $app->erms_control_no, true);
+                if ($app->employee_control_no) {
+                    $this->syncEmployeeCtoBalance((string) $app->employee_control_no, true);
                 }
 
                 if ($pendingUpdateRequest instanceof LeaveApplicationUpdateRequest) {
@@ -4284,101 +4338,203 @@ class LeaveApplicationController extends Controller
         ];
     }
 
-    private function buildLeaveBalanceAdjustments(
-        bool $sourceIsMonetization,
+    private function refundApplicationTrackedDeductions(
+        LeaveApplication $app,
         ?LeaveType $sourceLeaveType,
-        int $sourceLeaveTypeId,
         float $sourceDeductibleDays,
-        mixed $sourcePayMode,
-        bool $targetIsMonetization,
-        LeaveType $targetLeaveType,
-        int $targetLeaveTypeId,
-        float $targetDeductibleDays,
-        mixed $targetPayMode
-    ): array {
-        $adjustments = [];
-
-        $sourceDeductsBalance = $this->applicationDeductsEmployeeBalance(
-            $sourceIsMonetization,
-            $sourceLeaveType,
-            $sourcePayMode
-        );
-        if ($sourceDeductsBalance && $sourceLeaveTypeId > 0 && $sourceDeductibleDays > 0) {
-            $adjustments[$sourceLeaveTypeId] = ($adjustments[$sourceLeaveTypeId] ?? 0.0) - $sourceDeductibleDays;
+        string $balanceConflictError
+    ): void {
+        $employeeControlNo = $this->resolveApplicationBalanceOwnerControlNo($app);
+        if ($employeeControlNo === null) {
+            throw new \RuntimeException($balanceConflictError);
         }
 
-        $targetDeductsBalance = $this->applicationDeductsEmployeeBalance(
-            $targetIsMonetization,
-            $targetLeaveType,
-            $targetPayMode
-        );
-        if ($targetDeductsBalance && $targetLeaveTypeId > 0 && $targetDeductibleDays > 0) {
-            $adjustments[$targetLeaveTypeId] = ($adjustments[$targetLeaveTypeId] ?? 0.0) + $targetDeductibleDays;
+        $primaryRefundDays = round(max($sourceDeductibleDays, 0.0), 2);
+        if ((int) $app->leave_type_id > 0 && $primaryRefundDays > 0.0) {
+            $this->incrementEmployeeLeaveBalance($employeeControlNo, (int) $app->leave_type_id, $primaryRefundDays);
         }
 
-        foreach ($adjustments as $leaveTypeId => $delta) {
-            $normalizedDelta = round((float) $delta, 2);
-            if (abs($normalizedDelta) < 0.00001) {
-                unset($adjustments[$leaveTypeId]);
-                continue;
-            }
-
-            $adjustments[$leaveTypeId] = $normalizedDelta;
+        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
+        $linkedForcedRefundDays = $this->resolveStoredLinkedForcedLeaveDeduction($app, $sourceLeaveType, $sourceDeductibleDays);
+        if ($forcedLeaveTypeId !== null && $linkedForcedRefundDays > 0.0) {
+            $this->incrementEmployeeLeaveBalance($employeeControlNo, $forcedLeaveTypeId, $linkedForcedRefundDays);
         }
 
-        return $adjustments;
+        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+        $linkedVacationRefundDays = $this->resolveStoredLinkedVacationLeaveDeduction($app, $sourceLeaveType, $sourceDeductibleDays);
+        if ($vacationLeaveTypeId !== null && $linkedVacationRefundDays > 0.0) {
+            $this->incrementEmployeeLeaveBalance($employeeControlNo, $vacationLeaveTypeId, $linkedVacationRefundDays);
+        }
     }
 
-    private function applyEmployeeLeaveBalanceAdjustments(string $employeeControlNo, array $adjustments): bool
+    private function deductApplicationTrackedBalances(
+        LeaveApplication $app,
+        int $primaryLeaveTypeId,
+        float $daysToDeduct,
+        bool $isCtoDeduction,
+        bool $shouldDeductForcedLeave,
+        ?int $forcedLeaveTypeId,
+        bool $shouldDeductVacationLeave,
+        ?int $vacationLeaveTypeId,
+        string $balanceConflictError
+    ): array {
+        $employeeControlNo = $this->resolveApplicationBalanceOwnerControlNo($app);
+        if ($employeeControlNo === null) {
+            throw new \RuntimeException($balanceConflictError);
+        }
+
+        $primaryDaysToDeduct = round(max($daysToDeduct, 0.0), 2);
+        if ($primaryLeaveTypeId <= 0 || $primaryDaysToDeduct <= 0.0) {
+            return [
+                'linked_forced_leave_deducted_days' => 0.0,
+                'linked_vacation_leave_deducted_days' => 0.0,
+            ];
+        }
+
+        if ($isCtoDeduction) {
+            $this->syncEmployeeCtoBalance($employeeControlNo, true);
+        }
+
+        $primaryBalance = $this->lockEmployeeLeaveBalance($employeeControlNo, $primaryLeaveTypeId);
+        if (!$primaryBalance || (float) $primaryBalance->balance < $primaryDaysToDeduct) {
+            throw new \RuntimeException($balanceConflictError);
+        }
+
+        $primaryBalance->decrement('balance', $primaryDaysToDeduct);
+
+        $linkedForcedLeaveDeductedDays = 0.0;
+        if ($shouldDeductForcedLeave && $forcedLeaveTypeId !== null) {
+            $forcedBalance = $this->lockEmployeeLeaveBalance($employeeControlNo, $forcedLeaveTypeId);
+            $forcedAvailable = $forcedBalance ? (float) $forcedBalance->balance : 0.0;
+            $linkedForcedLeaveDeductedDays = round(min($primaryDaysToDeduct, max($forcedAvailable, 0.0)), 2);
+
+            if ($forcedBalance && $linkedForcedLeaveDeductedDays > 0.0) {
+                $forcedBalance->decrement('balance', $linkedForcedLeaveDeductedDays);
+            }
+        }
+
+        $linkedVacationLeaveDeductedDays = 0.0;
+        if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null) {
+            $vacationBalance = $this->lockEmployeeLeaveBalance($employeeControlNo, $vacationLeaveTypeId);
+            if (!$vacationBalance || (float) $vacationBalance->balance < $primaryDaysToDeduct) {
+                throw new \RuntimeException($balanceConflictError);
+            }
+
+            $vacationBalance->decrement('balance', $primaryDaysToDeduct);
+            $linkedVacationLeaveDeductedDays = $primaryDaysToDeduct;
+        }
+
+        return [
+            'linked_forced_leave_deducted_days' => $linkedForcedLeaveDeductedDays,
+            'linked_vacation_leave_deducted_days' => $linkedVacationLeaveDeductedDays,
+        ];
+    }
+
+    private function resolveApplicationBalanceOwnerControlNo(LeaveApplication $app): ?string
     {
-        $controlNoCandidates = $this->controlNoCandidates($employeeControlNo);
-        if ($controlNoCandidates === []) {
-            return false;
+        $directControlNo = trim((string) ($app->employee_control_no ?? ''));
+        if ($directControlNo !== '') {
+            return $directControlNo;
         }
 
-        foreach ($adjustments as $leaveTypeId => $delta) {
-            $normalizedLeaveTypeId = (int) $leaveTypeId;
-            $normalizedDelta = round((float) $delta, 2);
-            if ($normalizedLeaveTypeId <= 0 || abs($normalizedDelta) < 0.00001) {
-                continue;
-            }
-
-            $query = LeaveBalance::query()
-                ->whereIn('employee_id', $controlNoCandidates)
-                ->where('leave_type_id', $normalizedLeaveTypeId)
-                ->lockForUpdate();
-
-            $balance = $query->first();
-
-            if ($normalizedDelta > 0) {
-                if (!$balance || (float) $balance->balance < $normalizedDelta) {
-                    return false;
-                }
-
-                $balance->decrement('balance', $normalizedDelta);
-                continue;
-            }
-
-            $refundDays = abs($normalizedDelta);
-
-            if (!$balance) {
-                $canonicalControlNo = trim((string) ($this->findEmployeeByControlNo($employeeControlNo)?->control_no ?? $employeeControlNo));
-                if ($canonicalControlNo === '') {
-                    return false;
-                }
-
-                $balance = LeaveBalance::create([
-                    'employee_id' => $canonicalControlNo,
-                    'leave_type_id' => $normalizedLeaveTypeId,
-                    'balance' => 0,
-                    'year' => (int) now()->year,
-                ]);
-            }
-
-            $balance->increment('balance', $refundDays);
+        if ($app->applicant_admin_id) {
+            return $this->findAdminEmployeeControlNo((int) $app->applicant_admin_id);
         }
 
-        return true;
+        return null;
+    }
+
+    private function lockEmployeeLeaveBalance(string $employeeControlNo, int $leaveTypeId): ?LeaveBalance
+    {
+        return $this->queryLeaveBalancesByEmployeeControlNo($employeeControlNo)
+            ->where('leave_type_id', $leaveTypeId)
+            ->lockForUpdate()
+            ->first();
+    }
+
+    private function incrementEmployeeLeaveBalance(string $employeeControlNo, int $leaveTypeId, float $daysToAdd): void
+    {
+        $normalizedDaysToAdd = round(max($daysToAdd, 0.0), 2);
+        if ($leaveTypeId <= 0 || $normalizedDaysToAdd <= 0.0) {
+            return;
+        }
+
+        $balance = $this->lockEmployeeLeaveBalance($employeeControlNo, $leaveTypeId);
+        if (!$balance) {
+            $employee = $this->findEmployeeByControlNo($employeeControlNo);
+            $leaveType = LeaveType::query()->find($leaveTypeId);
+
+            $balance = LeaveBalance::query()->create([
+                'employee_control_no' => trim((string) ($employee?->control_no ?? $employeeControlNo)),
+                'employee_name' => $employee ? $this->formatEmployeeNameForBalance($employee) : null,
+                'leave_type_id' => $leaveTypeId,
+                'leave_type_name' => $leaveType?->name,
+                'balance' => 0,
+                'year' => (int) now()->year,
+            ]);
+        }
+
+        $balance->increment('balance', $normalizedDaysToAdd);
+    }
+
+    private function formatEmployeeNameForBalance(?Employee $employee): ?string
+    {
+        if (!$employee) {
+            return null;
+        }
+
+        $surname = trim((string) ($employee->surname ?? ''));
+        $firstname = trim((string) ($employee->firstname ?? ''));
+        $middlename = trim((string) ($employee->middlename ?? ''));
+        $fullName = trim(implode(', ', array_filter([$surname, trim($firstname . ' ' . $middlename)])));
+
+        return $fullName !== '' ? $fullName : null;
+    }
+
+    private function resolveStoredLinkedForcedLeaveDeduction(
+        LeaveApplication $app,
+        ?LeaveType $sourceLeaveType,
+        float $fallbackDeductibleDays
+    ): float {
+        if ($app->linked_forced_leave_deducted_days !== null) {
+            return round(max((float) $app->linked_forced_leave_deducted_days, 0.0), 2);
+        }
+
+        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
+        if (!$sourceLeaveType || !$this->shouldLeaveTypeDeductForcedLeave(
+            $sourceLeaveType,
+            (int) $app->leave_type_id,
+            (bool) $app->is_monetization,
+            $forcedLeaveTypeId
+        )) {
+            return 0.0;
+        }
+
+        return round(max($fallbackDeductibleDays, 0.0), 2);
+    }
+
+    private function resolveStoredLinkedVacationLeaveDeduction(
+        LeaveApplication $app,
+        ?LeaveType $sourceLeaveType,
+        float $fallbackDeductibleDays
+    ): float {
+        if ($app->linked_vacation_leave_deducted_days !== null) {
+            return round(max((float) $app->linked_vacation_leave_deducted_days, 0.0), 2);
+        }
+
+        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
+        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+        if (!$sourceLeaveType || !$this->shouldLeaveTypeDeductVacationLeave(
+            $sourceLeaveType,
+            (int) $app->leave_type_id,
+            (bool) $app->is_monetization,
+            $forcedLeaveTypeId,
+            $vacationLeaveTypeId
+        )) {
+            return 0.0;
+        }
+
+        return round(max($fallbackDeductibleDays, 0.0), 2);
     }
 
     private function resolveCtoLeaveTypeId(): ?int
@@ -4437,7 +4593,7 @@ class LeaveApplicationController extends Controller
         $effectiveBalance = round(max($effectiveBalance, 0.0), 2);
 
         $query = LeaveBalance::query()
-            ->whereIn('employee_id', $controlNoCandidates)
+            ->whereIn('employee_control_no', $controlNoCandidates)
             ->where('leave_type_id', $ctoLeaveTypeId);
 
         if ($lockForUpdate) {
@@ -4457,7 +4613,7 @@ class LeaveApplicationController extends Controller
             }
 
             $balance = LeaveBalance::query()->create([
-                'employee_id' => $canonicalControlNo,
+                'employee_control_no' => $canonicalControlNo,
                 'leave_type_id' => $ctoLeaveTypeId,
                 'balance' => $effectiveBalance,
                 'year' => (int) now()->year,
@@ -4495,7 +4651,7 @@ class LeaveApplicationController extends Controller
 
         $creditApplications = COCApplication::query()
             ->where('status', COCApplication::STATUS_APPROVED)
-            ->whereIn('erms_control_no', $controlNoCandidates)
+            ->whereIn('employee_control_no', $controlNoCandidates)
             ->where('cto_leave_type_id', $ctoLeaveTypeId)
             ->whereNotNull('cto_credited_days')
             ->where('cto_credited_days', '>', 0)
@@ -4540,7 +4696,7 @@ class LeaveApplicationController extends Controller
 
         $deductionApplications = LeaveApplication::query()
             ->where('status', LeaveApplication::STATUS_APPROVED)
-            ->whereIn('erms_control_no', $controlNoCandidates)
+            ->whereIn('employee_control_no', $controlNoCandidates)
             ->where('leave_type_id', $ctoLeaveTypeId)
             ->where(function ($query): void {
                 $query->where('is_monetization', true)
@@ -4641,20 +4797,18 @@ class LeaveApplicationController extends Controller
 
     private function shouldDeductForcedLeaveWithVacation(LeaveApplication $app, ?int $forcedLeaveTypeId): bool
     {
-        if ($forcedLeaveTypeId === null) {
-            return false;
+        $leaveType = $app->leaveType;
+        if (!$leaveType instanceof LeaveType) {
+            $leaveType = LeaveType::query()->find((int) $app->leave_type_id);
         }
 
-        if ($app->is_monetization) {
-            return false;
-        }
-
-        if ((int) $app->leave_type_id === $forcedLeaveTypeId) {
-            return false;
-        }
-
-        $leaveTypeName = trim((string) ($app->leaveType?->name ?? ''));
-        return strcasecmp($leaveTypeName, 'Vacation Leave') === 0;
+        return $leaveType instanceof LeaveType
+            && $this->shouldLeaveTypeDeductForcedLeave(
+                $leaveType,
+                (int) $app->leave_type_id,
+                (bool) $app->is_monetization,
+                $forcedLeaveTypeId
+            );
     }
 
     private function shouldDeductVacationLeaveWithForced(
@@ -4662,15 +4816,50 @@ class LeaveApplicationController extends Controller
         ?int $forcedLeaveTypeId,
         ?int $vacationLeaveTypeId
     ): bool {
-        if ($forcedLeaveTypeId === null || $vacationLeaveTypeId === null) {
+        $leaveType = $app->leaveType;
+        if (!$leaveType instanceof LeaveType) {
+            $leaveType = LeaveType::query()->find((int) $app->leave_type_id);
+        }
+
+        return $leaveType instanceof LeaveType
+            && $this->shouldLeaveTypeDeductVacationLeave(
+                $leaveType,
+                (int) $app->leave_type_id,
+                (bool) $app->is_monetization,
+                $forcedLeaveTypeId,
+                $vacationLeaveTypeId
+            );
+    }
+
+    private function shouldLeaveTypeDeductForcedLeave(
+        LeaveType $leaveType,
+        int $leaveTypeId,
+        bool $isMonetization,
+        ?int $forcedLeaveTypeId
+    ): bool {
+        if ($forcedLeaveTypeId === null || $isMonetization) {
             return false;
         }
 
-        if ($app->is_monetization) {
+        if ($leaveTypeId === $forcedLeaveTypeId) {
             return false;
         }
 
-        return (int) $app->leave_type_id === $forcedLeaveTypeId;
+        return strcasecmp(trim((string) ($leaveType->name ?? '')), 'Vacation Leave') === 0;
+    }
+
+    private function shouldLeaveTypeDeductVacationLeave(
+        LeaveType $leaveType,
+        int $leaveTypeId,
+        bool $isMonetization,
+        ?int $forcedLeaveTypeId,
+        ?int $vacationLeaveTypeId
+    ): bool {
+        if ($forcedLeaveTypeId === null || $vacationLeaveTypeId === null || $isMonetization) {
+            return false;
+        }
+
+        return $leaveTypeId === $forcedLeaveTypeId;
     }
 
     private function isSickLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
@@ -5939,7 +6128,7 @@ class LeaveApplicationController extends Controller
                 LeaveApplication::STATUS_PENDING_HR,
                 LeaveApplication::STATUS_APPROVED,
             ])
-            ->whereIn('erms_control_no', $this->controlNoCandidates($employeeControlNo))
+            ->whereIn('employee_control_no', $this->controlNoCandidates($employeeControlNo))
             ->when($excludeApplicationId !== null, function ($query) use ($excludeApplicationId): void {
                 $query->where('id', '<>', $excludeApplicationId);
             })
@@ -6104,7 +6293,7 @@ class LeaveApplicationController extends Controller
 
         $balance = LeaveBalance::query()
             ->where('leave_type_id', $leaveTypeId)
-            ->whereIn('employee_id', $controlNoCandidates)
+            ->whereIn('employee_control_no', $controlNoCandidates)
             ->first();
         $currentBalance = $balance ? (float) $balance->balance : 0.0;
 
@@ -6121,7 +6310,7 @@ class LeaveApplicationController extends Controller
                         [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY]
                     );
             })
-            ->whereIn('erms_control_no', $controlNoCandidates)
+            ->whereIn('employee_control_no', $controlNoCandidates)
             ->sum(DB::raw('COALESCE(deductible_days, total_days)'));
 
         $availableBalance = max(round($currentBalance - $pendingReservedDays, 2), 0.0);
@@ -6136,7 +6325,10 @@ class LeaveApplicationController extends Controller
     private function formatApplication(LeaveApplication $app): array
     {
         $resolvedEmployee = $this->resolveApplicationEmployee($app);
-        $employeeName = $this->formatEmployeeFullName($resolvedEmployee);
+        $employeeName = trim((string) ($app->employee_name ?? ''));
+        if ($employeeName === '') {
+            $employeeName = $this->formatEmployeeFullName($resolvedEmployee);
+        }
         $applicantName = $employeeName !== ''
             ? $employeeName
             : trim((string) ($app->applicantAdmin?->full_name ?? ''));
@@ -6155,7 +6347,7 @@ class LeaveApplicationController extends Controller
 
         $data = [
             'id' => $app->id,
-            'employee_id' => $app->erms_control_no,
+            'employee_control_no' => $app->employee_control_no,
             'applicant_admin_id' => $app->applicant_admin_id,
             'leave_type_id' => $app->leave_type_id,
             'leaveType' => $app->leaveType?->name ?? 'Unknown',
@@ -6317,7 +6509,7 @@ class LeaveApplicationController extends Controller
 
         $snapshot = LeaveBalance::query()
             ->with('leaveType')
-            ->whereIn('employee_id', $controlNoCandidates)
+            ->whereIn('employee_control_no', $controlNoCandidates)
             ->get()
             ->sortByDesc(fn(LeaveBalance $balance) => $balance->updated_at?->timestamp ?? 0)
             ->unique(fn(LeaveBalance $balance) => (int) $balance->leave_type_id)
@@ -6339,7 +6531,7 @@ class LeaveApplicationController extends Controller
 
     private function resolveApplicationBalanceLookupControlNo(LeaveApplication $app): ?string
     {
-        $directControlNo = trim((string) ($app->erms_control_no ?? ''));
+        $directControlNo = trim((string) ($app->employee_control_no ?? ''));
         if ($directControlNo !== '') {
             return $directControlNo;
         }
@@ -6364,6 +6556,31 @@ class LeaveApplicationController extends Controller
         return null;
     }
 
+    private function mergeEmployeeControlNoInput(Request $request): void
+    {
+        $employeeControlNo = trim((string) $request->input('employee_control_no', ''));
+        if ($employeeControlNo === '') {
+            return;
+        }
+
+        $request->merge([
+            'employee_control_no' => $employeeControlNo,
+        ]);
+    }
+
+    private function resolveValidatedEmployeeControlNo(array $validated): string
+    {
+        return trim((string) ($validated['employee_control_no'] ?? ''));
+    }
+
+    private function employeeControlNoResponse(?string $controlNo): array
+    {
+        $normalized = trim((string) ($controlNo ?? ''));
+        return [
+            'employee_control_no' => $normalized !== '' ? $normalized : null,
+        ];
+    }
+
     private function normalizeSelectedDatesInput(Request $request): void
     {
         $selectedDates = $request->input('selected_dates');
@@ -6379,6 +6596,8 @@ class LeaveApplicationController extends Controller
         }
     }
 }
+
+
 
 
 

@@ -130,8 +130,6 @@ class HRLeaveTypeController extends Controller
             'requires_documents' => ['nullable', 'boolean'],
             'allowed_status' => ['nullable', 'array'],
             'allowed_status.*' => ['string', Rule::in(array_keys(LeaveType::EMPLOYMENT_STATUS_LABELS))],
-            'allowed_statuses' => ['nullable', 'array'],
-            'allowed_statuses.*' => ['string', Rule::in(array_keys(LeaveType::EMPLOYMENT_STATUS_LABELS))],
             'description' => ['nullable', 'string', 'max:2000'],
         ]);
 
@@ -176,9 +174,7 @@ class HRLeaveTypeController extends Controller
             'is_credit_based' => $isCreditBased,
             'resets_yearly' => $resetsYearly,
             'requires_documents' => (bool) ($validated['requires_documents'] ?? false),
-            'allowed_status' => LeaveType::normalizeAllowedStatusesArray(
-                $validated['allowed_status'] ?? $validated['allowed_statuses'] ?? null
-            ),
+            'allowed_status' => LeaveType::normalizeAllowedStatusesArray($validated['allowed_status'] ?? null),
             'description' => isset($validated['description']) ? trim((string) $validated['description']) : null,
         ];
     }
