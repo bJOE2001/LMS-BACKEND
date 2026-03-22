@@ -12,12 +12,14 @@ use App\Models\LeaveApplicationLog;
 use App\Models\LeaveBalance;
 use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveType;
+use App\Services\RecycleBinService;
 use Carbon\Carbon;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Collection;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 
 /**
@@ -145,7 +147,24 @@ class EmployeeController extends Controller
             ], 404);
         }
 
-        $departmentHead->delete();
+        $departmentHead->loadMissing('department');
+
+        DB::transaction(function () use ($departmentHead, $request): void {
+            app(RecycleBinService::class)->storeDeletedModel(
+                $departmentHead,
+                $request->user(),
+                [
+                    'record_title' => $departmentHead->full_name,
+                    'delete_source' => 'admin.department-head',
+                    'delete_reason' => $request->input('reason'),
+                    'snapshot' => array_merge($departmentHead->toArray(), [
+                        'department' => $departmentHead->department?->only(['id', 'name']),
+                    ]),
+                ]
+            );
+
+            $departmentHead->delete();
+        });
 
         return response()->json([
             'message' => 'Department head removed successfully.',
@@ -358,7 +377,24 @@ class EmployeeController extends Controller
             ], 403);
         }
 
-        $employee->delete();
+        $employee->loadMissing('department');
+
+        DB::transaction(function () use ($employee, $request): void {
+            app(RecycleBinService::class)->storeDeletedModel(
+                $employee,
+                $request->user(),
+                [
+                    'record_title' => $employee->full_name,
+                    'delete_source' => 'admin.employees',
+                    'delete_reason' => $request->input('reason'),
+                    'snapshot' => array_merge($employee->toArray(), [
+                        'department' => $employee->department?->only(['id', 'name']),
+                    ]),
+                ]
+            );
+
+            $employee->delete();
+        });
 
         return response()->json([
             'message' => 'Employee deleted successfully.',
