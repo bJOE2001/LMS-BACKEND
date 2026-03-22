@@ -235,6 +235,7 @@ class LeaveApplicationController extends Controller
 
         return response()->json([
             ...$this->employeeControlNoResponse((string) $employee->control_no),
+            'salary' => $employee->rate_mon !== null ? (float) $employee->rate_mon : null,
             'balances' => $balances,
             'latest_accrued_credits' => $this->buildErmsLatestAccruedCreditsPayload(
                 $employee,
@@ -1893,6 +1894,12 @@ class LeaveApplicationController extends Controller
         $app = LeaveApplication::with('leaveType')->find($id);
         if (!$app) {
             return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        if ((bool) $app->is_monetization) {
+            return response()->json([
+                'message' => 'Monetization requests cannot be recalled.',
+            ], 422);
         }
 
         if ($app->status !== LeaveApplication::STATUS_APPROVED) {

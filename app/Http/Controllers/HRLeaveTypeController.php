@@ -3,8 +3,10 @@
 namespace App\Http\Controllers;
 
 use App\Models\LeaveType;
+use App\Services\RecycleBinService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
 
@@ -76,7 +78,7 @@ class HRLeaveTypeController extends Controller
         ]);
     }
 
-    public function destroy(int $id): JsonResponse
+    public function destroy(Request $request, int $id): JsonResponse
     {
         $leaveType = LeaveType::query()
             ->withCount(['leaveApplications', 'leaveBalances'])
@@ -101,7 +103,26 @@ class HRLeaveTypeController extends Controller
             ], 422);
         }
 
-        $leaveType->delete();
+        DB::transaction(function () use ($leaveType, $request, $usageTotal): void {
+            app(RecycleBinService::class)->storeDeletedModel(
+                $leaveType,
+                $request->user(),
+                [
+                    'record_title' => $leaveType->name,
+                    'delete_source' => 'hr.leave-types',
+                    'delete_reason' => $request->input('reason'),
+                    'snapshot' => array_merge($leaveType->toArray(), [
+                        'usage' => [
+                            'applications' => (int) $leaveType->leave_applications_count,
+                            'employee_balances' => (int) $leaveType->leave_balances_count,
+                            'total' => $usageTotal,
+                        ],
+                    ]),
+                ]
+            );
+
+            $leaveType->delete();
+        });
 
         return response()->json([
             'message' => 'Leave type deleted successfully.',

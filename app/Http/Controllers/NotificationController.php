@@ -4,8 +4,10 @@ namespace App\Http\Controllers;
 
 use App\Models\LeaveApplication;
 use App\Models\Notification;
+use App\Services\RecycleBinService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 /**
  * NotificationController — CRUD for user notifications.
@@ -115,7 +117,28 @@ class NotificationController extends Controller
             ->where('id', $id)
             ->firstOrFail();
 
-        $notification->delete();
+        $notification->loadMissing([
+            'leaveApplication.leaveType',
+            'leaveApplication.employee',
+            'leaveApplication.applicantAdmin.department',
+        ]);
+
+        DB::transaction(function () use ($notification, $request): void {
+            app(RecycleBinService::class)->storeDeletedModel(
+                $notification,
+                $request->user(),
+                [
+                    'record_title' => $notification->title,
+                    'delete_source' => 'notifications',
+                    'delete_reason' => $request->input('reason'),
+                    'snapshot' => array_merge($notification->toArray(), [
+                        'leave_application' => $this->formatLeaveApplication($notification->leaveApplication),
+                    ]),
+                ]
+            );
+
+            $notification->delete();
+        });
 
         return response()->json(['message' => 'Notification deleted.']);
     }

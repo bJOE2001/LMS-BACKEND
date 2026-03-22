@@ -8,8 +8,10 @@ use App\Models\Employee;
 use App\Models\HRAccount;
 use App\Models\LeaveBalance;
 use App\Models\LeaveApplication;
+use App\Services\RecycleBinService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
@@ -234,7 +236,7 @@ class HRUserManagementController extends Controller
     /**
      * Remove a department admin account.
      */
-    public function destroy(int $id): JsonResponse
+    public function destroy(Request $request, int $id): JsonResponse
     {
         $admin = DepartmentAdmin::query()->find($id);
         if (!$admin) {
@@ -251,7 +253,37 @@ class HRUserManagementController extends Controller
             ]);
         }
 
-        $admin->delete();
+        $admin->loadMissing([
+            'department:id,name',
+            'employee:control_no,surname,firstname,middlename,birth_date,office,status,designation',
+        ]);
+
+        DB::transaction(function () use ($admin, $request): void {
+            app(RecycleBinService::class)->storeDeletedModel(
+                $admin,
+                $request->user(),
+                [
+                    'record_title' => $admin->full_name,
+                    'delete_source' => 'hr.user-management',
+                    'delete_reason' => $request->input('reason'),
+                    'snapshot' => array_merge($admin->toArray(), [
+                        'department' => $admin->department?->only(['id', 'name']),
+                        'employee' => $admin->employee?->only([
+                            'control_no',
+                            'surname',
+                            'firstname',
+                            'middlename',
+                            'birth_date',
+                            'office',
+                            'status',
+                            'designation',
+                        ]),
+                    ]),
+                ]
+            );
+
+            $admin->delete();
+        });
 
         return response()->json([
             'message' => 'Department admin removed successfully.',
