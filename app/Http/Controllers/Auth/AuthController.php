@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Auth\LoginRequest;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
+use App\Models\HrisEmployee;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -89,7 +90,7 @@ class AuthController extends Controller
             ];
         }
 
-        $account->loadMissing(['department', 'employee']);
+        $account->loadMissing(['department']);
         return [
             [
                 'id' => $account->id,
@@ -108,7 +109,7 @@ class AuthController extends Controller
 
     private function resolveDepartmentAdminDisplayName(DepartmentAdmin $account): string
     {
-        $employee = $account->employee;
+        $employee = $this->resolveDepartmentAdminEmployee($account);
         if ($employee) {
             $parts = array_values(array_filter([
                 trim((string) $employee->firstname),
@@ -126,7 +127,18 @@ class AuthController extends Controller
 
     private function resolveDepartmentAdminPosition(DepartmentAdmin $account): string
     {
-        $designation = trim((string) ($account->employee?->designation ?? ''));
+        $employee = $this->resolveDepartmentAdminEmployee($account);
+        $designation = trim((string) ($employee?->designation ?? ''));
         return $designation !== '' ? $designation : 'Department Admin';
+    }
+
+    private function resolveDepartmentAdminEmployee(DepartmentAdmin $account): ?object
+    {
+        $controlNo = trim((string) ($account->employee_control_no ?? ''));
+        if ($controlNo === '') {
+            return null;
+        }
+
+        return HrisEmployee::findByControlNo($controlNo);
     }
 }

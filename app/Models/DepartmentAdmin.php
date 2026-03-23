@@ -8,7 +8,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Laravel\Sanctum\HasApiTokens;
 
 /**
- * Department admin — exactly one per department, has login credentials.
+ * Department admin account (default seeded account + optional assigned employee account).
  * LOCAL LMS_DB only. Used for login (no users table).
  */
 class DepartmentAdmin extends Model implements AuthenticatableContract
@@ -19,6 +19,7 @@ class DepartmentAdmin extends Model implements AuthenticatableContract
 
     protected $fillable = [
         'department_id',
+        'is_default_account',
         'employee_control_no',
         'full_name',
         'username',
@@ -34,6 +35,7 @@ class DepartmentAdmin extends Model implements AuthenticatableContract
     {
         return [
             'password' => 'hashed',
+            'is_default_account' => 'boolean',
             'must_change_password' => 'boolean',
         ];
     }
@@ -41,11 +43,6 @@ class DepartmentAdmin extends Model implements AuthenticatableContract
     public function department(): BelongsTo
     {
         return $this->belongsTo(Department::class);
-    }
-
-    public function employee(): BelongsTo
-    {
-        return $this->belongsTo(Employee::class, 'employee_control_no', 'control_no');
     }
 
     public function getAuthIdentifierName(): string

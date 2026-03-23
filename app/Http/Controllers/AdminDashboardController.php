@@ -3,8 +3,8 @@
 namespace App\Http\Controllers;
 
 use App\Models\DepartmentAdmin;
-use App\Models\Employee;
 use App\Models\HRAccount;
+use App\Models\HrisEmployee;
 use App\Models\LeaveApplication;
 use App\Models\LeaveApplicationLog;
 use App\Models\LeaveBalance;
@@ -39,13 +39,16 @@ class AdminDashboardController extends Controller
 
         $admin->loadMissing('department');
         $deptName = $admin->department?->name;
+        $departmentEmployeeControlNos = $this->departmentEmployeeControlNoCandidates($deptName);
 
-        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin', 'employee', 'logs'])
-            ->where(function ($query) use ($deptName, $admin) {
+        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin', 'logs'])
+            ->where(function ($query) use ($departmentEmployeeControlNos, $admin) {
                 // Include employee leaves for this department (matched by office)
-                $query->whereIn('employee_control_no', function ($q) use ($deptName) {
-                    $q->select('control_no')->from('tblEmployees')->where('office', $deptName);
-                })
+                $query->when(
+                    $departmentEmployeeControlNos !== [],
+                    fn($nestedQuery) => $nestedQuery->whereIn('employee_control_no', $departmentEmployeeControlNos),
+                    fn($nestedQuery) => $nestedQuery->whereRaw('1 = 0')
+                )
                     // OR admin self-apply leaves for this department
                     ->orWhereHas('applicantAdmin', fn($q) => $q->where('department_id', $admin->department_id));
             })
@@ -69,16 +72,10 @@ class AdminDashboardController extends Controller
         ]);
         $totalApproved = $totalApprovedApps->count();
 
-        $employeesByControlNo = Employee::query()
-            ->when($deptName, fn($query) => $query->where('office', $deptName))
-            ->get(['control_no', 'status', 'surname', 'firstname', 'middlename', 'office', 'designation', 'rate_mon'])
-            ->mapWithKeys(fn(Employee $employee) => [
-                $this->normalizeControlNo($employee->control_no) => $employee,
-            ])
-            ->all();
+        $employeesByControlNo = $this->loadDepartmentEmployeesByControlNo($deptName);
 
         $employeeStatusByControlNo = collect($employeesByControlNo)
-            ->map(fn(Employee $employee) => $employee->status)
+            ->map(fn(object $employee) => $employee->status ?? null)
             ->all();
 
         $actorDirectory = $this->buildActorDirectory($applications, $employeesByControlNo);
@@ -357,8 +354,8 @@ class AdminDashboardController extends Controller
         }
 
         $admin->loadMissing('department');
-        $employee = Employee::findByControlNo($employeeControlNo);
-        if (!$employee || $employee->office !== $admin->department?->name) {
+        $employee = HrisEmployee::findByControlNo($employeeControlNo);
+        if (!$employee || !$this->sameOffice($employee->office ?? null, $admin->department?->name)) {
             return response()->json(['message' => 'Employee not found in your department.'], 404);
         }
 
@@ -368,10 +365,11 @@ class AdminDashboardController extends Controller
         }
 
         if (!$leaveType->allowsEmploymentStatus($employee->status)) {
+            $employeeName = $this->formatEmployeeFullName($employee);
             return response()->json([
-                'message' => "{$leaveType->name} is not available for {$employee->full_name}.",
+                'message' => "{$leaveType->name} is not available for {$employeeName}.",
                 'errors' => [
-                    'leave_type_id' => ["{$leaveType->name} is not available for {$employee->full_name}."],
+                    'leave_type_id' => ["{$leaveType->name} is not available for {$employeeName}."],
                 ],
             ], 422);
         }
@@ -1100,13 +1098,9 @@ class AdminDashboardController extends Controller
 
     private function employmentStatusToBucket(LeaveApplication $application, array $employeeStatusByControlNo): ?string
     {
-        $employeeStatus = $application->employee?->status;
-
-        if ($employeeStatus === null) {
-            $rawControlNo = $application->employee_control_no;
-            $normalizedControlNo = $this->normalizeControlNo($rawControlNo);
-            $employeeStatus = $employeeStatusByControlNo[$normalizedControlNo] ?? null;
-        }
+        $rawControlNo = $application->employee_control_no;
+        $normalizedControlNo = $this->normalizeControlNo($rawControlNo);
+        $employeeStatus = $employeeStatusByControlNo[$normalizedControlNo] ?? null;
 
         $rawStatus = strtoupper(trim((string) ($employeeStatus ?? '')));
         if ($rawStatus === '') {
@@ -1128,6 +1122,62 @@ class AdminDashboardController extends Controller
         return $normalized === '' ? '0' : $normalized;
     }
 
+    /**
+     * @return array<int, string>
+     */
+    private function departmentEmployeeControlNoCandidates(?string $departmentName): array
+    {
+        $departmentControlNos = HrisEmployee::controlNosByOffice($departmentName);
+        if ($departmentControlNos === []) {
+            return [];
+        }
+
+        return collect($departmentControlNos)
+            ->flatMap(fn (string $controlNo): array => $this->buildControlNoCandidates($controlNo))
+            ->filter(fn (string $controlNo): bool => $controlNo !== '')
+            ->unique()
+            ->values()
+            ->all();
+    }
+
+    /**
+     * @return array<string, object>
+     */
+    private function loadDepartmentEmployeesByControlNo(?string $departmentName): array
+    {
+        $directory = [];
+        $employees = HrisEmployee::allByOffice($departmentName);
+
+        foreach ($employees as $employee) {
+            if (!is_object($employee)) {
+                continue;
+            }
+
+            $controlNo = trim((string) ($employee->control_no ?? ''));
+            if ($controlNo === '') {
+                continue;
+            }
+
+            $directory[$this->normalizeControlNo($controlNo)] = $employee;
+        }
+
+        return $directory;
+    }
+
+    private function sameOffice(mixed $left, mixed $right): bool
+    {
+        $leftOffice = $this->normalizeOffice($left);
+        $rightOffice = $this->normalizeOffice($right);
+
+        return $leftOffice !== '' && $leftOffice === $rightOffice;
+    }
+
+    private function normalizeOffice(mixed $value): string
+    {
+        $normalized = preg_replace('/\s+/', ' ', trim((string) $value));
+        return strtoupper($normalized ?? '');
+    }
+
     private function formatApplication(
         LeaveApplication $app,
         array $employeesByControlNo = [],
@@ -1143,10 +1193,13 @@ class AdminDashboardController extends Controller
             LeaveApplication::STATUS_RECALLED => 'Recalled',
         ];
 
-        $employee = $app->employee;
-        if (!$employee) {
-            $rawControlNo = $app->employee_control_no;
+        $employee = null;
+        $rawControlNo = trim((string) ($app->employee_control_no ?? ''));
+        if ($rawControlNo !== '') {
             $employee = $employeesByControlNo[$this->normalizeControlNo($rawControlNo)] ?? null;
+            if (!$employee) {
+                $employee = HrisEmployee::findByControlNo($rawControlNo);
+            }
         }
 
         // Determine employee name & office (could be admin self-apply)
@@ -1358,8 +1411,12 @@ class AdminDashboardController extends Controller
         ];
     }
 
-    private function formatEmployeeFullName(Employee $employee): string
+    private function formatEmployeeFullName(?object $employee): string
     {
+        if (!$employee) {
+            return '';
+        }
+
         return trim(implode(' ', array_filter([
             trim((string) ($employee->firstname ?? '')),
             trim((string) ($employee->middlename ?? '')),
@@ -1423,7 +1480,7 @@ class AdminDashboardController extends Controller
                 ->all();
 
         $employeeNamesByControlNo = collect($employeesByControlNo)
-            ->mapWithKeys(function (Employee $employee, string $normalizedControlNo) {
+            ->mapWithKeys(function (object $employee, string $normalizedControlNo) {
                 $name = $this->formatEmployeeFullName($employee);
                 return [$normalizedControlNo => $name !== '' ? $name : null];
             })
@@ -1439,7 +1496,7 @@ class AdminDashboardController extends Controller
     private function buildLeaveBalanceDirectory(Collection $applications, array $employeesByControlNo): array
     {
         $employeeControlNos = collect($employeesByControlNo)
-            ->map(fn(Employee $employee) => trim((string) $employee->control_no))
+            ->map(fn(object $employee) => trim((string) ($employee->control_no ?? '')))
             ->filter(fn(string $controlNo) => $controlNo !== '')
             ->unique()
             ->values();
@@ -1669,7 +1726,7 @@ class AdminDashboardController extends Controller
             return null;
         }
 
-        $employee = Employee::findByControlNo($rawControlNo);
+        $employee = HrisEmployee::findByControlNo($rawControlNo);
         if ($employee) {
             return trim((string) $employee->control_no);
         }
@@ -1677,16 +1734,14 @@ class AdminDashboardController extends Controller
         return $rawControlNo;
     }
 
-    private function resolveAdminEmployee(DepartmentAdmin $admin): ?Employee
+    private function resolveAdminEmployee(DepartmentAdmin $admin): ?object
     {
         $employeeControlNo = $this->resolveAdminEmployeeControlNo($admin);
         if ($employeeControlNo === null) {
             return null;
         }
 
-        return Employee::query()
-            ->matchingControlNo($employeeControlNo)
-            ->first();
+        return HrisEmployee::findByControlNo($employeeControlNo);
     }
 
     /**
@@ -1734,7 +1789,7 @@ class AdminDashboardController extends Controller
             return null;
         }
 
-        $employee = Employee::findByControlNo($controlNo);
+        $employee = HrisEmployee::findByControlNo($controlNo);
         if ($employee) {
             return trim((string) $employee->control_no);
         }

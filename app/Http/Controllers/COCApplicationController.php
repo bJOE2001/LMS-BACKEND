@@ -5,8 +5,8 @@ namespace App\Http\Controllers;
 use App\Models\COCApplication;
 use App\Models\COCApplicationRow;
 use App\Models\DepartmentAdmin;
-use App\Models\Employee;
 use App\Models\HRAccount;
+use App\Models\HrisEmployee;
 use App\Models\LeaveBalance;
 use App\Models\LeaveType;
 use Illuminate\Http\JsonResponse;
@@ -32,7 +32,7 @@ class COCApplicationController extends Controller
             return response()->json(['message' => 'The employee_control_no query parameter is required.'], 422);
         }
 
-        $employee = Employee::findByControlNo($controlNo);
+        $employee = HrisEmployee::findByControlNo($controlNo);
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
         }
@@ -45,7 +45,7 @@ class COCApplicationController extends Controller
         }
 
         $applications = COCApplication::query()
-            ->with(['rows', 'employee', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
+            ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
             ->matchingControlNo($controlNo)
             ->orderByDesc('created_at')
             ->get();
@@ -74,7 +74,7 @@ class COCApplicationController extends Controller
             'total_no_of_coc_applied_minutes' => ['nullable', 'integer', 'min:1', 'max:144000'],
         ]);
 
-        $employee = Employee::findByControlNo($this->resolveValidatedEmployeeControlNo($validated));
+        $employee = HrisEmployee::findByControlNo($this->resolveValidatedEmployeeControlNo($validated));
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
         }
@@ -141,7 +141,7 @@ class COCApplicationController extends Controller
             return $app;
         });
 
-        $application->load(['rows', 'employee', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType']);
+        $application->load(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType']);
 
         return response()->json([
             'message' => 'COC application submitted successfully.',
@@ -169,7 +169,7 @@ class COCApplicationController extends Controller
         $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
 
         $applications = $this->departmentScope($admin)
-            ->with(['rows', 'employee', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
+            ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
             ->when($controlNo !== '', function ($q) use ($controlNo): void {
                 $q->matchingControlNo($controlNo);
             })
@@ -218,7 +218,7 @@ class COCApplicationController extends Controller
             return $this->handleRuntimeException($exception);
         }
 
-        $app = COCApplication::query()->with(['rows', 'employee', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])->find($id);
+        $app = COCApplication::query()->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])->find($id);
 
         return response()->json([
             'message' => 'COC application approved and forwarded to HR.',
@@ -261,7 +261,7 @@ class COCApplicationController extends Controller
             return $this->handleRuntimeException($exception);
         }
 
-        $app = COCApplication::query()->with(['rows', 'employee', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])->find($id);
+        $app = COCApplication::query()->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])->find($id);
 
         return response()->json([
             'message' => 'COC application rejected by department admin.',
@@ -289,7 +289,7 @@ class COCApplicationController extends Controller
         $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
 
         $applications = COCApplication::query()
-            ->with(['rows', 'employee', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
+            ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
             ->when($controlNo !== '', function ($q) use ($controlNo): void {
                 $q->matchingControlNo($controlNo);
             })
@@ -322,7 +322,7 @@ class COCApplicationController extends Controller
                 if ($app->status !== COCApplication::STATUS_PENDING) throw new RuntimeException('ALREADY_REVIEWED');
                 if ($app->admin_reviewed_at === null) throw new RuntimeException('PENDING_ADMIN_REVIEW');
 
-                $employee = Employee::findByControlNo((string) $app->employee_control_no);
+                $employee = HrisEmployee::findByControlNo((string) $app->employee_control_no);
                 if (!$employee) throw new RuntimeException('EMPLOYEE_NOT_FOUND');
 
                 $ctoLeaveType = $this->resolveCTOLeaveType();
@@ -366,7 +366,7 @@ class COCApplicationController extends Controller
             return $this->handleRuntimeException($exception);
         }
 
-        $app = COCApplication::query()->with(['rows', 'employee', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])->find($id);
+        $app = COCApplication::query()->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])->find($id);
 
         return response()->json([
             'message' => 'COC application approved and converted to CTO leave credits.',
@@ -411,7 +411,7 @@ class COCApplicationController extends Controller
             return $this->handleRuntimeException($exception);
         }
 
-        $app = COCApplication::query()->with(['rows', 'employee', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])->find($id);
+        $app = COCApplication::query()->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])->find($id);
 
         return response()->json([
             'message' => 'COC application rejected.',
@@ -446,9 +446,22 @@ class COCApplicationController extends Controller
         $query = COCApplication::query();
         if ($departmentName === '') return $query->whereRaw('1 = 0');
 
-        return $query->whereIn('employee_control_no', function ($q) use ($departmentName): void {
-            $q->select('control_no')->from('tblEmployees')->where('office', $departmentName);
-        });
+        $departmentControlNos = HrisEmployee::controlNosByOffice($departmentName);
+        if ($departmentControlNos === []) {
+            return $query->whereRaw('1 = 0');
+        }
+
+        $candidateControlNos = collect($departmentControlNos)
+            ->flatMap(fn (string $controlNo): array => $this->controlNoCandidates($controlNo))
+            ->unique()
+            ->values()
+            ->all();
+
+        if ($candidateControlNos === []) {
+            return $query->whereRaw('1 = 0');
+        }
+
+        return $query->whereIn('employee_control_no', $candidateControlNos);
     }
 
     private function normalizeStatusFilter(?string $status): ?string
@@ -577,10 +590,11 @@ class COCApplicationController extends Controller
             default => $rawStatus,
         };
 
+        $resolvedEmployee = HrisEmployee::findByControlNo((string) ($app->employee_control_no ?? ''));
         $employeeName = trim((string) ($app->employee_name ?? '')) ?: trim(implode(' ', array_filter([
-            trim((string) ($app->employee?->firstname ?? '')),
-            trim((string) ($app->employee?->middlename ?? '')),
-            trim((string) ($app->employee?->surname ?? '')),
+            trim((string) ($resolvedEmployee?->firstname ?? '')),
+            trim((string) ($resolvedEmployee?->middlename ?? '')),
+            trim((string) ($resolvedEmployee?->surname ?? '')),
         ]))) ?: null;
 
         $remarks = trim((string) ($app->remarks ?? ''));
@@ -594,8 +608,8 @@ class COCApplicationController extends Controller
             'employee_control_no' => (string) $app->employee_control_no,
             'employeeName' => $employeeName,
             'employee_name' => $employeeName,
-            'office' => $app->employee?->office,
-            'department' => $app->employee?->office,
+            'office' => $resolvedEmployee?->office,
+            'department' => $resolvedEmployee?->office,
             'leaveType' => 'COC Application',
             'leave_type_name' => 'COC Application',
             'startDate' => $rowDates[0] ?? null,
@@ -729,5 +743,26 @@ class COCApplicationController extends Controller
     private function normalizeControlNo(mixed $value): string
     {
         return trim((string) ($value ?? ''));
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function controlNoCandidates(string $controlNo): array
+    {
+        $controlNo = trim($controlNo);
+        if ($controlNo === '') {
+            return [];
+        }
+
+        $normalized = ltrim($controlNo, '0');
+        if ($normalized === '') {
+            $normalized = '0';
+        }
+
+        return array_values(array_unique(array_filter([
+            $controlNo,
+            $normalized,
+        ], static fn (string $value): bool => $value !== '')));
     }
 }

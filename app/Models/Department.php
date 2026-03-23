@@ -4,7 +4,6 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\HasOne;
 
 /**
@@ -30,8 +29,4 @@ class Department extends Model
         return $this->hasOne(DepartmentHead::class, 'department_id');
     }
 
-    public function employees(): HasMany
-    {
-        return $this->hasMany(Employee::class, 'department_id');
-    }
 }

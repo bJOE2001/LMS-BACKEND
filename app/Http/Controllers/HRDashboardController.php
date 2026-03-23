@@ -3,8 +3,8 @@
 namespace App\Http\Controllers;
 
 use App\Models\DepartmentAdmin;
-use App\Models\Employee;
 use App\Models\HRAccount;
+use App\Models\HrisEmployee;
 use App\Models\LeaveApplication;
 use App\Models\LeaveApplicationUpdateRequest;
 use App\Models\LeaveBalance;
@@ -27,7 +27,7 @@ class HRDashboardController extends Controller
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
-        $applications = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin.department', 'updateRequests'])
+        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin.department', 'updateRequests'])
             ->orderByDesc('created_at')
             ->get();
 
@@ -73,14 +73,15 @@ class HRDashboardController extends Controller
         ];
 
         // Determine applicant name & office
+        $resolvedEmployee = $this->resolveApplicationEmployee($app);
         $employeeName = trim((string) ($app->employee_name ?? ''));
         if ($employeeName === '') {
-            $employeeName = $app->employee
-                ? trim(($app->employee->firstname ?? '') . ' ' . ($app->employee->surname ?? ''))
+            $employeeName = $resolvedEmployee
+                ? trim(($resolvedEmployee->firstname ?? '') . ' ' . ($resolvedEmployee->surname ?? ''))
                 : null;
         }
         $applicantName = $employeeName ?: ($app->applicantAdmin ? $app->applicantAdmin->full_name : 'Unknown');
-        $office = $app->employee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
+        $office = $resolvedEmployee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
         $durationDays = (float) $app->total_days;
         $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
         $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
@@ -316,8 +317,18 @@ class HRDashboardController extends Controller
             return null;
         }
 
-        $employee = Employee::findByControlNo($rawControlNo);
+        $employee = HrisEmployee::findByControlNo($rawControlNo);
         return trim((string) ($employee?->control_no ?? $rawControlNo));
+    }
+
+    private function resolveApplicationEmployee(LeaveApplication $application): ?object
+    {
+        $controlNo = trim((string) ($application->employee_control_no ?? ''));
+        if ($controlNo === '') {
+            return null;
+        }
+
+        return HrisEmployee::findByControlNo($controlNo);
     }
 
     private function controlNoCandidates(string $controlNo): array
@@ -334,7 +345,7 @@ class HRDashboardController extends Controller
 
         $candidates = [$rawControlNo, $normalizedControlNo];
 
-        $employee = Employee::findByControlNo($rawControlNo);
+        $employee = HrisEmployee::findByControlNo($rawControlNo);
         if ($employee && trim((string) $employee->control_no) !== '') {
             $candidates[] = trim((string) $employee->control_no);
         }
@@ -366,36 +377,56 @@ class HRDashboardController extends Controller
             ->where('end_date', '>=', $monthStart);
 
         if ($dept) {
-            $query->where(function ($q) use ($dept) {
-                $q->whereIn('employee_control_no', function ($sq) use ($dept) {
-                    $sq->select('control_no')->from('tblEmployees')->where('office', $dept);
-                })
+            $departmentControlNos = HrisEmployee::controlNosByOffice((string) $dept);
+            $departmentControlNoCandidates = collect($departmentControlNos)
+                ->flatMap(fn (string $controlNo): array => $this->controlNoCandidates($controlNo))
+                ->filter(fn (string $controlNo): bool => $controlNo !== '')
+                ->unique()
+                ->values()
+                ->all();
+
+            $query->where(function ($q) use ($dept, $departmentControlNoCandidates) {
+                $q->when(
+                    $departmentControlNoCandidates !== [],
+                    fn ($nestedQuery) => $nestedQuery->whereIn('employee_control_no', $departmentControlNoCandidates),
+                    fn ($nestedQuery) => $nestedQuery->whereRaw('1 = 0')
+                )
                     ->orWhereHas('applicantAdmin.department', fn($sq) => $sq->where('name', $dept));
             });
         }
 
         $applications = $query->orderBy('start_date')->get();
 
-        $formatted = $applications->map(fn($app) => [
-            'id' => $app->id,
-            'employeeName' => $app->employee
-                ? trim(($app->employee->firstname ?? '') . ' ' . ($app->employee->surname ?? ''))
-                : ($app->applicantAdmin ? $app->applicantAdmin->full_name : 'Unknown'),
-            'employee_control_no' => $app->employee_control_no,
-            'office' => $app->employee?->office ?? ($app->applicantAdmin?->department?->name ?? ''),
-            'leaveType' => $app->leaveType?->name ?? 'Unknown',
-            'startDate' => $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : '',
-            'endDate' => $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : '',
-            'selected_dates' => $app->resolvedSelectedDates(),
-            'days' => (float) $app->total_days,
-            'duration_value' => (float) $app->total_days,
-            'duration_unit' => 'day',
-            'duration_label' => ((float) $app->total_days == (int) $app->total_days)
-                ? ((int) $app->total_days) . ' ' . ((int) $app->total_days === 1 ? 'day' : 'days')
-                : ((float) $app->total_days) . ' days',
-            'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
-            'status' => 'Approved',
-        ]);
+        $formatted = $applications->map(function ($app): array {
+            $employee = $this->resolveApplicationEmployee($app);
+            $resolvedEmployeeName = trim((string) ($app->employee_name ?? ''));
+            if ($resolvedEmployeeName === '') {
+                $resolvedEmployeeName = $employee
+                    ? trim(($employee->firstname ?? '') . ' ' . ($employee->surname ?? ''))
+                    : '';
+            }
+
+            return [
+                'id' => $app->id,
+                'employeeName' => $resolvedEmployeeName !== ''
+                    ? $resolvedEmployeeName
+                    : ($app->applicantAdmin ? $app->applicantAdmin->full_name : 'Unknown'),
+                'employee_control_no' => $app->employee_control_no,
+                'office' => $employee?->office ?? ($app->applicantAdmin?->department?->name ?? ''),
+                'leaveType' => $app->leaveType?->name ?? 'Unknown',
+                'startDate' => $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : '',
+                'endDate' => $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : '',
+                'selected_dates' => $app->resolvedSelectedDates(),
+                'days' => (float) $app->total_days,
+                'duration_value' => (float) $app->total_days,
+                'duration_unit' => 'day',
+                'duration_label' => ((float) $app->total_days == (int) $app->total_days)
+                    ? ((int) $app->total_days) . ' ' . ((int) $app->total_days === 1 ? 'day' : 'days')
+                    : ((float) $app->total_days) . ' days',
+                'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
+                'status' => 'Approved',
+            ];
+        });
 
         return response()->json(['leaves' => $formatted]);
     }

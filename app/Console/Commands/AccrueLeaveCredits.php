@@ -2,7 +2,7 @@
 
 namespace App\Console\Commands;
 
-use App\Models\Employee;
+use App\Models\HrisEmployee;
 use App\Models\LeaveBalance;
 use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveType;
@@ -18,6 +18,9 @@ use Illuminate\Support\Facades\DB;
  */
 class AccrueLeaveCredits extends Command
 {
+    private const SQL_SERVER_SAFE_PARAMETER_LIMIT = 2000;
+    private const EXCLUDED_ACCRUAL_STATUS_KEYWORDS = ['HONORARIUM', 'CONTRACTUAL'];
+
     protected $signature = 'leave:accrue {--date= : Override accrual date (Y-m-d) for testing}';
 
     protected $description = 'Accrue monthly leave credits for ACCRUED leave types (run on 1st of month)';
@@ -137,10 +140,14 @@ class AccrueLeaveCredits extends Command
         $employees = [];
         $lookup = [];
 
-        $records = Employee::query()->get(['control_no', 'status', 'firstname', 'middlename', 'surname']);
+        $records = HrisEmployee::query(true)->get();
 
         foreach ($records as $employee) {
-            if (! $employee instanceof Employee) {
+            if (!is_object($employee)) {
+                continue;
+            }
+
+            if (! $this->isEmployeeEligibleForAccrual($employee)) {
                 continue;
             }
 
@@ -181,7 +188,13 @@ class AccrueLeaveCredits extends Command
     private function eligibleEmployeeControlNosForType(LeaveType $type, array $employees): array
     {
         return collect($employees)
-            ->filter(fn (array $employee): bool => $type->allowsEmploymentStatus($employee['status'] ?? null))
+            ->filter(function (array $employee) use ($type): bool {
+                if ($this->isExcludedAccrualStatus($employee['status'] ?? null)) {
+                    return false;
+                }
+
+                return $type->allowsEmploymentStatus($employee['status'] ?? null);
+            })
             ->pluck('control_no')
             ->filter(fn (mixed $controlNo): bool => trim((string) $controlNo) !== '')
             ->values()
@@ -202,11 +215,19 @@ class AccrueLeaveCredits extends Command
         }
 
         if (isset($employeeLookup[$rawControlNo])) {
+            if ($this->isExcludedAccrualStatus($employeeLookup[$rawControlNo]['status'] ?? null)) {
+                return false;
+            }
+
             return $type->allowsEmploymentStatus($employeeLookup[$rawControlNo]['status'] ?? null);
         }
 
         $normalizedControlNo = $this->normalizeControlNo($rawControlNo);
         if ($normalizedControlNo !== null && isset($employeeLookup[$normalizedControlNo])) {
+            if ($this->isExcludedAccrualStatus($employeeLookup[$normalizedControlNo]['status'] ?? null)) {
+                return false;
+            }
+
             return $type->allowsEmploymentStatus($employeeLookup[$normalizedControlNo]['status'] ?? null);
         }
 
@@ -262,13 +283,34 @@ class AccrueLeaveCredits extends Command
             return 0;
         }
 
-        LeaveBalance::query()->upsert(
-            $rows,
-            ['employee_control_no', 'leave_type_id'],
-            ['updated_at']
-        );
+        $this->upsertLeaveBalancesInChunks($rows);
 
         return count($rows);
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $rows
+     */
+    private function upsertLeaveBalancesInChunks(array $rows): void
+    {
+        if ($rows === []) {
+            return;
+        }
+
+        $columnsPerRow = count($rows[0]);
+        if ($columnsPerRow <= 0) {
+            return;
+        }
+
+        $chunkSize = max(1, intdiv(self::SQL_SERVER_SAFE_PARAMETER_LIMIT, $columnsPerRow));
+
+        foreach (array_chunk($rows, $chunkSize) as $chunk) {
+            LeaveBalance::query()->upsert(
+                $chunk,
+                ['employee_control_no', 'leave_type_id'],
+                ['updated_at']
+            );
+        }
     }
 
     /**
@@ -294,7 +336,7 @@ class AccrueLeaveCredits extends Command
         return null;
     }
 
-    private function formatEmployeeNameForStorage(Employee $employee): string
+    private function formatEmployeeNameForStorage(object $employee): string
     {
         $surname = trim((string) ($employee->surname ?? ''));
         $firstname = trim((string) ($employee->firstname ?? ''));
@@ -325,5 +367,50 @@ class AccrueLeaveCredits extends Command
 
         $normalized = ltrim($raw, '0');
         return $normalized !== '' ? $normalized : '0';
+    }
+
+    private function isEmployeeEligibleForAccrual(object $employee): bool
+    {
+        if (! $this->isEmployeeActiveForAccrual($employee)) {
+            return false;
+        }
+
+        return ! $this->isExcludedAccrualStatus($employee->status ?? null);
+    }
+
+    private function isEmployeeActiveForAccrual(object $employee): bool
+    {
+        $isActive = $employee->is_active ?? null;
+        if (is_bool($isActive)) {
+            return $isActive;
+        }
+
+        if (is_numeric($isActive)) {
+            return (int) $isActive === 1;
+        }
+
+        $activityStatus = strtoupper(trim((string) ($employee->activity_status ?? '')));
+        if ($activityStatus !== '') {
+            return $activityStatus === 'ACTIVE';
+        }
+
+        // Query already requests active records; default to true when fields are missing.
+        return true;
+    }
+
+    private function isExcludedAccrualStatus(mixed $status): bool
+    {
+        $normalizedStatus = strtoupper(trim((string) ($status ?? '')));
+        if ($normalizedStatus === '') {
+            return false;
+        }
+
+        foreach (self::EXCLUDED_ACCRUAL_STATUS_KEYWORDS as $keyword) {
+            if (str_contains($normalizedStatus, $keyword)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 }

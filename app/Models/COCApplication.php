@@ -71,26 +71,13 @@ class COCApplication extends Model
 
     public static function resolveSnapshotEmployeeName(self $application): ?string
     {
-        $employee = $application->employee;
-        if ($employee instanceof Employee) {
-            $employeeName = trim(implode(' ', array_filter([
-                trim((string) ($employee->firstname ?? '')),
-                trim((string) ($employee->middlename ?? '')),
-                trim((string) ($employee->surname ?? '')),
-            ])));
-
-            if ($employeeName !== '') {
-                return $employeeName;
-            }
-        }
-
         $rawControlNo = trim((string) ($application->employee_control_no ?? ''));
         if ($rawControlNo === '') {
             return null;
         }
 
-        $resolvedEmployee = Employee::findByControlNo($rawControlNo);
-        if (!$resolvedEmployee instanceof Employee) {
+        $resolvedEmployee = HrisEmployee::findByControlNo($rawControlNo);
+        if (!is_object($resolvedEmployee)) {
             return null;
         }
 
@@ -101,11 +88,6 @@ class COCApplication extends Model
         ])));
 
         return $employeeName !== '' ? $employeeName : null;
-    }
-
-    public function employee(): BelongsTo
-    {
-        return $this->belongsTo(Employee::class, 'employee_control_no', 'control_no');
     }
 
     public function rows(): HasMany

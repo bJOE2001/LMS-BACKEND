@@ -2,8 +2,8 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\Employee;
 use App\Models\HRAccount;
+use App\Models\HrisEmployee;
 use App\Models\LeaveBalance;
 use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveType;
@@ -13,7 +13,7 @@ use Illuminate\Support\Facades\DB;
 
 /**
  * HR-only: manage employee leave balances.
- * LOCAL LMS_DB only. No connection to pmis2003 or BIOASD.
+ * Writes stay in LMS_DB; employee validation/lookup reads HRIS.
  */
 class HRLeaveBalanceImportController extends Controller
 {
@@ -28,7 +28,7 @@ class HRLeaveBalanceImportController extends Controller
         }
 
         $validated = $request->validate([
-            'employee_control_no' => ['required', 'string', 'max:50', 'regex:/^\d+$/', 'exists:tblEmployees,control_no'],
+            'employee_control_no' => ['required', 'string', 'max:50', 'regex:/^\d+$/'],
             'leave_type_id' => ['nullable', 'integer', 'exists:tblLeaveTypes,id'],
             'balance' => ['nullable', 'numeric', 'min:0'],
             'balances' => ['required', 'array', 'min:1'],
@@ -142,7 +142,7 @@ class HRLeaveBalanceImportController extends Controller
             ], 422);
         }
 
-        $employee = Employee::findByControlNo($employeeControlNo);
+        $employee = HrisEmployee::findByControlNo($employeeControlNo);
         if (!$employee) {
             return response()->json(['message' => 'Employee not found.'], 422);
         }
@@ -176,11 +176,7 @@ class HRLeaveBalanceImportController extends Controller
             $manualCreditSource
         ): array {
             $recordedAt = now();
-            $lockedEmployee = Employee::query()
-                ->matchingControlNo($employee->control_no)
-                ->lockForUpdate()
-                ->first();
-            $canonicalControlNo = trim((string) ($lockedEmployee?->control_no ?? $employee->control_no));
+            $canonicalControlNo = trim((string) ($employee->control_no ?? ''));
             if ($canonicalControlNo === '') {
                 return [
                     'success' => false,
@@ -201,7 +197,7 @@ class HRLeaveBalanceImportController extends Controller
                 if (!$leaveType instanceof LeaveType) {
                     continue;
                 }
-                $resolvedEmployeeName = $this->formatEmployeeNameForStorage($lockedEmployee ?? $employee);
+                $resolvedEmployeeName = $this->formatEmployeeNameForStorage($employee);
                 $resolvedLeaveTypeName = trim((string) ($leaveType->name ?? ''));
 
                 $existing = LeaveBalance::query()
@@ -412,7 +408,7 @@ class HRLeaveBalanceImportController extends Controller
         ]);
     }
 
-    private function formatEmployeeNameForStorage(Employee $employee): string
+    private function formatEmployeeNameForStorage(object $employee): string
     {
         $surname = trim((string) ($employee->surname ?? ''));
         $firstname = trim((string) ($employee->firstname ?? ''));

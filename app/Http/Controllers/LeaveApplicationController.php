@@ -4,8 +4,8 @@ namespace App\Http\Controllers;
 
 use App\Models\COCApplication;
 use App\Models\DepartmentAdmin;
-use App\Models\Employee;
 use App\Models\HRAccount;
+use App\Models\HrisEmployee;
 use App\Models\LeaveApplication;
 use App\Models\LeaveApplicationLog;
 use App\Models\LeaveApplicationUpdateRequest;
@@ -16,6 +16,7 @@ use App\Models\Notification;
 
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 
@@ -25,7 +26,7 @@ use Illuminate\Support\Facades\Storage;
  * Flow: Employee submits → Admin approves/rejects → HR approves/rejects.
  * On HR approval, credit-based leave balances are deducted.
  * This system uses ERMS ControlNo as the authoritative employee identifier.
- * Employee records are resolved from LMS tblEmployees.
+ * Employee records are resolved from HRIS (xPersonal + vwpartitionforseparated).
  */
 class LeaveApplicationController extends Controller
 {
@@ -42,7 +43,7 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Only employee accounts can list their leave applications.'], 403);
         }
 
-        $applications = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin.department', 'updateRequests'])
+        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin.department', 'updateRequests'])
             ->where(fn($query) => $this->applyApplicationOwnershipFilter($query, (string) $controlNo))
             ->orderByDesc('created_at')
             ->get();
@@ -67,7 +68,7 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Only employee accounts can access this endpoint.'], 403);
         }
 
-        $employee = Employee::findByControlNo($controlNo);
+        $employee = $this->findEmployeeByControlNo((string) $controlNo);
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
         }
@@ -271,7 +272,7 @@ class LeaveApplicationController extends Controller
         }
 
         $applications = LeaveApplication::query()
-            ->with(['leaveType', 'employee', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
             ->where(fn($query) => $this->applyApplicationOwnershipFilter($query, $controlNo))
             ->orderByDesc('created_at')
             ->get();
@@ -631,7 +632,7 @@ class LeaveApplicationController extends Controller
             );
         }
 
-        $application = $app->fresh(['leaveType', 'employee', 'applicantAdmin.department', 'logs']);
+        $application = $app->fresh(['leaveType', 'applicantAdmin.department', 'logs']);
         $actorDirectory = $this->buildWorkflowActorDirectory([$application]);
 
         return response()->json([
@@ -915,7 +916,7 @@ class LeaveApplicationController extends Controller
             'message' => $isApprovedApplication
                 ? 'Leave update request submitted and forwarded to HR for approval.'
                 : 'Leave edit request submitted successfully.',
-            'application' => $this->formatApplication($app->fresh(['leaveType', 'employee', 'applicantAdmin.department'])),
+            'application' => $this->formatApplication($app->fresh(['leaveType', 'applicantAdmin.department'])),
         ]);
     }
 
@@ -936,7 +937,7 @@ class LeaveApplicationController extends Controller
         ]);
 
         // This system uses ERMS ControlNo as the authoritative employee identifier.
-        // Employee records are resolved from LMS tblEmployees.
+        // Employee records are resolved from HRIS (xPersonal + vwpartitionforseparated).
         $employee = $this->findEmployeeByControlNo($this->resolveValidatedEmployeeControlNo($baseValidated));
 
         if (!$employee) {
@@ -1293,13 +1294,15 @@ class LeaveApplicationController extends Controller
         }
 
         $deptName = $admin->department?->name;
-        $applications = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin.department', 'updateRequests'])
+        $departmentEmployeeControlNos = $this->findDepartmentEmployeeControlNos($deptName, null);
+
+        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin.department', 'updateRequests'])
             ->where('status', LeaveApplication::STATUS_PENDING_ADMIN)
-            ->whereIn('employee_control_no', function ($query) use ($deptName) {
-                $query->select('control_no')
-                ->from('tblEmployees')
-                ->where('office', $deptName);
-            })
+            ->when(
+                $departmentEmployeeControlNos !== [],
+                fn ($query) => $query->whereIn('employee_control_no', $departmentEmployeeControlNos),
+                fn ($query) => $query->whereRaw('1 = 0')
+            )
             ->orderByDesc('created_at')
             ->get();
 
@@ -1379,7 +1382,7 @@ class LeaveApplicationController extends Controller
         });
 
         // Notify the employee that admin approved
-        $app->load(['leaveType', 'employee']);
+        $app->load(['leaveType']);
         $isMonetization = (bool) $app->is_monetization;
         $actionLabel = $isMonetization ? 'monetization request' : 'leave application';
         $titleLabel = $isMonetization ? 'Monetization' : 'Leave';
@@ -1480,7 +1483,7 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
-        $applications = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin.department', 'updateRequests'])
+        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin.department', 'updateRequests'])
             ->where('status', LeaveApplication::STATUS_PENDING_HR)
             ->orderByDesc('created_at')
             ->get();
@@ -1804,7 +1807,7 @@ class LeaveApplicationController extends Controller
 
         return response()->json([
             'message' => 'Application approved by HR.',
-            'application' => $this->formatApplication($app->fresh(['leaveType', 'employee', 'applicantAdmin'])),
+            'application' => $this->formatApplication($app->fresh(['leaveType', 'applicantAdmin'])),
         ]);
     }
 
@@ -2017,7 +2020,7 @@ class LeaveApplicationController extends Controller
 
         return response()->json([
             'message' => 'Application recalled by HR.',
-            'application' => $this->formatApplication($app->fresh(['leaveType', 'employee', 'applicantAdmin'])),
+            'application' => $this->formatApplication($app->fresh(['leaveType', 'applicantAdmin'])),
         ]);
     }
 
@@ -2036,28 +2039,39 @@ class LeaveApplicationController extends Controller
 
         $admin->loadMissing('department');
         $deptName = $admin->department?->name;
+        $hrisEmployees = HrisEmployee::allByOffice($deptName, null);
+        $leaveBalanceLookup = $this->buildLeaveBalanceLookupForEmployees($hrisEmployees);
 
-        $employees = Employee::where('office', $deptName)
-            ->with(['leaveBalances.leaveType'])
-            ->orderBy('surname')
-            ->get()
-            ->map(fn($emp) => [
-                'control_no' => $emp->control_no,
-                'full_name' => $emp->full_name,
-                'firstname' => $emp->firstname,
-                'surname' => $emp->surname,
-                'status' => $this->formatEmploymentStatusLabel($emp->status),
-                'raw_status' => $this->trimNullableString($emp->status),
-                'employment_status_key' => $this->resolveEmploymentStatusKey($emp->status),
-                'designation' => $emp->designation,
-                'office' => $emp->office,
-                'salary' => $emp->rate_mon !== null ? (float) $emp->rate_mon : null,
-                'leave_balances' => $emp->leaveBalances->map(fn($lb) => [
-                    'leave_type_id' => $lb->leave_type_id,
-                    'leave_type_name' => trim((string) ($lb->leave_type_name ?? $lb->leaveType?->name ?? '')),
-                    'balance' => (float) $lb->balance,
-                ]),
-            ]);
+        $employees = $hrisEmployees->map(function ($employee) use ($leaveBalanceLookup): array {
+            $controlNo = trim((string) ($employee->control_no ?? ''));
+            $fullName = trim(implode(' ', array_filter([
+                trim((string) ($employee->firstname ?? '')),
+                trim((string) ($employee->middlename ?? '')),
+                trim((string) ($employee->surname ?? '')),
+            ])));
+            $normalizedControlNo = $this->normalizeControlNo($controlNo);
+            $leaveBalances = $leaveBalanceLookup[$normalizedControlNo] ?? [];
+
+            return [
+                'control_no' => $controlNo,
+                'full_name' => $fullName,
+                'firstname' => $employee->firstname ?? null,
+                'surname' => $employee->surname ?? null,
+                'status' => $this->formatEmploymentStatusLabel($employee->status ?? null),
+                'raw_status' => $this->trimNullableString($employee->status ?? null),
+                'employment_status_key' => $this->resolveEmploymentStatusKey($employee->status ?? null),
+                'activity_status' => strtoupper(trim((string) ($employee->activity_status ?? 'INACTIVE'))),
+                'is_active' => (bool) ($employee->is_active ?? false),
+                'designation' => $employee->designation ?? null,
+                'office' => $employee->office ?? null,
+                'salary' => $employee->rate_mon !== null ? (float) $employee->rate_mon : null,
+                'leave_balances' => collect($leaveBalances)->map(fn (LeaveBalance $leaveBalance) => [
+                    'leave_type_id' => $leaveBalance->leave_type_id,
+                    'leave_type_name' => trim((string) ($leaveBalance->leave_type_name ?? $leaveBalance->leaveType?->name ?? '')),
+                    'balance' => (float) $leaveBalance->balance,
+                ])->values(),
+            ];
+        })->values();
 
         $leaveTypes = LeaveType::orderBy('name')->get()->map(fn($lt) => [
             'id' => $lt->id,
@@ -2098,7 +2112,7 @@ class LeaveApplicationController extends Controller
         }
 
         $validated = $request->validate([
-            'employee_control_no' => ['required', 'string', 'exists:tblEmployees,control_no'],
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
             'start_date' => ['required', 'date'],
             'end_date' => ['required', 'date', 'after_or_equal:start_date'],
@@ -2190,8 +2204,15 @@ class LeaveApplicationController extends Controller
 
         // Verify the employee belongs to the admin's department (by office name)
         $admin->loadMissing('department');
-        $employee = Employee::findByControlNo($validated['employee_control_no']);
-        if (!$employee || $employee->office !== $admin->department?->name) {
+        $employee = $this->findEmployeeByControlNo((string) $validated['employee_control_no']);
+        if (!$employee) {
+            return response()->json([
+                'message' => 'Employee not found in HRIS.',
+                'errors' => ['employee_control_no' => ['Selected employee was not found in HRIS.']],
+            ], 422);
+        }
+
+        if (!$this->sameOffice($employee->office ?? null, $admin->department?->name)) {
             return response()->json(['message' => 'You can only file leave for employees in your department.'], 403);
         }
 
@@ -2314,7 +2335,7 @@ class LeaveApplicationController extends Controller
     private function adminStoreMonetization(Request $request, DepartmentAdmin $admin): JsonResponse
     {
         $validated = $request->validate([
-            'employee_control_no' => ['required', 'string', 'exists:tblEmployees,control_no'],
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
             'total_days' => ['required', 'numeric', 'min:1', 'max:999'],
             'reason' => ['nullable', 'string', 'max:2000'],
@@ -2322,8 +2343,15 @@ class LeaveApplicationController extends Controller
         ]);
 
         $admin->loadMissing('department');
-        $employee = Employee::findByControlNo($validated['employee_control_no']);
-        if (!$employee || $employee->office !== $admin->department?->name) {
+        $employee = $this->findEmployeeByControlNo((string) $validated['employee_control_no']);
+        if (!$employee) {
+            return response()->json([
+                'message' => 'Employee not found in HRIS.',
+                'errors' => ['employee_control_no' => ['Selected employee was not found in HRIS.']],
+            ], 422);
+        }
+
+        if (!$this->sameOffice($employee->office ?? null, $admin->department?->name)) {
             return response()->json(['message' => 'You can only file for employees in your department.'], 403);
         }
 
@@ -2471,7 +2499,77 @@ class LeaveApplicationController extends Controller
             return null;
         }
 
-        return Employee::findByControlNo($controlNo);
+        return HrisEmployee::findByControlNo($controlNo);
+    }
+
+    private function findDepartmentEmployeeControlNos(?string $departmentName, ?bool $activeOnly = null): array
+    {
+        return HrisEmployee::controlNosByOffice($departmentName, $activeOnly);
+    }
+
+    /**
+     * @param Collection<int, object> $hrisEmployees
+     * @return array<string, array<int, LeaveBalance>>
+     */
+    private function buildLeaveBalanceLookupForEmployees(Collection $hrisEmployees): array
+    {
+        if ($hrisEmployees->isEmpty()) {
+            return [];
+        }
+
+        $candidateControlNos = $hrisEmployees
+            ->map(static fn (object $employee): string => trim((string) ($employee->control_no ?? '')))
+            ->filter(static fn (string $controlNo): bool => $controlNo !== '')
+            ->flatMap(fn (string $controlNo): array => array_values(array_unique([
+                $controlNo,
+                $this->normalizeControlNo($controlNo),
+            ])))
+            ->filter(static fn (string $controlNo): bool => $controlNo !== '')
+            ->unique()
+            ->values()
+            ->all();
+
+        if ($candidateControlNos === []) {
+            return [];
+        }
+
+        $balances = LeaveBalance::query()
+            ->with('leaveType')
+            ->whereIn('employee_control_no', $candidateControlNos)
+            ->get();
+
+        $lookup = [];
+        foreach ($balances as $balance) {
+            if (!$balance instanceof LeaveBalance) {
+                continue;
+            }
+
+            $normalizedControlNo = $this->normalizeControlNo((string) ($balance->employee_control_no ?? ''));
+            if ($normalizedControlNo === '') {
+                continue;
+            }
+
+            if (!isset($lookup[$normalizedControlNo])) {
+                $lookup[$normalizedControlNo] = [];
+            }
+
+            $lookup[$normalizedControlNo][] = $balance;
+        }
+
+        return $lookup;
+    }
+
+    private function sameOffice(mixed $left, mixed $right): bool
+    {
+        $leftOffice = $this->normalizeOffice($left);
+        $rightOffice = $this->normalizeOffice($right);
+
+        return $leftOffice !== '' && $leftOffice === $rightOffice;
+    }
+
+    private function normalizeOffice(mixed $value): string
+    {
+        return strtoupper(trim((string) ($value ?? '')));
     }
 
     private function controlNoCandidates(string $controlNo): array
@@ -2499,10 +2597,6 @@ class LeaveApplicationController extends Controller
 
     private function resolveApplicationEmployee(LeaveApplication $app): ?object
     {
-        if ($app->employee) {
-            return $app->employee;
-        }
-
         if ($app->employee_control_no === null) {
             return null;
         }
@@ -2542,7 +2636,7 @@ class LeaveApplicationController extends Controller
             return null;
         }
 
-        $employee = Employee::findByControlNo($rawControlNo);
+        $employee = $this->findEmployeeByControlNo($rawControlNo);
         return trim((string) ($employee?->control_no ?? $rawControlNo));
     }
 
@@ -4028,7 +4122,7 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
-        $app = $app->fresh(['leaveType', 'employee', 'applicantAdmin']);
+        $app = $app->fresh(['leaveType', 'applicantAdmin']);
 
         return response()->json([
             'message' => 'Leave update request approved by HR and changes were applied.',
@@ -4071,7 +4165,7 @@ class LeaveApplicationController extends Controller
             ]);
         });
 
-        $app = $app->fresh(['leaveType', 'employee', 'applicantAdmin']);
+        $app = $app->fresh(['leaveType', 'applicantAdmin']);
 
         return response()->json([
             'message' => 'Leave update request rejected by HR. Original approved application remains unchanged.',
@@ -4484,7 +4578,7 @@ class LeaveApplicationController extends Controller
         $balance->increment('balance', $normalizedDaysToAdd);
     }
 
-    private function formatEmployeeNameForBalance(?Employee $employee): ?string
+    private function formatEmployeeNameForBalance(?object $employee): ?string
     {
         if (!$employee) {
             return null;
@@ -6603,8 +6697,3 @@ class LeaveApplicationController extends Controller
         }
     }
 }
-
-
-
-
-

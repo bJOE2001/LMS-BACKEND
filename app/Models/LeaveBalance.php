@@ -35,11 +35,6 @@ class LeaveBalance extends Model
 
     // ─── Relationships ───────────────────────────────────────────────
 
-    public function employee(): BelongsTo
-    {
-        return $this->belongsTo(Employee::class, 'employee_control_no', 'control_no');
-    }
-
     public function leaveType(): BelongsTo
     {
         return $this->belongsTo(LeaveType::class);

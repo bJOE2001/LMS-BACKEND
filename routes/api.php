@@ -6,6 +6,7 @@ use App\Http\Controllers\Auth\AuthController;
 use App\Http\Controllers\Auth\PasswordResetController;
 use App\Http\Controllers\EmployeeController;
 use App\Http\Controllers\HRDashboardController;
+use App\Http\Controllers\HRDepartmentLibraryController;
 use App\Http\Controllers\HRLeaveBalanceImportController;
 use App\Http\Controllers\HRLeaveTypeController;
 use App\Http\Controllers\HRReportController;
@@ -127,10 +128,18 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
 
         // User management
         Route::get('/user-management/department-admins', [HRUserManagementController::class, 'index']);
+        Route::get('/user-management/eligible-employees', [HRUserManagementController::class, 'eligibleEmployees']);
         Route::get('/user-management/departments/{departmentId}/eligible-employees', [HRUserManagementController::class, 'eligibleEmployees']);
         Route::post('/user-management/department-admins', [HRUserManagementController::class, 'store']);
         Route::put('/user-management/department-admins/{id}', [HRUserManagementController::class, 'update']);
         Route::delete('/user-management/department-admins/{id}', [HRUserManagementController::class, 'destroy']);
+
+        Route::prefix('departments')->group(function () {
+            Route::get('/', [HRDepartmentLibraryController::class, 'index']);
+            Route::post('/', [HRDepartmentLibraryController::class, 'store']);
+            Route::put('/{id}', [HRDepartmentLibraryController::class, 'update']);
+            Route::delete('/{id}', [HRDepartmentLibraryController::class, 'destroy']);
+        });
 
         Route::prefix('leave-types')->group(function () {
             Route::get('/', [HRLeaveTypeController::class, 'index']);

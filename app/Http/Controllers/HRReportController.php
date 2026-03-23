@@ -3,8 +3,8 @@
 namespace App\Http\Controllers;
 
 use App\Models\Department;
-use App\Models\Employee;
 use App\Models\HRAccount;
+use App\Models\HrisEmployee;
 use App\Models\LeaveApplication;
 use App\Models\LeaveType;
 use Carbon\Carbon;
@@ -44,7 +44,7 @@ class HRReportController extends Controller
                 return (float) $application->created_at?->diffInDays($application->hr_approved_at);
             });
 
-        $activeEmployeesCount = Employee::count();
+        $activeEmployeesCount = HrisEmployee::query(true)->count();
 
         return response()->json([
             'total_applications' => $totalApplications,
@@ -69,9 +69,11 @@ class HRReportController extends Controller
         $departments = Department::query()->orderBy('name')->get(['id', 'name']);
 
         $stats = $departments->map(function (Department $department) use ($today, $dateFrom, $dateTo): array {
-            $employeeControlNumbers = Employee::query()
-                ->where('office', $department->name)
-                ->pluck('control_no');
+            $employeeControlNumbers = collect(HrisEmployee::controlNosByOffice($department->name))
+                ->flatMap(fn (string $controlNo): array => $this->controlNoCandidates($controlNo))
+                ->filter(fn (string $controlNo): bool => $controlNo !== '')
+                ->unique()
+                ->values();
 
             $employeeCount = $employeeControlNumbers->count();
 
@@ -176,16 +178,17 @@ class HRReportController extends Controller
 
         [$dateFrom, $dateTo] = $this->toDateRange($validated);
 
-        $query = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin.department'])
+        $query = LeaveApplication::with(['leaveType', 'applicantAdmin.department'])
             ->orderByDesc('created_at');
 
         $this->applyDateRange($query, $dateFrom, $dateTo);
 
-        $applications = $query->get()->map(static function (LeaveApplication $application): array {
-            $applicantName = $application->employee
-                ? trim(($application->employee->firstname ?? '') . ' ' . ($application->employee->surname ?? ''))
+        $applications = $query->get()->map(function (LeaveApplication $application): array {
+            $employee = $this->resolveApplicationEmployee($application);
+            $applicantName = $employee
+                ? trim(($employee->firstname ?? '') . ' ' . ($employee->surname ?? ''))
                 : ($application->applicantAdmin ? $application->applicantAdmin->full_name : 'Unknown');
-            $deptName = $application->employee?->office ?? $application->applicantAdmin?->department?->name ?? 'N/A';
+            $deptName = $employee?->office ?? $application->applicantAdmin?->department?->name ?? 'N/A';
 
             return [
                 'id' => $application->id,
@@ -250,6 +253,37 @@ class HRReportController extends Controller
         }
 
         return $query;
+    }
+
+    private function resolveApplicationEmployee(LeaveApplication $application): ?object
+    {
+        $controlNo = trim((string) ($application->employee_control_no ?? ''));
+        if ($controlNo === '') {
+            return null;
+        }
+
+        return HrisEmployee::findByControlNo($controlNo);
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function controlNoCandidates(string $controlNo): array
+    {
+        $controlNo = trim($controlNo);
+        if ($controlNo === '') {
+            return [];
+        }
+
+        $normalized = ltrim($controlNo, '0');
+        if ($normalized === '') {
+            $normalized = '0';
+        }
+
+        return array_values(array_unique(array_filter([
+            $controlNo,
+            $normalized,
+        ], static fn (string $value): bool => $value !== '')));
     }
 
     private function ensureHr(Request $request): ?JsonResponse
