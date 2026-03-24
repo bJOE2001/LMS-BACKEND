@@ -115,6 +115,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
 
     Route::middleware('hr')->prefix('hr')->group(function () {
         // Employee management
+        Route::get('/employee-options', [EmployeeController::class, 'employeeOptions']);
         Route::get('/employees/{controlNo}/leave-history', [EmployeeController::class, 'leaveHistory']);
         Route::get('/employees/{controlNo}/leave-balance-ledger', [EmployeeController::class, 'leaveCreditsLedger']);
         Route::get('/employees/{controlNo}/leave-credits-ledger', [EmployeeController::class, 'leaveCreditsLedger']);

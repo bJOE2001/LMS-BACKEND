@@ -317,6 +317,107 @@ class EmployeeController extends Controller
     }
 
     /**
+     * Lightweight employee lookup for HR search-driven selects.
+     */
+    public function employeeOptions(Request $request): JsonResponse
+    {
+        $account = $request->user();
+        if (!$account instanceof HRAccount) {
+            return response()->json([
+                'message' => 'Only HR accounts can access this resource.',
+            ], 403);
+        }
+
+        $validated = $request->validate([
+            'department_id' => [
+                'nullable',
+                'integer',
+                Rule::exists('tblDepartments', 'id')->where(fn ($query) => $query->where('is_inactive', false)),
+            ],
+            'search' => ['nullable', 'string', 'max:120'],
+            'limit' => ['nullable', 'integer', 'min:1', 'max:25'],
+            'activity' => ['nullable', 'string', 'in:ALL,ACTIVE,INACTIVE'],
+        ]);
+
+        $departmentId = $validated['department_id'] ?? null;
+        $searchTerm = trim((string) ($validated['search'] ?? ''));
+        $limit = max(1, min(25, (int) ($validated['limit'] ?? 20)));
+        $activityFilter = strtoupper(trim((string) ($validated['activity'] ?? 'ALL')));
+        $activeOnly = match ($activityFilter) {
+            'ACTIVE' => true,
+            'INACTIVE' => false,
+            default => null,
+        };
+
+        if ($searchTerm === '' && $departmentId === null) {
+            return response()->json([
+                'employees' => [],
+            ]);
+        }
+
+        $departmentName = $departmentId
+            ? Department::query()->active()->find($departmentId)?->name
+            : null;
+
+        $employeeRows = $this->fetchHrisEmployeeRows(
+            $departmentName,
+            $searchTerm,
+            false,
+            $activeOnly,
+            $limit * 2
+        );
+
+        $existingEmployeeControlNoLookup = $this->buildControlNoLookup(
+            $employeeRows
+                ->map(fn(array $employee): string => trim((string) ($employee['control_no'] ?? '')))
+                ->filter()
+                ->values()
+                ->all()
+        );
+
+        $departmentHeadRows = DepartmentHead::query()
+            ->when($departmentId, function ($query) use ($departmentId) {
+                $query->where('department_id', $departmentId);
+            }, function ($query) use ($departmentName) {
+                if ($departmentName) {
+                    $query->where('office', $departmentName);
+                }
+            })
+            ->orderBy('surname')
+            ->orderBy('firstname')
+            ->get()
+            ->filter(function (DepartmentHead $departmentHead) use (
+                $searchTerm,
+                $existingEmployeeControlNoLookup,
+                $activeOnly
+            ): bool {
+                if (!$this->matchesDepartmentHeadEmployeeFilters($departmentHead, $searchTerm, true, $activeOnly)) {
+                    return false;
+                }
+
+                $controlNo = trim((string) ($departmentHead->control_no ?? ''));
+                if ($controlNo !== '' && $this->hasControlNoInLookup($controlNo, $existingEmployeeControlNoLookup)) {
+                    return false;
+                }
+
+                return true;
+            })
+            ->map(fn(DepartmentHead $departmentHead): array => $this->serializeDepartmentHeadAsEmployee($departmentHead));
+
+        $combinedRows = $this->sortEmployeeRows(
+            $employeeRows
+                ->concat($departmentHeadRows)
+                ->values()
+        )
+            ->take($limit)
+            ->values();
+
+        return response()->json([
+            'employees' => $combinedRows,
+        ]);
+    }
+
+    /**
      * Employee directory is read-only and sourced from HRIS.
      */
     public function store(Request $request): JsonResponse
@@ -1088,24 +1189,7 @@ class EmployeeController extends Controller
 
         $combinedRows = $employeeRows
             ->concat($departmentHeadRows)
-            ->sort(function (array $left, array $right): int {
-                $leftSurname = mb_strtoupper(trim((string) ($left['surname'] ?? '')));
-                $rightSurname = mb_strtoupper(trim((string) ($right['surname'] ?? '')));
-                if ($leftSurname !== $rightSurname) {
-                    return $leftSurname <=> $rightSurname;
-                }
-
-                $leftFirstname = mb_strtoupper(trim((string) ($left['firstname'] ?? '')));
-                $rightFirstname = mb_strtoupper(trim((string) ($right['firstname'] ?? '')));
-                if ($leftFirstname !== $rightFirstname) {
-                    return $leftFirstname <=> $rightFirstname;
-                }
-
-                return strcmp(
-                    trim((string) ($left['control_no'] ?? '')),
-                    trim((string) ($right['control_no'] ?? ''))
-                );
-            })
+            ->pipe(fn(Collection $rows): Collection => $this->sortEmployeeRows($rows))
             ->values();
 
         $paginatedRows = new LengthAwarePaginator(
@@ -1130,7 +1214,8 @@ class EmployeeController extends Controller
         ?string $departmentName,
         ?string $searchTerm,
         bool $excludeContractual,
-        ?bool $activeOnly = null
+        ?bool $activeOnly = null,
+        ?int $limit = null
     ): Collection {
         $query = HrisEmployee::query($activeOnly);
 
@@ -1181,13 +1266,41 @@ class EmployeeController extends Controller
             });
         }
 
-        return $query
+        $query
             ->orderByRaw('LTRIM(RTRIM(xp.Surname))')
             ->orderByRaw('LTRIM(RTRIM(xp.Firstname))')
-            ->orderByRaw('LTRIM(RTRIM(CONVERT(VARCHAR(64), xp.ControlNo)))')
+            ->orderByRaw('LTRIM(RTRIM(CONVERT(VARCHAR(64), xp.ControlNo)))');
+
+        if ($limit !== null && $limit > 0) {
+            $query->limit($limit);
+        }
+
+        return $query
             ->get()
             ->map(fn(object $employee): array => $this->serializeEmployee($employee))
             ->values();
+    }
+
+    private function sortEmployeeRows(Collection $rows): Collection
+    {
+        return $rows->sort(function (array $left, array $right): int {
+            $leftSurname = mb_strtoupper(trim((string) ($left['surname'] ?? '')));
+            $rightSurname = mb_strtoupper(trim((string) ($right['surname'] ?? '')));
+            if ($leftSurname !== $rightSurname) {
+                return $leftSurname <=> $rightSurname;
+            }
+
+            $leftFirstname = mb_strtoupper(trim((string) ($left['firstname'] ?? '')));
+            $rightFirstname = mb_strtoupper(trim((string) ($right['firstname'] ?? '')));
+            if ($leftFirstname !== $rightFirstname) {
+                return $leftFirstname <=> $rightFirstname;
+            }
+
+            return strcmp(
+                trim((string) ($left['control_no'] ?? '')),
+                trim((string) ($right['control_no'] ?? ''))
+            );
+        });
     }
 
     private function loadDepartmentAdminEmployeeControlNoLookup(): array
