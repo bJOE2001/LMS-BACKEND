@@ -71,6 +71,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
     // Shared LMS account routes
     Route::get('/departments', [EmployeeController::class, 'departments']);
     Route::get('/employees', [EmployeeController::class, 'index']);
+    Route::get('/notifications/unread-count', [NotificationController::class, 'unreadCount']);
     Route::get('/notifications', [NotificationController::class, 'index']);
     Route::get('/notifications/{id}/application', [NotificationController::class, 'applicationDetails']);
     Route::put('/notifications/{id}/read', [NotificationController::class, 'markAsRead']);
@@ -161,6 +162,12 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
 
         // Reports
         Route::prefix('reports')->group(function () {
+            Route::get('/lwop', [HRReportController::class, 'lwopReports']);
+            Route::get('/leave-balances', [HRReportController::class, 'leaveBalancesReports']);
+            Route::get('/monetization', [HRReportController::class, 'monetizationReports']);
+            Route::get('/cto-availment', [HRReportController::class, 'ctoAvailmentReports']);
+            Route::get('/coc-balances', [HRReportController::class, 'cocBalanceReports']);
+            Route::get('/leave-availment', [HRReportController::class, 'leaveAvailmentReports']);
             Route::get('/summary', [HRReportController::class, 'getSummaryStats']);
             Route::get('/departments', [HRReportController::class, 'getDepartmentStats']);
             Route::get('/leave-types', [HRReportController::class, 'getLeaveTypeStats']);

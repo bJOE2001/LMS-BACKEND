@@ -58,6 +58,7 @@ class HRDashboardController extends Controller
             'approved_count' => $totalApproved,
             'rejected_count' => $totalRejected,
             'on_leave_today' => $onLeaveToday,
+            'active_employees' => HrisEmployee::countCached(true),
             'applications' => $formatted,
         ]);
     }

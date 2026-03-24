@@ -4,6 +4,7 @@ namespace App\Models;
 
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -19,6 +20,7 @@ class HrisEmployee
     private const HR_CONNECTION = 'hr';
     private const PERSONAL_TABLE = 'xPersonal';
     private const PARTITION_VIEW = 'vwpartitionforseparated';
+    private const CACHE_TTL_MINUTES = 5;
 
     /**
      * Build the canonical HRIS employee query with normalized aliases.
@@ -54,19 +56,44 @@ class HrisEmployee
         return $query;
     }
 
+    public static function allCached(?bool $activeOnly = null): Collection
+    {
+        $rows = Cache::remember(
+            self::cacheKey('all', $activeOnly),
+            now()->addMinutes(self::CACHE_TTL_MINUTES),
+            static fn (): array => self::orderedQuery($activeOnly)
+                ->get()
+                ->map(static fn (object $employee): array => (array) $employee)
+                ->values()
+                ->all()
+        );
+
+        return collect($rows)->map(static fn (array $row): object => (object) $row);
+    }
+
+    public static function countCached(?bool $activeOnly = null): int
+    {
+        return self::allCached($activeOnly)->count();
+    }
+
     /**
      * Get all employees for a given office/department.
      */
     public static function allByOffice(?string $officeName, ?bool $activeOnly = null): Collection
     {
-        $query = self::query($activeOnly)
-            ->orderByRaw('LTRIM(RTRIM(xp.Surname))')
-            ->orderByRaw('LTRIM(RTRIM(xp.Firstname))')
-            ->orderByRaw('LTRIM(RTRIM(CONVERT(VARCHAR(64), xp.ControlNo)))');
+        $normalizedOfficeName = trim((string) ($officeName ?? ''));
+        if ($normalizedOfficeName === '') {
+            return collect();
+        }
 
-        self::applyOfficeFilter($query, $officeName);
-
-        return $query->get();
+        return self::allCached($activeOnly)
+            ->filter(static function (object $employee) use ($normalizedOfficeName): bool {
+                return strcasecmp(
+                    trim((string) ($employee->office ?? '')),
+                    $normalizedOfficeName
+                ) === 0;
+            })
+            ->values();
     }
 
     /**
@@ -76,10 +103,7 @@ class HrisEmployee
      */
     public static function controlNosByOffice(?string $officeName, ?bool $activeOnly = null): array
     {
-        $query = self::query($activeOnly);
-        self::applyOfficeFilter($query, $officeName);
-
-        return $query
+        return self::allByOffice($officeName, $activeOnly)
             ->pluck('control_no')
             ->map(static fn (mixed $value): string => trim((string) $value))
             ->filter(static fn (string $controlNo): bool => $controlNo !== '')
@@ -98,10 +122,23 @@ class HrisEmployee
             return null;
         }
 
-        $query = self::query($activeOnly);
-        self::applyControlNoFilter($query, $controlNo);
+        $normalizedControlNo = self::normalizeControlNoInt($controlNo);
 
-        return $query->first();
+        return self::allCached($activeOnly)->first(
+            static function (object $employee) use ($controlNo, $normalizedControlNo): bool {
+                $employeeControlNo = trim((string) ($employee->control_no ?? ''));
+                if ($employeeControlNo === '') {
+                    return false;
+                }
+
+                if ($employeeControlNo === $controlNo) {
+                    return true;
+                }
+
+                return $normalizedControlNo !== null
+                    && self::normalizeControlNoInt($employeeControlNo) === $normalizedControlNo;
+            }
+        );
     }
 
     /**
@@ -109,15 +146,26 @@ class HrisEmployee
      */
     public static function existsByControlNo(string $controlNo, ?bool $activeOnly = null): bool
     {
-        $controlNo = trim($controlNo);
-        if ($controlNo === '') {
-            return false;
-        }
+        return self::findByControlNo($controlNo, $activeOnly) !== null;
+    }
 
-        $query = self::query($activeOnly);
-        self::applyControlNoFilter($query, $controlNo);
+    private static function orderedQuery(?bool $activeOnly = null): Builder
+    {
+        return self::query($activeOnly)
+            ->orderByRaw('LTRIM(RTRIM(xp.Surname))')
+            ->orderByRaw('LTRIM(RTRIM(xp.Firstname))')
+            ->orderByRaw('LTRIM(RTRIM(CONVERT(VARCHAR(64), xp.ControlNo)))');
+    }
 
-        return $query->exists();
+    private static function cacheKey(string $suffix, ?bool $activeOnly): string
+    {
+        $activityKey = match ($activeOnly) {
+            true => 'active',
+            false => 'inactive',
+            default => 'all',
+        };
+
+        return "hris_employees.{$suffix}.{$activityKey}.v1";
     }
 
     private static function applyOfficeFilter(Builder $query, ?string $officeName): void

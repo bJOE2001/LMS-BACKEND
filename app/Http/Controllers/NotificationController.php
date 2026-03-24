@@ -17,6 +17,24 @@ use Illuminate\Support\Facades\DB;
 class NotificationController extends Controller
 {
     /**
+     * GET /notifications/unread-count - lightweight badge count for the header.
+     */
+    public function unreadCount(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        $count = Notification::query()
+            ->where('notifiable_type', get_class($user))
+            ->where('notifiable_id', $user->id)
+            ->whereNull('read_at')
+            ->count();
+
+        return response()->json([
+            'unread_count' => $count,
+        ]);
+    }
+
+    /**
      * GET /notifications — list notifications for the authenticated user.
      */
     public function index(Request $request): JsonResponse
@@ -148,8 +166,20 @@ class NotificationController extends Controller
             return null;
         }
 
-        $employee = $this->resolveApplicationEmployee($application);
-        $employeeName = trim(($employee?->firstname ?? '') . ' ' . ($employee?->surname ?? ''));
+        $employeeName = trim((string) ($application->employee_name ?? ''));
+        $office = $application->applicantAdmin?->department?->name;
+        $employee = null;
+
+        if ($employeeName === '' || trim((string) ($office ?? '')) === '') {
+            $employee = $this->resolveApplicationEmployee($application);
+            if ($employeeName === '') {
+                $employeeName = trim(($employee?->firstname ?? '') . ' ' . ($employee?->surname ?? ''));
+            }
+            if (trim((string) ($office ?? '')) === '') {
+                $office = $employee?->office;
+            }
+        }
+
         if ($employeeName === '') {
             $employeeName = $application->applicantAdmin?->full_name ?: null;
         }
@@ -159,7 +189,7 @@ class NotificationController extends Controller
             'employee_control_no' => $application->employee_control_no,
             'applicant_admin_id' => $application->applicant_admin_id,
             'applicant_name' => $employeeName,
-            'office' => $employee?->office ?? $application->applicantAdmin?->department?->name,
+            'office' => $office,
             'leave_type_id' => $application->leave_type_id,
             'leave_type_name' => $application->leaveType?->name,
             'start_date' => $application->start_date?->toDateString(),

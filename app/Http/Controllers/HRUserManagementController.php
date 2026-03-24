@@ -104,6 +104,7 @@ class HRUserManagementController extends Controller
     {
         $validated = $request->validate([
             'search' => ['nullable', 'string', 'max:100'],
+            'limit' => ['nullable', 'integer', 'min:1', 'max:25'],
             'department_id' => [
                 'nullable',
                 'integer',
@@ -122,14 +123,9 @@ class HRUserManagementController extends Controller
         }
 
         $searchTerm = trim((string) ($validated['search'] ?? ''));
+        $limit = max(1, min(25, (int) ($validated['limit'] ?? 20)));
 
-        $employeeQuery = HrisEmployee::query(true);
-
-        $employees = $employeeQuery
-            ->orderByRaw('LTRIM(RTRIM(xp.Surname))')
-            ->orderByRaw('LTRIM(RTRIM(xp.Firstname))')
-            ->orderByRaw('LTRIM(RTRIM(CONVERT(VARCHAR(64), xp.ControlNo)))')
-            ->get()
+        $employees = HrisEmployee::allCached(true)
             ->filter(fn(object $employee): bool => strtoupper(trim((string) ($employee->status ?? ''))) !== 'CONTRACTUAL')
             ->filter(function (object $employee) use ($searchTerm): bool {
                 if ($searchTerm === '') {
@@ -153,6 +149,7 @@ class HRUserManagementController extends Controller
 
                 return false;
             })
+            ->take($limit)
             ->values()
             ->map(fn(object $employee): array => $this->serializeEligibleEmployee($employee))
             ->values();

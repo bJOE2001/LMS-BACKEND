@@ -1217,68 +1217,74 @@ class EmployeeController extends Controller
         ?bool $activeOnly = null,
         ?int $limit = null
     ): Collection {
-        $query = HrisEmployee::query($activeOnly);
+        $normalizedDepartmentName = trim((string) ($departmentName ?? ''));
+        $normalizedSearchTerm = trim((string) ($searchTerm ?? ''));
 
-        $departmentName = trim((string) ($departmentName ?? ''));
-        if ($departmentName !== '') {
-            $query->whereRaw('UPPER(LTRIM(RTRIM(vp.Office))) = UPPER(?)', [$departmentName]);
-        }
+        $rows = HrisEmployee::allCached($activeOnly)
+            ->filter(function (object $employee) use (
+                $normalizedDepartmentName,
+                $excludeContractual,
+                $activeOnly,
+                $normalizedSearchTerm
+            ): bool {
+                $employeeOffice = trim((string) ($employee->office ?? ''));
+                $employeeStatus = strtoupper(trim((string) ($employee->status ?? '')));
+                $isActive = filter_var($employee->is_active ?? false, FILTER_VALIDATE_BOOLEAN);
 
-        if ($excludeContractual) {
-            $query->where(function ($q) {
-                $q->whereNull('vp.Status')
-                    ->orWhereRaw("UPPER(LTRIM(RTRIM(vp.Status))) <> 'CONTRACTUAL'");
-            });
-        }
+                if (
+                    $normalizedDepartmentName !== ''
+                    && strcasecmp($employeeOffice, $normalizedDepartmentName) !== 0
+                ) {
+                    return false;
+                }
 
-        if ($activeOnly === false) {
-            $query->where(function ($q) {
-                $q->whereNull('vp.Status')
-                    ->orWhereRaw("UPPER(LTRIM(RTRIM(vp.Status))) NOT IN ('HONORARIUM', 'CONTRACTUAL')");
-            });
-        }
+                if ($excludeContractual && $employeeStatus === 'CONTRACTUAL') {
+                    return false;
+                }
 
-        if ($activeOnly === null) {
-            $query->whereRaw(
-                "NOT (
-                    (
-                        vp.FromDate IS NULL
-                        OR vp.ToDate IS NULL
-                        OR GETDATE() < vp.FromDate
-                        OR GETDATE() > vp.ToDate
-                    )
-                    AND UPPER(LTRIM(RTRIM(COALESCE(vp.Status, '')))) IN ('HONORARIUM', 'CONTRACTUAL')
-                )"
-            );
-        }
+                if ($activeOnly === false && in_array($employeeStatus, ['HONORARIUM', 'CONTRACTUAL'], true)) {
+                    return false;
+                }
 
-        $searchTerm = trim((string) ($searchTerm ?? ''));
-        if ($searchTerm !== '') {
-            $like = '%' . $searchTerm . '%';
-            $query->where(function ($q) use ($like) {
-                $q->whereRaw('xp.Firstname LIKE ?', [$like])
-                    ->orWhereRaw('xp.Surname LIKE ?', [$like])
-                    ->orWhereRaw('xp.MIddlename LIKE ?', [$like])
-                    ->orWhereRaw('LTRIM(RTRIM(CONVERT(VARCHAR(64), xp.ControlNo))) LIKE ?', [$like])
-                    ->orWhereRaw('vp.Status LIKE ?', [$like])
-                    ->orWhereRaw('vp.Office LIKE ?', [$like])
-                    ->orWhereRaw('vp.Designation LIKE ?', [$like]);
-            });
-        }
+                if (
+                    $activeOnly === null
+                    && !$isActive
+                    && in_array($employeeStatus, ['HONORARIUM', 'CONTRACTUAL'], true)
+                ) {
+                    return false;
+                }
 
-        $query
-            ->orderByRaw('LTRIM(RTRIM(xp.Surname))')
-            ->orderByRaw('LTRIM(RTRIM(xp.Firstname))')
-            ->orderByRaw('LTRIM(RTRIM(CONVERT(VARCHAR(64), xp.ControlNo)))');
+                return $this->matchesHrisEmployeeSearch($employee, $normalizedSearchTerm);
+            })
+            ->map(fn(object $employee): array => $this->serializeEmployee($employee))
+            ->pipe(fn(Collection $employeeRows): Collection => $this->sortEmployeeRows($employeeRows))
+            ->values();
 
         if ($limit !== null && $limit > 0) {
-            $query->limit($limit);
+            return $rows->take($limit)->values();
         }
 
-        return $query
-            ->get()
-            ->map(fn(object $employee): array => $this->serializeEmployee($employee))
-            ->values();
+        return $rows;
+    }
+
+    private function matchesHrisEmployeeSearch(object $employee, string $searchTerm): bool
+    {
+        if ($searchTerm === '') {
+            return true;
+        }
+
+        $needle = mb_strtolower($searchTerm);
+        $haystack = implode(' ', array_filter([
+            trim((string) ($employee->firstname ?? '')),
+            trim((string) ($employee->surname ?? '')),
+            trim((string) ($employee->middlename ?? '')),
+            trim((string) ($employee->control_no ?? '')),
+            trim((string) ($employee->status ?? '')),
+            trim((string) ($employee->office ?? '')),
+            trim((string) ($employee->designation ?? '')),
+        ], static fn(string $value): bool => $value !== ''));
+
+        return mb_stripos($haystack, $needle) !== false;
     }
 
     private function sortEmployeeRows(Collection $rows): Collection
