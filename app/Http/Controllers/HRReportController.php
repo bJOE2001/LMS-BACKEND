@@ -66,7 +66,7 @@ class HRReportController extends Controller
         $today = Carbon::today()->toDateString();
 
         [$dateFrom, $dateTo] = $this->validateDateRange($request);
-        $departments = Department::query()->orderBy('name')->get(['id', 'name']);
+        $departments = Department::query()->active()->orderBy('name')->get(['id', 'name']);
 
         $stats = $departments->map(function (Department $department) use ($today, $dateFrom, $dateTo): array {
             $employeeControlNumbers = collect(HrisEmployee::controlNosByOffice($department->name))

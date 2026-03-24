@@ -20,6 +20,7 @@ use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Collection;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
 
 /**
  * Employee Management - employee directory is sourced from HRIS (read-only).
@@ -34,6 +35,7 @@ class EmployeeController extends Controller
     public function departments(): JsonResponse
     {
         $departments = Department::query()
+            ->active()
             ->orderBy('name')
             ->get(['id', 'name']);
 
@@ -193,7 +195,11 @@ class EmployeeController extends Controller
         }
 
         $validated = $request->validate([
-            'department_id' => ['nullable', 'integer', 'exists:tblDepartments,id'],
+            'department_id' => [
+                'nullable',
+                'integer',
+                Rule::exists('tblDepartments', 'id')->where(fn ($query) => $query->where('is_inactive', false)),
+            ],
             'search' => ['nullable', 'string', 'max:100'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
             'activity' => ['nullable', 'string', 'in:ALL,ACTIVE,INACTIVE'],
@@ -241,7 +247,7 @@ class EmployeeController extends Controller
             $departmentName = $account->department->name;
             $summaryDepartmentId = (int) $account->department_id;
         } elseif ($departmentId) {
-            $departmentName = Department::find($departmentId)?->name;
+            $departmentName = Department::query()->active()->find($departmentId)?->name;
             $summaryDepartmentId = $departmentName ? (int) $departmentId : null;
         }
 
@@ -673,7 +679,11 @@ class EmployeeController extends Controller
                     $recallOccurredAt = $recallLog?->created_at
                         ? CarbonImmutable::instance($recallLog->created_at)
                         : ($application->updated_at ? CarbonImmutable::instance($application->updated_at) : null);
-                    $recallDetails = $this->resolveLedgerRecallRestorableDetails($application, $recallOccurredAt);
+                    $storedRecallDateKeys = $this->resolveLedgerStoredRecallDateKeys($application, $recallOccurredAt);
+                    $recallEffectiveAt = $application->recall_effective_date
+                        ? CarbonImmutable::parse((string) $application->recall_effective_date)->startOfDay()
+                        : (!empty($storedRecallDateKeys) ? CarbonImmutable::parse($storedRecallDateKeys[0])->startOfDay() : $recallOccurredAt);
+                    $recallDetails = $this->resolveLedgerRecallRestorableDetails($application, $storedRecallDateKeys, $recallEffectiveAt);
                     $restoredAmount = (float) ($recallDetails['days'] ?? 0.0);
                     $restoredDates = is_array($recallDetails['dates'] ?? null)
                         ? $recallDetails['dates']
@@ -685,7 +695,7 @@ class EmployeeController extends Controller
                         && array_key_exists($restoreTypeKey, $runningBalances)
                         && $restoredAmount > 0.0
                     ) {
-                        $recallDate = $recallOccurredAt?->toDateString();
+                        $recallDate = $recallEffectiveAt?->toDateString() ?? $recallOccurredAt?->toDateString();
                         if ($recallDate !== null) {
                             $transactions[] = [
                                 'row_id' => $mergeKey . '-recall',
@@ -693,7 +703,11 @@ class EmployeeController extends Controller
                                 'type_key' => $restoreTypeKey,
                                 'transaction_date' => $recallDate,
                                 'sort_date' => $recallDate,
-                                'sort_timestamp' => (string) ($recallOccurredAt?->toIso8601String() ?? $recallDate),
+                                'sort_timestamp' => (string) (
+                                    $recallOccurredAt?->toIso8601String()
+                                    ?? $recallEffectiveAt?->toIso8601String()
+                                    ?? $recallDate
+                                ),
                                 'particulars' => match (true) {
                                     $isForcedLeave => 'Forced Leave recalled',
                                     $typeKey === 'vacation' => 'Vacation Leave recalled',
@@ -1605,7 +1619,8 @@ class EmployeeController extends Controller
 
     private function resolveLedgerRecallRestorableDetails(
         LeaveApplication $application,
-        ?CarbonImmutable $asOfDate = null
+        array $selectedRecallDateKeys = [],
+        ?CarbonImmutable $effectiveRecallDate = null
     ): array {
         $deductibleDays = $this->resolveLedgerApplicationDeductibleDays($application);
         if ($deductibleDays <= 0.0) {
@@ -1637,13 +1652,24 @@ class EmployeeController extends Controller
             round((float) ($application->total_days ?? 0), 2)
         );
 
-        $recallDate = ($asOfDate ?? CarbonImmutable::now())->startOfDay()->toDateString();
+        $selectedRecallDateSet = array_fill_keys(
+            $this->normalizeLedgerRecallDateKeys(
+                $selectedRecallDateKeys !== []
+                    ? $selectedRecallDateKeys
+                    : $this->resolveLedgerStoredRecallDateKeys($application, $effectiveRecallDate)
+            ),
+            true
+        );
+        if ($selectedRecallDateSet === []) {
+            return ['days' => 0.0, 'dates' => []];
+        }
+
         $restorableDays = 0.0;
         $restorableDates = [];
 
         foreach ($selectedDates as $rawDate) {
             $dateKey = $this->normalizeLedgerDateKey($rawDate) ?? trim((string) $rawDate);
-            if ($dateKey === '' || strcmp($dateKey, $recallDate) < 0) {
+            if ($dateKey === '' || !isset($selectedRecallDateSet[$dateKey])) {
                 continue;
             }
 
@@ -1674,6 +1700,65 @@ class EmployeeController extends Controller
             'days' => $restorableDays,
             'dates' => $restorableDates,
         ];
+    }
+
+    private function resolveLedgerStoredRecallDateKeys(
+        LeaveApplication $application,
+        ?CarbonImmutable $effectiveRecallDate = null
+    ): array {
+        $storedRecallDates = is_array($application->recall_selected_dates)
+            ? $application->recall_selected_dates
+            : null;
+        $normalizedStoredRecallDates = $this->normalizeLedgerRecallDateKeys($storedRecallDates ?? []);
+        if ($normalizedStoredRecallDates !== []) {
+            return $normalizedStoredRecallDates;
+        }
+
+        $selectedDates = $application->resolvedSelectedDates();
+        if (!is_array($selectedDates) || $selectedDates === []) {
+            return [];
+        }
+
+        $effectiveDateKey = $application->recall_effective_date
+            ? CarbonImmutable::parse((string) $application->recall_effective_date)->toDateString()
+            : ($effectiveRecallDate?->toDateString() ?? null);
+        if ($effectiveDateKey === null || $effectiveDateKey === '') {
+            return [];
+        }
+
+        $resolvedDateKeys = [];
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeLedgerDateKey($rawDate) ?? trim((string) $rawDate);
+            if ($dateKey === '' || strcmp($dateKey, $effectiveDateKey) < 0) {
+                continue;
+            }
+
+            $resolvedDateKeys[] = $dateKey;
+        }
+
+        $resolvedDateKeys = array_values(array_unique(array_filter($resolvedDateKeys)));
+        sort($resolvedDateKeys);
+
+        return $resolvedDateKeys;
+    }
+
+    private function normalizeLedgerRecallDateKeys(array $rawDates): array
+    {
+        $normalizedDateKeys = [];
+
+        foreach ($rawDates as $rawDate) {
+            $dateKey = $this->normalizeLedgerDateKey($rawDate) ?? trim((string) $rawDate);
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $normalizedDateKeys[] = $dateKey;
+        }
+
+        $normalizedDateKeys = array_values(array_unique(array_filter($normalizedDateKeys)));
+        sort($normalizedDateKeys);
+
+        return $normalizedDateKeys;
     }
 
     private function normalizeLedgerPayMode(mixed $payMode, bool $isMonetization = false): string

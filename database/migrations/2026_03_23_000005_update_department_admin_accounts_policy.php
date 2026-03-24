@@ -14,7 +14,7 @@ return new class extends Migration {
             });
         }
 
-        // Drop unique constraint on department_id to allow up to two accounts per department.
+        // Drop unique constraint on department_id to allow multiple accounts per department.
         try {
             Schema::table('tblDepartmentAdmins', function (Blueprint $table): void {
                 $table->dropUnique(['department_id']);
@@ -57,51 +57,12 @@ return new class extends Migration {
             // Ignore if index already exists.
         }
 
-        // Backfill likely seeded default accounts (empty employee_control_no).
-        DB::table('tblDepartmentAdmins')
-            ->where(function ($query): void {
-                $query->whereNull('employee_control_no')
-                    ->orWhereRaw("LTRIM(RTRIM(CONVERT(VARCHAR(64), employee_control_no))) = ''");
-            })
-            ->update(['is_default_account' => true]);
-
-        // Ensure only one default account marker per department.
-        $departmentIds = DB::table('tblDepartmentAdmins')
-            ->select('department_id')
-            ->where('is_default_account', true)
-            ->groupBy('department_id')
-            ->havingRaw('COUNT(*) > 1')
-            ->pluck('department_id');
-
-        foreach ($departmentIds as $departmentId) {
-            $keepId = DB::table('tblDepartmentAdmins')
-                ->where('department_id', $departmentId)
-                ->where('is_default_account', true)
-                ->orderBy('id')
-                ->value('id');
-
-            DB::table('tblDepartmentAdmins')
-                ->where('department_id', $departmentId)
-                ->where('is_default_account', true)
-                ->where('id', '!=', $keepId)
-                ->update(['is_default_account' => false]);
-        }
+        // Intentionally no data backfill here.
+        // Keep migrations schema-only to avoid mutating live records.
     }
 
     public function down(): void
     {
-        $hasDuplicateDepartments = DB::table('tblDepartmentAdmins')
-            ->select('department_id')
-            ->groupBy('department_id')
-            ->havingRaw('COUNT(*) > 1')
-            ->exists();
-
-        if ($hasDuplicateDepartments) {
-            throw new RuntimeException(
-                'Cannot rollback: tblDepartmentAdmins has multiple rows per department.'
-            );
-        }
-
         try {
             Schema::table('tblDepartmentAdmins', function (Blueprint $table): void {
                 $table->dropIndex('IX_tblDepartmentAdmins_department_default');

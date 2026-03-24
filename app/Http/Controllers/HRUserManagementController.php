@@ -19,7 +19,6 @@ use Illuminate\Validation\ValidationException;
 class HRUserManagementController extends Controller
 {
     private const HR_DEFAULT_DEPARTMENT = 'OFFICE OF THE CITY HUMAN RESOURCE MANAGEMENT OFFICER';
-    private const MAX_DEPARTMENT_ADMIN_ACCOUNTS_PER_DEPARTMENT = 2;
 
     /**
      * List user accounts for HR and Department Admin roles.
@@ -105,12 +104,16 @@ class HRUserManagementController extends Controller
     {
         $validated = $request->validate([
             'search' => ['nullable', 'string', 'max:100'],
-            'department_id' => ['nullable', 'integer', 'exists:tblDepartments,id'],
+            'department_id' => [
+                'nullable',
+                'integer',
+                Rule::exists('tblDepartments', 'id')->where(fn ($query) => $query->where('is_inactive', false)),
+            ],
         ]);
 
         $resolvedDepartmentId = $departmentId ?? (isset($validated['department_id']) ? (int) $validated['department_id'] : null);
         $department = $resolvedDepartmentId !== null
-            ? Department::query()->find($resolvedDepartmentId)
+            ? Department::query()->active()->find($resolvedDepartmentId)
             : null;
         if ($resolvedDepartmentId !== null && !$department) {
             return response()->json([
@@ -166,77 +169,89 @@ class HRUserManagementController extends Controller
     }
 
     /**
-     * Assign a department admin account from HRIS employee records to a department.
+     * Create a department admin account (employee-linked or guest) for a department.
      */
     public function store(Request $request): JsonResponse
     {
         $validated = $request->validate([
-            'department_id' => ['required', 'integer', 'exists:tblDepartments,id'],
-            'employee_control_no' => ['required', 'string', 'max:50', 'regex:/^\d+$/'],
+            'department_id' => [
+                'required',
+                'integer',
+                Rule::exists('tblDepartments', 'id')->where(fn ($query) => $query->where('is_inactive', false)),
+            ],
+            'is_guest' => ['nullable', 'boolean'],
+            'employee_control_no' => ['nullable', 'string', 'max:50', 'regex:/^\d+$/'],
+            'password' => ['nullable', 'string', 'min:8', 'max:255'],
             'username' => ['required', 'string', 'max:255', Rule::unique('tblDepartmentAdmins', 'username')],
         ]);
 
-        $department = Department::query()->find((int) $validated['department_id']);
+        $department = Department::query()->active()->find((int) $validated['department_id']);
         if (!$department) {
             return response()->json([
                 'message' => 'Department not found.',
             ], 404);
         }
 
-        $employee = $this->resolveEligibleEmployeeForAssignment((string) $validated['employee_control_no']);
-        $this->assertUsernameAvailableForDepartmentAdmin((string) $validated['username']);
-        $generatedPassword = $this->buildGeneratedPasswordFromBirthDate($employee);
+        $isGuest = filter_var((string) ($validated['is_guest'] ?? false), FILTER_VALIDATE_BOOLEAN);
+        $employeeControlNo = trim((string) ($validated['employee_control_no'] ?? ''));
+        $rawPassword = (string) ($validated['password'] ?? '');
 
-        $activeAssignedAdmin = DepartmentAdmin::query()
-            ->where('department_id', $department->id)
-            ->where('is_default_account', false)
-            ->whereRaw("LTRIM(RTRIM(CONVERT(VARCHAR(64), COALESCE(employee_control_no, '')))) <> ''")
-            ->first();
-
-        if ($activeAssignedAdmin) {
+        if (!$isGuest && $employeeControlNo === '') {
             throw ValidationException::withMessages([
-                'department_id' => ['Selected department already has an assigned admin.'],
+                'employee_control_no' => ['Employee is required when guest mode is off.'],
             ]);
         }
 
+        if ($isGuest && trim($rawPassword) === '') {
+            throw ValidationException::withMessages([
+                'password' => ['Password is required when guest mode is on.'],
+            ]);
+        }
+
+        $employee = !$isGuest
+            ? $this->resolveEligibleEmployeeForAssignment($employeeControlNo)
+            : null;
+
+        $this->assertUsernameAvailableForDepartmentAdmin((string) $validated['username']);
+        $generatedPassword = $isGuest
+            ? trim($rawPassword)
+            : $this->buildGeneratedPasswordFromBirthDate($employee);
+
         $admin = DepartmentAdmin::query()
             ->where('department_id', $department->id)
-            ->where('is_default_account', false)
             ->where(function ($query): void {
                 $query->whereNull('employee_control_no')
                     ->orWhereRaw("LTRIM(RTRIM(CONVERT(VARCHAR(64), employee_control_no))) = ''");
+            })
+            ->where(function ($query): void {
+                $query->whereRaw("username LIKE 'archived_admin_%'")
+                    ->orWhere('is_default_account', true);
             })
             ->orderBy('id')
             ->first();
 
         if (!$admin) {
-            $departmentAdminCount = DepartmentAdmin::query()
-                ->where('department_id', $department->id)
-                ->count();
-
-            if ($departmentAdminCount >= self::MAX_DEPARTMENT_ADMIN_ACCOUNTS_PER_DEPARTMENT) {
-                throw ValidationException::withMessages([
-                    'department_id' => ['The selected department already reached the maximum of 2 admin accounts.'],
-                ]);
-            }
-
             $admin = new DepartmentAdmin();
         }
 
         $admin->department_id = $department->id;
         $admin->is_default_account = false;
-        $admin->employee_control_no = trim((string) $employee->control_no);
-        $admin->full_name = $this->buildEmployeeFullName($employee);
+        $admin->employee_control_no = $employee ? trim((string) $employee->control_no) : null;
+        $admin->full_name = $employee
+            ? $this->buildEmployeeFullName($employee)
+            : $this->buildGuestAdminFullName((string) $validated['username']);
         $admin->username = trim((string) $validated['username']);
         $admin->password = $generatedPassword;
-        $admin->must_change_password = true;
+        $admin->must_change_password = !$isGuest;
         $admin->save();
         $admin->load([
             'department:id,name',
         ]);
 
         return response()->json([
-            'message' => 'Department admin assigned successfully. Default password is employee birthdate (MMDDYY).',
+            'message' => $isGuest
+                ? 'Guest department admin account created successfully.'
+                : 'Department admin assigned successfully. Default password is employee birthdate (MMDDYY).',
             'department_admin' => $this->serializeDepartmentAdmin($admin),
         ], 201);
     }
@@ -254,46 +269,20 @@ class HRUserManagementController extends Controller
         }
 
         $validated = $request->validate([
-            'department_id' => ['required', 'integer', 'exists:tblDepartments,id'],
+            'department_id' => [
+                'required',
+                'integer',
+                Rule::exists('tblDepartments', 'id')->where(fn ($query) => $query->where('is_inactive', false)),
+            ],
             'employee_control_no' => ['required', 'string', 'max:50', 'regex:/^\d+$/'],
             'username' => ['required', 'string', 'max:255', Rule::unique('tblDepartmentAdmins', 'username')->ignore($admin->id)],
         ]);
 
-        if ((bool) $admin->is_default_account) {
-            return response()->json([
-                'message' => 'Default seeded department admin accounts cannot be updated.',
-            ], 422);
-        }
-
-        $department = Department::query()->find((int) $validated['department_id']);
+        $department = Department::query()->active()->find((int) $validated['department_id']);
         if (!$department) {
             return response()->json([
                 'message' => 'Department not found.',
             ], 404);
-        }
-
-        $departmentAdminCount = DepartmentAdmin::query()
-            ->where('department_id', $department->id)
-            ->where('id', '!=', $admin->id)
-            ->count();
-
-        if ($departmentAdminCount >= self::MAX_DEPARTMENT_ADMIN_ACCOUNTS_PER_DEPARTMENT) {
-            throw ValidationException::withMessages([
-                'department_id' => ['The selected department already reached the maximum of 2 admin accounts.'],
-            ]);
-        }
-
-        $activeAssignedAdmin = DepartmentAdmin::query()
-            ->where('department_id', $department->id)
-            ->where('id', '!=', $admin->id)
-            ->where('is_default_account', false)
-            ->whereRaw("LTRIM(RTRIM(CONVERT(VARCHAR(64), COALESCE(employee_control_no, '')))) <> ''")
-            ->first();
-
-        if ($activeAssignedAdmin) {
-            throw ValidationException::withMessages([
-                'department_id' => ['Selected department already has an assigned admin.'],
-            ]);
         }
 
         $employee = $this->resolveEligibleEmployeeForAssignment((string) $validated['employee_control_no']);
@@ -332,12 +321,6 @@ class HRUserManagementController extends Controller
             return response()->json([
                 'message' => 'Department admin not found.',
             ], 404);
-        }
-
-        if ((bool) $admin->is_default_account) {
-            return response()->json([
-                'message' => 'Default seeded department admin account cannot be deleted.',
-            ], 422);
         }
 
         if ($this->hasHistoricalLeaveApplications($admin)) {
@@ -439,6 +422,16 @@ class HRUserManagementController extends Controller
         return trim(implode(' ', $parts));
     }
 
+    private function buildGuestAdminFullName(string $username): string
+    {
+        $normalizedUsername = trim($username);
+        if ($normalizedUsername === '') {
+            return 'Department Admin Guest';
+        }
+
+        return Str::limit($normalizedUsername, 255, '');
+    }
+
     private function buildEmployeeDisplayName(object $employee): string
     {
         $surname = trim((string) $employee->surname);
@@ -471,16 +464,14 @@ class HRUserManagementController extends Controller
         $employee = $this->resolveEmployeeForAdmin($admin);
         $position = trim((string) ($employee?->designation ?? ''));
         if ($position === '') {
-            $position = (bool) $admin->is_default_account
-                ? 'Department Admin (Default)'
-                : 'Department Admin';
+            $position = 'Department Admin';
         }
 
         return [
             'row_key' => 'DEPARTMENT_ADMIN-' . $admin->id,
             'account_id' => $admin->id,
             'role' => 'DEPARTMENT_ADMIN',
-            'role_label' => (bool) $admin->is_default_account ? 'Department Admin (Default)' : 'Department Admin',
+            'role_label' => 'Department Admin',
             'full_name' => trim((string) ($admin->full_name ?? '')),
             'username' => trim((string) ($admin->username ?? '')),
             'department' => trim((string) ($admin->department?->name ?? '')) !== ''
@@ -491,7 +482,7 @@ class HRUserManagementController extends Controller
                 ? trim((string) $admin->employee_control_no)
                 : null,
             'is_default_account' => (bool) $admin->is_default_account,
-            'can_delete' => !(bool) $admin->is_default_account,
+            'can_delete' => true,
             'must_change_password' => (bool) $admin->must_change_password,
             'created_at' => $admin->created_at?->toIso8601String(),
             'updated_at' => $admin->updated_at?->toIso8601String(),

@@ -1891,6 +1891,8 @@ class LeaveApplicationController extends Controller
 
         $validated = $request->validate([
             'recall_reason' => ['required', 'string', 'max:2000'],
+            'recall_selected_dates' => ['required', 'array', 'min:1'],
+            'recall_selected_dates.*' => ['required', 'date'],
             'remarks' => ['nullable', 'string', 'max:2000'],
         ]);
 
@@ -1938,13 +1940,29 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
+        $selectedRecallDateKeys = $this->resolveValidatedRecallSelectedDateKeys(
+            $app,
+            is_array($validated['recall_selected_dates'] ?? null)
+                ? $validated['recall_selected_dates']
+                : []
+        );
+        if ($selectedRecallDateKeys === null || $selectedRecallDateKeys === []) {
+            return response()->json([
+                'message' => 'Selected recall dates must match the application leave dates.',
+            ], 422);
+        }
+        $effectiveRecallDate = \Carbon\CarbonImmutable::parse($selectedRecallDateKeys[0])->startOfDay();
+
         $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
         $deductsBalance = $this->applicationDeductsEmployeeBalance(
             (bool) $app->is_monetization,
             $leaveType,
             $normalizedPayMode
         );
-        $daysToRestore = $deductsBalance ? $this->resolveRecallRestorableDays($app) : 0.0;
+        $recallDetails = $deductsBalance
+            ? $this->resolveRecallRestorableDetails($app, $selectedRecallDateKeys)
+            : ['days' => 0.0, 'dates' => []];
+        $daysToRestore = round((float) ($recallDetails['days'] ?? 0.0), 2);
 
         $restoreLeaveTypeId = (int) $app->leave_type_id;
         if ($forcedLeaveTypeId !== null && (int) $app->leave_type_id === $forcedLeaveTypeId) {
@@ -1976,7 +1994,9 @@ class LeaveApplicationController extends Controller
                 $hr,
                 $mainRestoreDays,
                 $restoreLeaveTypeId,
-                $recallRemarks
+                $recallRemarks,
+                $effectiveRecallDate,
+                $selectedRecallDateKeys
             ): void {
                 if ($mainRestoreDays > 0.0) {
                     $this->restoreApplicationBalance($app, $restoreLeaveTypeId, $mainRestoreDays);
@@ -1985,6 +2005,8 @@ class LeaveApplicationController extends Controller
                 $app->update([
                     'status' => LeaveApplication::STATUS_RECALLED,
                     'hr_id' => $hr->id,
+                    'recall_effective_date' => $effectiveRecallDate->toDateString(),
+                    'recall_selected_dates' => $selectedRecallDateKeys,
                     'remarks' => $recallRemarks,
                 ]);
 
@@ -6125,22 +6147,22 @@ class LeaveApplicationController extends Controller
             : $totalDays;
     }
 
-    private function resolveRecallRestorableDays(
+    private function resolveRecallRestorableDetails(
         LeaveApplication $app,
-        ?\Carbon\CarbonImmutable $asOfDate = null
-    ): float {
+        array $selectedRecallDateKeys = []
+    ): array {
         $deductibleDays = $this->resolveApplicationDeductibleDays($app);
         if ($deductibleDays <= 0.0) {
-            return 0.0;
+            return ['days' => 0.0, 'dates' => []];
         }
 
         if ((bool) $app->is_monetization) {
-            return $deductibleDays;
+            return ['days' => $deductibleDays, 'dates' => []];
         }
 
         $selectedDates = $app->resolvedSelectedDates();
         if (!is_array($selectedDates) || $selectedDates === []) {
-            return $deductibleDays;
+            return ['days' => $deductibleDays, 'dates' => []];
         }
 
         $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, false);
@@ -6159,15 +6181,23 @@ class LeaveApplicationController extends Controller
             round((float) ($app->total_days ?? 0), 2)
         );
 
-        $recallDate = ($asOfDate ?? \Carbon\CarbonImmutable::now())->startOfDay()->toDateString();
+        $selectedRecallDateSet = array_fill_keys(
+            $this->normalizeRecallDateKeys($selectedRecallDateKeys),
+            true
+        );
+        if ($selectedRecallDateSet === []) {
+            return ['days' => 0.0, 'dates' => []];
+        }
+
         $restorableDays = 0.0;
+        $restorableDateKeys = [];
 
         foreach ($selectedDates as $rawDate) {
             $dateKey = $this->normalizeDateKey($rawDate);
             if ($dateKey === null) {
                 $dateKey = trim((string) $rawDate);
             }
-            if ($dateKey === '' || strcmp($dateKey, $recallDate) < 0) {
+            if ($dateKey === '' || !isset($selectedRecallDateSet[$dateKey])) {
                 continue;
             }
 
@@ -6183,14 +6213,94 @@ class LeaveApplicationController extends Controller
             }
 
             $restorableDays += $weight;
+            $restorableDateKeys[] = $dateKey;
         }
 
         $restorableDays = round(max($restorableDays, 0.0), 2);
         if ($restorableDays > $deductibleDays) {
-            return $deductibleDays;
+            $restorableDays = $deductibleDays;
         }
 
-        return $restorableDays;
+        $restorableDateKeys = array_values(array_unique(array_filter($restorableDateKeys)));
+        sort($restorableDateKeys);
+
+        return [
+            'days' => $restorableDays,
+            'dates' => $restorableDateKeys,
+        ];
+    }
+
+    private function resolveValidatedRecallSelectedDateKeys(
+        LeaveApplication $app,
+        array $requestedDates = []
+    ): ?array {
+        $allowedDateKeys = $this->resolveRecallSelectedDateKeys($app);
+        $requestedDateKeys = $this->normalizeRecallDateKeys($requestedDates);
+
+        if ($requestedDateKeys === []) {
+            return null;
+        }
+
+        if ($allowedDateKeys === []) {
+            return $requestedDateKeys;
+        }
+
+        $allowedDateSet = array_fill_keys($allowedDateKeys, true);
+        foreach ($requestedDateKeys as $dateKey) {
+            if (!isset($allowedDateSet[$dateKey])) {
+                return null;
+            }
+        }
+
+        return $requestedDateKeys;
+    }
+
+    private function resolveRecallSelectedDateKeys(LeaveApplication $app): array
+    {
+        $selectedDates = $app->resolvedSelectedDates();
+        if (!is_array($selectedDates) || $selectedDates === []) {
+            return [];
+        }
+
+        $normalizedDateKeys = [];
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeDateKey($rawDate);
+            if ($dateKey === null) {
+                $dateKey = trim((string) $rawDate);
+            }
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $normalizedDateKeys[] = $dateKey;
+        }
+
+        $normalizedDateKeys = array_values(array_unique($normalizedDateKeys));
+        sort($normalizedDateKeys);
+
+        return $normalizedDateKeys;
+    }
+
+    private function normalizeRecallDateKeys(array $rawDates): array
+    {
+        $normalizedDateKeys = [];
+
+        foreach ($rawDates as $rawDate) {
+            $dateKey = $this->normalizeDateKey($rawDate);
+            if ($dateKey === null) {
+                $dateKey = trim((string) $rawDate);
+            }
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $normalizedDateKeys[] = $dateKey;
+        }
+
+        $normalizedDateKeys = array_values(array_unique($normalizedDateKeys));
+        sort($normalizedDateKeys);
+
+        return $normalizedDateKeys;
     }
 
     private function applicationDeductsEmployeeBalance(
@@ -6505,6 +6615,10 @@ class LeaveApplicationController extends Controller
             'hr_id' => $app->hr_id,
             'admin_approved_at' => $app->admin_approved_at?->toIso8601String(),
             'hr_approved_at' => $app->hr_approved_at?->toIso8601String(),
+            'recallEffectiveDate' => $app->recall_effective_date?->toDateString(),
+            'recall_effective_date' => $app->recall_effective_date?->toDateString(),
+            'recallSelectedDates' => is_array($app->recall_selected_dates) ? array_values($app->recall_selected_dates) : null,
+            'recall_selected_dates' => is_array($app->recall_selected_dates) ? array_values($app->recall_selected_dates) : null,
             'employeeName' => $applicantName,
             'employee_name' => $applicantName,
             'applicantName' => $applicantName,

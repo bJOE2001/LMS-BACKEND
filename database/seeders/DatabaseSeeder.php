@@ -19,7 +19,6 @@ class DatabaseSeeder extends Seeder
     {
         $this->call([
             DepartmentSeeder::class,
-            DepartmentAdminSeeder::class,
             HRAccountSeeder::class,
             LeaveTypeSeeder::class,
         ]);

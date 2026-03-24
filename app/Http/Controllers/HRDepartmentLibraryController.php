@@ -3,10 +3,8 @@
 namespace App\Http\Controllers;
 
 use App\Models\Department;
-use App\Services\RecycleBinService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 
 class HRDepartmentLibraryController extends Controller
@@ -20,6 +18,7 @@ class HRDepartmentLibraryController extends Controller
         $searchTerm = trim((string) ($validated['search'] ?? ''));
 
         $departments = Department::query()
+            ->active()
             ->with(['admin:id,department_id', 'departmentHead:id,department_id'])
             ->when($searchTerm !== '', function ($query) use ($searchTerm): void {
                 $query->where('name', 'like', "%{$searchTerm}%");
@@ -44,22 +43,23 @@ class HRDepartmentLibraryController extends Controller
         $validated = $this->validatePayload($request);
         $department = Department::create([
             'name' => trim((string) $validated['name']),
+            'is_inactive' => false,
         ]);
 
         $department->loadMissing(['admin:id,department_id', 'departmentHead:id,department_id']);
 
         return response()->json([
-            'message' => 'Department created successfully.',
+            'message' => 'Office created successfully.',
             'department' => $this->serializeDepartment($department),
         ], 201);
     }
 
     public function update(Request $request, int $id): JsonResponse
     {
-        $department = Department::query()->find($id);
+        $department = Department::query()->active()->find($id);
         if (!$department) {
             return response()->json([
-                'message' => 'Department not found.',
+                'message' => 'Office not found.',
             ], 404);
         }
 
@@ -69,7 +69,7 @@ class HRDepartmentLibraryController extends Controller
         $department->refresh()->loadMissing(['admin:id,department_id', 'departmentHead:id,department_id']);
 
         return response()->json([
-            'message' => 'Department updated successfully.',
+            'message' => 'Office updated successfully.',
             'department' => $this->serializeDepartment($department),
         ]);
     }
@@ -77,44 +77,21 @@ class HRDepartmentLibraryController extends Controller
     public function destroy(Request $request, int $id): JsonResponse
     {
         $department = Department::query()
+            ->active()
             ->with(['admin:id,department_id', 'departmentHead:id,department_id'])
             ->find($id);
 
         if (!$department) {
             return response()->json([
-                'message' => 'Department not found.',
+                'message' => 'Office not found.',
             ], 404);
         }
 
-        if ($department->admin !== null) {
-            return response()->json([
-                'message' => 'Cannot delete this department while a department admin is assigned. Remove the assignment first.',
-            ], 422);
-        }
-
-        if ($department->departmentHead !== null) {
-            return response()->json([
-                'message' => 'Cannot delete this department while a department head is assigned. Remove the department head first.',
-            ], 422);
-        }
-
-        DB::transaction(function () use ($department, $request): void {
-            app(RecycleBinService::class)->storeDeletedModel(
-                $department,
-                $request->user(),
-                [
-                    'record_title' => $department->name,
-                    'delete_source' => 'hr.departments-library',
-                    'delete_reason' => $request->input('reason'),
-                    'snapshot' => $this->serializeDepartment($department),
-                ]
-            );
-
-            $department->delete();
-        });
+        $department->is_inactive = true;
+        $department->save();
 
         return response()->json([
-            'message' => 'Department deleted successfully.',
+            'message' => 'Office marked inactive successfully.',
         ]);
     }
 

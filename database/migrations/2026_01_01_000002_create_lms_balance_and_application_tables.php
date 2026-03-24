@@ -95,6 +95,8 @@ return new class extends Migration {
                 ->constrained('tblHRAccounts')
                 ->nullOnDelete();
             $table->timestamp('hr_approved_at')->nullable();
+            $table->date('recall_effective_date')->nullable();
+            $table->longText('recall_selected_dates')->nullable();
             $table->text('remarks')->nullable();
 
             $table->boolean('requires_documents')->default(false);
