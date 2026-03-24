@@ -1,0 +1,58 @@
+<?php
+
+namespace Database\Seeders;
+
+use App\Models\Department;
+use Illuminate\Database\Seeder;
+
+/**
+ * Seed core departments used by HR Department Library.
+ */
+class DepartmentSeeder extends Seeder
+{
+    public function run(): void
+    {
+        $departments = [
+            'CITY PROSECUTOR OFFICE',
+            'CITY TRIAL COURT',
+            'CMO - DETAILED AT NATIONAL LINE AGENCIES',
+            'OFFICE OF THE CITY ACCOUNTANT',
+            'OFFICE OF THE CITY ADMINISTRATOR',
+            'OFFICE OF THE CITY AGRICULTURIST',
+            'OFFICE OF THE CITY ARCHITECT',
+            'OFFICE OF THE CITY ASSESSOR',
+            'OFFICE OF THE CITY BUDGET OFFICER',
+            'OFFICE OF THE CITY CIVIL REGISTRAR',
+            'OFFICE OF THE CITY DISASTER RISK REDUCTION AND MANAGEMENT OFFICER',
+            'OFFICE OF THE CITY ECONOMIC ENTERPRISES MANAGER',
+            'OFFICE OF THE CITY ENGINEER',
+            'OFFICE OF THE CITY ENVIRONMENT AND NATURAL RESOURCES OFFICER',
+            'OFFICE OF THE CITY GENERAL SERVICES OFFICER',
+            'OFFICE OF THE CITY HEALTH OFFICER',
+            'OFFICE OF THE CITY HOUSING AND LAND MANAGEMENT OFFICER',
+            'OFFICE OF THE CITY HUMAN RESOURCE MANAGEMENT OFFICER',
+            'OFFICE OF THE CITY INFORMATION AND COMMUNICATIONS TECHNOLOGY MANAGEMENT OFFICER',
+            'OFFICE OF THE CITY LEGAL OFFICER',
+            'OFFICE OF THE CITY MAYOR',
+            'OFFICE OF THE CITY MAYOR (DETAILED AT NATIONAL LINE AGENCIES)',
+            'OFFICE OF THE CITY PLANNING AND DEVELOPMENT COORDINATOR',
+            'OFFICE OF THE CITY PUBLIC EMPLOYMENT SERVICES AND CAPABILITY DEVELOPMENT OFFICER',
+            'OFFICE OF THE CITY SOCIAL WELFARE AND DEVELOPMENT OFFICER',
+            'OFFICE OF THE CITY TOURISM, ARTS, CULTURE AND HERITAGE MANAGEMENT OFFICER',
+            'OFFICE OF THE CITY TREASURER',
+            'OFFICE OF THE CITY VETERINARIAN',
+            'OFFICE OF THE CITY VICE MAYOR',
+            'OFFICE OF THE CITY VICE MAYOR / SANGGUNIANG PANLUNGSOD',
+            'OFFICE OF THE SANGGUNIANG PANLUNGSOD',
+            'OFFICE OF THE SECRETARY TO THE SANGGUNIAN',
+            'TAGUM CITY TRADE SCHOOL',
+        ];
+
+        foreach ($departments as $name) {
+            Department::updateOrCreate(
+                ['name' => $name],
+                ['name' => $name]
+            );
+        }
+    }
+}

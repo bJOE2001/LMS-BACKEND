@@ -115,7 +115,7 @@ return [
 
         /*
         |----------------------------------------------------------------------
-        | HRIS Server — pmis2003 (employee records via vwActive view)
+        | HRIS Server — pmis2003 (employee records via xPersonal + vwpartitionforseparated)
         |----------------------------------------------------------------------
         */
         'hr' => [

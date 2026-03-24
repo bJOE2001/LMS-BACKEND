@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\LeaveApplication;
 use App\Models\Notification;
+use App\Models\HrisEmployee;
 use App\Services\RecycleBinService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -16,6 +17,24 @@ use Illuminate\Support\Facades\DB;
 class NotificationController extends Controller
 {
     /**
+     * GET /notifications/unread-count - lightweight badge count for the header.
+     */
+    public function unreadCount(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        $count = Notification::query()
+            ->where('notifiable_type', get_class($user))
+            ->where('notifiable_id', $user->id)
+            ->whereNull('read_at')
+            ->count();
+
+        return response()->json([
+            'unread_count' => $count,
+        ]);
+    }
+
+    /**
      * GET /notifications — list notifications for the authenticated user.
      */
     public function index(Request $request): JsonResponse
@@ -24,7 +43,6 @@ class NotificationController extends Controller
 
         $notifications = Notification::with([
             'leaveApplication.leaveType',
-            'leaveApplication.employee',
             'leaveApplication.applicantAdmin.department',
         ])
             ->where('notifiable_type', get_class($user))
@@ -97,7 +115,7 @@ class NotificationController extends Controller
             ]);
         }
 
-        $application = LeaveApplication::with(['leaveType', 'employee', 'applicantAdmin.department'])
+        $application = LeaveApplication::with(['leaveType', 'applicantAdmin.department'])
             ->find($notification->leave_application_id);
 
         return response()->json([
@@ -119,7 +137,6 @@ class NotificationController extends Controller
 
         $notification->loadMissing([
             'leaveApplication.leaveType',
-            'leaveApplication.employee',
             'leaveApplication.applicantAdmin.department',
         ]);
 
@@ -149,7 +166,20 @@ class NotificationController extends Controller
             return null;
         }
 
-        $employeeName = trim(($application->employee?->firstname ?? '') . ' ' . ($application->employee?->surname ?? ''));
+        $employeeName = trim((string) ($application->employee_name ?? ''));
+        $office = $application->applicantAdmin?->department?->name;
+        $employee = null;
+
+        if ($employeeName === '' || trim((string) ($office ?? '')) === '') {
+            $employee = $this->resolveApplicationEmployee($application);
+            if ($employeeName === '') {
+                $employeeName = trim(($employee?->firstname ?? '') . ' ' . ($employee?->surname ?? ''));
+            }
+            if (trim((string) ($office ?? '')) === '') {
+                $office = $employee?->office;
+            }
+        }
+
         if ($employeeName === '') {
             $employeeName = $application->applicantAdmin?->full_name ?: null;
         }
@@ -159,7 +189,7 @@ class NotificationController extends Controller
             'employee_control_no' => $application->employee_control_no,
             'applicant_admin_id' => $application->applicant_admin_id,
             'applicant_name' => $employeeName,
-            'office' => $application->employee?->office ?? $application->applicantAdmin?->department?->name,
+            'office' => $office,
             'leave_type_id' => $application->leave_type_id,
             'leave_type_name' => $application->leaveType?->name,
             'start_date' => $application->start_date?->toDateString(),
@@ -177,6 +207,16 @@ class NotificationController extends Controller
             'admin_approved_at' => $application->admin_approved_at?->toIso8601String(),
             'hr_approved_at' => $application->hr_approved_at?->toIso8601String(),
         ];
+    }
+
+    private function resolveApplicationEmployee(LeaveApplication $application): ?object
+    {
+        $controlNo = trim((string) ($application->employee_control_no ?? ''));
+        if ($controlNo === '') {
+            return null;
+        }
+
+        return HrisEmployee::findByControlNo($controlNo);
     }
 
     private function toReadableStatus(?string $status): string

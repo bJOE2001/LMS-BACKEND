@@ -4,8 +4,8 @@ namespace App\Http\Controllers;
 
 use App\Models\Department;
 use App\Models\DepartmentAdmin;
-use App\Models\Employee;
 use App\Models\HRAccount;
+use App\Models\HrisEmployee;
 use App\Models\LeaveBalance;
 use App\Models\LeaveApplication;
 use App\Services\RecycleBinService;
@@ -18,8 +18,10 @@ use Illuminate\Validation\ValidationException;
 
 class HRUserManagementController extends Controller
 {
+    private const HR_DEFAULT_DEPARTMENT = 'OFFICE OF THE CITY HUMAN RESOURCE MANAGEMENT OFFICER';
+
     /**
-     * List all departments and current department admin assignments.
+     * List user accounts for HR and Department Admin roles.
      */
     public function index(Request $request): JsonResponse
     {
@@ -29,151 +31,224 @@ class HRUserManagementController extends Controller
 
         $searchTerm = trim((string) ($validated['search'] ?? ''));
 
-        $departments = Department::query()
-            ->with([
-                'admin:id,department_id,employee_control_no,full_name,username,must_change_password,created_at,updated_at',
-                'admin.employee:control_no,surname,firstname,middlename,birth_date,office,status,designation',
-            ])
-            ->when($searchTerm !== '', function ($query) use ($searchTerm): void {
-                $query->where(function ($nestedQuery) use ($searchTerm): void {
-                    $nestedQuery
-                        ->where('name', 'LIKE', "%{$searchTerm}%")
-                        ->orWhereHas('admin', function ($adminQuery) use ($searchTerm): void {
-                            $adminQuery
-                                ->where('full_name', 'LIKE', "%{$searchTerm}%")
-                                ->orWhere('username', 'LIKE', "%{$searchTerm}%")
-                                ->orWhere('employee_control_no', 'LIKE', "%{$searchTerm}%");
-                        });
-                });
-            })
-            ->orderBy('name')
+        $departmentAdminAccounts = DepartmentAdmin::query()
+            ->with(['department:id,name'])
+            ->orderBy('full_name')
             ->get()
-            ->map(fn(Department $department): array => $this->serializeDepartmentRow($department))
+            ->map(fn(DepartmentAdmin $admin): array => $this->serializeDepartmentAdminAccountRow($admin))
             ->values();
 
-        $assignedDepartments = $departments
-            ->filter(fn(array $department): bool => $department['department_admin'] !== null)
-            ->count();
+        $hrAccounts = HRAccount::query()
+            ->orderBy('full_name')
+            ->get()
+            ->map(fn(HRAccount $account): array => $this->serializeHrAccountRow($account))
+            ->values();
+
+        $needle = mb_strtolower($searchTerm);
+
+        $accounts = $departmentAdminAccounts
+            ->concat($hrAccounts)
+            ->filter(function (array $account) use ($needle): bool {
+                if ($needle === '') {
+                    return true;
+                }
+
+                $haystack = mb_strtolower(implode(' ', array_filter([
+                    trim((string) ($account['full_name'] ?? '')),
+                    trim((string) ($account['username'] ?? '')),
+                    trim((string) ($account['role_label'] ?? '')),
+                    trim((string) ($account['department'] ?? '')),
+                    trim((string) ($account['position'] ?? '')),
+                    trim((string) ($account['employee_control_no'] ?? '')),
+                ], fn(string $value): bool => $value !== '')));
+
+                return str_contains($haystack, $needle);
+            })
+            ->sort(function (array $left, array $right): int {
+                $leftRole = trim((string) ($left['role_label'] ?? ''));
+                $rightRole = trim((string) ($right['role_label'] ?? ''));
+                if ($leftRole !== $rightRole) {
+                    return $leftRole <=> $rightRole;
+                }
+
+                $leftName = mb_strtoupper(trim((string) ($left['full_name'] ?? '')));
+                $rightName = mb_strtoupper(trim((string) ($right['full_name'] ?? '')));
+                if ($leftName !== $rightName) {
+                    return $leftName <=> $rightName;
+                }
+
+                return strcmp(
+                    trim((string) ($left['username'] ?? '')),
+                    trim((string) ($right['username'] ?? ''))
+                );
+            })
+            ->values();
 
         return response()->json([
-            'departments' => $departments,
+            'accounts' => $accounts,
             'summary' => [
-                'total_departments' => $departments->count(),
-                'assigned_departments' => $assignedDepartments,
-                'unassigned_departments' => $departments->count() - $assignedDepartments,
+                'total_accounts' => $accounts->count(),
+                'hr_accounts' => $accounts->where('role', 'HR')->count(),
+                'department_admin_accounts' => $accounts->where('role', 'DEPARTMENT_ADMIN')->count(),
             ],
         ]);
     }
 
     /**
-     * List eligible employees for a department (excluding CONTRACTUAL).
+     * List eligible employees:
+     * - all ACTIVE employees (regardless of selected department)
+     *
+     * CONTRACTUAL employees are excluded.
      */
-    public function eligibleEmployees(Request $request, int $departmentId): JsonResponse
+    public function eligibleEmployees(Request $request, ?int $departmentId = null): JsonResponse
     {
         $validated = $request->validate([
             'search' => ['nullable', 'string', 'max:100'],
+            'limit' => ['nullable', 'integer', 'min:1', 'max:25'],
+            'department_id' => [
+                'nullable',
+                'integer',
+                Rule::exists('tblDepartments', 'id')->where(fn ($query) => $query->where('is_inactive', false)),
+            ],
         ]);
 
-        $department = Department::query()->find($departmentId);
-        if (!$department) {
+        $resolvedDepartmentId = $departmentId ?? (isset($validated['department_id']) ? (int) $validated['department_id'] : null);
+        $department = $resolvedDepartmentId !== null
+            ? Department::query()->active()->find($resolvedDepartmentId)
+            : null;
+        if ($resolvedDepartmentId !== null && !$department) {
             return response()->json([
                 'message' => 'Department not found.',
             ], 404);
         }
 
         $searchTerm = trim((string) ($validated['search'] ?? ''));
+        $limit = max(1, min(25, (int) ($validated['limit'] ?? 20)));
 
-        $employees = Employee::query()
-            ->select([
-                'control_no',
-                'surname',
-                'firstname',
-                'middlename',
-                'birth_date',
-                'office',
-                'status',
-                'designation',
-            ])
-            ->where('office', $department->name)
-            ->where(function ($query): void {
-                $query->whereNull('status')
-                    ->orWhereRaw("UPPER(LTRIM(RTRIM(status))) <> 'CONTRACTUAL'");
+        $employees = HrisEmployee::allCached(true)
+            ->filter(fn(object $employee): bool => strtoupper(trim((string) ($employee->status ?? ''))) !== 'CONTRACTUAL')
+            ->filter(function (object $employee) use ($searchTerm): bool {
+                if ($searchTerm === '') {
+                    return true;
+                }
+
+                $haystacks = [
+                    trim((string) ($employee->control_no ?? '')),
+                    trim((string) ($employee->surname ?? '')),
+                    trim((string) ($employee->firstname ?? '')),
+                    trim((string) ($employee->middlename ?? '')),
+                    trim((string) ($employee->designation ?? '')),
+                    trim((string) ($employee->office ?? '')),
+                ];
+
+                foreach ($haystacks as $haystack) {
+                    if ($haystack !== '' && stripos($haystack, $searchTerm) !== false) {
+                        return true;
+                    }
+                }
+
+                return false;
             })
-            ->when($searchTerm !== '', function ($query) use ($searchTerm): void {
-                $query->where(function ($nestedQuery) use ($searchTerm): void {
-                    $nestedQuery
-                        ->where('control_no', 'LIKE', "%{$searchTerm}%")
-                        ->orWhere('surname', 'LIKE', "%{$searchTerm}%")
-                        ->orWhere('firstname', 'LIKE', "%{$searchTerm}%")
-                        ->orWhere('middlename', 'LIKE', "%{$searchTerm}%")
-                        ->orWhere('designation', 'LIKE', "%{$searchTerm}%");
-                });
-            })
-            ->orderBy('surname')
-            ->orderBy('firstname')
-            ->get()
-            ->map(fn(Employee $employee): array => $this->serializeEligibleEmployee($employee))
+            ->take($limit)
+            ->values()
+            ->map(fn(object $employee): array => $this->serializeEligibleEmployee($employee))
             ->values();
 
         return response()->json([
-            'department' => [
-                'id' => $department->id,
-                'name' => $department->name,
-            ],
+            'department' => $department
+                ? [
+                    'id' => $department->id,
+                    'name' => $department->name,
+                ]
+                : null,
             'employees' => $employees,
         ]);
     }
 
     /**
-     * Assign a department admin account from tblEmployees to a department.
+     * Create a department admin account (employee-linked or guest) for a department.
      */
     public function store(Request $request): JsonResponse
     {
         $validated = $request->validate([
-            'department_id' => ['required', 'integer', 'exists:tblDepartments,id'],
-            'employee_control_no' => ['required', 'string', 'max:50', 'regex:/^\d+$/'],
+            'department_id' => [
+                'required',
+                'integer',
+                Rule::exists('tblDepartments', 'id')->where(fn ($query) => $query->where('is_inactive', false)),
+            ],
+            'is_guest' => ['nullable', 'boolean'],
+            'employee_control_no' => ['nullable', 'string', 'max:50', 'regex:/^\d+$/'],
+            'password' => ['nullable', 'string', 'min:8', 'max:255'],
             'username' => ['required', 'string', 'max:255', Rule::unique('tblDepartmentAdmins', 'username')],
         ]);
 
-        $department = Department::query()->find((int) $validated['department_id']);
+        $department = Department::query()->active()->find((int) $validated['department_id']);
         if (!$department) {
             return response()->json([
                 'message' => 'Department not found.',
             ], 404);
         }
 
-        $employee = $this->resolveEligibleEmployeeForDepartment(
-            $department,
-            (string) $validated['employee_control_no']
-        );
-        $this->assertUsernameAvailableForDepartmentAdmin((string) $validated['username']);
-        $generatedPassword = $this->buildGeneratedPasswordFromBirthDate($employee);
+        $isGuest = filter_var((string) ($validated['is_guest'] ?? false), FILTER_VALIDATE_BOOLEAN);
+        $employeeControlNo = trim((string) ($validated['employee_control_no'] ?? ''));
+        $rawPassword = (string) ($validated['password'] ?? '');
 
-        $existingAdmin = DepartmentAdmin::query()
-            ->where('department_id', $department->id)
-            ->first();
-
-        if ($existingAdmin && $this->isDepartmentAdminAssignmentActive($existingAdmin)) {
+        if (!$isGuest && $employeeControlNo === '') {
             throw ValidationException::withMessages([
-                'department_id' => ['Selected department already has an assigned admin.'],
+                'employee_control_no' => ['Employee is required when guest mode is off.'],
             ]);
         }
 
-        $admin = $existingAdmin ?? new DepartmentAdmin();
+        if ($isGuest && trim($rawPassword) === '') {
+            throw ValidationException::withMessages([
+                'password' => ['Password is required when guest mode is on.'],
+            ]);
+        }
+
+        $employee = !$isGuest
+            ? $this->resolveEligibleEmployeeForAssignment($employeeControlNo)
+            : null;
+
+        $this->assertUsernameAvailableForDepartmentAdmin((string) $validated['username']);
+        $generatedPassword = $isGuest
+            ? trim($rawPassword)
+            : $this->buildGeneratedPasswordFromBirthDate($employee);
+
+        $admin = DepartmentAdmin::query()
+            ->where('department_id', $department->id)
+            ->where(function ($query): void {
+                $query->whereNull('employee_control_no')
+                    ->orWhereRaw("LTRIM(RTRIM(CONVERT(VARCHAR(64), employee_control_no))) = ''");
+            })
+            ->where(function ($query): void {
+                $query->whereRaw("username LIKE 'archived_admin_%'")
+                    ->orWhere('is_default_account', true);
+            })
+            ->orderBy('id')
+            ->first();
+
+        if (!$admin) {
+            $admin = new DepartmentAdmin();
+        }
+
         $admin->department_id = $department->id;
-        $admin->employee_control_no = trim((string) $employee->control_no);
-        $admin->full_name = $this->buildEmployeeFullName($employee);
+        $admin->is_default_account = false;
+        $admin->employee_control_no = $employee ? trim((string) $employee->control_no) : null;
+        $admin->full_name = $employee
+            ? $this->buildEmployeeFullName($employee)
+            : $this->buildGuestAdminFullName((string) $validated['username']);
         $admin->username = trim((string) $validated['username']);
         $admin->password = $generatedPassword;
-        $admin->must_change_password = true;
+        $admin->must_change_password = !$isGuest;
         $admin->save();
         $admin->load([
             'department:id,name',
-            'employee:control_no,surname,firstname,middlename,birth_date,office,status,designation',
         ]);
 
         return response()->json([
-            'message' => 'Department admin assigned successfully. Default password is employee birthdate (MMDDYY).',
+            'message' => $isGuest
+                ? 'Guest department admin account created successfully.'
+                : 'Department admin assigned successfully. Default password is employee birthdate (MMDDYY).',
             'department_admin' => $this->serializeDepartmentAdmin($admin),
         ], 201);
     }
@@ -191,22 +266,23 @@ class HRUserManagementController extends Controller
         }
 
         $validated = $request->validate([
-            'department_id' => ['required', 'integer', 'exists:tblDepartments,id', Rule::unique('tblDepartmentAdmins', 'department_id')->ignore($admin->id)],
+            'department_id' => [
+                'required',
+                'integer',
+                Rule::exists('tblDepartments', 'id')->where(fn ($query) => $query->where('is_inactive', false)),
+            ],
             'employee_control_no' => ['required', 'string', 'max:50', 'regex:/^\d+$/'],
             'username' => ['required', 'string', 'max:255', Rule::unique('tblDepartmentAdmins', 'username')->ignore($admin->id)],
         ]);
 
-        $department = Department::query()->find((int) $validated['department_id']);
+        $department = Department::query()->active()->find((int) $validated['department_id']);
         if (!$department) {
             return response()->json([
                 'message' => 'Department not found.',
             ], 404);
         }
 
-        $employee = $this->resolveEligibleEmployeeForDepartment(
-            $department,
-            (string) $validated['employee_control_no']
-        );
+        $employee = $this->resolveEligibleEmployeeForAssignment((string) $validated['employee_control_no']);
         $this->assertUsernameAvailableForDepartmentAdmin(
             (string) $validated['username'],
             (int) $admin->id
@@ -222,7 +298,6 @@ class HRUserManagementController extends Controller
         $admin->save();
         $admin->load([
             'department:id,name',
-            'employee:control_no,surname,firstname,middlename,birth_date,office,status,designation',
         ]);
 
         return response()->json([
@@ -253,12 +328,10 @@ class HRUserManagementController extends Controller
             ]);
         }
 
-        $admin->loadMissing([
-            'department:id,name',
-            'employee:control_no,surname,firstname,middlename,birth_date,office,status,designation',
-        ]);
+        $admin->loadMissing(['department:id,name']);
+        $employeeSnapshot = $this->resolveEmployeeForAdmin($admin);
 
-        DB::transaction(function () use ($admin, $request): void {
+        DB::transaction(function () use ($admin, $request, $employeeSnapshot): void {
             app(RecycleBinService::class)->storeDeletedModel(
                 $admin,
                 $request->user(),
@@ -268,16 +341,7 @@ class HRUserManagementController extends Controller
                     'delete_reason' => $request->input('reason'),
                     'snapshot' => array_merge($admin->toArray(), [
                         'department' => $admin->department?->only(['id', 'name']),
-                        'employee' => $admin->employee?->only([
-                            'control_no',
-                            'surname',
-                            'firstname',
-                            'middlename',
-                            'birth_date',
-                            'office',
-                            'status',
-                            'designation',
-                        ]),
+                        'employee' => $employeeSnapshot ? $this->serializeEligibleEmployee($employeeSnapshot) : null,
                     ]),
                 ]
             );
@@ -290,9 +354,9 @@ class HRUserManagementController extends Controller
         ]);
     }
 
-    private function resolveEligibleEmployeeForDepartment(Department $department, string $employeeControlNo): Employee
+    private function resolveEligibleEmployeeForAssignment(string $employeeControlNo): object
     {
-        $employee = Employee::findByControlNo($employeeControlNo);
+        $employee = HrisEmployee::findByControlNo($employeeControlNo);
         if (!$employee) {
             throw ValidationException::withMessages([
                 'employee_control_no' => ['Employee not found.'],
@@ -306,24 +370,7 @@ class HRUserManagementController extends Controller
             ]);
         }
 
-        if (!$this->sameOffice($employee->office, $department->name)) {
-            throw ValidationException::withMessages([
-                'employee_control_no' => ['Selected employee does not belong to the selected department.'],
-            ]);
-        }
-
         return $employee;
-    }
-
-    private function sameOffice(mixed $left, mixed $right): bool
-    {
-        return $this->normalizeOffice($left) === $this->normalizeOffice($right);
-    }
-
-    private function normalizeOffice(mixed $value): string
-    {
-        $normalized = preg_replace('/\s+/', ' ', trim((string) $value));
-        return strtoupper($normalized ?? '');
     }
 
     private function assertUsernameAvailableForDepartmentAdmin(string $username, ?int $ignoreDepartmentAdminId = null): void
@@ -357,7 +404,7 @@ class HRUserManagementController extends Controller
         }
     }
 
-    private function buildEmployeeFullName(Employee $employee): string
+    private function buildEmployeeFullName(object $employee): string
     {
         $parts = array_values(array_filter([
             trim((string) $employee->firstname),
@@ -372,7 +419,17 @@ class HRUserManagementController extends Controller
         return trim(implode(' ', $parts));
     }
 
-    private function buildEmployeeDisplayName(Employee $employee): string
+    private function buildGuestAdminFullName(string $username): string
+    {
+        $normalizedUsername = trim($username);
+        if ($normalizedUsername === '') {
+            return 'Department Admin Guest';
+        }
+
+        return Str::limit($normalizedUsername, 255, '');
+    }
+
+    private function buildEmployeeDisplayName(object $employee): string
     {
         $surname = trim((string) $employee->surname);
         $firstname = trim((string) $employee->firstname);
@@ -396,6 +453,56 @@ class HRUserManagementController extends Controller
             'department_admin' => $admin && $this->isDepartmentAdminAssignmentActive($admin)
                 ? $this->serializeDepartmentAdmin($admin)
                 : null,
+        ];
+    }
+
+    private function serializeDepartmentAdminAccountRow(DepartmentAdmin $admin): array
+    {
+        $employee = $this->resolveEmployeeForAdmin($admin);
+        $position = trim((string) ($employee?->designation ?? ''));
+        if ($position === '') {
+            $position = 'Department Admin';
+        }
+
+        return [
+            'row_key' => 'DEPARTMENT_ADMIN-' . $admin->id,
+            'account_id' => $admin->id,
+            'role' => 'DEPARTMENT_ADMIN',
+            'role_label' => 'Department Admin',
+            'full_name' => trim((string) ($admin->full_name ?? '')),
+            'username' => trim((string) ($admin->username ?? '')),
+            'department' => trim((string) ($admin->department?->name ?? '')) !== ''
+                ? trim((string) $admin->department?->name)
+                : null,
+            'position' => $position,
+            'employee_control_no' => trim((string) ($admin->employee_control_no ?? '')) !== ''
+                ? trim((string) $admin->employee_control_no)
+                : null,
+            'is_default_account' => (bool) $admin->is_default_account,
+            'can_delete' => true,
+            'must_change_password' => (bool) $admin->must_change_password,
+            'created_at' => $admin->created_at?->toIso8601String(),
+            'updated_at' => $admin->updated_at?->toIso8601String(),
+        ];
+    }
+
+    private function serializeHrAccountRow(HRAccount $account): array
+    {
+        return [
+            'row_key' => 'HR-' . $account->id,
+            'account_id' => $account->id,
+            'role' => 'HR',
+            'role_label' => 'HR',
+            'full_name' => trim((string) ($account->full_name ?? '')),
+            'username' => trim((string) ($account->username ?? '')),
+            'department' => self::HR_DEFAULT_DEPARTMENT,
+            'position' => trim((string) ($account->position ?? '')) !== ''
+                ? trim((string) $account->position)
+                : null,
+            'employee_control_no' => null,
+            'must_change_password' => (bool) $account->must_change_password,
+            'created_at' => $account->created_at?->toIso8601String(),
+            'updated_at' => $account->updated_at?->toIso8601String(),
         ];
     }
 
@@ -443,9 +550,19 @@ class HRUserManagementController extends Controller
         return $candidate;
     }
 
+    private function resolveEmployeeForAdmin(DepartmentAdmin $admin): ?object
+    {
+        $controlNo = trim((string) ($admin->employee_control_no ?? ''));
+        if ($controlNo === '') {
+            return null;
+        }
+
+        return HrisEmployee::findByControlNo($controlNo);
+    }
+
     private function serializeDepartmentAdmin(DepartmentAdmin $admin): array
     {
-        $employee = $admin->employee;
+        $employee = $this->resolveEmployeeForAdmin($admin);
 
         return [
             'id' => $admin->id,
@@ -459,6 +576,7 @@ class HRUserManagementController extends Controller
                 : null,
             'full_name' => $admin->full_name,
             'username' => $admin->username,
+            'is_default_account' => (bool) $admin->is_default_account,
             'must_change_password' => (bool) $admin->must_change_password,
             'leave_initialized' => $this->resolveLeaveInitializedForEmployeeControlNo((string) $admin->employee_control_no),
             'employee' => $employee ? $this->serializeEligibleEmployee($employee) : null,
@@ -467,7 +585,7 @@ class HRUserManagementController extends Controller
         ];
     }
 
-    private function serializeEligibleEmployee(Employee $employee): array
+    private function serializeEligibleEmployee(object $employee): array
     {
         $status = strtoupper(trim((string) ($employee->status ?? '')));
 
@@ -486,7 +604,7 @@ class HRUserManagementController extends Controller
         ];
     }
 
-    private function buildGeneratedPasswordFromBirthDate(Employee $employee): string
+    private function buildGeneratedPasswordFromBirthDate(object $employee): string
     {
         $birthDate = $this->resolveEmployeeBirthDate($employee);
         if (!$birthDate) {
@@ -498,7 +616,7 @@ class HRUserManagementController extends Controller
         return $birthDate->format('mdy');
     }
 
-    private function resolveEmployeeBirthDate(Employee $employee): ?\DateTimeInterface
+    private function resolveEmployeeBirthDate(object $employee): ?\DateTimeInterface
     {
         $value = $employee->birth_date;
 
@@ -530,7 +648,7 @@ class HRUserManagementController extends Controller
         }
         $candidateEmployeeControlNos[] = $normalizedControlNo;
 
-        $employee = Employee::findByControlNo($employeeControlNo);
+        $employee = HrisEmployee::findByControlNo($employeeControlNo);
         if ($employee && trim((string) $employee->control_no) !== '') {
             $candidateEmployeeControlNos[] = trim((string) $employee->control_no);
         }

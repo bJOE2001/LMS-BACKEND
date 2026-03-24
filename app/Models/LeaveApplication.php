@@ -66,7 +66,7 @@ class LeaveApplication extends Model
     }
 
     // This system uses ERMS ControlNo as the authoritative employee identifier.
-    // Employee master records are stored and managed in LMS tblEmployees.
+    // Employee master records are resolved from HRIS employee sources.
     protected $fillable = [
         'applicant_admin_id',
         'employee_control_no',
@@ -83,6 +83,8 @@ class LeaveApplication extends Model
         'hr_id',
         'admin_approved_at',
         'hr_approved_at',
+        'recall_effective_date',
+        'recall_selected_dates',
         'remarks',
         'selected_dates',
         'selected_date_pay_status',
@@ -109,6 +111,8 @@ class LeaveApplication extends Model
             'deductible_days' => 'decimal:2',
             'admin_approved_at' => 'datetime',
             'hr_approved_at' => 'datetime',
+            'recall_effective_date' => 'date',
+            'recall_selected_dates' => 'array',
             'selected_dates' => 'array',
             'selected_date_pay_status' => 'array',
             'selected_date_coverage' => 'array',
@@ -152,11 +156,6 @@ class LeaveApplication extends Model
     public function applicantAdmin(): BelongsTo
     {
         return $this->belongsTo(DepartmentAdmin::class, 'applicant_admin_id');
-    }
-
-    public function employee(): BelongsTo
-    {
-        return $this->belongsTo(Employee::class, 'employee_control_no', 'control_no');
     }
 
     protected $hidden = [
@@ -311,7 +310,7 @@ class LeaveApplication extends Model
     {
         $controlNo = trim((string) ($application->employee_control_no ?? $application->erms_control_no ?? ''));
         if ($controlNo !== '') {
-            $employee = Employee::findByControlNo($controlNo);
+            $employee = HrisEmployee::findByControlNo($controlNo);
             $employeeName = self::formatSnapshotEmployeeName($employee);
             if ($employeeName !== null) {
                 return $employeeName;
@@ -320,8 +319,9 @@ class LeaveApplication extends Model
 
         $applicantAdminId = (int) ($application->applicant_admin_id ?? 0);
         if ($applicantAdminId > 0) {
-            $admin = DepartmentAdmin::query()->with('employee')->find($applicantAdminId);
-            $employeeName = self::formatSnapshotEmployeeName($admin?->employee);
+            $admin = DepartmentAdmin::query()->find($applicantAdminId);
+            $employee = $admin ? HrisEmployee::findByControlNo((string) ($admin->employee_control_no ?? '')) : null;
+            $employeeName = self::formatSnapshotEmployeeName($employee);
             if ($employeeName !== null) {
                 return $employeeName;
             }
@@ -333,7 +333,7 @@ class LeaveApplication extends Model
         return null;
     }
 
-    private static function formatSnapshotEmployeeName(?Employee $employee): ?string
+    private static function formatSnapshotEmployeeName(?object $employee): ?string
     {
         if (!$employee) {
             return null;
@@ -348,4 +348,3 @@ class LeaveApplication extends Model
         return $fullName !== '' ? $fullName : null;
     }
 }
-

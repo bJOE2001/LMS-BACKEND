@@ -14,6 +14,7 @@ return new class extends Migration {
         Schema::create('tblDepartments', function (Blueprint $table) {
             $table->id();
             $table->string('name')->unique();
+            $table->boolean('is_inactive')->default(false);
             $table->timestamps();
         });
 
@@ -92,4 +93,3 @@ return new class extends Migration {
         Schema::dropIfExists('tblDepartments');
     }
 };
-

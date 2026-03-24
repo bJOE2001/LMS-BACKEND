@@ -3,8 +3,8 @@
 namespace App\Http\Controllers;
 
 use App\Models\DepartmentAdmin;
-use App\Models\Employee;
 use App\Models\HRAccount;
+use App\Models\HrisEmployee;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
@@ -34,7 +34,7 @@ class SettingsController extends Controller
         }
 
         if ($user instanceof DepartmentAdmin) {
-            $user->loadMissing(['department', 'employee']);
+            $user->loadMissing(['department']);
 
             return response()->json([
                 'username' => $user->username,
@@ -141,8 +141,8 @@ class SettingsController extends Controller
 
     private function resolveDepartmentAdminFullName(DepartmentAdmin $admin): string
     {
-        $employee = $admin->employee;
-        if ($employee instanceof Employee) {
+        $employee = $this->resolveDepartmentAdminEmployee($admin);
+        if ($employee) {
             $parts = array_values(array_filter([
                 $this->trimNullableString($employee->firstname),
                 $this->trimNullableString($employee->middlename),
@@ -159,10 +159,21 @@ class SettingsController extends Controller
 
     private function resolveDepartmentAdminPosition(DepartmentAdmin $admin): string
     {
-        $position = $admin->employee?->designation;
+        $employee = $this->resolveDepartmentAdminEmployee($admin);
+        $position = $employee?->designation;
         $trimmedPosition = $this->trimNullableString($position);
 
         return $trimmedPosition ?? 'Department Admin';
+    }
+
+    private function resolveDepartmentAdminEmployee(DepartmentAdmin $admin): ?object
+    {
+        $controlNo = trim((string) ($admin->employee_control_no ?? ''));
+        if ($controlNo === '') {
+            return null;
+        }
+
+        return HrisEmployee::findByControlNo($controlNo);
     }
 
     private function assertUsernameAvailable(object $user, string $username): void

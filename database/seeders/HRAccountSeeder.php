@@ -9,26 +9,14 @@ use Illuminate\Support\Facades\Hash;
 
 /**
  * HR account seeder.
- *
- * Enabled by default in local, disabled by default in non-local.
- * Toggle with: HR_SEEDER_ENABLED=true|false
  */
 class HRAccountSeeder extends Seeder
 {
     public function run(): void
     {
-        $enabled = filter_var(
-            (string) env('HR_SEEDER_ENABLED', app()->environment('local') ? 'true' : 'false'),
-            FILTER_VALIDATE_BOOLEAN
-        );
-
-        if (! $enabled) {
-            return;
-        }
-
         $seedPassword = trim((string) env('HR_SEEDER_PASSWORD', ''));
         if ($seedPassword === '') {
-            throw new \RuntimeException('HR_SEEDER_PASSWORD is required when HR_SEEDER_ENABLED=true.');
+            throw new \RuntimeException('HR_SEEDER_PASSWORD is required to run HRAccountSeeder.');
         }
 
         $resetExistingPasswords = filter_var(
@@ -46,6 +34,11 @@ class HRAccountSeeder extends Seeder
                 [
                     'username' => 'hr2',
                     'full_name' => 'Kenneth Andallaza',
+                    'position' => 'HR',
+                ],
+                [
+                    'username' => 'hr3',
+                    'full_name' => 'Christian Andallaza',
                     'position' => 'HR',
                 ],
             ];

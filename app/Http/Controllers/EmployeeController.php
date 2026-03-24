@@ -5,8 +5,8 @@ namespace App\Http\Controllers;
 use App\Models\Department;
 use App\Models\DepartmentAdmin;
 use App\Models\DepartmentHead;
-use App\Models\Employee;
 use App\Models\HRAccount;
+use App\Models\HrisEmployee;
 use App\Models\LeaveApplication;
 use App\Models\LeaveApplicationLog;
 use App\Models\LeaveBalance;
@@ -23,26 +23,19 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 
 /**
- * Employee Management - uses local LMS_DB only.
+ * Employee Management - employee directory is sourced from HRIS (read-only).
  *
  * Employees are filtered by `office` (string) using the selected department name.
  */
 class EmployeeController extends Controller
 {
-    private const ALLOWED_STATUSES = [
-        'CASUAL',
-        'CO-TERMINOUS',
-        'CONTRACTUAL',
-        'ELECTIVE',
-        'REGULAR',
-    ];
-
     /**
      * List departments for the filter dropdown.
      */
     public function departments(): JsonResponse
     {
         $departments = Department::query()
+            ->active()
             ->orderBy('name')
             ->get(['id', 'name']);
 
@@ -83,7 +76,23 @@ class EmployeeController extends Controller
         }
 
         $validated = $this->validateDepartmentHeadPayload($request);
-        $attributes = $this->normalizeDepartmentHeadPayload($validated, $admin->department->name);
+        $employee = HrisEmployee::findByControlNo((string) ($validated['control_no'] ?? ''), true);
+        if (!$employee) {
+            return response()->json([
+                'message' => 'Employee not found in HRIS active records.',
+            ], 422);
+        }
+
+        $departmentName = trim((string) $admin->department->name);
+        $employeeOffice = trim((string) ($employee->office ?? ''));
+        if ($departmentName !== '' && strcasecmp($departmentName, $employeeOffice) !== 0) {
+            return response()->json([
+                'message' => 'Selected employee does not belong to your assigned department.',
+                'employee_office' => $employeeOffice !== '' ? $employeeOffice : null,
+            ], 422);
+        }
+
+        $attributes = $this->normalizeDepartmentHeadPayload($employee, $departmentName);
         $fullName = $this->buildDepartmentHeadFullName($attributes);
         $existingDepartmentHead = DepartmentHead::query()
             ->where('department_id', $admin->department_id)
@@ -103,7 +112,6 @@ class EmployeeController extends Controller
             }
 
             $departmentHead = DepartmentHead::query()->create($payload);
-            $this->syncDepartmentHeadToEmployeeRecord($departmentHead);
 
             return response()->json([
                 'message' => 'Department head added successfully.',
@@ -119,7 +127,6 @@ class EmployeeController extends Controller
 
         $existingDepartmentHead->fill($payload);
         $existingDepartmentHead->save();
-        $this->syncDepartmentHeadToEmployeeRecord($existingDepartmentHead);
 
         return response()->json([
             'message' => 'Department head updated successfully.',
@@ -181,10 +188,21 @@ class EmployeeController extends Controller
      */
     public function index(Request $request): JsonResponse
     {
+        if ($request->has('activity')) {
+            $request->merge([
+                'activity' => strtoupper(trim((string) $request->input('activity'))),
+            ]);
+        }
+
         $validated = $request->validate([
-            'department_id' => ['nullable', 'integer', 'exists:tblDepartments,id'],
+            'department_id' => [
+                'nullable',
+                'integer',
+                Rule::exists('tblDepartments', 'id')->where(fn ($query) => $query->where('is_inactive', false)),
+            ],
             'search' => ['nullable', 'string', 'max:100'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+            'activity' => ['nullable', 'string', 'in:ALL,ACTIVE,INACTIVE'],
         ]);
 
         $account = $request->user();
@@ -199,6 +217,12 @@ class EmployeeController extends Controller
 
         $departmentId = $validated['department_id'] ?? null;
         $searchTerm = $validated['search'] ?? null;
+        $activityFilter = strtoupper(trim((string) ($validated['activity'] ?? 'ALL')));
+        $activeOnly = match ($activityFilter) {
+            'ACTIVE' => true,
+            'INACTIVE' => false,
+            default => null,
+        };
         $perPage = max(1, min(100, (int) ($validated['per_page'] ?? 15)));
         $page = max(1, (int) $request->input('page', 1));
 
@@ -223,7 +247,7 @@ class EmployeeController extends Controller
             $departmentName = $account->department->name;
             $summaryDepartmentId = (int) $account->department_id;
         } elseif ($departmentId) {
-            $departmentName = Department::find($departmentId)?->name;
+            $departmentName = Department::query()->active()->find($departmentId)?->name;
             $summaryDepartmentId = $departmentName ? (int) $departmentId : null;
         }
 
@@ -235,7 +259,7 @@ class EmployeeController extends Controller
                 ->first();
             $departmentHeadControlNo = trim((string) ($departmentHead?->control_no ?? ''));
             $departmentHeadLookup = $departmentHead && $departmentHeadControlNo !== ''
-                ? [$departmentHeadControlNo => $departmentHead]
+                ? $this->buildControlNoLookup([$departmentHeadControlNo])
                 : [];
         } elseif ($isHrAccount) {
             $departmentHeadLookup = $this->buildDepartmentHeadLookup(null, $departmentName);
@@ -247,6 +271,7 @@ class EmployeeController extends Controller
                 $departmentName,
                 $summaryDepartmentId,
                 $searchTerm,
+                $activeOnly,
                 $perPage,
                 $page,
                 $departmentHeadLookup
@@ -255,12 +280,13 @@ class EmployeeController extends Controller
             $employees = $this->buildDepartmentAdminEmployeePaginator(
                 $departmentName,
                 $searchTerm,
+                $activeOnly,
                 $perPage,
                 $page,
                 $departmentHeadLookup
             );
             $totalEmployees = $employees->total();
-            $statusCounts = $this->buildDepartmentAdminStatusCounts($departmentName, $searchTerm);
+            $statusCounts = $this->buildDepartmentAdminStatusCounts($departmentName, $searchTerm, $activeOnly);
 
             if (
                 $departmentHead
@@ -268,7 +294,8 @@ class EmployeeController extends Controller
                     $departmentHead,
                     $departmentName,
                     $searchTerm,
-                    false
+                    false,
+                    $activeOnly
                 )
             ) {
                 $totalEmployees++;
@@ -284,13 +311,114 @@ class EmployeeController extends Controller
             'employees' => $employees,
             'total_employees' => $totalEmployees,
             'status_counts' => $statusCounts,
+            'activity_filter' => $activityFilter,
             'department_head' => $departmentHead ? $this->serializeDepartmentHead($departmentHead) : null,
         ]);
     }
 
     /**
-     * Create an employee in LMS_DB.
-     * Department admins can only create employees inside their own department.
+     * Lightweight employee lookup for HR search-driven selects.
+     */
+    public function employeeOptions(Request $request): JsonResponse
+    {
+        $account = $request->user();
+        if (!$account instanceof HRAccount) {
+            return response()->json([
+                'message' => 'Only HR accounts can access this resource.',
+            ], 403);
+        }
+
+        $validated = $request->validate([
+            'department_id' => [
+                'nullable',
+                'integer',
+                Rule::exists('tblDepartments', 'id')->where(fn ($query) => $query->where('is_inactive', false)),
+            ],
+            'search' => ['nullable', 'string', 'max:120'],
+            'limit' => ['nullable', 'integer', 'min:1', 'max:25'],
+            'activity' => ['nullable', 'string', 'in:ALL,ACTIVE,INACTIVE'],
+        ]);
+
+        $departmentId = $validated['department_id'] ?? null;
+        $searchTerm = trim((string) ($validated['search'] ?? ''));
+        $limit = max(1, min(25, (int) ($validated['limit'] ?? 20)));
+        $activityFilter = strtoupper(trim((string) ($validated['activity'] ?? 'ALL')));
+        $activeOnly = match ($activityFilter) {
+            'ACTIVE' => true,
+            'INACTIVE' => false,
+            default => null,
+        };
+
+        if ($searchTerm === '' && $departmentId === null) {
+            return response()->json([
+                'employees' => [],
+            ]);
+        }
+
+        $departmentName = $departmentId
+            ? Department::query()->active()->find($departmentId)?->name
+            : null;
+
+        $employeeRows = $this->fetchHrisEmployeeRows(
+            $departmentName,
+            $searchTerm,
+            false,
+            $activeOnly,
+            $limit * 2
+        );
+
+        $existingEmployeeControlNoLookup = $this->buildControlNoLookup(
+            $employeeRows
+                ->map(fn(array $employee): string => trim((string) ($employee['control_no'] ?? '')))
+                ->filter()
+                ->values()
+                ->all()
+        );
+
+        $departmentHeadRows = DepartmentHead::query()
+            ->when($departmentId, function ($query) use ($departmentId) {
+                $query->where('department_id', $departmentId);
+            }, function ($query) use ($departmentName) {
+                if ($departmentName) {
+                    $query->where('office', $departmentName);
+                }
+            })
+            ->orderBy('surname')
+            ->orderBy('firstname')
+            ->get()
+            ->filter(function (DepartmentHead $departmentHead) use (
+                $searchTerm,
+                $existingEmployeeControlNoLookup,
+                $activeOnly
+            ): bool {
+                if (!$this->matchesDepartmentHeadEmployeeFilters($departmentHead, $searchTerm, true, $activeOnly)) {
+                    return false;
+                }
+
+                $controlNo = trim((string) ($departmentHead->control_no ?? ''));
+                if ($controlNo !== '' && $this->hasControlNoInLookup($controlNo, $existingEmployeeControlNoLookup)) {
+                    return false;
+                }
+
+                return true;
+            })
+            ->map(fn(DepartmentHead $departmentHead): array => $this->serializeDepartmentHeadAsEmployee($departmentHead));
+
+        $combinedRows = $this->sortEmployeeRows(
+            $employeeRows
+                ->concat($departmentHeadRows)
+                ->values()
+        )
+            ->take($limit)
+            ->values();
+
+        return response()->json([
+            'employees' => $combinedRows,
+        ]);
+    }
+
+    /**
+     * Employee directory is read-only and sourced from HRIS.
      */
     public function store(Request $request): JsonResponse
     {
@@ -299,20 +427,13 @@ class EmployeeController extends Controller
             return $admin;
         }
 
-        $validated = $this->validateEmployeePayload($request);
-        $attributes = $this->normalizeEmployeePayload($validated, $admin->department->name, true);
-
-        $employee = Employee::query()->create($attributes);
-
         return response()->json([
-            'message' => 'Employee created successfully.',
-            'employee' => $this->serializeEmployee($employee),
-        ], 201);
+            'message' => 'Employee directory is read-only from HRIS. Create is disabled.',
+        ], 422);
     }
 
     /**
-     * Update an employee in LMS_DB.
-     * Department admins can only update employees inside their own department.
+     * Employee directory is read-only and sourced from HRIS.
      */
     public function update(Request $request, string $controlNo): JsonResponse
     {
@@ -321,43 +442,13 @@ class EmployeeController extends Controller
             return $admin;
         }
 
-        $employee = Employee::findByControlNo($controlNo);
-        if (!$employee) {
-            $departmentHead = DepartmentHead::query()
-                ->where('control_no', $controlNo)
-                ->first();
-
-            if (!$departmentHead) {
-                return response()->json(['message' => 'Employee not found.'], 404);
-            }
-
-            return response()->json([
-                'employee' => $this->serializeDepartmentHeadAsEmployee($departmentHead),
-                'applications' => [],
-            ]);
-        }
-
-        if (trim((string) $employee->office) !== trim((string) $admin->department->name)) {
-            return response()->json([
-                'message' => 'You can only update employees in your assigned department.',
-            ], 403);
-        }
-
-        $validated = $this->validateEmployeePayload($request, true);
-        $attributes = $this->normalizeEmployeePayload($validated, $admin->department->name, false);
-
-        $employee->fill($attributes);
-        $employee->save();
-
         return response()->json([
-            'message' => 'Employee updated successfully.',
-            'employee' => $this->serializeEmployee($employee),
-        ]);
+            'message' => 'Employee directory is read-only from HRIS. Update is disabled.',
+        ], 422);
     }
 
     /**
-     * Delete an employee in LMS_DB.
-     * Department admins can only delete employees inside their own department.
+     * Employee directory is read-only and sourced from HRIS.
      */
     public function destroy(Request $request, string $controlNo): JsonResponse
     {
@@ -366,39 +457,9 @@ class EmployeeController extends Controller
             return $admin;
         }
 
-        $employee = Employee::findByControlNo($controlNo);
-        if (!$employee) {
-            return response()->json(['message' => 'Employee not found.'], 404);
-        }
-
-        if (trim((string) $employee->office) !== trim((string) $admin->department->name)) {
-            return response()->json([
-                'message' => 'You can only delete employees in your assigned department.',
-            ], 403);
-        }
-
-        $employee->loadMissing('department');
-
-        DB::transaction(function () use ($employee, $request): void {
-            app(RecycleBinService::class)->storeDeletedModel(
-                $employee,
-                $request->user(),
-                [
-                    'record_title' => $employee->full_name,
-                    'delete_source' => 'admin.employees',
-                    'delete_reason' => $request->input('reason'),
-                    'snapshot' => array_merge($employee->toArray(), [
-                        'department' => $employee->department?->only(['id', 'name']),
-                    ]),
-                ]
-            );
-
-            $employee->delete();
-        });
-
         return response()->json([
-            'message' => 'Employee deleted successfully.',
-        ]);
+            'message' => 'Employee directory is read-only from HRIS. Delete is disabled.',
+        ], 422);
     }
 
     /**
@@ -411,13 +472,14 @@ class EmployeeController extends Controller
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
-        $employee = Employee::findByControlNo($controlNo);
+        $employee = HrisEmployee::findByControlNo($controlNo);
         if (!$employee) {
             return response()->json(['message' => 'Employee not found.'], 404);
         }
 
+        $controlNoCandidates = $this->buildLedgerControlNoCandidates($controlNo, $employee);
         $applications = LeaveApplication::with(['leaveType'])
-            ->where('employee_control_no', (string) $employee->control_no)
+            ->whereIn('employee_control_no', $controlNoCandidates)
             ->orderByDesc('created_at')
             ->get()
             ->map(function (LeaveApplication $application) {
@@ -467,7 +529,7 @@ class EmployeeController extends Controller
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
-        $employee = Employee::findByControlNo($controlNo);
+        $employee = HrisEmployee::findByControlNo($controlNo);
         if (!$employee) {
             return response()->json(['message' => 'Employee not found.'], 404);
         }
@@ -718,7 +780,11 @@ class EmployeeController extends Controller
                     $recallOccurredAt = $recallLog?->created_at
                         ? CarbonImmutable::instance($recallLog->created_at)
                         : ($application->updated_at ? CarbonImmutable::instance($application->updated_at) : null);
-                    $recallDetails = $this->resolveLedgerRecallRestorableDetails($application, $recallOccurredAt);
+                    $storedRecallDateKeys = $this->resolveLedgerStoredRecallDateKeys($application, $recallOccurredAt);
+                    $recallEffectiveAt = $application->recall_effective_date
+                        ? CarbonImmutable::parse((string) $application->recall_effective_date)->startOfDay()
+                        : (!empty($storedRecallDateKeys) ? CarbonImmutable::parse($storedRecallDateKeys[0])->startOfDay() : $recallOccurredAt);
+                    $recallDetails = $this->resolveLedgerRecallRestorableDetails($application, $storedRecallDateKeys, $recallEffectiveAt);
                     $restoredAmount = (float) ($recallDetails['days'] ?? 0.0);
                     $restoredDates = is_array($recallDetails['dates'] ?? null)
                         ? $recallDetails['dates']
@@ -730,7 +796,7 @@ class EmployeeController extends Controller
                         && array_key_exists($restoreTypeKey, $runningBalances)
                         && $restoredAmount > 0.0
                     ) {
-                        $recallDate = $recallOccurredAt?->toDateString();
+                        $recallDate = $recallEffectiveAt?->toDateString() ?? $recallOccurredAt?->toDateString();
                         if ($recallDate !== null) {
                             $transactions[] = [
                                 'row_id' => $mergeKey . '-recall',
@@ -738,7 +804,11 @@ class EmployeeController extends Controller
                                 'type_key' => $restoreTypeKey,
                                 'transaction_date' => $recallDate,
                                 'sort_date' => $recallDate,
-                                'sort_timestamp' => (string) ($recallOccurredAt?->toIso8601String() ?? $recallDate),
+                                'sort_timestamp' => (string) (
+                                    $recallOccurredAt?->toIso8601String()
+                                    ?? $recallEffectiveAt?->toIso8601String()
+                                    ?? $recallDate
+                                ),
                                 'particulars' => match (true) {
                                     $isForcedLeave => 'Forced Leave recalled',
                                     $typeKey === 'vacation' => 'Vacation Leave recalled',
@@ -932,81 +1002,10 @@ class EmployeeController extends Controller
     }
 
     /**
-     * Validate incoming employee payload against HRIS-aligned field constraints.
-     */
-    private function validateEmployeePayload(
-        Request $request,
-        bool $isUpdate = false
-    ): array {
-        if ($request->has('status')) {
-            $request->merge([
-                'status' => strtoupper(trim((string) $request->input('status'))),
-            ]);
-        }
-
-        if ($request->has('control_no')) {
-            $request->merge([
-                'control_no' => trim((string) $request->input('control_no')),
-            ]);
-        }
-
-        $rules = [
-            'surname' => ['required', 'string', 'max:255'],
-            'firstname' => ['required', 'string', 'max:255'],
-            'middlename' => ['nullable', 'string', 'max:255'],
-            'status' => ['required', 'string', Rule::in(self::ALLOWED_STATUSES)],
-            'designation' => ['nullable', 'string', 'max:255'],
-            'rate_mon' => ['nullable', 'numeric', 'min:0'],
-        ];
-
-        if (!$isUpdate) {
-            $rules['control_no'] = [
-                'required',
-                'string',
-                'max:50',
-                'regex:/^\d+$/',
-                Rule::unique('tblEmployees', 'control_no'),
-            ];
-        }
-
-        return $request->validate($rules);
-    }
-
-    /**
-     * Normalize and map validated employee payload for tblEmployees writes.
-     */
-    private function normalizeEmployeePayload(array $validated, string $office, bool $includeControlNo): array
-    {
-        $attributes = [
-            'surname' => trim((string) $validated['surname']),
-            'firstname' => trim((string) $validated['firstname']),
-            'middlename' => $this->trimNullable($validated['middlename'] ?? null),
-            'office' => $office,
-            'status' => strtoupper(trim((string) $validated['status'])),
-            'designation' => $this->trimNullable($validated['designation'] ?? null),
-            'rate_mon' => array_key_exists('rate_mon', $validated) && $validated['rate_mon'] !== null
-                ? round((float) $validated['rate_mon'], 2)
-                : null,
-        ];
-
-        if ($includeControlNo) {
-            $attributes['control_no'] = trim((string) $validated['control_no']);
-        }
-
-        return $attributes;
-    }
-
-    /**
-     * Validate incoming department head payload using the same fields as Add Employee.
+     * Validate incoming department head payload.
      */
     private function validateDepartmentHeadPayload(Request $request): array
     {
-        if ($request->has('status')) {
-            $request->merge([
-                'status' => strtoupper(trim((string) $request->input('status'))),
-            ]);
-        }
-
         if ($request->has('control_no')) {
             $request->merge([
                 'control_no' => trim((string) $request->input('control_no')),
@@ -1015,30 +1014,24 @@ class EmployeeController extends Controller
 
         return $request->validate([
             'control_no' => ['required', 'string', 'max:50', 'regex:/^\d+$/'],
-            'surname' => ['required', 'string', 'max:255'],
-            'firstname' => ['required', 'string', 'max:255'],
-            'middlename' => ['nullable', 'string', 'max:255'],
-            'status' => ['required', 'string', Rule::in(self::ALLOWED_STATUSES)],
-            'designation' => ['nullable', 'string', 'max:255'],
-            'rate_mon' => ['nullable', 'numeric', 'min:0'],
         ]);
     }
 
     /**
-     * Normalize and map validated department head payload for tblDepartmentHeads writes.
+     * Normalize and map HRIS employee data for tblDepartmentHeads writes.
      */
-    private function normalizeDepartmentHeadPayload(array $validated, string $office): array
+    private function normalizeDepartmentHeadPayload(object $employee, string $office): array
     {
         return [
-            'control_no' => trim((string) $validated['control_no']),
-            'surname' => trim((string) $validated['surname']),
-            'firstname' => trim((string) $validated['firstname']),
-            'middlename' => $this->trimNullable($validated['middlename'] ?? null),
+            'control_no' => trim((string) ($employee->control_no ?? '')),
+            'surname' => trim((string) ($employee->surname ?? '')),
+            'firstname' => trim((string) ($employee->firstname ?? '')),
+            'middlename' => $this->trimNullable($employee->middlename ?? null),
             'office' => $office,
-            'status' => strtoupper(trim((string) $validated['status'])),
-            'designation' => $this->trimNullable($validated['designation'] ?? null),
-            'rate_mon' => array_key_exists('rate_mon', $validated) && $validated['rate_mon'] !== null
-                ? round((float) $validated['rate_mon'], 2)
+            'status' => strtoupper(trim((string) ($employee->status ?? ''))),
+            'designation' => $this->trimNullable($employee->designation ?? null),
+            'rate_mon' => $employee->rate_mon !== null
+                ? round((float) $employee->rate_mon, 2)
                 : null,
         ];
     }
@@ -1046,16 +1039,16 @@ class EmployeeController extends Controller
     /**
      * Shared serializer for employee payloads used by API responses.
      */
-    private function serializeEmployee(Employee $employee): array
+    private function serializeEmployee(object $employee): array
     {
         return [
-            'control_no' => $employee->control_no,
-            'firstname' => $employee->firstname,
-            'surname' => $employee->surname,
-            'middlename' => $employee->middlename,
-            'designation' => $employee->designation,
-            'office' => $employee->office,
-            'status' => $employee->status,
+            'control_no' => trim((string) ($employee->control_no ?? '')),
+            'firstname' => trim((string) ($employee->firstname ?? '')),
+            'surname' => trim((string) ($employee->surname ?? '')),
+            'middlename' => $this->trimNullable($employee->middlename ?? null),
+            'designation' => $this->trimNullable($employee->designation ?? null),
+            'office' => trim((string) ($employee->office ?? '')),
+            'status' => trim((string) ($employee->status ?? '')),
             'rate_mon' => $employee->rate_mon !== null ? (float) $employee->rate_mon : null,
         ];
     }
@@ -1089,65 +1082,53 @@ class EmployeeController extends Controller
     private function buildDepartmentAdminEmployeePaginator(
         ?string $departmentName,
         ?string $searchTerm,
+        ?bool $activeOnly,
         int $perPage,
         int $page,
         array $departmentHeadLookup = []
     ): LengthAwarePaginator {
-        $employees = Employee::query()
-            ->when($departmentName, function ($query) use ($departmentName) {
-                $query->where('office', $departmentName);
-            })
-            ->when($searchTerm, function ($query, $term) {
-                $query->where(function ($q) use ($term) {
-                    $q->where('firstname', 'LIKE', "%{$term}%")
-                        ->orWhere('surname', 'LIKE', "%{$term}%");
-                });
-            })
-            ->whereNotIn('control_no', function ($query) {
-                $query->select('employee_control_no')
-                    ->from('tblDepartmentAdmins')
-                    ->whereNotNull('employee_control_no')
-                    ->whereRaw("LTRIM(RTRIM(employee_control_no)) <> ''");
-            })
-            ->orderBy('surname')
-            ->orderBy('firstname')
-            ->paginate($perPage, ['*'], 'page', $page);
+        $departmentAdminControlNoLookup = $this->loadDepartmentAdminEmployeeControlNoLookup();
+        $rows = $this->fetchHrisEmployeeRows($departmentName, $searchTerm, false, $activeOnly)
+            ->reject(fn(array $row): bool => $this->hasControlNoInLookup(
+                (string) ($row['control_no'] ?? ''),
+                $departmentAdminControlNoLookup
+            ))
+            ->values()
+            ->map(function (array $row) use ($departmentHeadLookup): array {
+                $controlNo = trim((string) ($row['control_no'] ?? ''));
+                return array_merge($row, [
+                    'has_account' => false,
+                    'is_department_head_record' => $controlNo !== '' && $this->hasControlNoInLookup($controlNo, $departmentHeadLookup),
+                ]);
+            });
 
-        $employees->getCollection()->transform(function (Employee $emp) use ($departmentHeadLookup) {
-            $controlNo = trim((string) $emp->control_no);
-            return array_merge($this->serializeEmployee($emp), [
-                'has_account' => false,
-                'is_department_head_record' => $controlNo !== '' && isset($departmentHeadLookup[$controlNo]),
-            ]);
-        });
-
-        return $employees;
+        return new LengthAwarePaginator(
+            $rows->forPage($page, $perPage)->values(),
+            $rows->count(),
+            $perPage,
+            $page,
+            [
+                'path' => request()->url(),
+                'pageName' => 'page',
+            ]
+        );
     }
 
-    private function buildDepartmentAdminStatusCounts(?string $departmentName, ?string $searchTerm): array
+    private function buildDepartmentAdminStatusCounts(
+        ?string $departmentName,
+        ?string $searchTerm,
+        ?bool $activeOnly
+    ): array
     {
-        $statusCountsQuery = Employee::query();
-        if ($departmentName) {
-            $statusCountsQuery->where('office', $departmentName);
-        }
-        if ($searchTerm) {
-            $statusCountsQuery->where(function ($q) use ($searchTerm) {
-                $q->where('firstname', 'LIKE', "%{$searchTerm}%")
-                    ->orWhere('surname', 'LIKE', "%{$searchTerm}%");
-            });
-        }
-        $statusCountsQuery->whereNotIn('control_no', function ($query) {
-            $query->select('employee_control_no')
-                ->from('tblDepartmentAdmins')
-                ->whereNotNull('employee_control_no')
-                ->whereRaw("LTRIM(RTRIM(employee_control_no)) <> ''");
-        });
+        $departmentAdminControlNoLookup = $this->loadDepartmentAdminEmployeeControlNoLookup();
+        $rows = $this->fetchHrisEmployeeRows($departmentName, $searchTerm, false, $activeOnly)
+            ->reject(fn(array $row): bool => $this->hasControlNoInLookup(
+                (string) ($row['control_no'] ?? ''),
+                $departmentAdminControlNoLookup
+            ))
+            ->values();
 
-        return $statusCountsQuery
-            ->selectRaw('status, COUNT(*) as count')
-            ->groupBy('status')
-            ->pluck('count', 'status')
-            ->toArray();
+        return $this->buildStatusCountsFromRows($rows);
     }
 
     private function buildHrEmployeeListing(
@@ -1155,41 +1136,27 @@ class EmployeeController extends Controller
         ?string $departmentName,
         ?int $departmentId,
         ?string $searchTerm,
+        ?bool $activeOnly,
         int $perPage,
         int $page,
         array $departmentHeadLookup = []
     ): array {
-        $employeeRows = Employee::query()
-            ->when($departmentName, function ($query) use ($departmentName) {
-                $query->where('office', $departmentName);
-            })
-            ->where(function ($q) {
-                $q->whereNull('status')
-                    ->orWhereRaw("UPPER(LTRIM(RTRIM(status))) <> 'CONTRACTUAL'");
-            })
-            ->when($searchTerm, function ($query, $term) {
-                $query->where(function ($q) use ($term) {
-                    $q->where('firstname', 'LIKE', "%{$term}%")
-                        ->orWhere('surname', 'LIKE', "%{$term}%");
-                });
-            })
-            ->orderBy('surname')
-            ->orderBy('firstname')
-            ->get()
-            ->map(function (Employee $employee) use ($departmentHeadLookup): array {
-                $controlNo = trim((string) $employee->control_no);
-                return array_merge($this->serializeEmployee($employee), [
+        $employeeRows = $this->fetchHrisEmployeeRows($departmentName, $searchTerm, false, $activeOnly)
+            ->map(function (array $employee) use ($departmentHeadLookup): array {
+                $controlNo = trim((string) ($employee['control_no'] ?? ''));
+                return array_merge($employee, [
                     'has_account' => false,
-                    'is_department_head_record' => $controlNo !== '' && isset($departmentHeadLookup[$controlNo]),
+                    'is_department_head_record' => $controlNo !== '' && $this->hasControlNoInLookup($controlNo, $departmentHeadLookup),
                 ]);
             });
 
-        $existingEmployeeControlNos = $employeeRows
-            ->map(fn(array $employee): string => trim((string) ($employee['control_no'] ?? '')))
-            ->filter()
-            ->values()
-            ->all();
-        $existingEmployeeControlNoLookup = array_fill_keys($existingEmployeeControlNos, true);
+        $existingEmployeeControlNoLookup = $this->buildControlNoLookup(
+            $employeeRows
+                ->map(fn(array $employee): string => trim((string) ($employee['control_no'] ?? '')))
+                ->filter()
+                ->values()
+                ->all()
+        );
 
         $departmentHeadRows = DepartmentHead::query()
             ->when($departmentId, function ($query) use ($departmentId) {
@@ -1203,16 +1170,16 @@ class EmployeeController extends Controller
             ->orderBy('firstname')
             ->get()
             ->filter(function (DepartmentHead $departmentHead) use (
-                $departmentName,
                 $searchTerm,
-                $existingEmployeeControlNoLookup
+                $existingEmployeeControlNoLookup,
+                $activeOnly
             ): bool {
-                if (!$this->matchesDepartmentHeadEmployeeFilters($departmentHead, $searchTerm, true)) {
+                if (!$this->matchesDepartmentHeadEmployeeFilters($departmentHead, $searchTerm, true, $activeOnly)) {
                     return false;
                 }
 
                 $controlNo = trim((string) ($departmentHead->control_no ?? ''));
-                if ($controlNo !== '' && isset($existingEmployeeControlNoLookup[$controlNo])) {
+                if ($controlNo !== '' && $this->hasControlNoInLookup($controlNo, $existingEmployeeControlNoLookup)) {
                     return false;
                 }
 
@@ -1222,24 +1189,7 @@ class EmployeeController extends Controller
 
         $combinedRows = $employeeRows
             ->concat($departmentHeadRows)
-            ->sort(function (array $left, array $right): int {
-                $leftSurname = mb_strtoupper(trim((string) ($left['surname'] ?? '')));
-                $rightSurname = mb_strtoupper(trim((string) ($right['surname'] ?? '')));
-                if ($leftSurname !== $rightSurname) {
-                    return $leftSurname <=> $rightSurname;
-                }
-
-                $leftFirstname = mb_strtoupper(trim((string) ($left['firstname'] ?? '')));
-                $rightFirstname = mb_strtoupper(trim((string) ($right['firstname'] ?? '')));
-                if ($leftFirstname !== $rightFirstname) {
-                    return $leftFirstname <=> $rightFirstname;
-                }
-
-                return strcmp(
-                    trim((string) ($left['control_no'] ?? '')),
-                    trim((string) ($right['control_no'] ?? ''))
-                );
-            })
+            ->pipe(fn(Collection $rows): Collection => $this->sortEmployeeRows($rows))
             ->values();
 
         $paginatedRows = new LengthAwarePaginator(
@@ -1259,6 +1209,159 @@ class EmployeeController extends Controller
             $this->buildStatusCountsFromRows($combinedRows),
         ];
     }
+
+    private function fetchHrisEmployeeRows(
+        ?string $departmentName,
+        ?string $searchTerm,
+        bool $excludeContractual,
+        ?bool $activeOnly = null,
+        ?int $limit = null
+    ): Collection {
+        $normalizedDepartmentName = trim((string) ($departmentName ?? ''));
+        $normalizedSearchTerm = trim((string) ($searchTerm ?? ''));
+
+        $rows = HrisEmployee::allCached($activeOnly)
+            ->filter(function (object $employee) use (
+                $normalizedDepartmentName,
+                $excludeContractual,
+                $activeOnly,
+                $normalizedSearchTerm
+            ): bool {
+                $employeeOffice = trim((string) ($employee->office ?? ''));
+                $employeeStatus = strtoupper(trim((string) ($employee->status ?? '')));
+                $isActive = filter_var($employee->is_active ?? false, FILTER_VALIDATE_BOOLEAN);
+
+                if (
+                    $normalizedDepartmentName !== ''
+                    && strcasecmp($employeeOffice, $normalizedDepartmentName) !== 0
+                ) {
+                    return false;
+                }
+
+                if ($excludeContractual && $employeeStatus === 'CONTRACTUAL') {
+                    return false;
+                }
+
+                if ($activeOnly === false && in_array($employeeStatus, ['HONORARIUM', 'CONTRACTUAL'], true)) {
+                    return false;
+                }
+
+                if (
+                    $activeOnly === null
+                    && !$isActive
+                    && in_array($employeeStatus, ['HONORARIUM', 'CONTRACTUAL'], true)
+                ) {
+                    return false;
+                }
+
+                return $this->matchesHrisEmployeeSearch($employee, $normalizedSearchTerm);
+            })
+            ->map(fn(object $employee): array => $this->serializeEmployee($employee))
+            ->pipe(fn(Collection $employeeRows): Collection => $this->sortEmployeeRows($employeeRows))
+            ->values();
+
+        if ($limit !== null && $limit > 0) {
+            return $rows->take($limit)->values();
+        }
+
+        return $rows;
+    }
+
+    private function matchesHrisEmployeeSearch(object $employee, string $searchTerm): bool
+    {
+        if ($searchTerm === '') {
+            return true;
+        }
+
+        $needle = mb_strtolower($searchTerm);
+        $haystack = implode(' ', array_filter([
+            trim((string) ($employee->firstname ?? '')),
+            trim((string) ($employee->surname ?? '')),
+            trim((string) ($employee->middlename ?? '')),
+            trim((string) ($employee->control_no ?? '')),
+            trim((string) ($employee->status ?? '')),
+            trim((string) ($employee->office ?? '')),
+            trim((string) ($employee->designation ?? '')),
+        ], static fn(string $value): bool => $value !== ''));
+
+        return mb_stripos($haystack, $needle) !== false;
+    }
+
+    private function sortEmployeeRows(Collection $rows): Collection
+    {
+        return $rows->sort(function (array $left, array $right): int {
+            $leftSurname = mb_strtoupper(trim((string) ($left['surname'] ?? '')));
+            $rightSurname = mb_strtoupper(trim((string) ($right['surname'] ?? '')));
+            if ($leftSurname !== $rightSurname) {
+                return $leftSurname <=> $rightSurname;
+            }
+
+            $leftFirstname = mb_strtoupper(trim((string) ($left['firstname'] ?? '')));
+            $rightFirstname = mb_strtoupper(trim((string) ($right['firstname'] ?? '')));
+            if ($leftFirstname !== $rightFirstname) {
+                return $leftFirstname <=> $rightFirstname;
+            }
+
+            return strcmp(
+                trim((string) ($left['control_no'] ?? '')),
+                trim((string) ($right['control_no'] ?? ''))
+            );
+        });
+    }
+
+    private function loadDepartmentAdminEmployeeControlNoLookup(): array
+    {
+        $controlNos = DepartmentAdmin::query()
+            ->whereNotNull('employee_control_no')
+            ->pluck('employee_control_no')
+            ->map(fn(mixed $value): string => trim((string) $value))
+            ->filter(fn(string $value): bool => $value !== '')
+            ->unique()
+            ->values()
+            ->all();
+
+        return $this->buildControlNoLookup($controlNos);
+    }
+
+    private function buildControlNoLookup(array $controlNos): array
+    {
+        $lookup = [];
+        foreach ($controlNos as $controlNo) {
+            $rawControlNo = trim((string) $controlNo);
+            if ($rawControlNo === '') {
+                continue;
+            }
+
+            $lookup[$rawControlNo] = true;
+            $normalizedControlNo = $this->normalizeLedgerControlNo($rawControlNo);
+            if ($normalizedControlNo !== null) {
+                $lookup[$normalizedControlNo] = true;
+            }
+        }
+
+        return $lookup;
+    }
+
+    private function hasControlNoInLookup(string $controlNo, array $lookup): bool
+    {
+        $rawControlNo = trim($controlNo);
+        if ($rawControlNo === '') {
+            return false;
+        }
+
+        if (isset($lookup[$rawControlNo])) {
+            return true;
+        }
+
+        $normalizedControlNo = $this->normalizeLedgerControlNo($rawControlNo);
+        return $normalizedControlNo !== null && isset($lookup[$normalizedControlNo]);
+    }
+
+    private function isContractualStatus(?string $status): bool
+    {
+        return strtoupper(trim((string) ($status ?? ''))) === 'CONTRACTUAL';
+    }
+
 
     private function buildStatusCountsFromRows(Collection $rows): array
     {
@@ -1290,39 +1393,29 @@ class EmployeeController extends Controller
             ->get()
             ->mapWithKeys(function (DepartmentHead $departmentHead): array {
                 $controlNo = trim((string) $departmentHead->control_no);
-                return $controlNo !== '' ? [$controlNo => $departmentHead] : [];
+                if ($controlNo === '') {
+                    return [];
+                }
+
+                $keys = [$controlNo => $departmentHead];
+                $normalizedControlNo = $this->normalizeLedgerControlNo($controlNo);
+                if ($normalizedControlNo !== null) {
+                    $keys[$normalizedControlNo] = $departmentHead;
+                }
+
+                return $keys;
             })
             ->all();
-    }
-
-    private function syncDepartmentHeadToEmployeeRecord(DepartmentHead $departmentHead): void
-    {
-        $controlNo = trim((string) ($departmentHead->control_no ?? ''));
-        if ($controlNo === '') {
-            return;
-        }
-
-        Employee::query()->updateOrCreate(
-            ['control_no' => $controlNo],
-            [
-                'surname' => trim((string) ($departmentHead->surname ?? '')),
-                'firstname' => trim((string) ($departmentHead->firstname ?? '')),
-                'middlename' => $this->trimNullable($departmentHead->middlename),
-                'office' => trim((string) ($departmentHead->office ?? '')),
-                'status' => strtoupper(trim((string) ($departmentHead->status ?? ''))),
-                'designation' => $this->trimNullable($departmentHead->designation),
-                'rate_mon' => $departmentHead->rate_mon !== null ? round((float) $departmentHead->rate_mon, 2) : null,
-            ]
-        );
     }
 
     private function shouldIncludeDepartmentHeadInEmployeeSummary(
         DepartmentHead $departmentHead,
         ?string $departmentName,
         ?string $searchTerm,
-        bool $isHrAccount
+        bool $isHrAccount,
+        ?bool $activeOnly = null
     ): bool {
-        if (!$this->matchesDepartmentHeadEmployeeFilters($departmentHead, $searchTerm, $isHrAccount)) {
+        if (!$this->matchesDepartmentHeadEmployeeFilters($departmentHead, $searchTerm, $isHrAccount, $activeOnly)) {
             return false;
         }
 
@@ -1331,34 +1424,47 @@ class EmployeeController extends Controller
             return true;
         }
 
-        return !Employee::query()
-            ->when($departmentName, function ($query) use ($departmentName) {
-                $query->where('office', $departmentName);
-            })
-            ->when($isHrAccount, function ($query) {
-                $query->where(function ($q) {
-                    $q->whereNull('status')
-                        ->orWhereRaw("UPPER(LTRIM(RTRIM(status))) <> 'CONTRACTUAL'");
-                });
-            })
-            ->when($searchTerm, function ($query, $term) {
-                $query->where(function ($q) use ($term) {
-                    $q->where('firstname', 'LIKE', "%{$term}%")
-                        ->orWhere('surname', 'LIKE', "%{$term}%");
-                });
-            })
-            ->where('control_no', $controlNo)
-            ->exists();
+        $employee = HrisEmployee::findByControlNo($controlNo);
+        if (!$employee) {
+            return true;
+        }
+
+        if ($departmentName !== null && strcasecmp(trim((string) ($employee->office ?? '')), trim($departmentName)) !== 0) {
+            return true;
+        }
+
+        if ($isHrAccount && $this->isContractualStatus((string) ($employee->status ?? null))) {
+            return true;
+        }
+
+        $term = strtolower(trim((string) ($searchTerm ?? '')));
+        if ($term !== '') {
+            $firstname = strtolower(trim((string) ($employee->firstname ?? '')));
+            $surname = strtolower(trim((string) ($employee->surname ?? '')));
+
+            if (!str_contains($firstname, $term) && !str_contains($surname, $term)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function matchesDepartmentHeadEmployeeFilters(
         DepartmentHead $departmentHead,
         ?string $searchTerm,
-        bool $isHrAccount
+        bool $isHrAccount,
+        ?bool $activeOnly = null
     ): bool {
-        $status = strtoupper(trim((string) ($departmentHead->status ?? '')));
-        if ($isHrAccount && $status === 'CONTRACTUAL') {
-            return false;
+        if ($activeOnly !== null) {
+            $controlNo = trim((string) ($departmentHead->control_no ?? ''));
+            if ($controlNo === '') {
+                return false;
+            }
+
+            if (!HrisEmployee::existsByControlNo($controlNo, $activeOnly)) {
+                return false;
+            }
         }
 
         $term = trim((string) ($searchTerm ?? ''));
@@ -1392,7 +1498,7 @@ class EmployeeController extends Controller
         return $text === '' ? null : $text;
     }
 
-    private function buildLedgerControlNoCandidates(string $controlNo, ?Employee $employee = null): array
+    private function buildLedgerControlNoCandidates(string $controlNo, ?object $employee = null): array
     {
         $rawControlNo = trim($controlNo);
         if ($rawControlNo === '') {
@@ -1632,7 +1738,8 @@ class EmployeeController extends Controller
 
     private function resolveLedgerRecallRestorableDetails(
         LeaveApplication $application,
-        ?CarbonImmutable $asOfDate = null
+        array $selectedRecallDateKeys = [],
+        ?CarbonImmutable $effectiveRecallDate = null
     ): array {
         $deductibleDays = $this->resolveLedgerApplicationDeductibleDays($application);
         if ($deductibleDays <= 0.0) {
@@ -1664,13 +1771,24 @@ class EmployeeController extends Controller
             round((float) ($application->total_days ?? 0), 2)
         );
 
-        $recallDate = ($asOfDate ?? CarbonImmutable::now())->startOfDay()->toDateString();
+        $selectedRecallDateSet = array_fill_keys(
+            $this->normalizeLedgerRecallDateKeys(
+                $selectedRecallDateKeys !== []
+                    ? $selectedRecallDateKeys
+                    : $this->resolveLedgerStoredRecallDateKeys($application, $effectiveRecallDate)
+            ),
+            true
+        );
+        if ($selectedRecallDateSet === []) {
+            return ['days' => 0.0, 'dates' => []];
+        }
+
         $restorableDays = 0.0;
         $restorableDates = [];
 
         foreach ($selectedDates as $rawDate) {
             $dateKey = $this->normalizeLedgerDateKey($rawDate) ?? trim((string) $rawDate);
-            if ($dateKey === '' || strcmp($dateKey, $recallDate) < 0) {
+            if ($dateKey === '' || !isset($selectedRecallDateSet[$dateKey])) {
                 continue;
             }
 
@@ -1701,6 +1819,65 @@ class EmployeeController extends Controller
             'days' => $restorableDays,
             'dates' => $restorableDates,
         ];
+    }
+
+    private function resolveLedgerStoredRecallDateKeys(
+        LeaveApplication $application,
+        ?CarbonImmutable $effectiveRecallDate = null
+    ): array {
+        $storedRecallDates = is_array($application->recall_selected_dates)
+            ? $application->recall_selected_dates
+            : null;
+        $normalizedStoredRecallDates = $this->normalizeLedgerRecallDateKeys($storedRecallDates ?? []);
+        if ($normalizedStoredRecallDates !== []) {
+            return $normalizedStoredRecallDates;
+        }
+
+        $selectedDates = $application->resolvedSelectedDates();
+        if (!is_array($selectedDates) || $selectedDates === []) {
+            return [];
+        }
+
+        $effectiveDateKey = $application->recall_effective_date
+            ? CarbonImmutable::parse((string) $application->recall_effective_date)->toDateString()
+            : ($effectiveRecallDate?->toDateString() ?? null);
+        if ($effectiveDateKey === null || $effectiveDateKey === '') {
+            return [];
+        }
+
+        $resolvedDateKeys = [];
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeLedgerDateKey($rawDate) ?? trim((string) $rawDate);
+            if ($dateKey === '' || strcmp($dateKey, $effectiveDateKey) < 0) {
+                continue;
+            }
+
+            $resolvedDateKeys[] = $dateKey;
+        }
+
+        $resolvedDateKeys = array_values(array_unique(array_filter($resolvedDateKeys)));
+        sort($resolvedDateKeys);
+
+        return $resolvedDateKeys;
+    }
+
+    private function normalizeLedgerRecallDateKeys(array $rawDates): array
+    {
+        $normalizedDateKeys = [];
+
+        foreach ($rawDates as $rawDate) {
+            $dateKey = $this->normalizeLedgerDateKey($rawDate) ?? trim((string) $rawDate);
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $normalizedDateKeys[] = $dateKey;
+        }
+
+        $normalizedDateKeys = array_values(array_unique(array_filter($normalizedDateKeys)));
+        sort($normalizedDateKeys);
+
+        return $normalizedDateKeys;
     }
 
     private function normalizeLedgerPayMode(mixed $payMode, bool $isMonetization = false): string

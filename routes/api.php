@@ -6,6 +6,7 @@ use App\Http\Controllers\Auth\AuthController;
 use App\Http\Controllers\Auth\PasswordResetController;
 use App\Http\Controllers\EmployeeController;
 use App\Http\Controllers\HRDashboardController;
+use App\Http\Controllers\HRDepartmentLibraryController;
 use App\Http\Controllers\HRLeaveBalanceImportController;
 use App\Http\Controllers\HRLeaveTypeController;
 use App\Http\Controllers\HRReportController;
@@ -70,6 +71,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
     // Shared LMS account routes
     Route::get('/departments', [EmployeeController::class, 'departments']);
     Route::get('/employees', [EmployeeController::class, 'index']);
+    Route::get('/notifications/unread-count', [NotificationController::class, 'unreadCount']);
     Route::get('/notifications', [NotificationController::class, 'index']);
     Route::get('/notifications/{id}/application', [NotificationController::class, 'applicationDetails']);
     Route::put('/notifications/{id}/read', [NotificationController::class, 'markAsRead']);
@@ -114,6 +116,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
 
     Route::middleware('hr')->prefix('hr')->group(function () {
         // Employee management
+        Route::get('/employee-options', [EmployeeController::class, 'employeeOptions']);
         Route::get('/employees/{controlNo}/leave-history', [EmployeeController::class, 'leaveHistory']);
         Route::get('/employees/{controlNo}/leave-balance-ledger', [EmployeeController::class, 'leaveCreditsLedger']);
         Route::get('/employees/{controlNo}/leave-credits-ledger', [EmployeeController::class, 'leaveCreditsLedger']);
@@ -127,10 +130,18 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
 
         // User management
         Route::get('/user-management/department-admins', [HRUserManagementController::class, 'index']);
+        Route::get('/user-management/eligible-employees', [HRUserManagementController::class, 'eligibleEmployees']);
         Route::get('/user-management/departments/{departmentId}/eligible-employees', [HRUserManagementController::class, 'eligibleEmployees']);
         Route::post('/user-management/department-admins', [HRUserManagementController::class, 'store']);
         Route::put('/user-management/department-admins/{id}', [HRUserManagementController::class, 'update']);
         Route::delete('/user-management/department-admins/{id}', [HRUserManagementController::class, 'destroy']);
+
+        Route::prefix('departments')->group(function () {
+            Route::get('/', [HRDepartmentLibraryController::class, 'index']);
+            Route::post('/', [HRDepartmentLibraryController::class, 'store']);
+            Route::put('/{id}', [HRDepartmentLibraryController::class, 'update']);
+            Route::delete('/{id}', [HRDepartmentLibraryController::class, 'destroy']);
+        });
 
         Route::prefix('leave-types')->group(function () {
             Route::get('/', [HRLeaveTypeController::class, 'index']);
@@ -151,6 +162,12 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
 
         // Reports
         Route::prefix('reports')->group(function () {
+            Route::get('/lwop', [HRReportController::class, 'lwopReports']);
+            Route::get('/leave-balances', [HRReportController::class, 'leaveBalancesReports']);
+            Route::get('/monetization', [HRReportController::class, 'monetizationReports']);
+            Route::get('/cto-availment', [HRReportController::class, 'ctoAvailmentReports']);
+            Route::get('/coc-balances', [HRReportController::class, 'cocBalanceReports']);
+            Route::get('/leave-availment', [HRReportController::class, 'leaveAvailmentReports']);
             Route::get('/summary', [HRReportController::class, 'getSummaryStats']);
             Route::get('/departments', [HRReportController::class, 'getDepartmentStats']);
             Route::get('/leave-types', [HRReportController::class, 'getLeaveTypeStats']);
