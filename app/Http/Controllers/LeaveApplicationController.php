@@ -1951,6 +1951,16 @@ class LeaveApplicationController extends Controller
                 'message' => 'Selected recall dates must match the application leave dates.',
             ], 422);
         }
+        $existingRecallDateKeys = $this->normalizeRecallDateKeys(
+            is_array($app->recall_selected_dates) ? $app->recall_selected_dates : []
+        );
+        $mergedRecallDateKeys = $this->normalizeRecallDateKeys(array_merge(
+            $existingRecallDateKeys,
+            $selectedRecallDateKeys
+        ));
+        $applicationDateKeys = $this->normalizeRecallDateKeys($app->resolvedSelectedDates() ?? []);
+        $isFullyRecalled = $applicationDateKeys !== []
+            && count(array_intersect($applicationDateKeys, $mergedRecallDateKeys)) >= count($applicationDateKeys);
         $effectiveRecallDate = \Carbon\CarbonImmutable::parse($selectedRecallDateKeys[0])->startOfDay();
 
         $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
@@ -1996,19 +2006,27 @@ class LeaveApplicationController extends Controller
                 $restoreLeaveTypeId,
                 $recallRemarks,
                 $effectiveRecallDate,
-                $selectedRecallDateKeys
+                $selectedRecallDateKeys,
+                $mergedRecallDateKeys,
+                $isFullyRecalled
             ): void {
                 if ($mainRestoreDays > 0.0) {
                     $this->restoreApplicationBalance($app, $restoreLeaveTypeId, $mainRestoreDays);
                 }
 
-                $app->update([
-                    'status' => LeaveApplication::STATUS_RECALLED,
+                $updatePayload = [
+                    'status' => $isFullyRecalled
+                        ? LeaveApplication::STATUS_RECALLED
+                        : LeaveApplication::STATUS_APPROVED,
                     'hr_id' => $hr->id,
                     'recall_effective_date' => $effectiveRecallDate->toDateString(),
-                    'recall_selected_dates' => $selectedRecallDateKeys,
-                    'remarks' => $recallRemarks,
-                ]);
+                    'recall_selected_dates' => $mergedRecallDateKeys,
+                ];
+                if ($isFullyRecalled) {
+                    $updatePayload['remarks'] = $recallRemarks;
+                }
+
+                $app->update($updatePayload);
 
                 LeaveApplicationLog::create([
                     'leave_application_id' => $app->id,
@@ -2041,7 +2059,9 @@ class LeaveApplicationController extends Controller
         }
 
         return response()->json([
-            'message' => 'Application recalled by HR.',
+            'message' => $isFullyRecalled
+                ? 'Application recalled by HR.'
+                : 'Selected leave dates recalled by HR.',
             'application' => $this->formatApplication($app->fresh(['leaveType', 'applicantAdmin'])),
         ]);
     }
@@ -6242,7 +6262,7 @@ class LeaveApplicationController extends Controller
         }
 
         if ($allowedDateKeys === []) {
-            return $requestedDateKeys;
+            return null;
         }
 
         $allowedDateSet = array_fill_keys($allowedDateKeys, true);
@@ -6262,6 +6282,13 @@ class LeaveApplicationController extends Controller
             return [];
         }
 
+        $storedRecallDateSet = array_fill_keys(
+            $this->normalizeRecallDateKeys(
+                is_array($app->recall_selected_dates) ? $app->recall_selected_dates : []
+            ),
+            true
+        );
+
         $normalizedDateKeys = [];
         foreach ($selectedDates as $rawDate) {
             $dateKey = $this->normalizeDateKey($rawDate);
@@ -6269,6 +6296,9 @@ class LeaveApplicationController extends Controller
                 $dateKey = trim((string) $rawDate);
             }
             if ($dateKey === '') {
+                continue;
+            }
+            if (isset($storedRecallDateSet[$dateKey])) {
                 continue;
             }
 

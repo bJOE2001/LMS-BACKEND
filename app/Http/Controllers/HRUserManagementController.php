@@ -98,7 +98,7 @@ class HRUserManagementController extends Controller
      * List eligible employees:
      * - all ACTIVE employees (regardless of selected department)
      *
-     * CONTRACTUAL employees are excluded.
+     * HONORARIUM and CONTRACTUAL employees are excluded.
      */
     public function eligibleEmployees(Request $request, ?int $departmentId = null): JsonResponse
     {
@@ -126,7 +126,7 @@ class HRUserManagementController extends Controller
         $limit = max(1, min(25, (int) ($validated['limit'] ?? 20)));
 
         $employees = HrisEmployee::allCached(true)
-            ->filter(fn(object $employee): bool => strtoupper(trim((string) ($employee->status ?? ''))) !== 'CONTRACTUAL')
+            ->filter(fn(object $employee): bool => !$this->isExcludedDepartmentAdminEmployeeStatus($employee))
             ->filter(function (object $employee) use ($searchTerm): bool {
                 if ($searchTerm === '') {
                     return true;
@@ -356,21 +356,27 @@ class HRUserManagementController extends Controller
 
     private function resolveEligibleEmployeeForAssignment(string $employeeControlNo): object
     {
-        $employee = HrisEmployee::findByControlNo($employeeControlNo);
+        $employee = HrisEmployee::findByControlNo($employeeControlNo, true);
         if (!$employee) {
             throw ValidationException::withMessages([
-                'employee_control_no' => ['Employee not found.'],
+                'employee_control_no' => ['Active employee not found.'],
             ]);
         }
 
-        $employeeStatus = strtoupper(trim((string) ($employee->status ?? '')));
-        if ($employeeStatus === 'CONTRACTUAL') {
+        if ($this->isExcludedDepartmentAdminEmployeeStatus($employee)) {
             throw ValidationException::withMessages([
-                'employee_control_no' => ['Contractual employees cannot be assigned as department admin.'],
+                'employee_control_no' => ['Honorarium and contractual employees cannot be assigned as department admin.'],
             ]);
         }
 
         return $employee;
+    }
+
+    private function isExcludedDepartmentAdminEmployeeStatus(object $employee): bool
+    {
+        $employeeStatus = strtoupper(trim((string) ($employee->status ?? '')));
+
+        return in_array($employeeStatus, ['HONORARIUM', 'CONTRACTUAL'], true);
     }
 
     private function assertUsernameAvailableForDepartmentAdmin(string $username, ?int $ignoreDepartmentAdminId = null): void

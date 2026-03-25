@@ -651,6 +651,8 @@ class EmployeeController extends Controller
                     'selected_dates',
                     'selected_date_pay_status',
                     'selected_date_coverage',
+                    'recall_effective_date',
+                    'recall_selected_dates',
                     'hr_approved_at',
                     'created_at',
                     'updated_at',
@@ -769,7 +771,8 @@ class EmployeeController extends Controller
                     ];
                 }
 
-                if ($application->status === LeaveApplication::STATUS_RECALLED) {
+                $storedRecallDateKeys = $this->resolveLedgerStoredRecallDateKeys($application);
+                if ($storedRecallDateKeys !== []) {
                     $recallLog = $application->relationLoaded('logs')
                         ? $application->logs->first(function (LeaveApplicationLog $log): bool {
                             return $log->action === LeaveApplicationLog::ACTION_HR_RECALLED
@@ -780,7 +783,6 @@ class EmployeeController extends Controller
                     $recallOccurredAt = $recallLog?->created_at
                         ? CarbonImmutable::instance($recallLog->created_at)
                         : ($application->updated_at ? CarbonImmutable::instance($application->updated_at) : null);
-                    $storedRecallDateKeys = $this->resolveLedgerStoredRecallDateKeys($application, $recallOccurredAt);
                     $recallEffectiveAt = $application->recall_effective_date
                         ? CarbonImmutable::parse((string) $application->recall_effective_date)->startOfDay()
                         : (!empty($storedRecallDateKeys) ? CarbonImmutable::parse($storedRecallDateKeys[0])->startOfDay() : $recallOccurredAt);

@@ -1274,11 +1274,7 @@ class HRReportController extends Controller
             is_array($application->recall_selected_dates) ? $application->recall_selected_dates : []
         );
 
-        if (
-            $application->status === LeaveApplication::STATUS_RECALLED
-            && $selectedDates !== []
-            && $recalledDates !== []
-        ) {
+        if ($selectedDates !== [] && $recalledDates !== []) {
             return round((float) count(array_values(array_diff($selectedDates, $recalledDates))), 2);
         }
 

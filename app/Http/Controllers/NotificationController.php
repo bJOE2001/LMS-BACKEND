@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\COCApplication;
 use App\Models\LeaveApplication;
 use App\Models\Notification;
 use App\Models\HrisEmployee;
@@ -44,6 +45,10 @@ class NotificationController extends Controller
         $notifications = Notification::with([
             'leaveApplication.leaveType',
             'leaveApplication.applicantAdmin.department',
+            'cocApplication.rows',
+            'cocApplication.reviewedByAdmin.department',
+            'cocApplication.reviewedByHr',
+            'cocApplication.ctoLeaveType',
         ])
             ->where('notifiable_type', get_class($user))
             ->where('notifiable_id', $user->id)
@@ -56,7 +61,11 @@ class NotificationController extends Controller
                 'title' => $n->title,
                 'message' => $n->message,
                 'leave_application_id' => $n->leave_application_id,
+                'coc_application_id' => $n->coc_application_id,
+                'application_type' => $this->resolveNotificationApplicationType($n),
+                'application' => $this->formatNotificationApplication($n),
                 'leave_application' => $this->formatLeaveApplication($n->leaveApplication),
+                'coc_application' => $this->formatCocApplication($n->cocApplication),
                 'read_at' => $n->read_at?->toIso8601String(),
                 'created_at' => $n->created_at->toIso8601String(),
             ]);
@@ -108,10 +117,20 @@ class NotificationController extends Controller
             ->where('id', $id)
             ->firstOrFail();
 
-        if (!$notification->leave_application_id) {
+        if (!$notification->leave_application_id && !$notification->coc_application_id) {
             return response()->json([
                 'application' => null,
-                'message' => 'Notification is not linked to a leave application.',
+                'message' => 'Notification is not linked to an application.',
+            ]);
+        }
+
+        if ($notification->coc_application_id) {
+            $application = COCApplication::with(['rows', 'reviewedByAdmin.department', 'reviewedByHr', 'ctoLeaveType'])
+                ->find($notification->coc_application_id);
+
+            return response()->json([
+                'application_type' => 'COC',
+                'application' => $this->formatCocApplication($application),
             ]);
         }
 
@@ -119,6 +138,7 @@ class NotificationController extends Controller
             ->find($notification->leave_application_id);
 
         return response()->json([
+            'application_type' => 'LEAVE',
             'application' => $this->formatLeaveApplication($application),
         ]);
     }
@@ -138,6 +158,10 @@ class NotificationController extends Controller
         $notification->loadMissing([
             'leaveApplication.leaveType',
             'leaveApplication.applicantAdmin.department',
+            'cocApplication.rows',
+            'cocApplication.reviewedByAdmin.department',
+            'cocApplication.reviewedByHr',
+            'cocApplication.ctoLeaveType',
         ]);
 
         DB::transaction(function () use ($notification, $request): void {
@@ -149,7 +173,10 @@ class NotificationController extends Controller
                     'delete_source' => 'notifications',
                     'delete_reason' => $request->input('reason'),
                     'snapshot' => array_merge($notification->toArray(), [
+                        'application_type' => $this->resolveNotificationApplicationType($notification),
+                        'application' => $this->formatNotificationApplication($notification),
                         'leave_application' => $this->formatLeaveApplication($notification->leaveApplication),
+                        'coc_application' => $this->formatCocApplication($notification->cocApplication),
                     ]),
                 ]
             );
@@ -185,6 +212,7 @@ class NotificationController extends Controller
         }
 
         return [
+            'application_type' => 'LEAVE',
             'id' => $application->id,
             'employee_control_no' => $application->employee_control_no,
             'applicant_admin_id' => $application->applicant_admin_id,
@@ -209,6 +237,58 @@ class NotificationController extends Controller
         ];
     }
 
+    private function formatCocApplication(?COCApplication $application): ?array
+    {
+        if (!$application) {
+            return null;
+        }
+
+        $resolvedEmployee = $this->resolveCocApplicationEmployee($application);
+        $employeeName = trim((string) ($application->employee_name ?? ''));
+        if ($employeeName === '') {
+            $employeeName = trim(implode(' ', array_filter([
+                trim((string) ($resolvedEmployee?->firstname ?? '')),
+                trim((string) ($resolvedEmployee?->middlename ?? '')),
+                trim((string) ($resolvedEmployee?->surname ?? '')),
+            ])));
+        }
+
+        $rowDates = $application->relationLoaded('rows')
+            ? $application->rows
+                ->map(fn ($row) => $row->overtime_date?->toDateString())
+                ->filter(fn (?string $date): bool => $date !== null && trim($date) !== '')
+                ->unique()
+                ->sort()
+                ->values()
+                ->all()
+            : [];
+
+        $durationHours = $this->minutesToHours((int) ($application->total_minutes ?? 0));
+
+        return [
+            'application_type' => 'COC',
+            'id' => $application->id,
+            'employee_control_no' => (string) ($application->employee_control_no ?? ''),
+            'applicant_name' => $employeeName !== '' ? $employeeName : null,
+            'office' => $resolvedEmployee?->office,
+            'leave_type_name' => 'COC Application',
+            'status' => $this->toReadableCocStatus($application),
+            'raw_status' => $this->deriveRawCocStatus($application),
+            'selected_dates' => $rowDates,
+            'start_date' => $rowDates[0] ?? null,
+            'end_date' => $rowDates !== [] ? $rowDates[count($rowDates) - 1] : null,
+            'total_hours' => $durationHours,
+            'duration_label' => $this->formatHours($durationHours),
+            'remarks' => $application->remarks,
+            'date_filed' => $application->created_at?->toDateString(),
+            'reviewed_by_admin' => $application->reviewedByAdmin?->full_name,
+            'reviewed_by_hr' => $application->reviewedByHr?->full_name,
+            'cto_leave_type_name' => $application->ctoLeaveType?->name,
+            'cto_credited_days' => $application->cto_credited_days !== null ? (float) $application->cto_credited_days : null,
+            'cto_credited_at' => $application->cto_credited_at?->toIso8601String(),
+        ];
+    }
+
     private function resolveApplicationEmployee(LeaveApplication $application): ?object
     {
         $controlNo = trim((string) ($application->employee_control_no ?? ''));
@@ -217,6 +297,34 @@ class NotificationController extends Controller
         }
 
         return HrisEmployee::findByControlNo($controlNo);
+    }
+
+    private function resolveCocApplicationEmployee(COCApplication $application): ?object
+    {
+        $controlNo = trim((string) ($application->employee_control_no ?? ''));
+        if ($controlNo === '') {
+            return null;
+        }
+
+        return HrisEmployee::findByControlNo($controlNo);
+    }
+
+    private function formatNotificationApplication(Notification $notification): ?array
+    {
+        if ($notification->coc_application_id) {
+            return $this->formatCocApplication($notification->cocApplication);
+        }
+
+        return $this->formatLeaveApplication($notification->leaveApplication);
+    }
+
+    private function resolveNotificationApplicationType(Notification $notification): ?string
+    {
+        if ($notification->coc_application_id) {
+            return 'COC';
+        }
+
+        return $notification->leave_application_id ? 'LEAVE' : null;
     }
 
     private function toReadableStatus(?string $status): string
@@ -229,5 +337,36 @@ class NotificationController extends Controller
             LeaveApplication::STATUS_RECALLED => 'Recalled',
             default => (string) $status,
         };
+    }
+
+    private function deriveRawCocStatus(COCApplication $application): string
+    {
+        if ($application->status !== COCApplication::STATUS_PENDING) {
+            return (string) $application->status;
+        }
+
+        return $application->admin_reviewed_at ? 'PENDING_HR' : 'PENDING_ADMIN';
+    }
+
+    private function toReadableCocStatus(COCApplication $application): string
+    {
+        return match ($this->deriveRawCocStatus($application)) {
+            'PENDING_ADMIN' => 'Pending Admin',
+            'PENDING_HR' => 'Pending HR',
+            'APPROVED' => 'Approved',
+            'REJECTED' => 'Rejected',
+            default => (string) $application->status,
+        };
+    }
+
+    private function minutesToHours(int $minutes): float
+    {
+        return $minutes > 0 ? round($minutes / 60, 2) : 0.0;
+    }
+
+    private function formatHours(float $hours): string
+    {
+        $display = $hours === (float) ((int) $hours) ? (string) ((int) $hours) : (string) $hours;
+        return "{$display} h";
     }
 }

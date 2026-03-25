@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\COCApplication;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
@@ -55,8 +56,21 @@ class AdminDashboardController extends Controller
             ->orderByDesc('created_at')
             ->get();
 
+        $cocApplications = COCApplication::query()
+            ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
+            ->when(
+                $departmentEmployeeControlNos !== [],
+                fn($query) => $query->whereIn('employee_control_no', $departmentEmployeeControlNos),
+                fn($query) => $query->whereRaw('1 = 0')
+            )
+            ->orderByDesc('created_at')
+            ->get();
+
         $pendingApps = $applications->where('status', LeaveApplication::STATUS_PENDING_ADMIN);
-        $pending = $pendingApps->count();
+        $pendingCocApps = $cocApplications->filter(
+            fn(COCApplication $app): bool => $this->deriveCocRawStatus($app) === 'PENDING_ADMIN'
+        );
+        $pending = $pendingApps->count() + $pendingCocApps->count();
 
         $approvedTodayApps = $applications->filter(function (LeaveApplication $app): bool {
             return in_array($app->status, [
@@ -64,13 +78,29 @@ class AdminDashboardController extends Controller
                 LeaveApplication::STATUS_APPROVED,
             ], true) && (bool) $app->admin_approved_at?->isToday();
         });
-        $approvedToday = $approvedTodayApps->count();
+        $approvedTodayCocApps = $cocApplications->filter(function (COCApplication $app): bool {
+            return in_array($this->deriveCocRawStatus($app), [
+                'PENDING_HR',
+                COCApplication::STATUS_APPROVED,
+            ], true) && (bool) $app->admin_reviewed_at?->isToday();
+        });
+        $approvedToday = $approvedTodayApps->count() + $approvedTodayCocApps->count();
 
         $totalApprovedApps = $applications->whereIn('status', [
             LeaveApplication::STATUS_PENDING_HR,
             LeaveApplication::STATUS_APPROVED,
         ]);
-        $totalApproved = $totalApprovedApps->count();
+        $totalApprovedCocApps = $cocApplications->filter(
+            fn(COCApplication $app): bool => in_array(
+                $this->deriveCocRawStatus($app),
+                ['PENDING_HR', COCApplication::STATUS_APPROVED],
+                true
+            )
+        );
+        $totalApproved = $totalApprovedApps->count() + $totalApprovedCocApps->count();
+        $visibleLeaveApplications = $applications->reject(
+            fn(LeaveApplication $app): bool => $app->status === LeaveApplication::STATUS_RECALLED
+        );
 
         $employeesByControlNo = $this->loadDepartmentEmployeesByControlNo($deptName);
 
@@ -84,10 +114,10 @@ class AdminDashboardController extends Controller
             fn($app) => $this->formatApplication($app, $employeesByControlNo, $actorDirectory, $leaveBalanceDirectory)
         );
         $kpiBreakdown = [
-            'pending' => $this->buildEmploymentStatusBreakdown($pendingApps, $employeeStatusByControlNo),
-            'approved_today' => $this->buildEmploymentStatusBreakdown($approvedTodayApps, $employeeStatusByControlNo),
-            'total_approved' => $this->buildEmploymentStatusBreakdown($totalApprovedApps, $employeeStatusByControlNo),
-            'total' => $this->buildEmploymentStatusBreakdown($applications, $employeeStatusByControlNo),
+            'pending' => $this->buildEmploymentStatusBreakdown($pendingApps->concat($pendingCocApps), $employeeStatusByControlNo),
+            'approved_today' => $this->buildEmploymentStatusBreakdown($approvedTodayApps->concat($approvedTodayCocApps), $employeeStatusByControlNo),
+            'total_approved' => $this->buildEmploymentStatusBreakdown($totalApprovedApps->concat($totalApprovedCocApps), $employeeStatusByControlNo),
+            'total' => $this->buildEmploymentStatusBreakdown($visibleLeaveApplications->concat($cocApplications), $employeeStatusByControlNo),
         ];
         $analytics = $this->buildDashboardTrendAnalytics($applications);
 
@@ -95,11 +125,20 @@ class AdminDashboardController extends Controller
             'pending_count' => $pending,
             'approved_today' => $approvedToday,
             'total_approved' => $totalApproved,
-            'total_count' => $applications->count(),
+            'total_count' => $visibleLeaveApplications->count() + $cocApplications->count(),
             'kpi_breakdown' => $kpiBreakdown,
             'analytics' => $analytics,
             'applications' => $formatted,
         ]);
+    }
+
+    private function deriveCocRawStatus(COCApplication $app): string
+    {
+        if ($app->status !== COCApplication::STATUS_PENDING) {
+            return (string) $app->status;
+        }
+
+        return $app->admin_reviewed_at ? 'PENDING_HR' : 'PENDING_ADMIN';
     }
 
     // ─── Admin's own leave credits ────────────────────────────────────
@@ -1083,7 +1122,7 @@ class AdminDashboardController extends Controller
         $breakdown = $this->emptyEmploymentBreakdown();
 
         foreach ($applications as $application) {
-            if (!$application instanceof LeaveApplication) {
+            if (!is_object($application)) {
                 continue;
             }
 
@@ -1096,9 +1135,9 @@ class AdminDashboardController extends Controller
         return $breakdown;
     }
 
-    private function employmentStatusToBucket(LeaveApplication $application, array $employeeStatusByControlNo): ?string
+    private function employmentStatusToBucket(object $application, array $employeeStatusByControlNo): ?string
     {
-        $rawControlNo = $application->employee_control_no;
+        $rawControlNo = $application->employee_control_no ?? null;
         $normalizedControlNo = $this->normalizeControlNo($rawControlNo);
         $employeeStatus = $employeeStatusByControlNo[$normalizedControlNo] ?? null;
 
@@ -1374,6 +1413,10 @@ class AdminDashboardController extends Controller
             'selected_dates' => $selectedDates,
             'selected_date_pay_status' => $selectedDatePayStatus,
             'selected_date_coverage' => $selectedDateCoverage,
+            'recallEffectiveDate' => $app->recall_effective_date?->toDateString(),
+            'recall_effective_date' => $app->recall_effective_date?->toDateString(),
+            'recallSelectedDates' => is_array($app->recall_selected_dates) ? array_values($app->recall_selected_dates) : null,
+            'recall_selected_dates' => is_array($app->recall_selected_dates) ? array_values($app->recall_selected_dates) : null,
             'commutation' => $app->commutation ?? 'Not Requested',
             'pay_mode' => $normalizedPayMode,
             'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
