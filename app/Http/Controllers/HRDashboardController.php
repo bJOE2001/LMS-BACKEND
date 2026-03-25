@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\COCApplication;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
@@ -18,7 +19,7 @@ use Illuminate\Http\Request;
 class HRDashboardController extends Controller
 {
     /**
-     * Dashboard data: total, pending HR, approved, on-leave-today counts + all applications.
+     * Dashboard data: leave-focused charts plus summary counts for leave + COC applications.
      */
     public function index(Request $request): JsonResponse
     {
@@ -31,9 +32,33 @@ class HRDashboardController extends Controller
             ->orderByDesc('created_at')
             ->get();
 
-        $pendingHR = $applications->where('status', LeaveApplication::STATUS_PENDING_HR)->count();
-        $totalApproved = $applications->where('status', LeaveApplication::STATUS_APPROVED)->count();
-        $totalRejected = $applications->where('status', LeaveApplication::STATUS_REJECTED)->count();
+        $cocApplications = COCApplication::query()
+            ->select(['id', 'status', 'admin_reviewed_at'])
+            ->orderByDesc('created_at')
+            ->get();
+
+        $pendingHR = $applications->where('status', LeaveApplication::STATUS_PENDING_HR)->count()
+            + $cocApplications->filter(fn (COCApplication $app): bool => $this->deriveCocRawStatus($app) === 'PENDING_HR')->count();
+        $totalApproved = $applications->where('status', LeaveApplication::STATUS_APPROVED)->count()
+            + $cocApplications->where('status', COCApplication::STATUS_APPROVED)->count();
+        $totalRejected = $applications->where('status', LeaveApplication::STATUS_REJECTED)->count()
+            + $cocApplications->where('status', COCApplication::STATUS_REJECTED)->count();
+        $visibleLeaveApplications = $applications->reject(function (LeaveApplication $app): bool {
+            return in_array($app->status, [
+                LeaveApplication::STATUS_PENDING_ADMIN,
+                LeaveApplication::STATUS_RECALLED,
+            ], true);
+        });
+        $visibleCocApplications = $cocApplications->reject(
+            fn (COCApplication $app): bool => $this->deriveCocRawStatus($app) === 'PENDING_ADMIN'
+        );
+        $totalApplications = $visibleLeaveApplications->count() + $visibleCocApplications->count();
+        $employeeStatusByControlNo = $this->buildEmployeeStatusDirectory(
+            $visibleLeaveApplications
+                ->pluck('employee_control_no')
+                ->concat($visibleCocApplications->pluck('employee_control_no'))
+                ->all()
+        );
 
         // Count employees/admins currently on approved leave today
         $today = now()->toDateString();
@@ -50,20 +75,35 @@ class HRDashboardController extends Controller
             return $startStr <= $today && $endStr >= $today;
         })->count();
 
-        $formatted = $applications->map(fn($app) => $this->formatApplication($app));
+        $formatted = $applications->map(fn($app) => $this->formatApplication($app, $employeeStatusByControlNo));
 
         return response()->json([
-            'total_count' => $applications->count(),
+            'total_count' => $totalApplications,
             'pending_count' => $pendingHR,
             'approved_count' => $totalApproved,
             'rejected_count' => $totalRejected,
+            'kpi_breakdown' => [
+                'total' => $this->buildEmploymentStatusBreakdown(
+                    $visibleLeaveApplications->concat($visibleCocApplications),
+                    $employeeStatusByControlNo
+                ),
+            ],
             'on_leave_today' => $onLeaveToday,
             'active_employees' => HrisEmployee::countCached(true),
             'applications' => $formatted,
         ]);
     }
 
-    private function formatApplication(LeaveApplication $app): array
+    private function deriveCocRawStatus(COCApplication $app): string
+    {
+        if ($app->status !== COCApplication::STATUS_PENDING) {
+            return (string) $app->status;
+        }
+
+        return $app->admin_reviewed_at ? 'PENDING_HR' : 'PENDING_ADMIN';
+    }
+
+    private function formatApplication(LeaveApplication $app, array $employeeStatusByControlNo = []): array
     {
         $statusMap = [
             LeaveApplication::STATUS_PENDING_ADMIN => 'Pending Admin',
@@ -81,6 +121,7 @@ class HRDashboardController extends Controller
                 ? trim(($resolvedEmployee->firstname ?? '') . ' ' . ($resolvedEmployee->surname ?? ''))
                 : null;
         }
+        $employmentStatus = $employeeStatusByControlNo[$this->normalizeControlNo($app->employee_control_no)] ?? ($resolvedEmployee?->status ?? null);
         $applicantName = $employeeName ?: ($app->applicantAdmin ? $app->applicantAdmin->full_name : 'Unknown');
         $office = $resolvedEmployee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
         $durationDays = (float) $app->total_days;
@@ -101,6 +142,12 @@ class HRDashboardController extends Controller
             'employee_control_no' => $app->employee_control_no,
             'employeeName' => $applicantName,
             'office' => $office,
+            'employment_status' => $employmentStatus,
+            'employmentStatus' => $employmentStatus,
+            'employee_status' => $employmentStatus,
+            'employeeStatus' => $employmentStatus,
+            'appointment_status' => $employmentStatus,
+            'appointmentStatus' => $employmentStatus,
             'leaveType' => $app->leaveType?->name ?? 'Unknown',
             'startDate' => $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : null,
             'endDate' => $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : null,
@@ -132,6 +179,10 @@ class HRDashboardController extends Controller
             'selected_dates' => $app->resolvedSelectedDates(),
             'selected_date_pay_status' => $selectedDatePayStatus,
             'selected_date_coverage' => $selectedDateCoverage,
+            'recallEffectiveDate' => $app->recall_effective_date?->toDateString(),
+            'recall_effective_date' => $app->recall_effective_date?->toDateString(),
+            'recallSelectedDates' => is_array($app->recall_selected_dates) ? array_values($app->recall_selected_dates) : null,
+            'recall_selected_dates' => is_array($app->recall_selected_dates) ? array_values($app->recall_selected_dates) : null,
             'pay_mode' => $normalizedPayMode,
             'pay_status' => $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 'Without Pay' : 'With Pay',
             'without_pay' => $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY,
@@ -141,6 +192,87 @@ class HRDashboardController extends Controller
             'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
             'leaveBalance' => $this->getBalanceForApp($app),
         ];
+    }
+
+    private function buildEmployeeStatusDirectory(array $controlNos): array
+    {
+        $normalizedControlNos = collect($controlNos)
+            ->map(fn (mixed $value): string => $this->normalizeControlNo($value))
+            ->filter(fn (string $value): bool => $value !== '')
+            ->unique()
+            ->values()
+            ->all();
+
+        if ($normalizedControlNos === []) {
+            return [];
+        }
+
+        $directory = [];
+        foreach (HrisEmployee::allCached() as $employee) {
+            $normalizedControlNo = $this->normalizeControlNo($employee->control_no ?? null);
+            if ($normalizedControlNo === '' || !in_array($normalizedControlNo, $normalizedControlNos, true)) {
+                continue;
+            }
+
+            $directory[$normalizedControlNo] = trim((string) ($employee->status ?? '')) ?: null;
+        }
+
+        return $directory;
+    }
+
+    private function buildEmploymentStatusBreakdown(iterable $applications, array $employeeStatusByControlNo): array
+    {
+        $breakdown = $this->emptyEmploymentBreakdown();
+
+        foreach ($applications as $application) {
+            if (!is_object($application)) {
+                continue;
+            }
+
+            $bucket = $this->employmentStatusToBucket($application->employee_control_no ?? null, $employeeStatusByControlNo);
+            if ($bucket !== null) {
+                $breakdown[$bucket]++;
+            }
+        }
+
+        return $breakdown;
+    }
+
+    private function employmentStatusToBucket(mixed $controlNo, array $employeeStatusByControlNo): ?string
+    {
+        $employeeStatus = $employeeStatusByControlNo[$this->normalizeControlNo($controlNo)] ?? null;
+        $rawStatus = strtoupper(trim((string) ($employeeStatus ?? '')));
+        if ($rawStatus === '') {
+            return null;
+        }
+
+        return match ($rawStatus) {
+            'ELECTIVE' => 'elective',
+            'CO-TERMINOUS', 'CO TERMINOUS', 'COTERMINOUS' => 'co_terminous',
+            'REGULAR' => 'regular',
+            'CASUAL' => 'casual',
+            default => null,
+        };
+    }
+
+    private function emptyEmploymentBreakdown(): array
+    {
+        return [
+            'elective' => 0,
+            'co_terminous' => 0,
+            'regular' => 0,
+            'casual' => 0,
+        ];
+    }
+
+    private function normalizeControlNo(mixed $controlNo): string
+    {
+        $normalized = ltrim(trim((string) ($controlNo ?? '')), '0');
+        if ($normalized === '') {
+            $normalized = '0';
+        }
+
+        return preg_match('/^\d+$/', $normalized) ? $normalized : '';
     }
 
     private function getPendingApprovedUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest

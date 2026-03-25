@@ -88,6 +88,16 @@ return new class extends Migration {
             $table->index(['coc_application_id', 'line_no']);
             $table->index(['employee_control_no', 'overtime_date'], 'IX_tblCOCApplicationRows_employee_control_no_overtime_date');
         });
+
+        if (Schema::hasTable('tblNotifications') && !Schema::hasColumn('tblNotifications', 'coc_application_id')) {
+            Schema::table('tblNotifications', function (Blueprint $table): void {
+                $table->foreignId('coc_application_id')
+                    ->nullable()
+                    ->after('leave_application_id')
+                    ->constrained('tblCOCApplications')
+                    ->nullOnDelete();
+            });
+        }
     }
 
     /**
@@ -95,6 +105,12 @@ return new class extends Migration {
      */
     public function down(): void
     {
+        if (Schema::hasTable('tblNotifications') && Schema::hasColumn('tblNotifications', 'coc_application_id')) {
+            Schema::table('tblNotifications', function (Blueprint $table): void {
+                $table->dropConstrainedForeignId('coc_application_id');
+            });
+        }
+
         Schema::dropIfExists('tblCOCApplicationRows');
         Schema::dropIfExists('tblCOCApplications');
         Schema::dropIfExists('tblDepartmentHeads');

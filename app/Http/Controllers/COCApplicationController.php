@@ -9,6 +9,7 @@ use App\Models\HRAccount;
 use App\Models\HrisEmployee;
 use App\Models\LeaveBalance;
 use App\Models\LeaveType;
+use App\Models\Notification;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
@@ -143,6 +144,8 @@ class COCApplicationController extends Controller
 
         $application->load(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType']);
 
+        $this->notifyDepartmentAdminsOfSubmittedCoc($employee, $application);
+
         return response()->json([
             'message' => 'COC application submitted successfully.',
             'application' => $this->formatApplication($application),
@@ -219,6 +222,9 @@ class COCApplicationController extends Controller
         }
 
         $app = COCApplication::query()->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])->find($id);
+        if ($app) {
+            $this->notifyHrOfPendingCocReview($app);
+        }
 
         return response()->json([
             'message' => 'COC application approved and forwarded to HR.',
@@ -367,6 +373,10 @@ class COCApplicationController extends Controller
         }
 
         $app = COCApplication::query()->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])->find($id);
+        if ($app) {
+            $creditedDays = isset($result['days']) ? (float) $result['days'] : null;
+            $this->notifyAdminOfHrCocDecision($app, true, $creditedDays);
+        }
 
         return response()->json([
             'message' => 'COC application approved and converted to CTO leave credits.',
@@ -412,6 +422,9 @@ class COCApplicationController extends Controller
         }
 
         $app = COCApplication::query()->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])->find($id);
+        if ($app) {
+            $this->notifyAdminOfHrCocDecision($app, false);
+        }
 
         return response()->json([
             'message' => 'COC application rejected.',
@@ -764,5 +777,110 @@ class COCApplicationController extends Controller
             $controlNo,
             $normalized,
         ], static fn (string $value): bool => $value !== '')));
+    }
+
+    private function notifyDepartmentAdminsOfSubmittedCoc(object $employee, COCApplication $application): void
+    {
+        $officeName = trim((string) ($employee->office ?? ''));
+        if ($officeName === '') {
+            return;
+        }
+
+        $admins = DepartmentAdmin::query()
+            ->whereHas('department', fn ($query) => $query->where('name', $officeName))
+            ->get();
+
+        if ($admins->isEmpty()) {
+            return;
+        }
+
+        $employeeName = $this->resolveEmployeeDisplayName($employee, $application);
+        $durationLabel = $this->formatHours($this->minutesToHours((int) ($application->total_minutes ?? 0)));
+
+        foreach ($admins as $admin) {
+            Notification::send(
+                $admin,
+                Notification::TYPE_COC_REQUEST,
+                'New COC Application',
+                "{$employeeName} submitted a COC application ({$durationLabel}).",
+                null,
+                (int) $application->id
+            );
+        }
+    }
+
+    private function notifyHrOfPendingCocReview(COCApplication $application): void
+    {
+        $hrAccounts = HRAccount::query()->get();
+        if ($hrAccounts->isEmpty()) {
+            return;
+        }
+
+        $employee = HrisEmployee::findByControlNo((string) ($application->employee_control_no ?? ''));
+        $employeeName = $this->resolveEmployeeDisplayName($employee, $application);
+        $durationLabel = $this->formatHours($this->minutesToHours((int) ($application->total_minutes ?? 0)));
+
+        foreach ($hrAccounts as $hrAccount) {
+            Notification::send(
+                $hrAccount,
+                Notification::TYPE_COC_PENDING,
+                'COC Application Pending HR Review',
+                "{$employeeName}'s COC application ({$durationLabel}) is pending HR review.",
+                null,
+                (int) $application->id
+            );
+        }
+    }
+
+    private function notifyAdminOfHrCocDecision(COCApplication $application, bool $approved, ?float $creditedDays = null): void
+    {
+        $admin = $application->reviewedByAdmin;
+        if (!$admin instanceof DepartmentAdmin) {
+            return;
+        }
+
+        $employee = HrisEmployee::findByControlNo((string) ($application->employee_control_no ?? ''));
+        $employeeName = $this->resolveEmployeeDisplayName($employee, $application);
+
+        $type = $approved ? Notification::TYPE_COC_APPROVED : Notification::TYPE_COC_REJECTED;
+        $title = $approved ? 'COC Application Approved' : 'COC Application Rejected';
+        $message = $approved
+            ? "COC application for {$employeeName} was approved by HR."
+            : "COC application for {$employeeName} was rejected by HR.";
+
+        if ($approved && $creditedDays !== null) {
+            $message .= ' CTO credited: ' . $this->formatDays($creditedDays) . '.';
+        }
+
+        Notification::send(
+            $admin,
+            $type,
+            $title,
+            $message,
+            null,
+            (int) $application->id
+        );
+    }
+
+    private function resolveEmployeeDisplayName(?object $employee, COCApplication $application): string
+    {
+        $employeeName = trim((string) ($application->employee_name ?? ''));
+        if ($employeeName !== '') {
+            return $employeeName;
+        }
+
+        $resolvedName = trim(implode(' ', array_filter([
+            trim((string) ($employee?->firstname ?? '')),
+            trim((string) ($employee?->middlename ?? '')),
+            trim((string) ($employee?->surname ?? '')),
+        ])));
+
+        return $resolvedName !== '' ? $resolvedName : 'Employee ' . trim((string) ($application->employee_control_no ?? ''));
+    }
+
+    private function formatDays(float $days): string
+    {
+        $display = $days === (float) ((int) $days) ? (string) ((int) $days) : rtrim(rtrim(number_format($days, 2, '.', ''), '0'), '.');
+        return "{$display} day" . ((float) $days === 1.0 ? '' : 's');
     }
 }

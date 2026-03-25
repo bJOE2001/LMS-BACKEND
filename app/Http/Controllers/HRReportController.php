@@ -1274,11 +1274,7 @@ class HRReportController extends Controller
             is_array($application->recall_selected_dates) ? $application->recall_selected_dates : []
         );
 
-        if (
-            $application->status === LeaveApplication::STATUS_RECALLED
-            && $selectedDates !== []
-            && $recalledDates !== []
-        ) {
+        if ($selectedDates !== [] && $recalledDates !== []) {
             return round((float) count(array_values(array_diff($selectedDates, $recalledDates))), 2);
         }
 
@@ -1362,11 +1358,16 @@ class HRReportController extends Controller
     {
         $normalized = strtoupper(trim((string) ($leaveTypeName ?? '')));
 
-        if ($normalized === 'MANDATORY / FORCED LEAVE') {
-            return null;
+        if (in_array($normalized, ['MCO6 LEAVE', 'MC06 LEAVE'], true)) {
+            return 'mc_co';
         }
 
-        return $this->classifyLeaveAvailmentType($leaveTypeName);
+        return match (true) {
+            $normalized === 'VACATION LEAVE' => 'vl_fl',
+            $normalized === 'SICK LEAVE' => 'sl',
+            $normalized === 'WELLNESS LEAVE' => 'wlp',
+            default => 'others',
+        };
     }
 
     private function buildEmployeeNameFromSnapshot(?object $employee): ?string
