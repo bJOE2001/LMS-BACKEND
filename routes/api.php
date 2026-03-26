@@ -102,10 +102,12 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
 
         // Leave application review
         Route::get('/leave-applications', [LeaveApplicationController::class, 'adminIndex']);
+        Route::get('/leave-applications/{id}', [LeaveApplicationController::class, 'adminShow']);
         Route::get('/leave-applications/{id}/attachment', [LeaveApplicationController::class, 'adminViewAttachment']);
         Route::post('/leave-applications/{id}/approve', [LeaveApplicationController::class, 'adminApprove']);
         Route::post('/leave-applications/{id}/reject', [LeaveApplicationController::class, 'adminReject']);
         Route::get('/coc-applications', [COCApplicationController::class, 'adminIndex']);
+        Route::get('/coc-applications/{id}', [COCApplicationController::class, 'adminShow']);
         Route::post('/coc-applications/{id}/approve', [COCApplicationController::class, 'adminApprove']);
         Route::post('/coc-applications/{id}/reject', [COCApplicationController::class, 'adminReject']);
 
@@ -152,11 +154,13 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
 
         // Leave application review
         Route::get('/leave-applications', [LeaveApplicationController::class, 'hrIndex']);
+        Route::get('/leave-applications/{id}', [LeaveApplicationController::class, 'hrShow']);
         Route::get('/leave-applications/{id}/attachment', [LeaveApplicationController::class, 'hrViewAttachment']);
         Route::post('/leave-applications/{id}/approve', [LeaveApplicationController::class, 'hrApprove']);
         Route::post('/leave-applications/{id}/reject', [LeaveApplicationController::class, 'hrReject']);
         Route::post('/leave-applications/{id}/recall', [LeaveApplicationController::class, 'hrRecall']);
         Route::get('/coc-applications', [COCApplicationController::class, 'hrIndex']);
+        Route::get('/coc-applications/{id}', [COCApplicationController::class, 'hrShow']);
         Route::post('/coc-applications/{id}/approve', [COCApplicationController::class, 'hrApprove']);
         Route::post('/coc-applications/{id}/reject', [COCApplicationController::class, 'hrReject']);
 
