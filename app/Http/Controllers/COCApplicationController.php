@@ -317,6 +317,11 @@ class COCApplicationController extends Controller
 
         $applications = COCApplication::query()
             ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
+            ->where(function ($query): void {
+                $query
+                    ->where('status', '!=', COCApplication::STATUS_PENDING)
+                    ->orWhereNotNull('admin_reviewed_at');
+            })
             ->when($controlNo !== '', function ($q) use ($controlNo): void {
                 $q->matchingControlNo($controlNo);
             })
@@ -342,6 +347,11 @@ class COCApplicationController extends Controller
 
         $application = COCApplication::query()
             ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
+            ->where(function ($query): void {
+                $query
+                    ->where('status', '!=', COCApplication::STATUS_PENDING)
+                    ->orWhereNotNull('admin_reviewed_at');
+            })
             ->find($id);
 
         if (!$application) {

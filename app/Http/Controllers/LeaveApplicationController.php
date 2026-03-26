@@ -1347,7 +1347,8 @@ class LeaveApplicationController extends Controller
         }
 
         $admin->loadMissing('department');
-        $application = LeaveApplication::find($id);
+        $application = LeaveApplication::query()
+            ->find($id);
         if (!$application) {
             return response()->json(['message' => 'Leave application not found.'], 404);
         }
@@ -1530,6 +1531,7 @@ class LeaveApplicationController extends Controller
 
         $application = LeaveApplication::query()
             ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->where('status', '!=', LeaveApplication::STATUS_PENDING_ADMIN)
             ->find($id);
 
         if (!$application) {
@@ -1550,7 +1552,9 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
-        $application = LeaveApplication::find($id);
+        $application = LeaveApplication::query()
+            ->where('status', '!=', LeaveApplication::STATUS_PENDING_ADMIN)
+            ->find($id);
         if (!$application) {
             return response()->json(['message' => 'Leave application not found.'], 404);
         }

@@ -98,9 +98,6 @@ class AdminDashboardController extends Controller
             )
         );
         $totalApproved = $totalApprovedApps->count() + $totalApprovedCocApps->count();
-        $visibleLeaveApplications = $applications->reject(
-            fn(LeaveApplication $app): bool => $app->status === LeaveApplication::STATUS_RECALLED
-        );
 
         $employeesByControlNo = $this->loadDepartmentEmployeesByControlNo($deptName);
 
@@ -117,7 +114,7 @@ class AdminDashboardController extends Controller
             'pending' => $this->buildEmploymentStatusBreakdown($pendingApps->concat($pendingCocApps), $employeeStatusByControlNo),
             'approved_today' => $this->buildEmploymentStatusBreakdown($approvedTodayApps->concat($approvedTodayCocApps), $employeeStatusByControlNo),
             'total_approved' => $this->buildEmploymentStatusBreakdown($totalApprovedApps->concat($totalApprovedCocApps), $employeeStatusByControlNo),
-            'total' => $this->buildEmploymentStatusBreakdown($visibleLeaveApplications->concat($cocApplications), $employeeStatusByControlNo),
+            'total' => $this->buildEmploymentStatusBreakdown($applications->concat($cocApplications), $employeeStatusByControlNo),
         ];
         $analytics = $this->buildDashboardTrendAnalytics($applications);
 
@@ -125,7 +122,7 @@ class AdminDashboardController extends Controller
             'pending_count' => $pending,
             'approved_today' => $approvedToday,
             'total_approved' => $totalApproved,
-            'total_count' => $visibleLeaveApplications->count() + $cocApplications->count(),
+            'total_count' => $applications->count() + $cocApplications->count(),
             'kpi_breakdown' => $kpiBreakdown,
             'analytics' => $analytics,
             'applications' => $formatted,
@@ -857,6 +854,10 @@ class AdminDashboardController extends Controller
 
         foreach ($applications as $application) {
             if (!$application instanceof LeaveApplication) {
+                continue;
+            }
+
+            if ($application->status !== LeaveApplication::STATUS_APPROVED) {
                 continue;
             }
 

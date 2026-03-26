@@ -9,6 +9,7 @@ use App\Models\HrisEmployee;
 use App\Models\LeaveApplication;
 use App\Models\LeaveApplicationUpdateRequest;
 use App\Models\LeaveBalance;
+use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
@@ -29,11 +30,17 @@ class HRDashboardController extends Controller
         }
 
         $applications = LeaveApplication::with(['leaveType', 'applicantAdmin.department', 'updateRequests'])
+            ->where('status', '!=', LeaveApplication::STATUS_PENDING_ADMIN)
             ->orderByDesc('created_at')
             ->get();
 
         $cocApplications = COCApplication::query()
             ->select(['id', 'status', 'admin_reviewed_at'])
+            ->where(function ($query): void {
+                $query
+                    ->where('status', '!=', COCApplication::STATUS_PENDING)
+                    ->orWhereNotNull('admin_reviewed_at');
+            })
             ->orderByDesc('created_at')
             ->get();
 
@@ -43,20 +50,12 @@ class HRDashboardController extends Controller
             + $cocApplications->where('status', COCApplication::STATUS_APPROVED)->count();
         $totalRejected = $applications->where('status', LeaveApplication::STATUS_REJECTED)->count()
             + $cocApplications->where('status', COCApplication::STATUS_REJECTED)->count();
-        $visibleLeaveApplications = $applications->reject(function (LeaveApplication $app): bool {
-            return in_array($app->status, [
-                LeaveApplication::STATUS_PENDING_ADMIN,
-                LeaveApplication::STATUS_RECALLED,
-            ], true);
-        });
-        $visibleCocApplications = $cocApplications->reject(
-            fn (COCApplication $app): bool => $this->deriveCocRawStatus($app) === 'PENDING_ADMIN'
-        );
-        $totalApplications = $visibleLeaveApplications->count() + $visibleCocApplications->count();
+        $totalRecalled = $applications->where('status', LeaveApplication::STATUS_RECALLED)->count();
+        $totalApplications = $applications->count() + $cocApplications->count();
         $employeeStatusByControlNo = $this->buildEmployeeStatusDirectory(
-            $visibleLeaveApplications
+            $applications
                 ->pluck('employee_control_no')
-                ->concat($visibleCocApplications->pluck('employee_control_no'))
+                ->concat($cocApplications->pluck('employee_control_no'))
                 ->all()
         );
 
@@ -76,18 +75,21 @@ class HRDashboardController extends Controller
         })->count();
 
         $formatted = $applications->map(fn($app) => $this->formatApplication($app, $employeeStatusByControlNo));
+        $analytics = $this->buildDashboardTrendAnalytics($applications);
 
         return response()->json([
             'total_count' => $totalApplications,
             'pending_count' => $pendingHR,
             'approved_count' => $totalApproved,
             'rejected_count' => $totalRejected,
+            'recalled_count' => $totalRecalled,
             'kpi_breakdown' => [
                 'total' => $this->buildEmploymentStatusBreakdown(
-                    $visibleLeaveApplications->concat($visibleCocApplications),
+                    $applications->concat($cocApplications),
                     $employeeStatusByControlNo
                 ),
             ],
+            'analytics' => $analytics,
             'on_leave_today' => $onLeaveToday,
             'active_employees' => HrisEmployee::countCached(true),
             'applications' => $formatted,
@@ -101,6 +103,81 @@ class HRDashboardController extends Controller
         }
 
         return $app->admin_reviewed_at ? 'PENDING_HR' : 'PENDING_ADMIN';
+    }
+
+    private function buildDashboardTrendAnalytics(iterable $applications): array
+    {
+        $trendYear = (int) now()->year;
+        $monthlyTrend = array_fill(0, 12, 0);
+        $leaveTypeMonthlyTrend = [];
+
+        foreach ($applications as $application) {
+            if (!$application instanceof LeaveApplication) {
+                continue;
+            }
+
+            if ($application->status !== LeaveApplication::STATUS_APPROVED) {
+                continue;
+            }
+
+            $trendDate = $this->resolveDashboardTrendDate($application);
+            if (!$trendDate || (int) $trendDate->year !== $trendYear) {
+                continue;
+            }
+
+            $monthIndex = max(0, min(11, (int) $trendDate->month - 1));
+            $monthlyTrend[$monthIndex]++;
+
+            $leaveTypeName = $this->resolveDashboardTrendLeaveTypeName($application);
+            if (!array_key_exists($leaveTypeName, $leaveTypeMonthlyTrend)) {
+                $leaveTypeMonthlyTrend[$leaveTypeName] = array_fill(0, 12, 0);
+            }
+
+            $leaveTypeMonthlyTrend[$leaveTypeName][$monthIndex]++;
+        }
+
+        if ($leaveTypeMonthlyTrend !== []) {
+            ksort($leaveTypeMonthlyTrend, SORT_NATURAL | SORT_FLAG_CASE);
+        }
+
+        return [
+            'trend_year' => $trendYear,
+            'monthly_leave_trend' => $monthlyTrend,
+            'leave_type_monthly_trend' => $leaveTypeMonthlyTrend,
+        ];
+    }
+
+    private function resolveDashboardTrendDate(LeaveApplication $application): ?CarbonImmutable
+    {
+        $candidates = [
+            $application->getAttribute('date_filed'),
+            $application->getAttribute('created_at'),
+            $application->getAttribute('start_date'),
+        ];
+
+        foreach ($candidates as $candidate) {
+            if ($candidate === null || $candidate === '') {
+                continue;
+            }
+
+            try {
+                if ($candidate instanceof \DateTimeInterface) {
+                    return CarbonImmutable::instance($candidate)->startOfDay();
+                }
+
+                return CarbonImmutable::parse((string) $candidate)->startOfDay();
+            } catch (\Throwable) {
+                continue;
+            }
+        }
+
+        return null;
+    }
+
+    private function resolveDashboardTrendLeaveTypeName(LeaveApplication $application): string
+    {
+        $name = trim((string) ($application->leaveType?->name ?? ''));
+        return $name !== '' ? $name : 'Unknown';
     }
 
     private function formatApplication(LeaveApplication $app, array $employeeStatusByControlNo = []): array
