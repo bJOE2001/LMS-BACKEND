@@ -11,6 +11,13 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
  */
 class LeaveType extends Model
 {
+    public const SPECIAL_PRIVILEGE_LEAVE_NAME = 'Special Privilege Leave';
+    public const SPECIAL_PRIVILEGE_LEGACY_NAMES = [
+        'MCO6 Leave',
+        'MC06 Leave',
+        'MO6 Leave',
+    ];
+
     protected $table = 'tblLeaveTypes';
 
     protected $fillable = [
@@ -72,6 +79,11 @@ class LeaveType extends Model
     public function scopeEventBased($query)
     {
         return $query->where('category', self::CATEGORY_EVENT);
+    }
+
+    public function scopeWithoutLegacySpecialPrivilegeAliases($query)
+    {
+        return $query->whereNotIn('name', self::SPECIAL_PRIVILEGE_LEGACY_NAMES);
     }
 
     // ─── Relationships ───────────────────────────────────────────────
@@ -200,5 +212,155 @@ class LeaveType extends Model
 
         return in_array($statusKey, $allowedStatuses, true);
     }
-}
 
+    public static function normalizeLeaveTypeName(mixed $name): string
+    {
+        $normalized = preg_replace('/\s+/', ' ', strtoupper(trim((string) ($name ?? ''))));
+
+        return is_string($normalized) ? $normalized : '';
+    }
+
+    public static function specialPrivilegeAliasNames(): array
+    {
+        return [
+            self::SPECIAL_PRIVILEGE_LEAVE_NAME,
+            ...self::SPECIAL_PRIVILEGE_LEGACY_NAMES,
+        ];
+    }
+
+    public static function isSpecialPrivilegeAliasName(mixed $name): bool
+    {
+        $normalizedName = self::normalizeLeaveTypeName($name);
+        if ($normalizedName === '') {
+            return false;
+        }
+
+        foreach (self::specialPrivilegeAliasNames() as $alias) {
+            if ($normalizedName === self::normalizeLeaveTypeName($alias)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public static function isLegacySpecialPrivilegeAliasName(mixed $name): bool
+    {
+        $normalizedName = self::normalizeLeaveTypeName($name);
+        if ($normalizedName === '') {
+            return false;
+        }
+
+        foreach (self::SPECIAL_PRIVILEGE_LEGACY_NAMES as $alias) {
+            if ($normalizedName === self::normalizeLeaveTypeName($alias)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public static function canonicalizeLeaveTypeName(mixed $name): ?string
+    {
+        $trimmedName = trim((string) ($name ?? ''));
+        if ($trimmedName === '') {
+            return null;
+        }
+
+        return self::isSpecialPrivilegeAliasName($trimmedName)
+            ? self::SPECIAL_PRIVILEGE_LEAVE_NAME
+            : $trimmedName;
+    }
+
+    public static function resolveSpecialPrivilegeLeaveTypeId(): ?int
+    {
+        static $resolved = false;
+        static $cachedValue = null;
+
+        if ($resolved) {
+            return $cachedValue;
+        }
+
+        $value = self::query()
+            ->whereRaw('UPPER(LTRIM(RTRIM(name))) = ?', [self::normalizeLeaveTypeName(self::SPECIAL_PRIVILEGE_LEAVE_NAME)])
+            ->value('id');
+
+        $cachedValue = $value !== null ? (int) $value : null;
+        $resolved = true;
+
+        return $cachedValue;
+    }
+
+    public static function resolveSpecialPrivilegeRelatedTypeIds(): array
+    {
+        static $resolved = false;
+        static $cachedValues = [];
+
+        if ($resolved) {
+            return $cachedValues;
+        }
+
+        $query = self::query()->select(['id', 'name']);
+        $query->where(function ($nestedQuery): void {
+            foreach (self::specialPrivilegeAliasNames() as $index => $name) {
+                $method = $index === 0 ? 'whereRaw' : 'orWhereRaw';
+                $nestedQuery->{$method}(
+                    'UPPER(LTRIM(RTRIM(name))) = ?',
+                    [self::normalizeLeaveTypeName($name)]
+                );
+            }
+        });
+
+        $cachedValues = $query
+            ->get()
+            ->map(fn (self $leaveType): int => (int) $leaveType->id)
+            ->filter(fn (int $leaveTypeId): bool => $leaveTypeId > 0)
+            ->values()
+            ->all();
+
+        $resolved = true;
+
+        return $cachedValues;
+    }
+
+    public static function resolveCanonicalLeaveTypeId(?int $leaveTypeId): ?int
+    {
+        $normalizedLeaveTypeId = (int) ($leaveTypeId ?? 0);
+        if ($normalizedLeaveTypeId <= 0) {
+            return null;
+        }
+
+        static $nameCache = [];
+        if (!array_key_exists($normalizedLeaveTypeId, $nameCache)) {
+            $nameCache[$normalizedLeaveTypeId] = self::query()
+                ->whereKey($normalizedLeaveTypeId)
+                ->value('name');
+        }
+
+        $leaveTypeName = $nameCache[$normalizedLeaveTypeId];
+        if (!self::isSpecialPrivilegeAliasName($leaveTypeName)) {
+            return $normalizedLeaveTypeId;
+        }
+
+        return self::resolveSpecialPrivilegeLeaveTypeId() ?? $normalizedLeaveTypeId;
+    }
+
+    public static function isSpecialPrivilegeType(?self $leaveType = null, ?int $leaveTypeId = null): bool
+    {
+        if ($leaveType instanceof self && self::isSpecialPrivilegeAliasName($leaveType->name)) {
+            return true;
+        }
+
+        $normalizedLeaveTypeId = (int) ($leaveTypeId ?? 0);
+        if ($normalizedLeaveTypeId <= 0) {
+            return false;
+        }
+
+        $canonicalLeaveTypeId = self::resolveCanonicalLeaveTypeId($normalizedLeaveTypeId);
+        $specialPrivilegeLeaveTypeId = self::resolveSpecialPrivilegeLeaveTypeId();
+
+        return $canonicalLeaveTypeId !== null
+            && $specialPrivilegeLeaveTypeId !== null
+            && $canonicalLeaveTypeId === $specialPrivilegeLeaveTypeId;
+    }
+}

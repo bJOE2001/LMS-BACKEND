@@ -108,18 +108,6 @@ class LeaveTypeSeeder extends Seeder
                 'allowed_status' => $generalStatuses,
                 'description' => '5 days per year for calamity situations. Resets every January 1.',
             ],
-            [
-                'name' => 'MCO6 Leave',
-                'category' => 'RESETTABLE',
-                'accrual_rate' => null,
-                'accrual_day_of_month' => null,
-                'max_days' => 3,
-                'is_credit_based' => true,
-                'resets_yearly' => true,
-                'requires_documents' => false,
-                'allowed_status' => $generalStatuses,
-                'description' => '3 days per year, max 3 consecutive days. Resets every January 1.',
-            ],
 
             // ─── EVENT-BASED (Triggered by Event — No Accrual, No Reset) ─────
             [
@@ -252,4 +240,3 @@ class LeaveTypeSeeder extends Seeder
         }
     }
 }
-

@@ -291,11 +291,10 @@ class HRDashboardController extends Controller
             'VACATION LEAVE' => 'vacationLeave',
             'SICK LEAVE' => 'sickLeave',
             'MANDATORY FORCED LEAVE', 'MANDATORY LEAVE', 'FORCED LEAVE' => 'mandatoryForcedLeave',
-            'MCO6 LEAVE', 'MC06 LEAVE' => 'mco6Leave',
+            'MCO6 LEAVE', 'MC06 LEAVE', 'MO6 LEAVE', 'SPECIAL PRIVILEGE LEAVE' => 'specialPrivilegeLeave',
             'WELLNESS LEAVE' => 'wellnessLeave',
             'MATERNITY LEAVE' => 'maternityLeave',
             'PATERNITY LEAVE' => 'paternityLeave',
-            'SPECIAL PRIVILEGE LEAVE' => 'specialPrivilegeLeave',
             'SOLO PARENT LEAVE' => 'soloParentLeave',
             default => null,
         };
