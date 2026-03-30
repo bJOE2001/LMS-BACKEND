@@ -83,6 +83,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
 
     Route::middleware('department_admin')->prefix('admin')->group(function () {
         // Employee management
+        Route::get('/employee-options', [EmployeeController::class, 'adminEmployeeOptions']);
         Route::post('/employees', [EmployeeController::class, 'store']);
         Route::put('/employees/{controlNo}', [EmployeeController::class, 'update']);
         Route::delete('/employees/{controlNo}', [EmployeeController::class, 'destroy']);
