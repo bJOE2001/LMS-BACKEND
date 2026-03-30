@@ -1311,6 +1311,34 @@ class LeaveApplicationController extends Controller
         ]);
     }
 
+    public function adminShow(Request $request, int $id): JsonResponse
+    {
+        $admin = $request->user();
+        if (!$admin instanceof DepartmentAdmin) {
+            return response()->json(['message' => 'Only department admins can access this endpoint.'], 403);
+        }
+
+        $admin->loadMissing('department');
+        $application = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($id);
+
+        if (!$application) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $applicationEmployee = $this->resolveApplicationEmployee($application);
+        if (($applicationEmployee?->office ?? null) !== $admin->department?->name) {
+            return response()->json(['message' => 'You can only view applications from your department.'], 403);
+        }
+
+        $actorDirectory = $this->buildWorkflowActorDirectory([$application]);
+
+        return response()->json([
+            'application' => $this->formatErmsApplication($application, $actorDirectory),
+        ]);
+    }
+
     public function adminViewAttachment(Request $request, int $id)
     {
         $admin = $request->user();
@@ -1319,7 +1347,8 @@ class LeaveApplicationController extends Controller
         }
 
         $admin->loadMissing('department');
-        $application = LeaveApplication::find($id);
+        $application = LeaveApplication::query()
+            ->find($id);
         if (!$application) {
             return response()->json(['message' => 'Leave application not found.'], 404);
         }
@@ -1493,6 +1522,29 @@ class LeaveApplicationController extends Controller
         ]);
     }
 
+    public function hrShow(Request $request, int $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (!$hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $application = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->where('status', '!=', LeaveApplication::STATUS_PENDING_ADMIN)
+            ->find($id);
+
+        if (!$application) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $actorDirectory = $this->buildWorkflowActorDirectory([$application]);
+
+        return response()->json([
+            'application' => $this->formatErmsApplication($application, $actorDirectory),
+        ]);
+    }
+
     public function hrViewAttachment(Request $request, int $id)
     {
         $hr = $request->user();
@@ -1500,7 +1552,9 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
-        $application = LeaveApplication::find($id);
+        $application = LeaveApplication::query()
+            ->where('status', '!=', LeaveApplication::STATUS_PENDING_ADMIN)
+            ->find($id);
         if (!$application) {
             return response()->json(['message' => 'Leave application not found.'], 404);
         }

@@ -189,6 +189,27 @@ class COCApplicationController extends Controller
         ]);
     }
 
+    public function adminShow(Request $request, int $id): JsonResponse
+    {
+        $admin = $request->user();
+        if (!$admin instanceof DepartmentAdmin) {
+            return response()->json(['message' => 'Only department admins can view COC applications.'], 403);
+        }
+
+        $application = $this->departmentScope($admin)
+            ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
+            ->where('id', $id)
+            ->first();
+
+        if (!$application) {
+            return response()->json(['message' => 'COC application not found.'], 404);
+        }
+
+        return response()->json([
+            'application' => $this->formatApplication($application),
+        ]);
+    }
+
     public function adminApprove(Request $request, int $id): JsonResponse
     {
         $admin = $request->user();
@@ -296,6 +317,11 @@ class COCApplicationController extends Controller
 
         $applications = COCApplication::query()
             ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
+            ->where(function ($query): void {
+                $query
+                    ->where('status', '!=', COCApplication::STATUS_PENDING)
+                    ->orWhereNotNull('admin_reviewed_at');
+            })
             ->when($controlNo !== '', function ($q) use ($controlNo): void {
                 $q->matchingControlNo($controlNo);
             })
@@ -309,6 +335,31 @@ class COCApplicationController extends Controller
             'applications' => $applications
                 ->map(fn(COCApplication $app) => $this->formatApplication($app, $leaveBalanceDirectory))
                 ->values(),
+        ]);
+    }
+
+    public function hrShow(Request $request, int $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (!$hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can view COC applications.'], 403);
+        }
+
+        $application = COCApplication::query()
+            ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
+            ->where(function ($query): void {
+                $query
+                    ->where('status', '!=', COCApplication::STATUS_PENDING)
+                    ->orWhereNotNull('admin_reviewed_at');
+            })
+            ->find($id);
+
+        if (!$application) {
+            return response()->json(['message' => 'COC application not found.'], 404);
+        }
+
+        return response()->json([
+            'application' => $this->formatApplication($application),
         ]);
     }
 
@@ -609,6 +660,7 @@ class COCApplicationController extends Controller
             trim((string) ($resolvedEmployee?->middlename ?? '')),
             trim((string) ($resolvedEmployee?->surname ?? '')),
         ]))) ?: null;
+        $employeePosition = trim((string) ($resolvedEmployee?->designation ?? '')) ?: null;
 
         $remarks = trim((string) ($app->remarks ?? ''));
         $isCancelled = (bool) preg_match('/^cancelled\b/i', $remarks);
@@ -623,6 +675,10 @@ class COCApplicationController extends Controller
             'employee_name' => $employeeName,
             'office' => $resolvedEmployee?->office,
             'department' => $resolvedEmployee?->office,
+            'position' => $employeePosition,
+            'designation' => $employeePosition,
+            'job_title' => $employeePosition,
+            'jobTitle' => $employeePosition,
             'leaveType' => 'COC Application',
             'leave_type_name' => 'COC Application',
             'startDate' => $rowDates[0] ?? null,
