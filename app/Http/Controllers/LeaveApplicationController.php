@@ -656,7 +656,7 @@ class LeaveApplicationController extends Controller
      *
      * Protected endpoint for ERMS-to-LMS leave update request.
      * - Pending applications: logs a legacy edit request note.
-     * - Approved applications: stores requested field updates for HR approval.
+     * - Approved applications: stores requested updates for admin review, then HR review.
      */
     public function ermsRequestUpdate(Request $request, ?int $id = null): JsonResponse
     {
@@ -820,7 +820,7 @@ class LeaveApplicationController extends Controller
 
             if ($isApprovedApplication) {
                 $app->update([
-                    'status' => LeaveApplication::STATUS_PENDING_HR,
+                    'status' => LeaveApplication::STATUS_PENDING_ADMIN,
                     'remarks' => $updatedRemarks,
                 ]);
 
@@ -873,7 +873,7 @@ class LeaveApplicationController extends Controller
         }
         $leaveTypeName = $app->leaveType?->name ?? 'leave';
         $pendingStage = $isApprovedApplication
-            ? 'pending HR review'
+            ? 'pending department review'
             : ($app->status === LeaveApplication::STATUS_PENDING_HR
                 ? 'pending HR review'
                 : 'pending department review');
@@ -888,11 +888,22 @@ class LeaveApplicationController extends Controller
             ? 'Approved Leave Update Requested'
             : 'Leave Application Edit Requested';
 
+        $admins = DepartmentAdmin::whereHas('department', fn($q) => $q->where('name', $employee->office))->get();
+        foreach ($admins as $deptAdmin) {
+            Notification::send(
+                $deptAdmin,
+                Notification::TYPE_LEAVE_EDIT_REQUEST,
+                $title,
+                $message,
+                $app->id
+            );
+        }
+
         if (!$isApprovedApplication) {
-            $admins = DepartmentAdmin::whereHas('department', fn($q) => $q->where('name', $employee->office))->get();
-            foreach ($admins as $deptAdmin) {
+            $hrAccounts = HRAccount::all();
+            foreach ($hrAccounts as $hrAccount) {
                 Notification::send(
-                    $deptAdmin,
+                    $hrAccount,
                     Notification::TYPE_LEAVE_EDIT_REQUEST,
                     $title,
                     $message,
@@ -901,20 +912,9 @@ class LeaveApplicationController extends Controller
             }
         }
 
-        $hrAccounts = HRAccount::all();
-        foreach ($hrAccounts as $hrAccount) {
-            Notification::send(
-                $hrAccount,
-                Notification::TYPE_LEAVE_EDIT_REQUEST,
-                $title,
-                $message,
-                $app->id
-            );
-        }
-
         return response()->json([
             'message' => $isApprovedApplication
-                ? 'Leave update request submitted and forwarded to HR for approval.'
+                ? 'Leave update request submitted and forwarded to department admin for approval.'
                 : 'Leave edit request submitted successfully.',
             'application' => $this->formatApplication($app->fresh(['leaveType', 'applicantAdmin.department'])),
         ]);
@@ -1295,14 +1295,56 @@ class LeaveApplicationController extends Controller
 
         $deptName = $admin->department?->name;
         $departmentEmployeeControlNos = $this->findDepartmentEmployeeControlNos($deptName, null);
+        $departmentAdminIds = $admin->department_id !== null
+            ? DepartmentAdmin::query()
+                ->where('department_id', $admin->department_id)
+                ->pluck('id')
+                ->map(fn($value) => (int) $value)
+                ->values()
+                ->all()
+            : [];
 
         $applications = LeaveApplication::with(['leaveType', 'applicantAdmin.department', 'updateRequests'])
             ->where('status', LeaveApplication::STATUS_PENDING_ADMIN)
-            ->when(
-                $departmentEmployeeControlNos !== [],
-                fn ($query) => $query->whereIn('employee_control_no', $departmentEmployeeControlNos),
-                fn ($query) => $query->whereRaw('1 = 0')
-            )
+            ->where(function ($query) use ($departmentEmployeeControlNos, $admin, $departmentAdminIds): void {
+                $hasVisibilityConstraint = false;
+
+                if ($departmentEmployeeControlNos !== []) {
+                    $query->whereIn('employee_control_no', $departmentEmployeeControlNos);
+                    $hasVisibilityConstraint = true;
+                }
+
+                if ($admin->department_id !== null) {
+                    if ($hasVisibilityConstraint) {
+                        $query->orWhereHas('applicantAdmin', fn($nestedQuery) => $nestedQuery->where('department_id', $admin->department_id));
+                    } else {
+                        $query->whereHas('applicantAdmin', fn($nestedQuery) => $nestedQuery->where('department_id', $admin->department_id));
+                    }
+                    $hasVisibilityConstraint = true;
+                }
+
+                if ($departmentAdminIds !== []) {
+                    if ($hasVisibilityConstraint) {
+                        $query->orWhereIn('admin_id', $departmentAdminIds);
+                    } else {
+                        $query->whereIn('admin_id', $departmentAdminIds);
+                    }
+                    $hasVisibilityConstraint = true;
+                }
+
+                if ($admin->id !== null) {
+                    if ($hasVisibilityConstraint) {
+                        $query->orWhere('admin_id', $admin->id);
+                    } else {
+                        $query->where('admin_id', $admin->id);
+                    }
+                    $hasVisibilityConstraint = true;
+                }
+
+                if (!$hasVisibilityConstraint) {
+                    $query->whereRaw('1 = 0');
+                }
+            })
             ->orderByDesc('created_at')
             ->get();
 
@@ -1327,8 +1369,7 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Leave application not found.'], 404);
         }
 
-        $applicationEmployee = $this->resolveApplicationEmployee($application);
-        if (($applicationEmployee?->office ?? null) !== $admin->department?->name) {
+        if (!$this->adminCanManageApplication($admin, $application)) {
             return response()->json(['message' => 'You can only view applications from your department.'], 403);
         }
 
@@ -1353,8 +1394,7 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Leave application not found.'], 404);
         }
 
-        $applicationEmployee = $this->resolveApplicationEmployee($application);
-        if (($applicationEmployee?->office ?? null) !== $admin->department?->name) {
+        if (!$this->adminCanManageApplication($admin, $application)) {
             return response()->json(['message' => 'You can only view attachments from your department.'], 403);
         }
 
@@ -1382,8 +1422,7 @@ class LeaveApplicationController extends Controller
         }
 
         // Security: admin can only act on their own department's applications.
-        $applicationEmployee = $this->resolveApplicationEmployee($app);
-        if (($applicationEmployee?->office ?? null) !== $admin->department?->name) {
+        if (!$this->adminCanManageApplication($admin, $app)) {
             return response()->json(['message' => 'You can only manage applications from your department.'], 403);
         }
 
@@ -1392,20 +1431,31 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => "Cannot approve: application status is '{$app->status}', expected 'PENDING_ADMIN'."], 422);
         }
 
-        DB::transaction(function () use ($app, $admin, $request) {
-            $app->update([
+        $isPendingApprovedUpdateRequest = $this->hasPendingApprovedUpdateRequest($app);
+
+        DB::transaction(function () use ($app, $admin, $request, $isPendingApprovedUpdateRequest) {
+            $updateAttributes = [
                 'status' => LeaveApplication::STATUS_PENDING_HR,
                 'admin_id' => $admin->id,
-                'admin_approved_at' => now(),
                 'remarks' => $request->input('remarks'),
-            ]);
+            ];
+            if (!$isPendingApprovedUpdateRequest) {
+                $updateAttributes['admin_approved_at'] = now();
+            }
+
+            $app->update($updateAttributes);
+
+            $logRemarks = $request->input('remarks');
+            if ($this->trimNullableString($logRemarks) === null && $isPendingApprovedUpdateRequest) {
+                $logRemarks = 'Approved leave update request and forwarded to HR.';
+            }
 
             LeaveApplicationLog::create([
                 'leave_application_id' => $app->id,
                 'action' => LeaveApplicationLog::ACTION_ADMIN_APPROVED,
                 'performed_by_type' => LeaveApplicationLog::PERFORMER_ADMIN,
                 'performed_by_id' => $admin->id,
-                'remarks' => $request->input('remarks'),
+                'remarks' => $logRemarks,
                 'created_at' => now(),
             ]);
         });
@@ -1416,21 +1466,32 @@ class LeaveApplicationController extends Controller
         $actionLabel = $isMonetization ? 'monetization request' : 'leave application';
         $titleLabel = $isMonetization ? 'Monetization' : 'Leave';
         $employeeName = $this->resolveEmployeeDisplayName($app);
+        $notificationType = $isPendingApprovedUpdateRequest
+            ? Notification::TYPE_LEAVE_EDIT_REQUEST
+            : Notification::TYPE_LEAVE_REQUEST;
+        $notificationTitle = $isPendingApprovedUpdateRequest
+            ? "{$titleLabel} Edit Request Pending HR Review"
+            : "{$titleLabel} Application Pending HR Review";
+        $notificationMessage = $isPendingApprovedUpdateRequest
+            ? "{$employeeName} submitted an update request for an approved {$app->leaveType->name} {$actionLabel}. The request has been approved by department admin and awaits your review."
+            : "{$employeeName} submitted a {$app->leaveType->name} {$actionLabel} (" . self::formatDays($app->total_days) . ") that has been approved by admin and awaits your review.";
 
         // Notify all HR accounts about the new pending application
         $hrAccounts = HRAccount::all();
         foreach ($hrAccounts as $hrAccount) {
             Notification::send(
                 $hrAccount,
-                Notification::TYPE_LEAVE_REQUEST,
-                "{$titleLabel} Application Pending HR Review",
-                "{$employeeName} submitted a {$app->leaveType->name} {$actionLabel} (" . self::formatDays($app->total_days) . ") that has been approved by admin and awaits your review.",
+                $notificationType,
+                $notificationTitle,
+                $notificationMessage,
                 $app->id
             );
         }
 
         return response()->json([
-            'message' => 'Application approved by admin. Forwarded to HR.',
+            'message' => $isPendingApprovedUpdateRequest
+                ? 'Leave update request approved by admin. Forwarded to HR for final approval.'
+                : 'Application approved by admin. Forwarded to HR.',
             'application' => $this->formatApplication($app->fresh('leaveType')),
         ]);
     }
@@ -1455,8 +1516,7 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Leave application not found.'], 404);
         }
 
-        $applicationEmployee = $this->resolveApplicationEmployee($app);
-        if (($applicationEmployee?->office ?? null) !== $admin->department?->name) {
+        if (!$this->adminCanManageApplication($admin, $app)) {
             return response()->json(['message' => 'You can only manage applications from your department.'], 403);
         }
 
@@ -1467,6 +1527,10 @@ class LeaveApplicationController extends Controller
             return response()->json([
                 'message' => "Cannot reject: application status is '{$app->status}'. Expected 'PENDING_ADMIN' or 'PENDING_HR'."
             ], 422);
+        }
+
+        if ($this->hasPendingApprovedUpdateRequest($app)) {
+            return $this->adminRejectPendingUpdateRequest($request, $app, $admin);
         }
 
         DB::transaction(function () use ($app, $admin, $request) {
@@ -1513,7 +1577,22 @@ class LeaveApplicationController extends Controller
         }
 
         $applications = LeaveApplication::with(['leaveType', 'applicantAdmin.department', 'updateRequests'])
-            ->where('status', LeaveApplication::STATUS_PENDING_HR)
+            ->where(function ($query): void {
+                $query
+                    ->where('status', LeaveApplication::STATUS_PENDING_HR)
+                    ->orWhere(function ($nestedQuery): void {
+                        $nestedQuery
+                            ->where('status', LeaveApplication::STATUS_PENDING_ADMIN)
+                            ->whereHas('updateRequests', function ($updateRequestQuery): void {
+                                $updateRequestQuery
+                                    ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
+                                    ->whereRaw(
+                                        'UPPER(LTRIM(RTRIM(COALESCE(previous_status, ?)))) = ?',
+                                        ['', LeaveApplication::STATUS_APPROVED]
+                                    );
+                            });
+                    });
+            })
             ->orderByDesc('created_at')
             ->get();
 
@@ -1531,7 +1610,22 @@ class LeaveApplicationController extends Controller
 
         $application = LeaveApplication::query()
             ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
-            ->where('status', '!=', LeaveApplication::STATUS_PENDING_ADMIN)
+            ->where(function ($query): void {
+                $query
+                    ->where('status', '!=', LeaveApplication::STATUS_PENDING_ADMIN)
+                    ->orWhere(function ($nestedQuery): void {
+                        $nestedQuery
+                            ->where('status', LeaveApplication::STATUS_PENDING_ADMIN)
+                            ->whereHas('updateRequests', function ($updateRequestQuery): void {
+                                $updateRequestQuery
+                                    ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
+                                    ->whereRaw(
+                                        'UPPER(LTRIM(RTRIM(COALESCE(previous_status, ?)))) = ?',
+                                        ['', LeaveApplication::STATUS_APPROVED]
+                                    );
+                            });
+                    });
+            })
             ->find($id);
 
         if (!$application) {
@@ -1553,7 +1647,22 @@ class LeaveApplicationController extends Controller
         }
 
         $application = LeaveApplication::query()
-            ->where('status', '!=', LeaveApplication::STATUS_PENDING_ADMIN)
+            ->where(function ($query): void {
+                $query
+                    ->where('status', '!=', LeaveApplication::STATUS_PENDING_ADMIN)
+                    ->orWhere(function ($nestedQuery): void {
+                        $nestedQuery
+                            ->where('status', LeaveApplication::STATUS_PENDING_ADMIN)
+                            ->whereHas('updateRequests', function ($updateRequestQuery): void {
+                                $updateRequestQuery
+                                    ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
+                                    ->whereRaw(
+                                        'UPPER(LTRIM(RTRIM(COALESCE(previous_status, ?)))) = ?',
+                                        ['', LeaveApplication::STATUS_APPROVED]
+                                    );
+                            });
+                    });
+            })
             ->find($id);
         if (!$application) {
             return response()->json(['message' => 'Leave application not found.'], 404);
@@ -3255,6 +3364,35 @@ class LeaveApplicationController extends Controller
         return 'Employee';
     }
 
+    private function adminCanManageApplication(DepartmentAdmin $admin, LeaveApplication $app): bool
+    {
+        $admin->loadMissing('department');
+        $app->loadMissing('applicantAdmin.department');
+
+        $applicationEmployee = $this->resolveApplicationEmployee($app);
+        if (($applicationEmployee?->office ?? null) === $admin->department?->name) {
+            return true;
+        }
+
+        if ((int) ($app->admin_id ?? 0) > 0 && (int) $app->admin_id === (int) $admin->id) {
+            return true;
+        }
+
+        if ((int) ($app->admin_id ?? 0) > 0) {
+            $reviewingAdminDepartmentId = DepartmentAdmin::query()
+                ->whereKey((int) $app->admin_id)
+                ->value('department_id');
+            if ((int) ($reviewingAdminDepartmentId ?? 0) > 0
+                && (int) $reviewingAdminDepartmentId === (int) ($admin->department_id ?? 0)
+            ) {
+                return true;
+            }
+        }
+
+        return (int) ($app->applicantAdmin?->department_id ?? 0) > 0
+            && (int) $app->applicantAdmin->department_id === (int) ($admin->department_id ?? 0);
+    }
+
     private function resolveLeaveApplicationUpdateEmployeeControlNo(LeaveApplication $app): ?string
     {
         $controlNo = $this->resolveApplicationBalanceLookupControlNo($app);
@@ -3527,7 +3665,10 @@ class LeaveApplicationController extends Controller
         }
 
         $isCancelled = $cancelledLog !== null || $this->isCancelledRemark($app->remarks);
-        $displayStatus = $isCancelled ? 'Cancelled' : $this->ermsStatusLabel($app->status);
+        $hasPendingApprovedUpdateRequest = $this->hasPendingApprovedUpdateRequest($app);
+        $displayStatus = $isCancelled
+            ? 'Cancelled'
+            : ($hasPendingApprovedUpdateRequest ? 'Approved' : $this->ermsStatusLabel($app->status));
         $cancellationReason = $this->extractCancellationReason($app->remarks);
         $cancelledBy = $cancelledLog
             ? ($this->resolveWorkflowPerformerName($cancelledLog, $actorDirectory, $employeeName) ?? $employeeName)
@@ -3641,7 +3782,7 @@ class LeaveApplicationController extends Controller
             'pending_update_previous_status' => $pendingUpdateMeta['previous_status'],
             'pending_update_requested_by' => $pendingUpdateMeta['requested_by'],
             'pending_update_requested_at' => $pendingUpdateMeta['requested_at']?->toIso8601String(),
-            'has_pending_update_request' => $this->isPendingApprovedUpdateRequest($app),
+            'has_pending_update_request' => $hasPendingApprovedUpdateRequest,
             'latest_update_request_status' => $latestUpdateMeta['status'],
             'latest_update_request_payload' => $latestUpdateMeta['payload'],
             'latest_update_request_reason' => $latestUpdateMeta['reason'],
@@ -3925,15 +4066,21 @@ class LeaveApplicationController extends Controller
         return ($currentPayload['commutation'] ?? 'Not Requested') !== ($normalizedRequestedPayload['commutation'] ?? 'Not Requested');
     }
 
+    private function hasPendingApprovedUpdateRequest(LeaveApplication $app): bool
+    {
+        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
+
+        return ($pendingUpdateMeta['payload'] ?? null) !== null
+            && strtoupper(trim((string) ($pendingUpdateMeta['previous_status'] ?? ''))) === LeaveApplication::STATUS_APPROVED;
+    }
+
     private function isPendingApprovedUpdateRequest(LeaveApplication $app): bool
     {
         if ($app->status !== LeaveApplication::STATUS_PENDING_HR) {
             return false;
         }
 
-        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
-        return ($pendingUpdateMeta['payload'] ?? null) !== null
-            && strtoupper(trim((string) ($pendingUpdateMeta['previous_status'] ?? ''))) === LeaveApplication::STATUS_APPROVED;
+        return $this->hasPendingApprovedUpdateRequest($app);
     }
 
     private function hrApprovePendingUpdateRequest(Request $request, LeaveApplication $app, HRAccount $hr): JsonResponse
@@ -4262,6 +4409,52 @@ class LeaveApplicationController extends Controller
 
         return response()->json([
             'message' => 'Leave update request rejected by HR. Original approved application remains unchanged.',
+            'application' => $this->formatApplication($app),
+        ]);
+    }
+
+    private function adminRejectPendingUpdateRequest(
+        Request $request,
+        LeaveApplication $app,
+        DepartmentAdmin $admin
+    ): JsonResponse {
+        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
+        $pendingUpdateRequest = $pendingUpdateMeta['request_record'] ?? null;
+
+        $previousStatus = strtoupper(trim((string) ($pendingUpdateMeta['previous_status'] ?? '')));
+        if ($previousStatus !== LeaveApplication::STATUS_APPROVED) {
+            $previousStatus = LeaveApplication::STATUS_APPROVED;
+        }
+
+        DB::transaction(function () use ($app, $request, $admin, $previousStatus, $pendingUpdateRequest): void {
+            $app->update([
+                'status' => $previousStatus,
+                'admin_id' => $admin->id,
+                'remarks' => $request->input('remarks'),
+            ]);
+
+            if ($pendingUpdateRequest instanceof LeaveApplicationUpdateRequest) {
+                $pendingUpdateRequest->update([
+                    'status' => LeaveApplicationUpdateRequest::STATUS_REJECTED,
+                    'reviewed_at' => now(),
+                    'review_remarks' => $request->input('remarks'),
+                ]);
+            }
+
+            LeaveApplicationLog::create([
+                'leave_application_id' => $app->id,
+                'action' => LeaveApplicationLog::ACTION_ADMIN_REJECTED,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_ADMIN,
+                'performed_by_id' => $admin->id,
+                'remarks' => $request->input('remarks') ?: 'Rejected leave update request.',
+                'created_at' => now(),
+            ]);
+        });
+
+        $app = $app->fresh(['leaveType', 'applicantAdmin']);
+
+        return response()->json([
+            'message' => 'Leave update request rejected by admin. Original approved application remains unchanged.',
             'application' => $this->formatApplication($app),
         ]);
     }
@@ -6636,6 +6829,10 @@ class LeaveApplicationController extends Controller
         $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
         $withoutPay = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
         $deductibleDays = $this->resolveApplicationDeductibleDays($app);
+        $hasPendingApprovedUpdateRequest = $this->hasPendingApprovedUpdateRequest($app);
+        $displayStatus = $hasPendingApprovedUpdateRequest
+            ? $this->statusToFrontend(LeaveApplication::STATUS_APPROVED)
+            : $this->statusToFrontend($app->status);
 
         $data = [
             'id' => $app->id,
@@ -6650,7 +6847,7 @@ class LeaveApplicationController extends Controller
             'duration_unit' => 'day',
             'duration_label' => self::formatDays($durationDays),
             'reason' => $app->reason,
-            'status' => $this->statusToFrontend($app->status),
+            'status' => $displayStatus,
             'rawStatus' => $app->status,
             'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
             'filedAt' => $app->created_at?->toIso8601String(),
@@ -6663,7 +6860,7 @@ class LeaveApplicationController extends Controller
             'pending_update_previous_status' => $pendingUpdateMeta['previous_status'],
             'pending_update_requested_by' => $pendingUpdateMeta['requested_by'],
             'pending_update_requested_at' => $pendingUpdateMeta['requested_at']?->toIso8601String(),
-            'has_pending_update_request' => $this->isPendingApprovedUpdateRequest($app),
+            'has_pending_update_request' => $hasPendingApprovedUpdateRequest,
             'latest_update_request_status' => $latestUpdateMeta['status'],
             'latest_update_request_payload' => $latestUpdateMeta['payload'],
             'latest_update_request_reason' => $latestUpdateMeta['reason'],
