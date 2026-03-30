@@ -61,11 +61,15 @@ class HrisEmployee
         $rows = Cache::remember(
             self::cacheKey('all', $activeOnly),
             now()->addMinutes(self::CACHE_TTL_MINUTES),
-            static fn (): array => self::orderedQuery($activeOnly)
-                ->get()
-                ->map(static fn (object $employee): array => (array) $employee)
-                ->values()
-                ->all()
+            static function () use ($activeOnly): array {
+                $rows = self::orderedQuery($activeOnly)
+                    ->get()
+                    ->map(static fn (object $employee): array => (array) $employee)
+                    ->values()
+                    ->all();
+
+                return self::applyDepartmentAssignments($rows);
+            }
         );
 
         return collect($rows)->map(static fn (array $row): object => (object) $row);
@@ -165,7 +169,14 @@ class HrisEmployee
             default => 'all',
         };
 
-        return "hris_employees.{$suffix}.{$activityKey}.v1";
+        return "hris_employees.{$suffix}.{$activityKey}.v2";
+    }
+
+    public static function flushCache(): void
+    {
+        Cache::forget(self::cacheKey('all', null));
+        Cache::forget(self::cacheKey('all', true));
+        Cache::forget(self::cacheKey('all', false));
     }
 
     private static function applyOfficeFilter(Builder $query, ?string $officeName): void
@@ -230,5 +241,76 @@ class HrisEmployee
         }
 
         return preg_match('/^\d+$/', $normalized) ? $normalized : null;
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $rows
+     * @return array<int, array<string, mixed>>
+     */
+    private static function applyDepartmentAssignments(array $rows): array
+    {
+        if ($rows === []) {
+            return [];
+        }
+
+        $departmentNamesByControlNo = self::loadAssignedDepartmentNames();
+        if ($departmentNamesByControlNo === []) {
+            return array_map(static function (array $row): array {
+                $row['hris_office'] = trim((string) ($row['office'] ?? ''));
+                $row['assigned_department_name'] = null;
+                $row['assigned_department_id'] = null;
+                $row['is_department_reassigned'] = false;
+
+                return $row;
+            }, $rows);
+        }
+
+        return array_map(static function (array $row) use ($departmentNamesByControlNo): array {
+            $originalOffice = trim((string) ($row['office'] ?? ''));
+            $normalizedControlNo = self::normalizeControlNoInt($row['control_no'] ?? null);
+            $assignment = $normalizedControlNo !== null
+                ? ($departmentNamesByControlNo[$normalizedControlNo] ?? null)
+                : null;
+
+            $row['hris_office'] = $originalOffice;
+            $row['assigned_department_name'] = $assignment['department_name'] ?? null;
+            $row['assigned_department_id'] = $assignment['department_id'] ?? null;
+            $row['is_department_reassigned'] = $assignment !== null
+                && strcasecmp((string) ($assignment['department_name'] ?? ''), $originalOffice) !== 0;
+
+            if ($assignment !== null && trim((string) ($assignment['department_name'] ?? '')) !== '') {
+                $row['office'] = trim((string) $assignment['department_name']);
+            }
+
+            return $row;
+        }, $rows);
+    }
+
+    /**
+     * @return array<string, array{department_id:int|null, department_name:string}>
+     */
+    private static function loadAssignedDepartmentNames(): array
+    {
+        return EmployeeDepartmentAssignment::query()
+            ->with(['department:id,name,is_inactive'])
+            ->get()
+            ->reduce(static function (array $carry, EmployeeDepartmentAssignment $assignment): array {
+                $departmentName = trim((string) ($assignment->department?->name ?? ''));
+                if ($departmentName === '' || ($assignment->department?->is_inactive ?? false)) {
+                    return $carry;
+                }
+
+                $normalizedControlNo = self::normalizeControlNoInt($assignment->employee_control_no);
+                if ($normalizedControlNo === null) {
+                    return $carry;
+                }
+
+                $carry[$normalizedControlNo] = [
+                    'department_id' => $assignment->department_id ? (int) $assignment->department_id : null,
+                    'department_name' => $departmentName,
+                ];
+
+                return $carry;
+            }, []);
     }
 }

@@ -6,6 +6,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasOne;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 /**
  * Department model — local LMS_DB table.
@@ -41,6 +42,11 @@ class Department extends Model
     public function departmentHead(): HasOne
     {
         return $this->hasOne(DepartmentHead::class, 'department_id');
+    }
+
+    public function employeeAssignments(): HasMany
+    {
+        return $this->hasMany(EmployeeDepartmentAssignment::class, 'department_id');
     }
 
 }

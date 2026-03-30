@@ -64,6 +64,21 @@ return new class extends Migration {
             $table->index('employee_control_no');
         });
 
+        // LMS-only employee department reassignments / overlays
+        Schema::create('tblEmployeeDepartmentAssignments', function (Blueprint $table) {
+            $table->id();
+            $table->string('employee_control_no')->unique();
+            $table->foreignId('department_id')
+                ->constrained('tblDepartments')
+                ->cascadeOnDelete();
+            $table->unsignedBigInteger('assigned_by_department_admin_id')->nullable();
+            $table->timestamp('assigned_at')->nullable();
+            $table->timestamps();
+
+            $table->index('department_id', 'IX_tblEmployeeDepartmentAssignments_department_id');
+            $table->index('assigned_by_department_admin_id', 'IX_tblEmployeeDepartmentAssignments_assigned_by');
+        });
+
         // Leave types
         Schema::create('tblLeaveTypes', function (Blueprint $table) {
             $table->id();
@@ -87,6 +102,7 @@ return new class extends Migration {
     public function down(): void
     {
         Schema::dropIfExists('tblLeaveTypes');
+        Schema::dropIfExists('tblEmployeeDepartmentAssignments');
         Schema::dropIfExists('tblDepartmentAdmins');
         Schema::dropIfExists('tblEmployees');
         Schema::dropIfExists('tblHRAccounts');

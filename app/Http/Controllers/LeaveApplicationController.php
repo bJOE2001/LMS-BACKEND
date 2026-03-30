@@ -3012,34 +3012,31 @@ class LeaveApplicationController extends Controller
         array $balanceRecordsByType,
         array $deductionHistoryByType
     ): array {
-        if (
-            $this->resolveEmploymentStatusKey($employee->status ?? null)
-            === LeaveType::EMPLOYMENT_STATUS_CONTRACTUAL
-        ) {
-            return [
-                'vacation' => $this->emptyErmsLeaveBalancePayload('Vacation Leave'),
-                'sick' => $this->emptyErmsLeaveBalancePayload('Sick Leave'),
-                'wellness' => $this->buildErmsAccruedLeaveCard(
+        $isContractual = $this->resolveEmploymentStatusKey($employee->status ?? null)
+            === LeaveType::EMPLOYMENT_STATUS_CONTRACTUAL;
+
+        return [
+            'vacation' => $isContractual
+                ? $this->emptyErmsLeaveBalancePayload('Vacation Leave')
+                : $this->buildErmsAccruedLeaveCard(
                     $typesByName,
                     $balanceRecordsByType,
                     $deductionHistoryByType,
-                    'Wellness Leave'
+                    'Vacation Leave'
                 ),
-            ];
-        }
-
-        return [
-            'vacation' => $this->buildErmsAccruedLeaveCard(
+            'sick' => $isContractual
+                ? $this->emptyErmsLeaveBalancePayload('Sick Leave')
+                : $this->buildErmsAccruedLeaveCard(
+                    $typesByName,
+                    $balanceRecordsByType,
+                    $deductionHistoryByType,
+                    'Sick Leave'
+                ),
+            'wellness' => $this->buildErmsAccruedLeaveCard(
                 $typesByName,
                 $balanceRecordsByType,
                 $deductionHistoryByType,
-                'Vacation Leave'
-            ),
-            'sick' => $this->buildErmsAccruedLeaveCard(
-                $typesByName,
-                $balanceRecordsByType,
-                $deductionHistoryByType,
-                'Sick Leave'
+                'Wellness Leave'
             ),
         ];
     }

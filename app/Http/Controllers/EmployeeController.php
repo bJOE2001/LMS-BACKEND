@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\Department;
 use App\Models\DepartmentAdmin;
 use App\Models\DepartmentHead;
+use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
 use App\Models\LeaveApplication;
@@ -418,6 +419,48 @@ class EmployeeController extends Controller
     }
 
     /**
+     * Lightweight employee lookup for department-admin reassignment picker.
+     */
+    public function adminEmployeeOptions(Request $request): JsonResponse
+    {
+        $admin = $this->resolveDepartmentAdmin($request);
+        if ($admin instanceof JsonResponse) {
+            return $admin;
+        }
+
+        $validated = $request->validate([
+            'search' => ['nullable', 'string', 'max:120'],
+            'limit' => ['nullable', 'integer', 'min:1', 'max:25'],
+        ]);
+
+        $searchTerm = trim((string) ($validated['search'] ?? ''));
+        $limit = max(1, min(25, (int) ($validated['limit'] ?? 20)));
+        $adminDepartmentName = trim((string) ($admin->department?->name ?? ''));
+
+        $rows = HrisEmployee::allCached(true)
+            ->filter(function (object $employee) use ($searchTerm, $adminDepartmentName): bool {
+                $effectiveOffice = trim((string) ($employee->office ?? ''));
+
+                if (
+                    $adminDepartmentName !== ''
+                    && strcasecmp($effectiveOffice, $adminDepartmentName) === 0
+                ) {
+                    return false;
+                }
+
+                return $this->matchesHrisEmployeeSearch($employee, $searchTerm);
+            })
+            ->map(fn (object $employee): array => $this->serializeEmployee($employee))
+            ->pipe(fn (Collection $employeeRows): Collection => $this->sortEmployeeRows($employeeRows))
+            ->take($limit)
+            ->values();
+
+        return response()->json([
+            'employees' => $rows,
+        ]);
+    }
+
+    /**
      * Employee directory is read-only and sourced from HRIS.
      */
     public function store(Request $request): JsonResponse
@@ -427,9 +470,11 @@ class EmployeeController extends Controller
             return $admin;
         }
 
-        return response()->json([
-            'message' => 'Employee directory is read-only from HRIS. Create is disabled.',
-        ], 422);
+        $validated = $request->validate([
+            'control_no' => ['required', 'string', 'max:50', 'regex:/^\d+$/'],
+        ]);
+
+        return $this->assignEmployeeToDepartment($admin, (string) $validated['control_no']);
     }
 
     /**
@@ -442,9 +487,7 @@ class EmployeeController extends Controller
             return $admin;
         }
 
-        return response()->json([
-            'message' => 'Employee directory is read-only from HRIS. Update is disabled.',
-        ], 422);
+        return $this->assignEmployeeToDepartment($admin, $controlNo);
     }
 
     /**
@@ -457,9 +500,34 @@ class EmployeeController extends Controller
             return $admin;
         }
 
+        $employee = HrisEmployee::findByControlNo($controlNo);
+        if (!$employee) {
+            return response()->json([
+                'message' => 'Employee not found in HRIS records.',
+            ], 404);
+        }
+
+        $assignment = EmployeeDepartmentAssignment::query()
+            ->where('employee_control_no', trim((string) ($employee->control_no ?? '')))
+            ->first();
+
+        if (!$assignment) {
+            return response()->json([
+                'message' => 'Only reassigned employees can be removed from this department. Original HRIS employees cannot be deleted.',
+            ], 422);
+        }
+
+        if ((int) $assignment->department_id !== (int) $admin->department_id) {
+            return response()->json([
+                'message' => 'This employee is assigned to another LMS department.',
+            ], 403);
+        }
+
+        $assignment->delete();
+
         return response()->json([
-            'message' => 'Employee directory is read-only from HRIS. Delete is disabled.',
-        ], 422);
+            'message' => 'Employee removed from this department successfully.',
+        ]);
     }
 
     /**
@@ -1050,6 +1118,12 @@ class EmployeeController extends Controller
             'middlename' => $this->trimNullable($employee->middlename ?? null),
             'designation' => $this->trimNullable($employee->designation ?? null),
             'office' => trim((string) ($employee->office ?? '')),
+            'hris_office' => $this->trimNullable($employee->hris_office ?? null),
+            'assigned_department_name' => $this->trimNullable($employee->assigned_department_name ?? null),
+            'assigned_department_id' => $employee->assigned_department_id !== null
+                ? (int) $employee->assigned_department_id
+                : null,
+            'is_department_reassigned' => (bool) ($employee->is_department_reassigned ?? false),
             'status' => trim((string) ($employee->status ?? '')),
             'rate_mon' => $employee->rate_mon !== null ? (float) $employee->rate_mon : null,
         ];
@@ -1323,6 +1397,51 @@ class EmployeeController extends Controller
             ->all();
 
         return $this->buildControlNoLookup($controlNos);
+    }
+
+    private function assignEmployeeToDepartment(DepartmentAdmin $admin, string $controlNo): JsonResponse
+    {
+        $employee = HrisEmployee::findByControlNo($controlNo, true);
+        if (!$employee) {
+            return response()->json([
+                'message' => 'Employee not found in HRIS active records.',
+            ], 422);
+        }
+
+        $targetDepartmentName = trim((string) ($admin->department?->name ?? ''));
+        $effectiveOffice = trim((string) ($employee->office ?? ''));
+        if ($targetDepartmentName !== '' && strcasecmp($targetDepartmentName, $effectiveOffice) === 0) {
+            return response()->json([
+                'message' => 'Selected employee already belongs to your department in LMS.',
+            ], 422);
+        }
+
+        $storedControlNo = trim((string) ($employee->control_no ?? ''));
+        $existingAssignment = EmployeeDepartmentAssignment::query()
+            ->where('employee_control_no', $storedControlNo)
+            ->first();
+
+        EmployeeDepartmentAssignment::query()->updateOrCreate(
+            [
+                'employee_control_no' => $storedControlNo,
+            ],
+            [
+                'department_id' => $admin->department_id,
+                'assigned_by_department_admin_id' => $admin->id,
+                'assigned_at' => now(),
+            ]
+        );
+
+        $updatedEmployee = HrisEmployee::findByControlNo($storedControlNo, true) ?? $employee;
+        $wasReassigned = $existingAssignment !== null
+            && (int) $existingAssignment->department_id !== (int) $admin->department_id;
+
+        return response()->json([
+            'message' => $wasReassigned
+                ? 'Employee reassigned to your department successfully.'
+                : 'Employee added to your department successfully.',
+            'employee' => $this->serializeEmployee($updatedEmployee),
+        ], $existingAssignment ? 200 : 201);
     }
 
     private function buildControlNoLookup(array $controlNos): array
