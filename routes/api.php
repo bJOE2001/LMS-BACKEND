@@ -39,7 +39,7 @@ Route::post('/reset-password', [PasswordResetController::class, 'resetPassword']
 
 /*
 |--------------------------------------------------------------------------
-| ERMS Integration Routes (external, API key protected)
+| ERMS Integration Routes (trusted frontend origins or API key protected)
 |--------------------------------------------------------------------------
 */
 Route::prefix('erms')->middleware('erms.auth')->group(function () {
