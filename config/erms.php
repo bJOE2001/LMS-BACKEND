@@ -9,6 +9,7 @@ return [
     |
     | Keep ERMS_API_KEY for single-key setups. Use ERMS_API_KEYS when you
     | need key rotation so old and new keys can overlap without downtime.
+    | Browser clients like HRPDS can be allowed by trusted origin instead.
     |
     */
     'header' => 'X-ERMS-KEY',
@@ -26,6 +27,26 @@ return [
                 explode(',', $configuredKeys)
             ),
             static fn (string $key): bool => $key !== ''
+        )));
+    })(),
+
+    'trusted_origins' => (static function (): array {
+        $configuredOrigins = trim((string) env('ERMS_TRUSTED_ORIGINS', ''));
+
+        if ($configuredOrigins === '') {
+            $configuredOrigins = trim((string) env('CORS_ALLOWED_ORIGINS', ''));
+        }
+
+        if ($configuredOrigins === '') {
+            $configuredOrigins = trim((string) env('FRONTEND_URL', ''));
+        }
+
+        return array_values(array_unique(array_filter(
+            array_map(
+                static fn (string $origin): string => trim($origin),
+                explode(',', $configuredOrigins)
+            ),
+            static fn (string $origin): bool => $origin !== '' && $origin !== '*'
         )));
     })(),
 

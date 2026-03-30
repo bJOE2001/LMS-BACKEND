@@ -102,7 +102,7 @@ class LeaveApplicationController extends Controller
 
     /**
      * GET /erms/leave-balance/{id}
-     * API-key protected endpoint for ERMS-to-LMS integration.
+     * Protected endpoint for ERMS-to-LMS integration.
      *
      * Supports either:
      * - /erms/leave-balance/{leaveTypeId}?employee_control_no={controlNo}
@@ -177,7 +177,7 @@ class LeaveApplicationController extends Controller
 
     /**
      * GET /erms/leave-balances/{controlNo}
-     * API-key protected endpoint for loading all leave balances in one request.
+     * Protected endpoint for loading all leave balances in one request.
      * Also returns the latest Vacation/Sick accrued credits for ERMS leave cards.
      */
     public function ermsGetLeaveBalances(Request $request, string $controlNo): JsonResponse
@@ -249,7 +249,7 @@ class LeaveApplicationController extends Controller
 
     /**
      * GET /erms/apply-leave
-     * API-key protected endpoint for ERMS/HRPDS personal leave records listing.
+     * Protected endpoint for ERMS/HRPDS personal leave records listing.
      */
     public function ermsIndex(Request $request): JsonResponse
     {
@@ -297,7 +297,7 @@ class LeaveApplicationController extends Controller
 
     /**
      * POST /erms/apply-leave
-     * API-key protected endpoint for ERMS-to-LMS leave application submission.
+     * Protected endpoint for ERMS-to-LMS leave application submission.
      */
     public function ermsStore(Request $request): JsonResponse
     {
@@ -514,7 +514,7 @@ class LeaveApplicationController extends Controller
     /**
      * POST /erms/leave-applications/{id}/cancel
      *
-     * API-key protected endpoint for ERMS-to-LMS leave cancellation.
+     * Protected endpoint for ERMS-to-LMS leave cancellation.
      * Cancels only pending applications owned by the provided employee.
      */
     public function ermsCancel(Request $request, ?int $id = null): JsonResponse
@@ -654,7 +654,7 @@ class LeaveApplicationController extends Controller
     /**
      * POST /erms/leave-applications/{id}/request-update
      *
-     * API-key protected endpoint for ERMS-to-LMS leave update request.
+     * Protected endpoint for ERMS-to-LMS leave update request.
      * - Pending applications: logs a legacy edit request note.
      * - Approved applications: stores requested field updates for HR approval.
      */
