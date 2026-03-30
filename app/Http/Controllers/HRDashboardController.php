@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\COCApplication;
+use App\Models\Department;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
@@ -96,6 +97,105 @@ class HRDashboardController extends Controller
         ]);
     }
 
+    /**
+     * Department Leave Statistics table for the HR dashboard.
+     * Returns leave-application counts grouped by office and leave type
+     * for the selected period based on approved leave applications only.
+     */
+    public function departmentStatistics(Request $request): JsonResponse
+    {
+        $hr = $request->user();
+        if (!$hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        [$periodKey, $periodStart, $periodEnd] = $this->resolveDepartmentStatisticsPeriod(
+            (string) $request->query('period', 'daily')
+        );
+
+        $activeDepartmentNames = Department::query()
+            ->active()
+            ->orderBy('name')
+            ->pluck('name')
+            ->map(fn (mixed $value): string => trim((string) $value))
+            ->filter(fn (string $value): bool => $value !== '')
+            ->values();
+
+        if ($activeDepartmentNames->isEmpty()) {
+            return response()->json([]);
+        }
+
+        $rowsByDepartment = $activeDepartmentNames
+            ->mapWithKeys(fn (string $departmentName): array => [
+                $departmentName => $this->emptyDepartmentStatisticsRow($departmentName),
+            ])
+            ->all();
+
+        $officeByControlNo = $this->buildDepartmentStatisticsOfficeDirectory();
+
+        $applications = LeaveApplication::query()
+            ->with([
+                'leaveType:id,name',
+                'applicantAdmin.department:id,name',
+            ])
+            ->where('status', LeaveApplication::STATUS_APPROVED)
+            ->whereBetween('created_at', [$periodStart, $periodEnd])
+            ->orderBy('created_at')
+            ->get([
+                'id',
+                'employee_control_no',
+                'leave_type_id',
+                'applicant_admin_id',
+                'status',
+                'is_monetization',
+                'created_at',
+            ]);
+
+        foreach ($applications as $application) {
+            if ((bool) $application->is_monetization) {
+                continue;
+            }
+
+            $departmentName = $this->resolveDepartmentStatisticsDepartment($application, $officeByControlNo);
+            if ($departmentName === null || !array_key_exists($departmentName, $rowsByDepartment)) {
+                continue;
+            }
+
+            $leaveTypeColumn = $this->mapDepartmentStatisticsLeaveType($application->leaveType?->name);
+            if ($leaveTypeColumn === null) {
+                continue;
+            }
+
+            $rowsByDepartment[$departmentName][$leaveTypeColumn]++;
+        }
+
+        $rows = collect($rowsByDepartment)
+            ->filter(function (array $row): bool {
+                $countKeys = [
+                    'vacationLeave',
+                    'sickLeave',
+                    'mandatoryForcedLeave',
+                    'mco6Leave',
+                    'wellnessLeave',
+                    'maternityLeave',
+                    'paternityLeave',
+                    'specialPrivilegeLeave',
+                    'soloParentLeave',
+                ];
+
+                $total = 0;
+                foreach ($countKeys as $countKey) {
+                    $total += (int) ($row[$countKey] ?? 0);
+                }
+
+                return $total > 0;
+            })
+            ->values()
+            ->all();
+
+        return response()->json($rows);
+    }
+
     private function deriveCocRawStatus(COCApplication $app): string
     {
         if ($app->status !== COCApplication::STATUS_PENDING) {
@@ -103,6 +203,102 @@ class HRDashboardController extends Controller
         }
 
         return $app->admin_reviewed_at ? 'PENDING_HR' : 'PENDING_ADMIN';
+    }
+
+    private function resolveDepartmentStatisticsPeriod(string $period): array
+    {
+        $normalizedPeriod = strtolower(trim($period));
+        $now = CarbonImmutable::now();
+
+        return match ($normalizedPeriod) {
+            'weekly' => [
+                'weekly',
+                $now->startOfWeek(),
+                $now->endOfWeek(),
+            ],
+            'monthly' => [
+                'monthly',
+                $now->startOfMonth(),
+                $now->endOfMonth(),
+            ],
+            'yearly' => [
+                'yearly',
+                $now->startOfYear(),
+                $now->endOfYear(),
+            ],
+            default => [
+                'daily',
+                $now->startOfDay(),
+                $now->endOfDay(),
+            ],
+        };
+    }
+
+    private function emptyDepartmentStatisticsRow(string $departmentName): array
+    {
+        return [
+            'department' => $departmentName,
+            'vacationLeave' => 0,
+            'sickLeave' => 0,
+            'mandatoryForcedLeave' => 0,
+            'mco6Leave' => 0,
+            'wellnessLeave' => 0,
+            'maternityLeave' => 0,
+            'paternityLeave' => 0,
+            'specialPrivilegeLeave' => 0,
+            'soloParentLeave' => 0,
+        ];
+    }
+
+    private function buildDepartmentStatisticsOfficeDirectory(): array
+    {
+        $directory = [];
+
+        foreach (HrisEmployee::allCached() as $employee) {
+            $normalizedControlNo = $this->normalizeControlNo($employee->control_no ?? null);
+            $office = trim((string) ($employee->office ?? ''));
+
+            if ($normalizedControlNo === '' || $office === '') {
+                continue;
+            }
+
+            $directory[$normalizedControlNo] = $office;
+        }
+
+        return $directory;
+    }
+
+    private function resolveDepartmentStatisticsDepartment(LeaveApplication $application, array $officeByControlNo): ?string
+    {
+        $normalizedControlNo = $this->normalizeControlNo($application->employee_control_no ?? null);
+        $office = $officeByControlNo[$normalizedControlNo] ?? null;
+
+        if (is_string($office) && trim($office) !== '') {
+            return trim($office);
+        }
+
+        $fallbackDepartment = trim((string) ($application->applicantAdmin?->department?->name ?? ''));
+        return $fallbackDepartment !== '' ? $fallbackDepartment : null;
+    }
+
+    private function mapDepartmentStatisticsLeaveType(?string $leaveTypeName): ?string
+    {
+        $normalized = strtoupper(trim((string) $leaveTypeName));
+        $normalized = preg_replace('/[^A-Z0-9]+/', ' ', $normalized ?? '');
+        $normalized = trim((string) $normalized);
+
+        return match ($normalized) {
+            'VACATION LEAVE' => 'vacationLeave',
+            'SICK LEAVE' => 'sickLeave',
+            'MANDATORY FORCED LEAVE', 'MANDATORY LEAVE', 'FORCED LEAVE' => 'mandatoryForcedLeave',
+            'MCO6 LEAVE', 'MC06 LEAVE' => 'mco6Leave',
+            'WELLNESS LEAVE' => 'wellnessLeave',
+            'MATERNITY LEAVE' => 'maternityLeave',
+            'PATERNITY LEAVE' => 'paternityLeave',
+            'SPECIAL PRIVILEGE LEAVE' => 'specialPrivilegeLeave',
+            'SOLO PARENT LEAVE' => 'soloParentLeave',
+            default => null,
+        };
     }
 
     private function buildDashboardTrendAnalytics(iterable $applications): array

@@ -126,6 +126,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         // Dashboard
         Route::get('/dashboard', [HRDashboardController::class, 'index']);
         Route::get('/calendar', [HRDashboardController::class, 'calendarLeaves']);
+        Route::get('/department-statistics', [HRDashboardController::class, 'departmentStatistics']);
 
         // Leave balance management
         Route::post('/leave-balances', [HRLeaveBalanceImportController::class, 'store']);
