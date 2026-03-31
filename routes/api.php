@@ -10,6 +10,7 @@ use App\Http\Controllers\HRDepartmentLibraryController;
 use App\Http\Controllers\HRLeaveBalanceImportController;
 use App\Http\Controllers\HRLeaveTypeController;
 use App\Http\Controllers\HRReportController;
+use App\Http\Controllers\HRWorkScheduleController;
 use App\Http\Controllers\HRUserManagementController;
 use App\Http\Controllers\LeaveApplicationController;
 use App\Http\Controllers\NotificationController;
@@ -128,6 +129,13 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::get('/dashboard', [HRDashboardController::class, 'index']);
         Route::get('/calendar', [HRDashboardController::class, 'calendarLeaves']);
         Route::get('/department-statistics', [HRDashboardController::class, 'departmentStatistics']);
+
+        // Work schedule and leave deduction settings
+        Route::get('/work-schedules', [HRWorkScheduleController::class, 'index']);
+        Route::put('/work-schedules/default', [HRWorkScheduleController::class, 'updateDefault']);
+        Route::post('/work-schedules/overrides', [HRWorkScheduleController::class, 'storeOverride']);
+        Route::put('/work-schedules/overrides/{id}', [HRWorkScheduleController::class, 'updateOverride']);
+        Route::delete('/work-schedules/overrides/{id}', [HRWorkScheduleController::class, 'destroyOverride']);
 
         // Leave balance management
         Route::post('/leave-balances', [HRLeaveBalanceImportController::class, 'store']);

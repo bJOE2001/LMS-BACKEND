@@ -11,6 +11,7 @@ use App\Models\LeaveApplicationLog;
 use App\Models\LeaveBalance;
 use App\Models\LeaveType;
 use App\Models\Notification;
+use App\Services\WorkScheduleService;
 
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
@@ -26,6 +27,11 @@ class AdminDashboardController extends Controller
 {
     public function __construct()
     {
+    }
+
+    private function workScheduleService(): WorkScheduleService
+    {
+        return app(WorkScheduleService::class);
     }
 
     /**
@@ -482,12 +488,14 @@ class AdminDashboardController extends Controller
             $this->normalizeSelectedDateCoverageMap($validated['selected_date_coverage'] ?? null),
             $resolvedSelectedDates
         );
+        $adminEmployeeControlNo = $this->resolveAdminEmployeeControlNo($admin);
         $requestedDeductibleDays = $this->resolveRequestedDeductibleDays(
             $resolvedSelectedDates,
             $selectedDateCoverage,
             $selectedDatePayStatus,
             $requestedPayMode,
-            $requestedTotalDays
+            $requestedTotalDays,
+            $adminEmployeeControlNo
         );
 
         $leaveType = LeaveType::find($validated['leave_type_id']);
@@ -607,7 +615,8 @@ class AdminDashboardController extends Controller
                         $resolvedSelectedDates,
                         $selectedDateCoverage,
                         $selectedDatePayStatus,
-                        $deductibleDays
+                        $deductibleDays,
+                        $adminEmployeeControlNo
                     );
                 }
             }
@@ -2047,9 +2056,12 @@ class AdminDashboardController extends Controller
         return $resolved;
     }
 
-    private function resolveCoverageDurationDays(mixed $coverage): float
+    private function resolveCoverageDurationDays(mixed $coverage, ?string $employeeControlNo = null): float
     {
-        return $this->normalizeSelectedDateCoverageValue($coverage) === 'half' ? 0.5 : 1.0;
+        return $this->workScheduleService()->resolveCoverageDeductionDays(
+            $this->normalizeSelectedDateCoverageValue($coverage) === 'half' ? 'half' : 'whole',
+            $employeeControlNo
+        );
     }
 
     private function resolveRequestedDeductibleDays(
@@ -2057,7 +2069,8 @@ class AdminDashboardController extends Controller
         array $selectedDateCoverage,
         array $selectedDatePayStatus,
         string $requestedPayMode,
-        float $requestedTotalDays
+        float $requestedTotalDays,
+        ?string $employeeControlNo = null
     ): float {
         if ($this->normalizePayMode($requestedPayMode) === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
             return 0.0;
@@ -2079,7 +2092,10 @@ class AdminDashboardController extends Controller
                 continue;
             }
 
-            $deductible += $this->resolveCoverageDurationDays($selectedDateCoverage[$dateKey] ?? 'whole');
+            $deductible += $this->resolveCoverageDurationDays(
+                $selectedDateCoverage[$dateKey] ?? 'whole',
+                $employeeControlNo
+            );
         }
 
         $deductible = round(max($deductible, 0.0), 2);
@@ -2115,7 +2131,8 @@ class AdminDashboardController extends Controller
         array $selectedDates,
         array $selectedDateCoverage,
         array $selectedDatePayStatus,
-        float $targetDeductibleDays
+        float $targetDeductibleDays,
+        ?string $employeeControlNo = null
     ): array {
         if ($selectedDates === []) {
             return [];
@@ -2136,7 +2153,10 @@ class AdminDashboardController extends Controller
                 continue;
             }
 
-            $durationDays = $this->resolveCoverageDurationDays($selectedDateCoverage[$dateKey] ?? 'whole');
+            $durationDays = $this->resolveCoverageDurationDays(
+                $selectedDateCoverage[$dateKey] ?? 'whole',
+                $employeeControlNo
+            );
             if ($remainingDeductible + 1e-9 >= $durationDays) {
                 $adjusted[$dateKey] = LeaveApplication::PAY_MODE_WITH_PAY;
                 $remainingDeductible = round(max($remainingDeductible - $durationDays, 0.0), 2);
