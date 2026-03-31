@@ -13,6 +13,7 @@ use App\Models\LeaveBalance;
 use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveType;
 use App\Models\Notification;
+use App\Services\WorkScheduleService;
 
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -32,6 +33,11 @@ class LeaveApplicationController extends Controller
 {
     public function __construct()
     {
+    }
+
+    private function workScheduleService(): WorkScheduleService
+    {
+        return app(WorkScheduleService::class);
     }
     // ─── Employee: List own applications ──────────────────────────────
 
@@ -403,7 +409,8 @@ class LeaveApplicationController extends Controller
             true,
             $request->input('date_filed') ?? $request->input('dateOfFiling') ?? now(),
             (string) $validated['start_date'],
-            (string) $validated['end_date']
+            (string) $validated['end_date'],
+            (string) $employee->control_no
         );
         if ($policyResolution instanceof JsonResponse) {
             return $policyResolution;
@@ -443,7 +450,8 @@ class LeaveApplicationController extends Controller
                 $selectedDateCoverage,
                 (float) $validated['total_days'],
                 (float) ($eligibility['available_balance'] ?? 0.0),
-                $selectedDatePayStatus
+                $selectedDatePayStatus,
+                (string) $employee->control_no
             );
             $requestedPayMode = $allocation['pay_mode'];
             $selectedDatePayStatus = $allocation['selected_date_pay_status'];
@@ -1035,7 +1043,8 @@ class LeaveApplicationController extends Controller
             true,
             $request->input('date_filed') ?? $request->input('dateOfFiling') ?? now(),
             (string) $validated['start_date'],
-            (string) $validated['end_date']
+            (string) $validated['end_date'],
+            (string) $employee->control_no
         );
         if ($policyResolution instanceof JsonResponse) {
             return $policyResolution;
@@ -1075,7 +1084,8 @@ class LeaveApplicationController extends Controller
                 $selectedDateCoverage,
                 (float) $validated['total_days'],
                 (float) ($eligibility['available_balance'] ?? 0.0),
-                $selectedDatePayStatus
+                $selectedDatePayStatus,
+                (string) $employee->control_no
             );
             $requestedPayMode = $allocation['pay_mode'];
             $selectedDatePayStatus = $allocation['selected_date_pay_status'];
@@ -1380,9 +1390,11 @@ class LeaveApplicationController extends Controller
         }
 
         $actorDirectory = $this->buildWorkflowActorDirectory([$application]);
+        $workflowPayload = $this->formatErmsApplication($application, $actorDirectory);
+        $detailPayload = $this->formatApplication($application);
 
         return response()->json([
-            'application' => $this->formatErmsApplication($application, $actorDirectory),
+            'application' => array_replace($workflowPayload, $detailPayload),
         ]);
     }
 
@@ -1639,9 +1651,11 @@ class LeaveApplicationController extends Controller
         }
 
         $actorDirectory = $this->buildWorkflowActorDirectory([$application]);
+        $workflowPayload = $this->formatErmsApplication($application, $actorDirectory);
+        $detailPayload = $this->formatApplication($application);
 
         return response()->json([
-            'application' => $this->formatErmsApplication($application, $actorDirectory),
+            'application' => array_replace($workflowPayload, $detailPayload),
         ]);
     }
 
@@ -1783,7 +1797,8 @@ class LeaveApplicationController extends Controller
             true,
             $app->created_at ?? null,
             $app->start_date?->toDateString(),
-            $app->end_date?->toDateString()
+            $app->end_date?->toDateString(),
+            (string) ($app->employee_control_no ?? '')
         );
         if ($policyResolution instanceof JsonResponse) {
             return $policyResolution;
@@ -2465,7 +2480,8 @@ class LeaveApplicationController extends Controller
             true,
             $request->input('date_filed') ?? now(),
             (string) $validated['start_date'],
-            (string) $validated['end_date']
+            (string) $validated['end_date'],
+            (string) ($validated['employee_control_no'] ?? '')
         );
         if ($policyResolution instanceof JsonResponse) {
             return $policyResolution;
@@ -2519,7 +2535,8 @@ class LeaveApplicationController extends Controller
                 $selectedDateCoverage,
                 (float) $validated['total_days'],
                 (float) ($eligibility['available_balance'] ?? 0.0),
-                $selectedDatePayStatus
+                $selectedDatePayStatus,
+                (string) ($employee->control_no ?? $validated['employee_control_no'] ?? '')
             );
             $requestedPayMode = $allocation['pay_mode'];
             $selectedDatePayStatus = $allocation['selected_date_pay_status'];
@@ -4088,7 +4105,8 @@ class LeaveApplicationController extends Controller
             true,
             $app->created_at ?? null,
             $resolvedStartDate,
-            $resolvedEndDate
+            $resolvedEndDate,
+            (string) ($app->employee_control_no ?? '')
         );
         if ($policyResolution instanceof JsonResponse) {
             return $policyResolution;
@@ -4334,7 +4352,8 @@ class LeaveApplicationController extends Controller
             true,
             $app->created_at ?? null,
             $targetStartDate,
-            $targetEndDate
+            $targetEndDate,
+            (string) ($app->employee_control_no ?? '')
         );
         if ($policyResolution instanceof JsonResponse) {
             return $policyResolution;
@@ -4844,7 +4863,8 @@ class LeaveApplicationController extends Controller
                 false,
                 $payload['date_filed'] ?? null,
                 $startDate,
-                $endDate
+                $endDate,
+                isset($payload['employee_control_no']) ? (string) $payload['employee_control_no'] : null
             );
 
             if (!($policyResolution instanceof JsonResponse)) {
@@ -4861,7 +4881,8 @@ class LeaveApplicationController extends Controller
                     $selectedDatePayStatus,
                     $selectedDateCoverage,
                     $isMonetization,
-                    $payMode
+                    $payMode,
+                    isset($payload['employee_control_no']) ? (string) $payload['employee_control_no'] : null
                 );
             }
         } else {
@@ -4871,7 +4892,8 @@ class LeaveApplicationController extends Controller
                 $selectedDatePayStatus,
                 $selectedDateCoverage,
                 $isMonetization,
-                $payMode
+                $payMode,
+                isset($payload['employee_control_no']) ? (string) $payload['employee_control_no'] : null
             );
         }
 
@@ -5574,7 +5596,8 @@ class LeaveApplicationController extends Controller
         bool $enforceAttachment = true,
         mixed $filedAt = null,
         ?string $absenceStartDate = null,
-        ?string $absenceEndDate = null
+        ?string $absenceEndDate = null,
+        ?string $employeeControlNo = null
     ): array|JsonResponse {
         $normalizedTotalDays = round(max((float) $totalDays, 0.0), 2);
 
@@ -5639,7 +5662,8 @@ class LeaveApplicationController extends Controller
                 $normalizedSelectedDatePayStatus,
                 $normalizedSelectedDateCoverage,
                 false,
-                $normalizedPayMode
+                $normalizedPayMode,
+                $employeeControlNo
             );
         } else {
             $normalizedSelectedDatePayStatus = $this->compactSelectedDatePayStatusMap(
@@ -5654,7 +5678,8 @@ class LeaveApplicationController extends Controller
                 $normalizedSelectedDatePayStatus,
                 $normalizedSelectedDateCoverage,
                 false,
-                $normalizedPayMode
+                $normalizedPayMode,
+                $employeeControlNo
             );
 
             if (!$attachmentRequired) {
@@ -5797,7 +5822,8 @@ class LeaveApplicationController extends Controller
         ?array $selectedDates,
         ?array $selectedDateCoverage,
         float $totalDays,
-        float $withPayCap = 5.0
+        float $withPayCap = 5.0,
+        ?string $employeeControlNo = null
     ): ?array {
         if (!is_array($selectedDates) || $selectedDates === []) {
             return null;
@@ -5826,7 +5852,8 @@ class LeaveApplicationController extends Controller
         $coverageWeights = $this->resolveDateCoverageWeights(
             $resolvedDates,
             $selectedDateCoverage,
-            $totalDays
+            $totalDays,
+            $employeeControlNo
         );
 
         $remainingWithPay = round(max($withPayCap, 0.0), 2);
@@ -5861,7 +5888,8 @@ class LeaveApplicationController extends Controller
         ?array $selectedDateCoverage,
         float $totalDays,
         float $availableCredits,
-        ?array $preferredSelectedDatePayStatus = null
+        ?array $preferredSelectedDatePayStatus = null,
+        ?string $employeeControlNo = null
     ): array {
         $normalizedTotalDays = round(max($totalDays, 0.0), 2);
         $normalizedAvailableCredits = round(max($availableCredits, 0.0), 2);
@@ -5898,7 +5926,8 @@ class LeaveApplicationController extends Controller
                 $preferredCompactedPayStatus,
                 $selectedDateCoverage,
                 false,
-                LeaveApplication::PAY_MODE_WITH_PAY
+                LeaveApplication::PAY_MODE_WITH_PAY,
+                $employeeControlNo
             );
 
             if ($preferredDeductibleDays <= $normalizedAvailableCredits + 1e-9) {
@@ -5913,7 +5942,7 @@ class LeaveApplicationController extends Controller
                 return [
                     'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
                     'selected_date_pay_status' => $preferredCompactedPayStatus,
-                    'deductible_days' => round(min($preferredDeductibleDays, $normalizedTotalDays), 2),
+                    'deductible_days' => round(max($preferredDeductibleDays, 0.0), 2),
                 ];
             }
         }
@@ -5930,7 +5959,8 @@ class LeaveApplicationController extends Controller
             $selectedDates,
             $selectedDateCoverage,
             $normalizedTotalDays,
-            $normalizedAvailableCredits
+            $normalizedAvailableCredits,
+            $employeeControlNo
         );
         $compactedPayStatusOverrides = $this->compactSelectedDatePayStatusMap(
             $payStatusOverrides,
@@ -5944,7 +5974,8 @@ class LeaveApplicationController extends Controller
             $compactedPayStatusOverrides,
             $selectedDateCoverage,
             false,
-            LeaveApplication::PAY_MODE_WITH_PAY
+            LeaveApplication::PAY_MODE_WITH_PAY,
+            $employeeControlNo
         );
 
         if ($deductibleDays > $normalizedAvailableCredits) {
@@ -5962,14 +5993,15 @@ class LeaveApplicationController extends Controller
         return [
             'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
             'selected_date_pay_status' => $compactedPayStatusOverrides,
-            'deductible_days' => round(min($deductibleDays, $normalizedTotalDays), 2),
+            'deductible_days' => round(max($deductibleDays, 0.0), 2),
         ];
     }
 
     private function resolveDateCoverageWeights(
         array $selectedDates,
         ?array $selectedDateCoverage,
-        float $totalDays
+        float $totalDays,
+        ?string $employeeControlNo = null
     ): array {
         $resolvedDates = [];
         foreach ($selectedDates as $rawDate) {
@@ -5994,15 +6026,17 @@ class LeaveApplicationController extends Controller
         $coverageMap = is_array($selectedDateCoverage) ? $selectedDateCoverage : [];
         $hasCoverageOverrides = $coverageMap !== [];
 
-        $defaultCoverageWeight = 1.0;
+        $defaultWholeDayWeight = $this->workScheduleService()->resolveCoverageDeductionDays('whole', $employeeControlNo);
+        $defaultHalfDayWeight = $this->workScheduleService()->resolveCoverageDeductionDays('half', $employeeControlNo);
+        $defaultCoverageWeight = $defaultWholeDayWeight;
         $dateCount = count($resolvedDates);
         if ($dateCount > 0) {
-            $halfMatch = abs(($dateCount * 0.5) - $totalDays) < 0.00001;
+            $halfMatch = abs(($dateCount * $defaultHalfDayWeight) - $totalDays) < 0.00001;
             $wholeMatch = abs(((float) $dateCount) - $totalDays) < 0.00001;
             if ($halfMatch) {
-                $defaultCoverageWeight = 0.5;
+                $defaultCoverageWeight = $defaultHalfDayWeight;
             } elseif (!$wholeMatch) {
-                $defaultCoverageWeight = max(min($totalDays / $dateCount, 1.0), 0.5);
+                $defaultCoverageWeight = round(max(min($totalDays / $dateCount, $defaultWholeDayWeight), $defaultHalfDayWeight), 2);
             }
         }
 
@@ -6011,17 +6045,17 @@ class LeaveApplicationController extends Controller
             $hasCoverageValue = array_key_exists($dateKey, $coverageMap);
             $coverage = strtolower(trim((string) ($coverageMap[$dateKey] ?? '')));
             if ($coverage === 'half') {
-                $weights[$dateKey] = 0.5;
+                $weights[$dateKey] = $defaultHalfDayWeight;
                 continue;
             }
 
             if ($coverage === 'whole') {
-                $weights[$dateKey] = 1.0;
+                $weights[$dateKey] = $defaultWholeDayWeight;
                 continue;
             }
 
             if ($hasCoverageOverrides && !$hasCoverageValue) {
-                $weights[$dateKey] = 1.0;
+                $weights[$dateKey] = $defaultWholeDayWeight;
                 continue;
             }
 
@@ -6423,7 +6457,8 @@ class LeaveApplicationController extends Controller
         ?array $selectedDatePayStatus,
         ?array $selectedDateCoverage,
         bool $isMonetization,
-        string $payMode
+        string $payMode,
+        ?string $employeeControlNo = null
     ): float {
         $normalizedTotalDays = round(max($totalDays, 0.0), 2);
         if ($normalizedTotalDays <= 0) {
@@ -6507,15 +6542,17 @@ class LeaveApplicationController extends Controller
             return $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $normalizedTotalDays;
         }
 
-        $defaultCoverageWeight = 1.0;
+        $defaultWholeDayWeight = $this->workScheduleService()->resolveCoverageDeductionDays('whole', $employeeControlNo);
+        $defaultHalfDayWeight = $this->workScheduleService()->resolveCoverageDeductionDays('half', $employeeControlNo);
+        $defaultCoverageWeight = $defaultWholeDayWeight;
         $dateCount = count($resolvedDates);
         if ($dateCount > 0) {
-            $halfMatch = abs(($dateCount * 0.5) - $normalizedTotalDays) < 0.00001;
+            $halfMatch = abs(($dateCount * $defaultHalfDayWeight) - $normalizedTotalDays) < 0.00001;
             $wholeMatch = abs(((float) $dateCount) - $normalizedTotalDays) < 0.00001;
             if ($halfMatch) {
-                $defaultCoverageWeight = 0.5;
+                $defaultCoverageWeight = $defaultHalfDayWeight;
             } elseif (!$wholeMatch) {
-                $defaultCoverageWeight = max(min($normalizedTotalDays / $dateCount, 1.0), 0.5);
+                $defaultCoverageWeight = round(max(min($normalizedTotalDays / $dateCount, $defaultWholeDayWeight), $defaultHalfDayWeight), 2);
             }
         }
 
@@ -6525,12 +6562,12 @@ class LeaveApplicationController extends Controller
             $hasCoverageValue = array_key_exists($dateKey, $coverageMap);
             $coverage = $hasCoverageValue ? strtolower(trim((string) ($coverageMap[$dateKey] ?? ''))) : '';
             if ($coverage === 'half') {
-                $weight = 0.5;
+                $weight = $defaultHalfDayWeight;
             } elseif ($coverage === 'whole') {
-                $weight = 1.0;
+                $weight = $defaultWholeDayWeight;
             } elseif ($hasCoverageOverrides) {
                 // Stored coverage maps are sparse (half-day overrides only), so missing keys mean whole-day.
-                $weight = 1.0;
+                $weight = $defaultWholeDayWeight;
             } else {
                 $weight = $defaultCoverageWeight;
             }
@@ -6549,13 +6586,7 @@ class LeaveApplicationController extends Controller
             return $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $normalizedTotalDays;
         }
 
-        $scale = $normalizedTotalDays / $weightedTotal;
-        $deductible = round(max($weightedPaid * $scale, 0.0), 2);
-        if ($deductible > $normalizedTotalDays) {
-            $deductible = $normalizedTotalDays;
-        }
-
-        return $deductible;
+        return round(max($weightedPaid, 0.0), 2);
     }
 
     private function resolveApplicationDeductibleDays(LeaveApplication $app): float
@@ -6569,9 +6600,6 @@ class LeaveApplicationController extends Controller
             $stored = round((float) $app->deductible_days, 2);
             if ($stored < 0) {
                 return 0.0;
-            }
-            if ($stored > $totalDays) {
-                return $totalDays;
             }
             return $stored;
         }
@@ -6616,7 +6644,8 @@ class LeaveApplicationController extends Controller
         $coverageWeights = $this->resolveDateCoverageWeights(
             $selectedDates,
             $normalizedCoverage,
-            round((float) ($app->total_days ?? 0), 2)
+            round((float) ($app->total_days ?? 0), 2),
+            (string) ($app->employee_control_no ?? '')
         );
 
         $selectedRecallDateSet = array_fill_keys(
