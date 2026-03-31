@@ -1678,6 +1678,63 @@ class LeaveApplicationController extends Controller
     }
 
     /**
+     * HR confirms the hard-copy leave application form was received.
+     * This action is informational only and does not change approval status.
+     */
+    public function hrReceive(Request $request, int $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (!$hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can confirm received applications.'], 403);
+        }
+
+        $request->validate([
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $app = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($id);
+        if (!$app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $isPendingApprovedUpdateRequest = $this->isPendingApprovedUpdateRequest($app);
+        if ($app->status === LeaveApplication::STATUS_PENDING_ADMIN && !$isPendingApprovedUpdateRequest) {
+            return response()->json([
+                'message' => "Cannot mark as received: application status is '{$app->status}'.",
+            ], 422);
+        }
+
+        $receivedLog = $app->logs->first(
+            fn(LeaveApplicationLog $log) =>
+                $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
+
+        if (!$receivedLog) {
+            LeaveApplicationLog::create([
+                'leave_application_id' => $app->id,
+                'action' => LeaveApplicationLog::ACTION_HR_RECEIVED,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
+                'performed_by_id' => $hr->id,
+                'remarks' => $request->input('remarks') ?: 'Received hard copy leave application form.',
+                'created_at' => now(),
+            ]);
+            $app->load('logs');
+        }
+
+        $actorDirectory = $this->buildWorkflowActorDirectory([$app]);
+
+        return response()->json([
+            'message' => $receivedLog
+                ? 'Hard-copy receipt was already confirmed for this application.'
+                : 'Hard-copy receipt confirmed.',
+            'application' => $this->formatErmsApplication($app, $actorDirectory),
+        ]);
+    }
+
+    /**
      * HR approves → status becomes APPROVED.
      * If leave type is credit-based OR is monetization, deduct from leave_balances inside a transaction.
      */
@@ -3698,6 +3755,7 @@ class LeaveApplicationController extends Controller
             LeaveApplicationLog::ACTION_HR_APPROVED => 'hr approved',
             LeaveApplicationLog::ACTION_HR_REJECTED => 'hr rejected',
             LeaveApplicationLog::ACTION_HR_RECALLED => 'hr recalled',
+            LeaveApplicationLog::ACTION_HR_RECEIVED => 'received application',
             default => strtolower(str_replace('_', ' ', (string) $log->action)),
         };
     }
@@ -3727,6 +3785,11 @@ class LeaveApplicationController extends Controller
         );
         $hrApprovedLog = $logs->first(
             fn(LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_APPROVED
+        );
+        $hrReceivedLog = $logs->first(
+            fn(LeaveApplicationLog $log) =>
+                $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
         );
         $hrRecalledLog = $logs->first(
             fn(LeaveApplicationLog $log) =>
@@ -3762,6 +3825,7 @@ class LeaveApplicationController extends Controller
         if ($recallActionBy === null && $app->status === LeaveApplication::STATUS_RECALLED && $app->hr_id && isset($actorDirectory['hr'][(int) $app->hr_id])) {
             $recallActionBy = $actorDirectory['hr'][(int) $app->hr_id];
         }
+        $receivedActionBy = $this->resolveWorkflowPerformerName($hrReceivedLog, $actorDirectory, $employeeName);
 
         $isCancelled = $cancelledLog !== null || $this->isCancelledRemark($app->remarks);
         $hasPendingApprovedUpdateRequest = $this->hasPendingApprovedUpdateRequest($app);
@@ -3794,6 +3858,7 @@ class LeaveApplicationController extends Controller
             ?? $app->hr_approved_at;
         $recallActionAt = $hrRecalledLog?->created_at
             ?? ($app->status === LeaveApplication::STATUS_RECALLED ? $app->updated_at : null);
+        $receivedActionAt = $hrReceivedLog?->created_at;
         $cancelledAt = $cancelledLog?->created_at ?? ($isCancelled ? $app->updated_at : null);
 
         $disapprovedAt = null;
@@ -3896,6 +3961,9 @@ class LeaveApplicationController extends Controller
             'approver_name' => $approverName,
             'admin_action_by' => $adminActionBy,
             'hr_action_by' => $hrActionBy,
+            'received_by' => $receivedActionBy,
+            'receivedBy' => $receivedActionBy,
+            'hr_received_by' => $receivedActionBy,
             'recall_action_by' => $recallActionBy,
             'processed_by' => $processedBy,
             'disapproved_by' => $disapprovedBy,
@@ -3905,9 +3973,14 @@ class LeaveApplicationController extends Controller
             'reviewed_at' => $reviewedAt?->toIso8601String(),
             'admin_action_at' => $adminActionAt?->toIso8601String(),
             'hr_action_at' => $hrActionAt?->toIso8601String(),
+            'received_at' => $receivedActionAt?->toIso8601String(),
+            'receivedAt' => $receivedActionAt?->toIso8601String(),
+            'hr_received_at' => $receivedActionAt?->toIso8601String(),
             'recall_action_at' => $recallActionAt?->toIso8601String(),
             'disapproved_at' => $disapprovedAt?->toIso8601String(),
             'cancelled_at' => $cancelledAt?->toIso8601String(),
+            'has_hr_received' => $hrReceivedLog !== null,
+            'hasHrReceived' => $hrReceivedLog !== null,
             'status_history' => $statusHistory,
         ];
     }
