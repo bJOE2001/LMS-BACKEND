@@ -1335,8 +1335,8 @@ class HRReportController extends Controller
             $normalized === 'VACATION LEAVE' => 'vacation',
             $normalized === 'SICK LEAVE' => 'sick',
             $normalized === 'MANDATORY / FORCED LEAVE' => 'forced',
-            in_array($normalized, ['MCO6 LEAVE', 'MC06 LEAVE', 'CTO LEAVE'], true) => 'mc_co',
-            in_array($normalized, ['SPECIAL PRIVILEGE LEAVE', 'WELLNESS LEAVE', 'SOLO PARENT LEAVE'], true) => 'wlp',
+            in_array($normalized, ['MCO6 LEAVE', 'MC06 LEAVE', 'MO6 LEAVE', 'SPECIAL PRIVILEGE LEAVE'], true) => 'mc_co',
+            in_array($normalized, ['WELLNESS LEAVE', 'SOLO PARENT LEAVE'], true) => 'wlp',
             default => 'others',
         };
     }
@@ -1348,8 +1348,8 @@ class HRReportController extends Controller
         return match (true) {
             in_array($normalized, ['VACATION LEAVE', 'MANDATORY / FORCED LEAVE'], true) => 'vl_fl',
             $normalized === 'SICK LEAVE' => 'sl',
-            in_array($normalized, ['MCO6 LEAVE', 'MC06 LEAVE', 'CTO LEAVE'], true) => 'mc_co',
-            in_array($normalized, ['SPECIAL PRIVILEGE LEAVE', 'WELLNESS LEAVE', 'SOLO PARENT LEAVE'], true) => 'wlp',
+            in_array($normalized, ['MCO6 LEAVE', 'MC06 LEAVE', 'MO6 LEAVE', 'SPECIAL PRIVILEGE LEAVE'], true) => 'mc_co',
+            in_array($normalized, ['WELLNESS LEAVE', 'SOLO PARENT LEAVE'], true) => 'wlp',
             default => 'others',
         };
     }
@@ -1358,7 +1358,7 @@ class HRReportController extends Controller
     {
         $normalized = strtoupper(trim((string) ($leaveTypeName ?? '')));
 
-        if (in_array($normalized, ['MCO6 LEAVE', 'MC06 LEAVE'], true)) {
+        if (in_array($normalized, ['MCO6 LEAVE', 'MC06 LEAVE', 'MO6 LEAVE', 'SPECIAL PRIVILEGE LEAVE'], true)) {
             return 'mc_co';
         }
 

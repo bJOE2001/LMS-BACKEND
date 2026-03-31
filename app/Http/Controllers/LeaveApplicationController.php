@@ -73,7 +73,8 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Employee record not found.'], 404);
         }
 
-        $leaveType = LeaveType::find($leaveTypeId);
+        $resolvedLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+        $leaveType = LeaveType::find($resolvedLeaveTypeId);
         if (!$leaveType) {
             return response()->json(['message' => 'Leave type not found.'], 404);
         }
@@ -87,11 +88,10 @@ class LeaveApplicationController extends Controller
             $this->syncEmployeeCtoBalance((string) $employee->control_no);
         }
 
-        $balance = LeaveBalance::query()
-            ->with('accrualHistories')
-            ->where('employee_control_no', $employee->control_no)
-            ->where('leave_type_id', $leaveTypeId)
-            ->first();
+        $balance = $this->findPreferredEmployeeLeaveBalanceRecord((string) $employee->control_no, (int) $leaveType->id);
+        if ($balance instanceof LeaveBalance) {
+            $balance->loadMissing('accrualHistories');
+        }
 
         return response()->json([
             'leave_type_id' => $leaveType->id,
@@ -142,7 +142,8 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Employee record not found.'], 404);
         }
 
-        $leaveType = LeaveType::find($leaveTypeId);
+        $resolvedLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+        $leaveType = LeaveType::find($resolvedLeaveTypeId);
         if (!$leaveType) {
             return response()->json(['message' => 'Leave type not found.'], 404);
         }
@@ -156,14 +157,13 @@ class LeaveApplicationController extends Controller
             $this->syncEmployeeCtoBalance((string) $employee->control_no);
         }
 
-        $balance = LeaveBalance::query()
-            ->with('accrualHistories')
-            ->where('employee_control_no', $employee->control_no)
-            ->where('leave_type_id', $leaveTypeId)
-            ->first();
+        $balance = $this->findPreferredEmployeeLeaveBalanceRecord((string) $employee->control_no, (int) $leaveType->id);
+        if ($balance instanceof LeaveBalance) {
+            $balance->loadMissing('accrualHistories');
+        }
 
-        $deductionHistoryByType = $this->loadEmployeeLeaveDeductionHistoryByType((string) $employee->control_no, $leaveTypeId);
-        $cocCreditHistoryByType = $this->loadEmployeeCOCCreditHistoryByType((string) $employee->control_no, $leaveTypeId);
+        $deductionHistoryByType = $this->loadEmployeeLeaveDeductionHistoryByType((string) $employee->control_no, (int) $leaveType->id);
+        $cocCreditHistoryByType = $this->loadEmployeeCOCCreditHistoryByType((string) $employee->control_no, (int) $leaveType->id);
         $creditHistoryByType = $this->mergeCreditHistoriesByType(
             $deductionHistoryByType,
             $cocCreditHistoryByType
@@ -171,7 +171,7 @@ class LeaveApplicationController extends Controller
 
         return response()->json(array_merge(
             $this->employeeControlNoResponse((string) $employee->control_no),
-            $this->formatErmsLeaveBalancePayload($leaveType, $balance, $creditHistoryByType[(int) $leaveTypeId] ?? [])
+            $this->formatErmsLeaveBalancePayload($leaveType, $balance, $creditHistoryByType[(int) $leaveType->id] ?? [])
         ));
     }
 
@@ -192,6 +192,7 @@ class LeaveApplicationController extends Controller
         }
 
         $types = LeaveType::query()
+            ->withoutLegacySpecialPrivilegeAliases()
             ->select([
                 'id',
                 'name',
@@ -212,12 +213,11 @@ class LeaveApplicationController extends Controller
 
         $this->syncEmployeeCtoBalance((string) $employee->control_no);
 
-        $balanceRecordsByType = LeaveBalance::query()
+        $balanceRecordsByType = $this->mapLeaveBalancesByCanonicalTypeId(LeaveBalance::query()
             ->with('accrualHistories')
             ->where('employee_control_no', $employee->control_no)
             ->get()
-            ->keyBy(fn(LeaveBalance $balance) => (int) $balance->leave_type_id)
-            ->all();
+        );
         $deductionHistoryByType = $this->loadEmployeeLeaveDeductionHistoryByType((string) $employee->control_no);
         $cocCreditHistoryByType = $this->loadEmployeeCOCCreditHistoryByType((string) $employee->control_no);
         $creditHistoryByType = $this->mergeCreditHistoriesByType(
@@ -377,6 +377,8 @@ class LeaveApplicationController extends Controller
             $selectedDateCoverage,
             $resolvedSelectedDates
         );
+        $validated['leave_type_id'] = $this->resolveCanonicalLeaveTypeId((int) $validated['leave_type_id'])
+            ?? (int) $validated['leave_type_id'];
         $leaveType = LeaveType::find((int) $validated['leave_type_id']);
         if (!$leaveType) {
             return response()->json([
@@ -777,13 +779,15 @@ class LeaveApplicationController extends Controller
             }
         }
 
-        $targetLeaveTypeId = (int) ($requestedUpdatePayload['leave_type_id'] ?? 0);
+        $targetLeaveTypeId = $this->resolveCanonicalLeaveTypeId((int) ($requestedUpdatePayload['leave_type_id'] ?? 0))
+            ?? (int) ($requestedUpdatePayload['leave_type_id'] ?? 0);
         $targetLeaveType = LeaveType::find($targetLeaveTypeId);
         if (!$targetLeaveType) {
             return response()->json([
                 'message' => 'Selected leave type is not available.',
             ], 422);
         }
+        $requestedUpdatePayload['leave_type_id'] = $targetLeaveTypeId;
 
         $leaveTypeRestriction = $this->assertEmployeeCanApplyForLeaveType($employee, $targetLeaveType);
         if ($leaveTypeRestriction instanceof JsonResponse) {
@@ -1005,6 +1009,8 @@ class LeaveApplicationController extends Controller
             $selectedDateCoverage,
             $resolvedSelectedDates
         );
+        $validated['leave_type_id'] = $this->resolveCanonicalLeaveTypeId((int) $validated['leave_type_id'])
+            ?? (int) $validated['leave_type_id'];
         $leaveType = LeaveType::find((int) $validated['leave_type_id']);
         if (!$leaveType) {
             return response()->json([
@@ -1757,11 +1763,13 @@ class LeaveApplicationController extends Controller
         if ($needsDeduction) {
             if ($app->employee_control_no) {
                 // For monetization, deduct from the selected leave type (VL or SL)
-                $deductTypeId = $app->leave_type_id;
+                $deductTypeId = $this->resolveCanonicalLeaveTypeId((int) $app->leave_type_id)
+                    ?? (int) $app->leave_type_id;
 
-                $balance = LeaveBalance::where('employee_control_no', $app->employee_control_no)
-                    ->where('leave_type_id', $deductTypeId)
-                    ->first();
+                $balance = $this->findPreferredEmployeeLeaveBalanceRecord(
+                    (string) $app->employee_control_no,
+                    $deductTypeId
+                );
 
                 if (!$balance || (float) $balance->balance < $daysToDeduct) {
                     $currentBalance = $balance ? (float) $balance->balance : 0;
@@ -1780,10 +1788,10 @@ class LeaveApplicationController extends Controller
 
                 // Business rule: approving Forced Leave also consumes Vacation Leave credits.
                 if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null) {
-                    $vacationBalance = LeaveBalance::query()
-                        ->where('employee_control_no', $app->employee_control_no)
-                        ->where('leave_type_id', $vacationLeaveTypeId)
-                        ->first();
+                    $vacationBalance = $this->findPreferredEmployeeLeaveBalanceRecord(
+                        (string) $app->employee_control_no,
+                        $vacationLeaveTypeId
+                    );
                     $currentVacationBalance = $vacationBalance ? (float) $vacationBalance->balance : 0.0;
                     if ($currentVacationBalance + 1e-9 < $daysToDeduct) {
                         return response()->json([
@@ -1900,10 +1908,12 @@ class LeaveApplicationController extends Controller
                     $this->syncEmployeeCtoBalance((string) $app->employee_control_no);
                 }
 
-                $currentBalance = (float) (LeaveBalance::query()
-                    ->where('employee_control_no', $app->employee_control_no)
-                    ->where('leave_type_id', $app->leave_type_id)
-                    ->value('balance') ?? 0);
+                $currentBalance = (float) (
+                    $this->findPreferredEmployeeLeaveBalanceRecord(
+                        (string) $app->employee_control_no,
+                        (int) $app->leave_type_id
+                    )?->balance ?? 0
+                );
 
                 if ($app->is_monetization && $currentBalance < 10) {
                     return response()->json([
@@ -1912,10 +1922,12 @@ class LeaveApplicationController extends Controller
                 }
 
                 if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null) {
-                    $currentVacationBalance = (float) (LeaveBalance::query()
-                        ->where('employee_control_no', $app->employee_control_no)
-                        ->where('leave_type_id', $vacationLeaveTypeId)
-                        ->value('balance') ?? 0.0);
+                    $currentVacationBalance = (float) (
+                        $this->findPreferredEmployeeLeaveBalanceRecord(
+                            (string) $app->employee_control_no,
+                            $vacationLeaveTypeId
+                        )?->balance ?? 0.0
+                    );
                     if ($currentVacationBalance + 1e-9 < $daysToDeduct) {
                         return response()->json([
                             'message' => 'Insufficient Vacation Leave balance for Mandatory / Forced Leave approval.'
@@ -2370,6 +2382,8 @@ class LeaveApplicationController extends Controller
             $selectedDateCoverage,
             $resolvedSelectedDates
         );
+        $validated['leave_type_id'] = $this->resolveCanonicalLeaveTypeId((int) $validated['leave_type_id'])
+            ?? (int) $validated['leave_type_id'];
         $leaveType = LeaveType::find((int) $validated['leave_type_id']);
         if (!$leaveType) {
             return response()->json([
@@ -2845,6 +2859,88 @@ class LeaveApplicationController extends Controller
         return trim((string) ($employee?->control_no ?? $rawControlNo));
     }
 
+    private function resolveCanonicalLeaveTypeId(?int $leaveTypeId): ?int
+    {
+        return LeaveType::resolveCanonicalLeaveTypeId($leaveTypeId);
+    }
+
+    private function resolveBalanceLookupLeaveTypeIds(int $leaveTypeId): array
+    {
+        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+        if ($canonicalLeaveTypeId <= 0) {
+            return [];
+        }
+
+        if (LeaveType::isSpecialPrivilegeType(null, $canonicalLeaveTypeId)) {
+            $relatedLeaveTypeIds = LeaveType::resolveSpecialPrivilegeRelatedTypeIds();
+            if ($relatedLeaveTypeIds !== []) {
+                return $relatedLeaveTypeIds;
+            }
+        }
+
+        return [$canonicalLeaveTypeId];
+    }
+
+    private function shouldPreferLeaveBalanceRecord(LeaveBalance $candidate, LeaveBalance $current): bool
+    {
+        $candidateUpdatedAt = $candidate->updated_at?->timestamp ?? 0;
+        $currentUpdatedAt = $current->updated_at?->timestamp ?? 0;
+
+        if ($candidateUpdatedAt !== $currentUpdatedAt) {
+            return $candidateUpdatedAt > $currentUpdatedAt;
+        }
+
+        return (int) $candidate->id > (int) $current->id;
+    }
+
+    private function mapLeaveBalancesByCanonicalTypeId(iterable $balances): array
+    {
+        $mappedBalances = [];
+
+        foreach ($balances as $balance) {
+            if (!$balance instanceof LeaveBalance) {
+                continue;
+            }
+
+            $typeId = (int) ($balance->leave_type_id ?? 0);
+            if ($typeId <= 0) {
+                continue;
+            }
+
+            $canonicalTypeId = $this->resolveCanonicalLeaveTypeId($typeId) ?? $typeId;
+            if (
+                !array_key_exists($canonicalTypeId, $mappedBalances)
+                || $this->shouldPreferLeaveBalanceRecord($balance, $mappedBalances[$canonicalTypeId])
+            ) {
+                $mappedBalances[$canonicalTypeId] = $balance;
+            }
+        }
+
+        return $mappedBalances;
+    }
+
+    private function findPreferredEmployeeLeaveBalanceRecord(
+        string $employeeControlNo,
+        int $leaveTypeId,
+        bool $lockForUpdate = false
+    ): ?LeaveBalance {
+        $lookupLeaveTypeIds = $this->resolveBalanceLookupLeaveTypeIds($leaveTypeId);
+        if ($lookupLeaveTypeIds === []) {
+            return null;
+        }
+
+        $query = $this->queryLeaveBalancesByEmployeeControlNo($employeeControlNo)
+            ->whereIn('leave_type_id', $lookupLeaveTypeIds)
+            ->orderByDesc('updated_at')
+            ->orderByDesc('id');
+
+        if ($lockForUpdate) {
+            $query->lockForUpdate();
+        }
+
+        return $query->first();
+    }
+
     private function queryLeaveBalancesByEmployeeControlNo(string $employeeControlNo)
     {
         $candidateEmployeeIds = $this->controlNoCandidates($employeeControlNo);
@@ -2863,14 +2959,7 @@ class LeaveApplicationController extends Controller
             return null;
         }
 
-        $query = $this->queryLeaveBalancesByEmployeeControlNo($employeeControlNo)
-            ->where('leave_type_id', $leaveTypeId);
-
-        if ($lockForUpdate) {
-            $query->lockForUpdate();
-        }
-
-        return $query->first();
+        return $this->findPreferredEmployeeLeaveBalanceRecord($employeeControlNo, $leaveTypeId, $lockForUpdate);
     }
 
     private function restoreApplicationBalance(
@@ -2878,17 +2967,18 @@ class LeaveApplicationController extends Controller
         int $restoreLeaveTypeId,
         float $daysToRestore
     ): void {
+        $restoreLeaveTypeId = $this->resolveCanonicalLeaveTypeId($restoreLeaveTypeId) ?? $restoreLeaveTypeId;
         $restoreAmount = round(max($daysToRestore, 0.0), 2);
         if ($restoreLeaveTypeId <= 0 || $restoreAmount <= 0.0) {
             return;
         }
 
         if ($app->employee_control_no) {
-            $balance = LeaveBalance::query()
-                ->where('leave_type_id', $restoreLeaveTypeId)
-                ->whereIn('employee_control_no', $this->controlNoCandidates((string) $app->employee_control_no))
-                ->lockForUpdate()
-                ->first();
+            $balance = $this->findPreferredEmployeeLeaveBalanceRecord(
+                (string) $app->employee_control_no,
+                $restoreLeaveTypeId,
+                true
+            );
 
             if (!$balance) {
                 throw new \RuntimeException('HR_RECALL_BALANCE_CONFLICT');
@@ -2936,6 +3026,7 @@ class LeaveApplicationController extends Controller
     private function getAllowedErmsLeaveTypesForEmployee(object $employee)
     {
         return LeaveType::query()
+            ->withoutLegacySpecialPrivilegeAliases()
             ->orderBy('name')
             ->get([
                 'id',
@@ -3199,12 +3290,19 @@ class LeaveApplicationController extends Controller
 
     private function loadEmployeeLeaveDeductionHistoryByType(string $controlNo, ?int $leaveTypeId = null): array
     {
+        $lookupLeaveTypeIds = $leaveTypeId !== null
+            ? $this->resolveBalanceLookupLeaveTypeIds($leaveTypeId)
+            : [];
+
         $applications = LeaveApplication::query()
             ->with(['leaveType:id,name,is_credit_based'])
             ->where('status', LeaveApplication::STATUS_APPROVED)
             ->whereIn('employee_control_no', $this->controlNoCandidates($controlNo))
-            ->when($leaveTypeId !== null, function ($query) use ($leaveTypeId): void {
-                $query->where('leave_type_id', $leaveTypeId);
+            ->when($leaveTypeId !== null, function ($query) use ($leaveTypeId, $lookupLeaveTypeIds): void {
+                $query->whereIn(
+                    'leave_type_id',
+                    $lookupLeaveTypeIds !== [] ? $lookupLeaveTypeIds : [$leaveTypeId]
+                );
             })
             ->orderByDesc('hr_approved_at')
             ->orderByDesc('id')
@@ -3228,7 +3326,8 @@ class LeaveApplicationController extends Controller
                 continue;
             }
 
-            $typeId = (int) $application->leave_type_id;
+            $typeId = $this->resolveCanonicalLeaveTypeId((int) $application->leave_type_id)
+                ?? (int) $application->leave_type_id;
             if ($typeId <= 0) {
                 continue;
             }
@@ -3884,7 +3983,8 @@ class LeaveApplicationController extends Controller
                 $resolvedSelectedDates
             );
 
-        $targetLeaveTypeId = (int) ($validated['leave_type_id'] ?? $app->leave_type_id);
+        $targetLeaveTypeId = $this->resolveCanonicalLeaveTypeId((int) ($validated['leave_type_id'] ?? $app->leave_type_id))
+            ?? (int) ($validated['leave_type_id'] ?? $app->leave_type_id);
         $targetLeaveType = LeaveType::find($targetLeaveTypeId);
         if (!$targetLeaveType) {
             return response()->json([
@@ -4095,7 +4195,8 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
-        $targetLeaveTypeId = (int) ($payload['leave_type_id'] ?? 0);
+        $targetLeaveTypeId = $this->resolveCanonicalLeaveTypeId((int) ($payload['leave_type_id'] ?? 0))
+            ?? (int) ($payload['leave_type_id'] ?? 0);
         $targetLeaveType = LeaveType::find($targetLeaveTypeId);
         if (!$targetLeaveType) {
             return response()->json([
@@ -4602,7 +4703,8 @@ class LeaveApplicationController extends Controller
         $endDate = $isMonetization ? null : $this->trimNullableString($payload['end_date'] ?? null);
 
         $commutation = $this->trimNullableString($payload['commutation'] ?? null) ?? 'Not Requested';
-        $leaveTypeId = (int) ($payload['leave_type_id'] ?? 0);
+        $leaveTypeId = $this->resolveCanonicalLeaveTypeId((int) ($payload['leave_type_id'] ?? 0))
+            ?? (int) ($payload['leave_type_id'] ?? 0);
         $totalDays = round((float) ($payload['total_days'] ?? 0), 2);
         $selectedDates = $isMonetization
             ? null
@@ -4770,6 +4872,7 @@ class LeaveApplicationController extends Controller
             throw new \RuntimeException($balanceConflictError);
         }
 
+        $primaryLeaveTypeId = $this->resolveCanonicalLeaveTypeId($primaryLeaveTypeId) ?? $primaryLeaveTypeId;
         $primaryDaysToDeduct = round(max($daysToDeduct, 0.0), 2);
         if ($primaryLeaveTypeId <= 0 || $primaryDaysToDeduct <= 0.0) {
             return [
@@ -4833,14 +4936,12 @@ class LeaveApplicationController extends Controller
 
     private function lockEmployeeLeaveBalance(string $employeeControlNo, int $leaveTypeId): ?LeaveBalance
     {
-        return $this->queryLeaveBalancesByEmployeeControlNo($employeeControlNo)
-            ->where('leave_type_id', $leaveTypeId)
-            ->lockForUpdate()
-            ->first();
+        return $this->findPreferredEmployeeLeaveBalanceRecord($employeeControlNo, $leaveTypeId, true);
     }
 
     private function incrementEmployeeLeaveBalance(string $employeeControlNo, int $leaveTypeId, float $daysToAdd): void
     {
+        $leaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
         $normalizedDaysToAdd = round(max($daysToAdd, 0.0), 2);
         if ($leaveTypeId <= 0 || $normalizedDaysToAdd <= 0.0) {
             return;
@@ -6775,15 +6876,14 @@ class LeaveApplicationController extends Controller
     private function resolveEmployeeLeaveBalanceSnapshot(string $employeeControlNo, int $leaveTypeId): array
     {
         $controlNoCandidates = $this->controlNoCandidates($employeeControlNo);
+        $lookupLeaveTypeIds = $this->resolveBalanceLookupLeaveTypeIds($leaveTypeId);
+        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
 
-        $balance = LeaveBalance::query()
-            ->where('leave_type_id', $leaveTypeId)
-            ->whereIn('employee_control_no', $controlNoCandidates)
-            ->first();
+        $balance = $this->findPreferredEmployeeLeaveBalanceRecord($employeeControlNo, $canonicalLeaveTypeId);
         $currentBalance = $balance ? (float) $balance->balance : 0.0;
 
         $pendingReservedDays = (float) LeaveApplication::query()
-            ->where('leave_type_id', $leaveTypeId)
+            ->whereIn('leave_type_id', $lookupLeaveTypeIds === [] ? [$canonicalLeaveTypeId] : $lookupLeaveTypeIds)
             ->whereIn('status', [
                 LeaveApplication::STATUS_PENDING_ADMIN,
                 LeaveApplication::STATUS_PENDING_HR,
@@ -7000,17 +7100,15 @@ class LeaveApplicationController extends Controller
             return [];
         }
 
-        $snapshot = LeaveBalance::query()
+        $snapshot = collect($this->mapLeaveBalancesByCanonicalTypeId(LeaveBalance::query()
             ->with('leaveType')
             ->whereIn('employee_control_no', $controlNoCandidates)
-            ->get()
-            ->sortByDesc(fn(LeaveBalance $balance) => $balance->updated_at?->timestamp ?? 0)
-            ->unique(fn(LeaveBalance $balance) => (int) $balance->leave_type_id)
+            ->get()))
             ->sortBy(fn(LeaveBalance $balance) => strtolower(trim((string) ($balance->leaveType?->name ?? ''))))
             ->values()
             ->map(fn(LeaveBalance $balance) => [
-                'leave_type_id' => (int) $balance->leave_type_id,
-                'leave_type_name' => $balance->leaveType?->name ?? 'Unknown',
+                'leave_type_id' => $this->resolveCanonicalLeaveTypeId((int) $balance->leave_type_id) ?? (int) $balance->leave_type_id,
+                'leave_type_name' => LeaveType::canonicalizeLeaveTypeName($balance->leaveType?->name ?? 'Unknown') ?? 'Unknown',
                 'balance' => (float) $balance->balance,
                 'year' => $balance->year !== null ? (int) $balance->year : null,
                 'updated_at' => $balance->updated_at?->toIso8601String(),
@@ -7040,8 +7138,9 @@ class LeaveApplicationController extends Controller
             return null;
         }
 
+        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
         foreach ($snapshot as $entry) {
-            if ((int) ($entry['leave_type_id'] ?? 0) === $leaveTypeId) {
+            if ((int) ($entry['leave_type_id'] ?? 0) === $canonicalLeaveTypeId) {
                 return (float) ($entry['balance'] ?? 0.0);
             }
         }

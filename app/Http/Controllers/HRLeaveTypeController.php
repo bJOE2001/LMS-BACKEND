@@ -27,6 +27,7 @@ class HRLeaveTypeController extends Controller
         $category = $validated['category'] ?? null;
 
         $leaveTypes = LeaveType::query()
+            ->withoutLegacySpecialPrivilegeAliases()
             ->withCount(['leaveApplications', 'leaveBalances'])
             ->when($search !== '', function ($query) use ($search): void {
                 $query->where('name', 'like', "%{$search}%");
@@ -131,6 +132,7 @@ class HRLeaveTypeController extends Controller
 
     private function validatePayload(Request $request, ?int $leaveTypeId = null): array
     {
+        $currentLeaveType = $leaveTypeId !== null ? LeaveType::find($leaveTypeId) : null;
         $nameRule = Rule::unique('tblLeaveTypes', 'name');
         if ($leaveTypeId !== null) {
             $nameRule = $nameRule->ignore($leaveTypeId);
@@ -153,6 +155,50 @@ class HRLeaveTypeController extends Controller
             'allowed_status.*' => ['string', Rule::in(array_keys(LeaveType::EMPLOYMENT_STATUS_LABELS))],
             'description' => ['nullable', 'string', 'max:2000'],
         ]);
+
+        $canonicalName = LeaveType::canonicalizeLeaveTypeName($validated['name'] ?? null);
+        if ($canonicalName !== null) {
+            $canonicalConflictQuery = LeaveType::query();
+
+            if (LeaveType::isSpecialPrivilegeAliasName($canonicalName)) {
+                $isEditingCanonicalSpecialPrivilege = $currentLeaveType instanceof LeaveType
+                    && LeaveType::normalizeLeaveTypeName($currentLeaveType->name) === LeaveType::normalizeLeaveTypeName(LeaveType::SPECIAL_PRIVILEGE_LEAVE_NAME);
+
+                if ($isEditingCanonicalSpecialPrivilege) {
+                    $canonicalConflictQuery->whereRaw(
+                        'UPPER(LTRIM(RTRIM(name))) = ?',
+                        [LeaveType::normalizeLeaveTypeName(LeaveType::SPECIAL_PRIVILEGE_LEAVE_NAME)]
+                    );
+                } else {
+                    $canonicalConflictQuery->where(function ($query): void {
+                        foreach (LeaveType::specialPrivilegeAliasNames() as $index => $aliasName) {
+                            $method = $index === 0 ? 'whereRaw' : 'orWhereRaw';
+                            $query->{$method}(
+                                'UPPER(LTRIM(RTRIM(name))) = ?',
+                                [LeaveType::normalizeLeaveTypeName($aliasName)]
+                            );
+                        }
+                    });
+                }
+            } else {
+                $canonicalConflictQuery->whereRaw(
+                    'UPPER(LTRIM(RTRIM(name))) = ?',
+                    [LeaveType::normalizeLeaveTypeName($canonicalName)]
+                );
+            }
+
+            if ($leaveTypeId !== null) {
+                $canonicalConflictQuery->whereKeyNot($leaveTypeId);
+            }
+
+            if ($canonicalConflictQuery->exists()) {
+                throw ValidationException::withMessages([
+                    'name' => ['A leave type with this name already exists.'],
+                ]);
+            }
+
+            $validated['name'] = $canonicalName;
+        }
 
         if (($validated['category'] ?? null) === LeaveType::CATEGORY_ACCRUED) {
             if (!array_key_exists('accrual_rate', $validated) || $validated['accrual_rate'] === null) {
@@ -209,6 +255,7 @@ class HRLeaveTypeController extends Controller
         return [
             'id' => $type->id,
             'name' => $type->name,
+            'display_name' => $this->formatDisplayLeaveTypeName($type->name),
             'category' => $type->category,
             'accrual_rate' => $type->accrual_rate !== null ? (float) $type->accrual_rate : null,
             'accrual_day_of_month' => $type->accrual_day_of_month,
@@ -229,5 +276,14 @@ class HRLeaveTypeController extends Controller
             'updated_at' => $type->updated_at?->toIso8601String(),
         ];
     }
-}
 
+    private function formatDisplayLeaveTypeName(?string $name): string
+    {
+        $canonicalName = LeaveType::canonicalizeLeaveTypeName($name);
+        if ($canonicalName === LeaveType::SPECIAL_PRIVILEGE_LEAVE_NAME) {
+            return 'Special Privilege Leave(MC06)';
+        }
+
+        return trim((string) ($canonicalName ?? $name ?? ''));
+    }
+}
