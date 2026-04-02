@@ -167,6 +167,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::get('/leave-applications/{id}', [LeaveApplicationController::class, 'hrShow']);
         Route::get('/leave-applications/{id}/attachment', [LeaveApplicationController::class, 'hrViewAttachment']);
         Route::post('/leave-applications/{id}/receive', [LeaveApplicationController::class, 'hrReceive']);
+        Route::post('/leave-applications/{id}/release', [LeaveApplicationController::class, 'hrRelease']);
         Route::post('/leave-applications/{id}/approve', [LeaveApplicationController::class, 'hrApprove']);
         Route::post('/leave-applications/{id}/reject', [LeaveApplicationController::class, 'hrReject']);
         Route::post('/leave-applications/{id}/recall', [LeaveApplicationController::class, 'hrRecall']);

@@ -15,6 +15,7 @@ use App\Models\LeaveType;
 use App\Models\Notification;
 use App\Services\WorkScheduleService;
 
+use Illuminate\Filesystem\FilesystemAdapter;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
@@ -1744,6 +1745,75 @@ class LeaveApplicationController extends Controller
             'message' => $receivedLog
                 ? 'Hard-copy receipt was already confirmed for this application.'
                 : 'Hard-copy receipt confirmed.',
+            'application' => $this->formatErmsApplication($app, $actorDirectory),
+        ]);
+    }
+
+    /**
+     * HR confirms the hard-copy leave application form was released.
+     * This action is informational only and does not change approval status.
+     */
+    public function hrRelease(Request $request, int $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (!$hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can confirm released applications.'], 403);
+        }
+
+        $request->validate([
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $app = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($id);
+        if (!$app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $isPendingApprovedUpdateRequest = $this->isPendingApprovedUpdateRequest($app);
+        if ($app->status === LeaveApplication::STATUS_PENDING_ADMIN && !$isPendingApprovedUpdateRequest) {
+            return response()->json([
+                'message' => "Cannot mark as released: application status is '{$app->status}'.",
+            ], 422);
+        }
+
+        $releasedLog = $app->logs->first(
+            fn(LeaveApplicationLog $log) =>
+                $log->action === LeaveApplicationLog::ACTION_HR_RELEASED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
+
+        if (!$releasedLog) {
+            $receivedLog = $app->logs->first(
+                fn(LeaveApplicationLog $log) =>
+                    $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
+                    && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+            );
+
+            if (!$receivedLog) {
+                return response()->json([
+                    'message' => 'Cannot mark as released before confirming receipt of the hard-copy application.',
+                ], 422);
+            }
+
+            LeaveApplicationLog::create([
+                'leave_application_id' => $app->id,
+                'action' => LeaveApplicationLog::ACTION_HR_RELEASED,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
+                'performed_by_id' => $hr->id,
+                'remarks' => $request->input('remarks') ?: 'Released hard copy leave application form.',
+                'created_at' => now(),
+            ]);
+            $app->load('logs');
+        }
+
+        $actorDirectory = $this->buildWorkflowActorDirectory([$app]);
+
+        return response()->json([
+            'message' => $releasedLog
+                ? 'Hard-copy release was already confirmed for this application.'
+                : 'Hard-copy release confirmed.',
             'application' => $this->formatErmsApplication($app, $actorDirectory),
         ]);
     }
@@ -3773,6 +3843,7 @@ class LeaveApplicationController extends Controller
             LeaveApplicationLog::ACTION_HR_REJECTED => 'hr rejected',
             LeaveApplicationLog::ACTION_HR_RECALLED => 'hr recalled',
             LeaveApplicationLog::ACTION_HR_RECEIVED => 'received application',
+            LeaveApplicationLog::ACTION_HR_RELEASED => 'released application',
             default => strtolower(str_replace('_', ' ', (string) $log->action)),
         };
     }
@@ -3806,6 +3877,11 @@ class LeaveApplicationController extends Controller
         $hrReceivedLog = $logs->first(
             fn(LeaveApplicationLog $log) =>
                 $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
+        $hrReleasedLog = $logs->first(
+            fn(LeaveApplicationLog $log) =>
+                $log->action === LeaveApplicationLog::ACTION_HR_RELEASED
                 && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
         );
         $hrRecalledLog = $logs->first(
@@ -3843,6 +3919,7 @@ class LeaveApplicationController extends Controller
             $recallActionBy = $actorDirectory['hr'][(int) $app->hr_id];
         }
         $receivedActionBy = $this->resolveWorkflowPerformerName($hrReceivedLog, $actorDirectory, $employeeName);
+        $releasedActionBy = $this->resolveWorkflowPerformerName($hrReleasedLog, $actorDirectory, $employeeName);
 
         $isCancelled = $cancelledLog !== null || $this->isCancelledRemark($app->remarks);
         $hasPendingApprovedUpdateRequest = $this->hasPendingApprovedUpdateRequest($app);
@@ -3876,6 +3953,7 @@ class LeaveApplicationController extends Controller
         $recallActionAt = $hrRecalledLog?->created_at
             ?? ($app->status === LeaveApplication::STATUS_RECALLED ? $app->updated_at : null);
         $receivedActionAt = $hrReceivedLog?->created_at;
+        $releasedActionAt = $hrReleasedLog?->created_at;
         $cancelledAt = $cancelledLog?->created_at ?? ($isCancelled ? $app->updated_at : null);
 
         $disapprovedAt = null;
@@ -3981,6 +4059,9 @@ class LeaveApplicationController extends Controller
             'received_by' => $receivedActionBy,
             'receivedBy' => $receivedActionBy,
             'hr_received_by' => $receivedActionBy,
+            'released_by' => $releasedActionBy,
+            'releasedBy' => $releasedActionBy,
+            'hr_released_by' => $releasedActionBy,
             'recall_action_by' => $recallActionBy,
             'processed_by' => $processedBy,
             'disapproved_by' => $disapprovedBy,
@@ -3993,11 +4074,16 @@ class LeaveApplicationController extends Controller
             'received_at' => $receivedActionAt?->toIso8601String(),
             'receivedAt' => $receivedActionAt?->toIso8601String(),
             'hr_received_at' => $receivedActionAt?->toIso8601String(),
+            'released_at' => $releasedActionAt?->toIso8601String(),
+            'releasedAt' => $releasedActionAt?->toIso8601String(),
+            'hr_released_at' => $releasedActionAt?->toIso8601String(),
             'recall_action_at' => $recallActionAt?->toIso8601String(),
             'disapproved_at' => $disapprovedAt?->toIso8601String(),
             'cancelled_at' => $cancelledAt?->toIso8601String(),
             'has_hr_received' => $hrReceivedLog !== null,
             'hasHrReceived' => $hrReceivedLog !== null,
+            'has_hr_released' => $hrReleasedLog !== null,
+            'hasHrReleased' => $hrReleasedLog !== null,
             'status_history' => $statusHistory,
         ];
     }
@@ -7153,6 +7239,7 @@ class LeaveApplicationController extends Controller
         ])));
 
         foreach ($candidateDisks as $disk) {
+            /** @var FilesystemAdapter $storage */
             $storage = Storage::disk($disk);
             foreach ($candidatePaths as $path) {
                 if (!$storage->exists($path)) {
