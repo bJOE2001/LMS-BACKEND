@@ -101,7 +101,7 @@ class HRWorkScheduleController extends Controller
             return response()->json(['message' => 'Employee work schedule override not found.'], 404);
         }
 
-        $validated = $this->validateSchedulePayload($request, false, true);
+        $validated = $this->validateSchedulePayload($request);
 
         try {
             $override = app(WorkScheduleService::class)->updateEmployeeOverride($override, $validated, $hr);
@@ -142,7 +142,7 @@ class HRWorkScheduleController extends Controller
     /**
      * @return array<string, mixed>
      */
-    private function validateSchedulePayload(Request $request, bool $requireEmployee = false, bool $allowIsActive = true): array
+    private function validateSchedulePayload(Request $request, bool $requireEmployee = false): array
     {
         $rules = [
             'work_start_time' => ['required', 'date_format:H:i'],
@@ -154,10 +154,6 @@ class HRWorkScheduleController extends Controller
 
         if ($requireEmployee) {
             $rules['employee_control_no'] = ['required', 'string', 'regex:/^\d+$/'];
-        }
-
-        if ($allowIsActive) {
-            $rules['is_active'] = ['nullable', 'boolean'];
         }
 
         return $request->validate($rules);

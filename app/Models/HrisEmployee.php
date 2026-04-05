@@ -20,6 +20,7 @@ class HrisEmployee
     private const HR_CONNECTION = 'hr';
     private const PERSONAL_TABLE = 'xPersonal';
     private const PARTITION_VIEW = 'vwpartitionforseparated';
+    private const OFFICE_TABLE = 'yOffice';
     private const CACHE_TTL_MINUTES = 5;
 
     /**
@@ -33,12 +34,20 @@ class HrisEmployee
                 $join->on('xp.ControlNo', '=', 'vp.ControlNo')
                     ->where('vp.RN', '=', 1);
             })
+            ->leftJoin(self::OFFICE_TABLE.' as yo', function ($join): void {
+                $join->on(
+                    DB::raw('LTRIM(RTRIM(vp.OffCode))'),
+                    '=',
+                    DB::raw('LTRIM(RTRIM(yo.Codes))')
+                );
+            })
             ->selectRaw('LTRIM(RTRIM(CONVERT(VARCHAR(64), xp.ControlNo))) as control_no')
             ->selectRaw('xp.Surname as surname')
             ->selectRaw('xp.Firstname as firstname')
             ->selectRaw('xp.MIddlename as middlename')
             ->selectRaw('xp.BirthDate as birth_date')
             ->selectRaw('vp.Office as office')
+            ->selectRaw('NULLIF(LTRIM(RTRIM(CONVERT(VARCHAR(255), yo.Abbr))), \'\') as officeAcronym')
             ->selectRaw('vp.Status as status')
             ->selectRaw('vp.Designation as designation')
             ->selectRaw('vp.RateMon as rate_mon')
@@ -169,7 +178,7 @@ class HrisEmployee
             default => 'all',
         };
 
-        return "hris_employees.{$suffix}.{$activityKey}.v2";
+        return "hris_employees.{$suffix}.{$activityKey}.v3";
     }
 
     public static function flushCache(): void
@@ -257,6 +266,7 @@ class HrisEmployee
         if ($departmentNamesByControlNo === []) {
             return array_map(static function (array $row): array {
                 $row['hris_office'] = trim((string) ($row['office'] ?? ''));
+                $row['hrisOfficeAcronym'] = self::trimNullableString($row['officeAcronym'] ?? null);
                 $row['assigned_department_name'] = null;
                 $row['assigned_department_id'] = null;
                 $row['is_department_reassigned'] = false;
@@ -267,12 +277,14 @@ class HrisEmployee
 
         return array_map(static function (array $row) use ($departmentNamesByControlNo): array {
             $originalOffice = trim((string) ($row['office'] ?? ''));
+            $originalOfficeAcronym = self::trimNullableString($row['officeAcronym'] ?? null);
             $normalizedControlNo = self::normalizeControlNoInt($row['control_no'] ?? null);
             $assignment = $normalizedControlNo !== null
                 ? ($departmentNamesByControlNo[$normalizedControlNo] ?? null)
                 : null;
 
             $row['hris_office'] = $originalOffice;
+            $row['hrisOfficeAcronym'] = $originalOfficeAcronym;
             $row['assigned_department_name'] = $assignment['department_name'] ?? null;
             $row['assigned_department_id'] = $assignment['department_id'] ?? null;
             $row['is_department_reassigned'] = $assignment !== null
@@ -280,6 +292,9 @@ class HrisEmployee
 
             if ($assignment !== null && trim((string) ($assignment['department_name'] ?? '')) !== '') {
                 $row['office'] = trim((string) $assignment['department_name']);
+                if ($row['is_department_reassigned']) {
+                    $row['officeAcronym'] = null;
+                }
             }
 
             return $row;
@@ -312,5 +327,12 @@ class HrisEmployee
 
                 return $carry;
             }, []);
+    }
+
+    private static function trimNullableString(mixed $value): ?string
+    {
+        $trimmed = trim((string) ($value ?? ''));
+
+        return $trimmed !== '' ? $trimmed : null;
     }
 }
