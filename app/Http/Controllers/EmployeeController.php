@@ -1118,7 +1118,9 @@ class EmployeeController extends Controller
             'middlename' => $this->trimNullable($employee->middlename ?? null),
             'designation' => $this->trimNullable($employee->designation ?? null),
             'office' => trim((string) ($employee->office ?? '')),
+            'officeAcronym' => $this->trimNullable($employee->officeAcronym ?? null),
             'hris_office' => $this->trimNullable($employee->hris_office ?? null),
+            'hrisOfficeAcronym' => $this->trimNullable($employee->hrisOfficeAcronym ?? null),
             'assigned_department_name' => $this->trimNullable($employee->assigned_department_name ?? null),
             'assigned_department_id' => $employee->assigned_department_id !== null
                 ? (int) $employee->assigned_department_id

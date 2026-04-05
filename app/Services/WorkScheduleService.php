@@ -7,7 +7,6 @@ use App\Models\HRAccount;
 use App\Models\HrisEmployee;
 use App\Models\WorkScheduleSetting;
 use Carbon\CarbonImmutable;
-use Illuminate\Support\Arr;
 use InvalidArgumentException;
 
 class WorkScheduleService
@@ -73,6 +72,7 @@ class WorkScheduleService
     public function listEmployeeOverrides(): array
     {
         return EmployeeWorkScheduleOverride::query()
+            ->active()
             ->with('updatedByHr:id,full_name')
             ->orderBy('employee_name')
             ->orderBy('employee_control_no')
@@ -96,7 +96,7 @@ class WorkScheduleService
         $override->office = trim((string) ($employee->office ?? '')) ?: null;
         $override->designation = trim((string) ($employee->designation ?? '')) ?: null;
         $override->status = trim((string) ($employee->status ?? '')) ?: null;
-        $override->is_active = Arr::get($payload, 'is_active', true) !== false;
+        $override->is_active = true;
         $override->save();
 
         return $override->fresh(['updatedByHr']) ?? $override;
@@ -113,9 +113,7 @@ class WorkScheduleService
         }
 
         $override->fill($this->normalizeSchedulePayload($payload, $updatedBy));
-        if (array_key_exists('is_active', $payload)) {
-            $override->is_active = filter_var($payload['is_active'], FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE) ?? (bool) $override->is_active;
-        }
+        $override->is_active = true;
         $override->save();
 
         return $override->fresh(['updatedByHr']) ?? $override;
@@ -247,6 +245,7 @@ class WorkScheduleService
         string $source,
         ?EmployeeWorkScheduleOverride $override = null
     ): array {
+        $officeContext = $this->resolveOfficeContext($data);
         $workingHoursPerDay = round((float) ($data['working_hours_per_day'] ?? 0), 2);
         $deductions = $workingHoursPerDay > 0
             ? $this->calculateDeductionWeights($workingHoursPerDay)
@@ -261,7 +260,10 @@ class WorkScheduleService
             'setting_key' => $data['setting_key'] ?? WorkScheduleSetting::GLOBAL_SETTING_KEY,
             'employee_control_no' => $data['employee_control_no'] ?? null,
             'employee_name' => $data['employee_name'] ?? null,
-            'office' => $data['office'] ?? null,
+            'office' => $officeContext['office'],
+            'officeAcronym' => $officeContext['officeAcronym'],
+            'hris_office' => $officeContext['hris_office'],
+            'hrisOfficeAcronym' => $officeContext['hrisOfficeAcronym'],
             'designation' => $data['designation'] ?? null,
             'status' => $data['status'] ?? null,
             'work_start_time' => $this->normalizeNullableTimeValue($data['work_start_time'] ?? null),
@@ -278,6 +280,40 @@ class WorkScheduleService
                 : null,
             'updated_by_hr' => $override?->updatedByHr?->full_name
                 ?? (($data['updated_by_hr']['full_name'] ?? null) ?: null),
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $data
+     * @return array{office:?string, officeAcronym:?string, hris_office:?string, hrisOfficeAcronym:?string}
+     */
+    private function resolveOfficeContext(array $data): array
+    {
+        $office = $this->trimNullableString($data['office'] ?? null);
+        $officeAcronym = $this->trimNullableString($data['officeAcronym'] ?? null);
+        $hrisOffice = $this->trimNullableString($data['hris_office'] ?? null) ?? $office;
+        $hrisOfficeAcronym = $this->trimNullableString($data['hrisOfficeAcronym'] ?? null) ?? $officeAcronym;
+
+        $employeeControlNo = trim((string) ($data['employee_control_no'] ?? ''));
+        if ($employeeControlNo !== '') {
+            $employee = HrisEmployee::findByControlNo($employeeControlNo);
+            if ($employee) {
+                $office = $this->trimNullableString($employee->office ?? null) ?? $office;
+                $officeAcronym = $this->trimNullableString($employee->officeAcronym ?? null) ?? $officeAcronym;
+                $hrisOffice = $this->trimNullableString($employee->hris_office ?? null)
+                    ?? $this->trimNullableString($employee->office ?? null)
+                    ?? $hrisOffice;
+                $hrisOfficeAcronym = $this->trimNullableString($employee->hrisOfficeAcronym ?? null)
+                    ?? $this->trimNullableString($employee->officeAcronym ?? null)
+                    ?? $hrisOfficeAcronym;
+            }
+        }
+
+        return [
+            'office' => $office,
+            'officeAcronym' => $officeAcronym,
+            'hris_office' => $hrisOffice,
+            'hrisOfficeAcronym' => $hrisOfficeAcronym,
         ];
     }
 
