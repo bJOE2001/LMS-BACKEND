@@ -7,9 +7,11 @@ use App\Models\COCApplicationRow;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
+use App\Models\LeaveApplication;
 use App\Models\LeaveBalance;
 use App\Models\LeaveType;
 use App\Models\Notification;
+use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
@@ -19,6 +21,14 @@ use RuntimeException;
 class COCApplicationController extends Controller
 {
     private const MINUTES_PER_WORKDAY = 480;
+    private const MINUTES_PER_HOUR = 60;
+    private const CTO_HOURS_PER_DAY = 8.0;
+    private const MINIMUM_OVERTIME_MINUTES = 120;
+    private const MINIMUM_CREDITABLE_EXCESS_MINUTES = 20;
+    private const MONTHLY_COC_HOURS_CAP = 40.0;
+    private const BALANCE_COC_HOURS_CAP = 120.0;
+    private const CREDIT_CATEGORY_REGULAR = 'REGULAR';
+    private const CREDIT_CATEGORY_SPECIAL = 'SPECIAL';
 
     public function ermsIndex(Request $request): JsonResponse
     {
@@ -82,43 +92,25 @@ class COCApplicationController extends Controller
 
         if ($this->isCocRestrictedEmployeeStatus($employee->status)) {
             return response()->json([
-                'message' => 'COC application is not available for contractual employees.',
+                'message' => 'COC application is not available for contractual or honorarium employees.',
             ], 422);
         }
 
-        $runningMinutes = 0;
-        $rows = [];
-        foreach ($validated['rows'] as $index => $row) {
-            $minutes = $this->calculateDurationMinutes((string) $row['time_from'], (string) $row['time_to']);
-            if ($minutes === null || $minutes <= 0) {
-                return response()->json([
-                    'message' => 'Invalid overtime time range detected.',
-                    'errors' => ["rows.{$index}.time_to" => ['The overtime end time must be after the start time.']],
-                ], 422);
-            }
-
-            $runningMinutes += $minutes;
-            $rows[] = [
-                'line_no' => $index + 1,
-                'overtime_date' => $row['date'],
-                'nature_of_overtime' => trim((string) $row['nature_of_overtime']),
-                'time_from' => (string) $row['time_from'],
-                'time_to' => (string) $row['time_to'],
-                'minutes' => $minutes,
-                'cumulative_minutes' => $runningMinutes,
-            ];
+        $policySummary = $this->buildValidatedRows($validated['rows']);
+        if ($policySummary instanceof JsonResponse) {
+            return $policySummary;
         }
 
         $submittedTotalMinutes = isset($validated['total_no_of_coc_applied_minutes'])
             ? (int) $validated['total_no_of_coc_applied_minutes']
             : null;
-        if ($submittedTotalMinutes !== null && $submittedTotalMinutes !== $runningMinutes) {
+        if ($submittedTotalMinutes !== null && $submittedTotalMinutes !== (int) $policySummary['total_minutes']) {
             return response()->json([
                 'message' => 'Total COC minutes do not match the provided overtime rows.',
             ], 422);
         }
 
-        $application = DB::transaction(function () use ($employee, $rows, $runningMinutes): COCApplication {
+        $application = DB::transaction(function () use ($employee, $policySummary): COCApplication {
             $app = COCApplication::create([
                 'employee_control_no' => (string) $employee->control_no,
                 'employee_name' => trim(implode(' ', array_filter([
@@ -127,11 +119,14 @@ class COCApplicationController extends Controller
                     trim((string) ($employee->surname ?? '')),
                 ]))) ?: null,
                 'status' => COCApplication::STATUS_PENDING,
-                'total_minutes' => $runningMinutes,
+                'total_minutes' => (int) $policySummary['total_minutes'],
+                'application_year' => (int) $policySummary['application_year'],
+                'application_month' => (int) $policySummary['application_month'],
+                'credited_hours' => null,
                 'submitted_at' => now(),
             ]);
 
-            foreach ($rows as $row) {
+            foreach ($policySummary['rows'] as $row) {
                 $app->rows()->create([
                     ...$row,
                     'employee_control_no' => (string) $app->employee_control_no,
@@ -370,11 +365,16 @@ class COCApplicationController extends Controller
             return response()->json(['message' => 'Only HR accounts can approve COC applications.'], 403);
         }
 
-        $validated = $request->validate(['remarks' => ['nullable', 'string', 'max:2000']]);
+        $validated = $request->validate([
+            'remarks' => ['nullable', 'string', 'max:2000'],
+            'rows' => ['required', 'array', 'min:1', 'max:100'],
+            'rows.*.line_no' => ['required', 'integer', 'min:1'],
+            'rows.*.credit_category' => ['required', 'string', 'in:REGULAR,SPECIAL'],
+        ]);
 
         try {
             $result = DB::transaction(function () use ($id, $hr, $validated): array {
-                $app = COCApplication::query()->lockForUpdate()->find($id);
+                $app = COCApplication::query()->with('rows')->lockForUpdate()->find($id);
                 if (!$app) throw new RuntimeException('NOT_FOUND');
                 if ($app->status !== COCApplication::STATUS_PENDING) throw new RuntimeException('ALREADY_REVIEWED');
                 if ($app->admin_reviewed_at === null) throw new RuntimeException('PENDING_ADMIN_REVIEW');
@@ -385,8 +385,57 @@ class COCApplicationController extends Controller
                 $ctoLeaveType = $this->resolveCTOLeaveType();
                 if (!$ctoLeaveType) throw new RuntimeException('CTO_MISSING');
 
-                $creditedDays = $this->minutesToLeaveDays((int) $app->total_minutes);
+                $policySummary = $this->buildHrReviewedRows($app, $validated['rows']);
+                $creditedHours = (float) $policySummary['credited_hours'];
+                if ($creditedHours <= 0) throw new RuntimeException('INVALID_CREDIT');
+
+                $applicationYear = (int) ($policySummary['application_year'] ?? 0);
+                $applicationMonth = (int) ($policySummary['application_month'] ?? 0);
+                if ($applicationYear <= 0 || $applicationMonth <= 0) throw new RuntimeException('INVALID_PERIOD');
+
+                $approvedMonthlyHours = $this->resolveMonthlyApprovedCocHours(
+                    (string) $employee->control_no,
+                    $applicationYear,
+                    $applicationMonth,
+                    (int) $app->id
+                );
+
+                if (round($approvedMonthlyHours + $creditedHours, 2) > self::MONTHLY_COC_HOURS_CAP) {
+                    throw new RuntimeException('MONTHLY_CAP_EXCEEDED');
+                }
+
+                $availableBalanceHours = $this->resolveCurrentCtoAvailableHours(
+                    (string) $employee->control_no,
+                    (int) $ctoLeaveType->id
+                );
+
+                if (round($availableBalanceHours + $creditedHours, 2) > self::BALANCE_COC_HOURS_CAP) {
+                    throw new RuntimeException('BALANCE_CAP_EXCEEDED');
+                }
+
+                $creditedDays = $this->hoursToLeaveDays($creditedHours);
                 if ($creditedDays <= 0) throw new RuntimeException('INVALID_CREDIT');
+
+                $reviewedRowsByLineNo = collect($policySummary['rows'])->keyBy('line_no');
+                foreach ($app->rows as $row) {
+                    if (!$row instanceof COCApplicationRow) {
+                        continue;
+                    }
+
+                    $reviewedRow = $reviewedRowsByLineNo->get((int) $row->line_no);
+                    if (!is_array($reviewedRow)) {
+                        throw new RuntimeException('INVALID_REVIEW_ROWS');
+                    }
+
+                    $row->fill([
+                        'cumulative_minutes' => (int) ($reviewedRow['cumulative_minutes'] ?? $row->cumulative_minutes),
+                        'credit_category' => $reviewedRow['credit_category'] ?? null,
+                        'credit_multiplier' => $reviewedRow['credit_multiplier'] ?? null,
+                        'creditable_minutes' => $reviewedRow['creditable_minutes'] ?? null,
+                        'credited_hours' => $reviewedRow['credited_hours'] ?? null,
+                    ]);
+                    $row->save();
+                }
 
                 $balance = LeaveBalance::query()
                     ->where('employee_control_no', (string) $employee->control_no)
@@ -414,10 +463,19 @@ class COCApplicationController extends Controller
                     'cto_leave_type_id' => (int) $ctoLeaveType->id,
                     'cto_credited_days' => $creditedDays,
                     'cto_credited_at' => now(),
+                    'total_minutes' => (int) ($policySummary['total_minutes'] ?? $app->total_minutes),
+                    'credited_hours' => $creditedHours,
+                    'application_year' => $applicationYear,
+                    'application_month' => $applicationMonth,
                     'remarks' => trim((string) ($validated['remarks'] ?? '')) ?: $app->remarks,
                 ]);
 
-                return ['days' => $creditedDays, 'balance' => (float) $balance->balance, 'leave_type' => $ctoLeaveType];
+                return [
+                    'days' => $creditedDays,
+                    'hours' => $creditedHours,
+                    'balance' => (float) $balance->balance,
+                    'leave_type' => $ctoLeaveType,
+                ];
             });
         } catch (RuntimeException $exception) {
             return $this->handleRuntimeException($exception);
@@ -436,7 +494,8 @@ class COCApplicationController extends Controller
                 'leave_type_id' => (int) $result['leave_type']->id,
                 'leave_type_name' => (string) $result['leave_type']->name,
                 'credited_days' => (float) $result['days'],
-                'expires_on' => now()->addYearNoOverflow()->toDateString(),
+                'credited_hours' => (float) $result['hours'],
+                'expires_on' => $this->resolveCocExpiryDate(CarbonImmutable::now())->toDateString(),
                 'updated_balance' => (float) $result['balance'],
             ],
         ]);
@@ -500,6 +559,436 @@ class COCApplicationController extends Controller
         $minute = (int) $matches['m'];
         if ($hour < 0 || $hour > 23 || $minute < 0 || $minute > 59) return null;
         return ($hour * 60) + $minute;
+    }
+
+    private function buildValidatedRows(array $submittedRows): array|JsonResponse
+    {
+        $rows = [];
+        $runningMinutes = 0;
+        $applicationYear = null;
+        $applicationMonth = null;
+
+        foreach ($submittedRows as $index => $row) {
+            $minutes = $this->calculateDurationMinutes((string) $row['time_from'], (string) $row['time_to']);
+            if ($minutes === null || $minutes <= 0) {
+                return response()->json([
+                    'message' => 'Invalid overtime time range detected.',
+                    'errors' => ["rows.{$index}.time_to" => ['The overtime end time must be after the start time.']],
+                ], 422);
+            }
+
+            if ($minutes < self::MINIMUM_OVERTIME_MINUTES) {
+                return response()->json([
+                    'message' => 'Each COC overtime row must be at least 2 hours.',
+                    'errors' => ["rows.{$index}.time_to" => ['The minimum overtime duration is 2 hours.']],
+                ], 422);
+            }
+
+            $overtimeDate = CarbonImmutable::parse((string) $row['date'])->startOfDay();
+            if ($applicationYear === null || $applicationMonth === null) {
+                $applicationYear = (int) $overtimeDate->year;
+                $applicationMonth = (int) $overtimeDate->month;
+            } elseif ($applicationYear !== (int) $overtimeDate->year || $applicationMonth !== (int) $overtimeDate->month) {
+                return response()->json([
+                    'message' => 'All COC rows must belong to the same month and year.',
+                    'errors' => ["rows.{$index}.date" => ['Please submit one COC application per month.']],
+                ], 422);
+            }
+
+            $runningMinutes += $minutes;
+
+            $rows[] = [
+                'line_no' => $index + 1,
+                'overtime_date' => $overtimeDate->toDateString(),
+                'nature_of_overtime' => trim((string) $row['nature_of_overtime']),
+                'time_from' => (string) $row['time_from'],
+                'time_to' => (string) $row['time_to'],
+                'minutes' => $minutes,
+                'cumulative_minutes' => $runningMinutes,
+                'credit_category' => null,
+                'credit_multiplier' => null,
+                'creditable_minutes' => null,
+                'credited_hours' => null,
+            ];
+        }
+
+        return [
+            'rows' => $rows,
+            'total_minutes' => $runningMinutes,
+            'application_year' => $applicationYear,
+            'application_month' => $applicationMonth,
+        ];
+    }
+
+    private function buildHrReviewedRows(COCApplication $application, array $submittedRows): array
+    {
+        $existingRows = $application->relationLoaded('rows')
+            ? $application->rows->sortBy('line_no')->values()
+            : $application->rows()->orderBy('line_no')->get()->values();
+
+        if ($existingRows->isEmpty()) {
+            throw new RuntimeException('INVALID_REVIEW_ROWS');
+        }
+
+        $submittedByLineNo = [];
+        foreach ($submittedRows as $row) {
+            $lineNo = (int) ($row['line_no'] ?? 0);
+            if ($lineNo <= 0 || isset($submittedByLineNo[$lineNo])) {
+                throw new RuntimeException('INVALID_REVIEW_ROWS');
+            }
+
+            $creditCategory = $this->normalizeCreditCategory($row['credit_category'] ?? null);
+            if ($creditCategory === null) {
+                throw new RuntimeException('MISSING_CREDIT_CATEGORY');
+            }
+
+            $submittedByLineNo[$lineNo] = $creditCategory;
+        }
+
+        $rows = [];
+        $runningMinutes = 0;
+        $creditedHours = 0.0;
+        $applicationYear = null;
+        $applicationMonth = null;
+
+        foreach ($existingRows as $index => $existingRow) {
+            if (!$existingRow instanceof COCApplicationRow) {
+                continue;
+            }
+
+            $lineNo = (int) $existingRow->line_no;
+            if (!isset($submittedByLineNo[$lineNo])) {
+                throw new RuntimeException('MISSING_CREDIT_CATEGORY');
+            }
+
+            $minutes = (int) ($existingRow->minutes ?? 0);
+            if ($minutes < self::MINIMUM_OVERTIME_MINUTES) {
+                throw new RuntimeException('INVALID_CREDIT');
+            }
+
+            $overtimeDate = $existingRow->overtime_date instanceof CarbonImmutable
+                ? $existingRow->overtime_date->startOfDay()
+                : CarbonImmutable::parse((string) $existingRow->overtime_date)->startOfDay();
+
+            if ($applicationYear === null || $applicationMonth === null) {
+                $applicationYear = (int) $overtimeDate->year;
+                $applicationMonth = (int) $overtimeDate->month;
+            } elseif ($applicationYear !== (int) $overtimeDate->year || $applicationMonth !== (int) $overtimeDate->month) {
+                throw new RuntimeException('INVALID_PERIOD');
+            }
+
+            $creditCategory = $submittedByLineNo[$lineNo];
+            $creditableMinutes = $this->calculateCreditableMinutes($minutes);
+            $creditMultiplier = $creditCategory === self::CREDIT_CATEGORY_SPECIAL ? 1.5 : 1.0;
+            $rowCreditedHours = round(($creditableMinutes / self::MINUTES_PER_HOUR) * $creditMultiplier, 2);
+
+            $runningMinutes += $minutes;
+            $creditedHours += $rowCreditedHours;
+
+            $rows[] = [
+                'line_no' => $lineNo,
+                'cumulative_minutes' => $runningMinutes,
+                'credit_category' => $creditCategory,
+                'credit_multiplier' => $creditMultiplier,
+                'creditable_minutes' => $creditableMinutes,
+                'credited_hours' => $rowCreditedHours,
+            ];
+        }
+
+        if (count($rows) !== count($submittedByLineNo)) {
+            throw new RuntimeException('INVALID_REVIEW_ROWS');
+        }
+
+        return [
+            'rows' => $rows,
+            'total_minutes' => $runningMinutes,
+            'credited_hours' => round($creditedHours, 2),
+            'application_year' => $applicationYear,
+            'application_month' => $applicationMonth,
+        ];
+    }
+
+    private function normalizeCreditCategory(mixed $value): ?string
+    {
+        $normalized = strtoupper(trim((string) ($value ?? '')));
+
+        return in_array($normalized, [self::CREDIT_CATEGORY_REGULAR, self::CREDIT_CATEGORY_SPECIAL], true)
+            ? $normalized
+            : null;
+    }
+
+    private function calculateCreditableMinutes(int $minutes): int
+    {
+        if ($minutes <= 0) {
+            return 0;
+        }
+
+        $wholeHoursMinutes = intdiv($minutes, self::MINUTES_PER_HOUR) * self::MINUTES_PER_HOUR;
+        $excessMinutes = $minutes % self::MINUTES_PER_HOUR;
+        $creditableExcessMinutes = $excessMinutes >= self::MINIMUM_CREDITABLE_EXCESS_MINUTES
+            ? $excessMinutes
+            : 0;
+
+        return $wholeHoursMinutes + $creditableExcessMinutes;
+    }
+
+    private function resolveMonthlySubmittedCocHours(
+        string $employeeControlNo,
+        int $applicationYear,
+        int $applicationMonth,
+        ?int $excludeApplicationId = null
+    ): float {
+        return $this->resolveMonthlyCocHoursByStatuses(
+            $employeeControlNo,
+            $applicationYear,
+            $applicationMonth,
+            [COCApplication::STATUS_PENDING, COCApplication::STATUS_APPROVED],
+            $excludeApplicationId
+        );
+    }
+
+    private function resolveMonthlyApprovedCocHours(
+        string $employeeControlNo,
+        int $applicationYear,
+        int $applicationMonth,
+        ?int $excludeApplicationId = null
+    ): float {
+        return $this->resolveMonthlyCocHoursByStatuses(
+            $employeeControlNo,
+            $applicationYear,
+            $applicationMonth,
+            [COCApplication::STATUS_APPROVED],
+            $excludeApplicationId
+        );
+    }
+
+    private function resolveMonthlyCocHoursByStatuses(
+        string $employeeControlNo,
+        int $applicationYear,
+        int $applicationMonth,
+        array $statuses,
+        ?int $excludeApplicationId = null
+    ): float {
+        $applications = COCApplication::query()
+            ->with('rows:id,coc_application_id,overtime_date')
+            ->whereIn('employee_control_no', $this->controlNoCandidates($employeeControlNo))
+            ->whereIn('status', $statuses)
+            ->get([
+                'id',
+                'employee_control_no',
+                'status',
+                'application_year',
+                'application_month',
+                'credited_hours',
+                'cto_credited_days',
+                'total_minutes',
+            ]);
+
+        $hours = 0.0;
+        foreach ($applications as $application) {
+            if (!$application instanceof COCApplication) {
+                continue;
+            }
+
+            if ($excludeApplicationId !== null && (int) $application->id === $excludeApplicationId) {
+                continue;
+            }
+
+            [$rowYear, $rowMonth] = $this->resolveApplicationPeriod($application);
+            if ($rowYear !== $applicationYear || $rowMonth !== $applicationMonth) {
+                continue;
+            }
+
+            $hours += $this->resolveApplicationCreditedHours($application);
+        }
+
+        return round($hours, 2);
+    }
+
+    private function resolveApplicationPeriod(COCApplication $application): array
+    {
+        $applicationYear = (int) ($application->application_year ?? 0);
+        $applicationMonth = (int) ($application->application_month ?? 0);
+
+        if ($applicationYear > 0 && $applicationMonth > 0) {
+            return [$applicationYear, $applicationMonth];
+        }
+
+        $rowDate = $application->relationLoaded('rows')
+            ? optional($application->rows->first())->overtime_date
+            : optional($application->rows()->orderBy('line_no')->first())->overtime_date;
+
+        if ($rowDate) {
+            $resolvedDate = CarbonImmutable::parse((string) $rowDate)->startOfDay();
+            return [(int) $resolvedDate->year, (int) $resolvedDate->month];
+        }
+
+        return [0, 0];
+    }
+
+    private function resolveApplicationCreditedHours(COCApplication $application): float
+    {
+        $creditedHours = round((float) ($application->credited_hours ?? 0), 2);
+        if ($creditedHours > 0) {
+            return $creditedHours;
+        }
+
+        if ($application->relationLoaded('rows')) {
+            $rowCreditedHours = round((float) $application->rows->sum('credited_hours'), 2);
+            if ($rowCreditedHours > 0) {
+                return $rowCreditedHours;
+            }
+        }
+
+        $creditedDays = round((float) ($application->cto_credited_days ?? 0), 2);
+        if ($creditedDays > 0) {
+            return round($creditedDays * self::CTO_HOURS_PER_DAY, 2);
+        }
+
+        return 0.0;
+    }
+
+    private function resolveCurrentCtoAvailableHours(string $employeeControlNo, ?int $ctoLeaveTypeId = null): float
+    {
+        $resolvedLeaveTypeId = $ctoLeaveTypeId ?: (int) ($this->resolveCTOLeaveType()?->id ?? 0);
+        if ($resolvedLeaveTypeId <= 0) {
+            return 0.0;
+        }
+
+        $controlNoCandidates = $this->controlNoCandidates($employeeControlNo);
+        if ($controlNoCandidates === []) {
+            return 0.0;
+        }
+
+        $asOf = CarbonImmutable::today();
+
+        $creditApplications = COCApplication::query()
+            ->with('rows:id,coc_application_id,overtime_date,credited_hours')
+            ->where('status', COCApplication::STATUS_APPROVED)
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->where('cto_leave_type_id', $resolvedLeaveTypeId)
+            ->where(function ($query): void {
+                $query
+                    ->whereNotNull('credited_hours')
+                    ->where('credited_hours', '>', 0)
+                    ->orWhere(function ($nestedQuery): void {
+                        $nestedQuery
+                            ->whereNotNull('cto_credited_days')
+                            ->where('cto_credited_days', '>', 0);
+                    });
+            })
+            ->orderBy('cto_credited_at')
+            ->orderBy('reviewed_at')
+            ->orderBy('id')
+            ->get([
+                'id',
+                'credited_hours',
+                'cto_credited_days',
+                'cto_credited_at',
+                'reviewed_at',
+                'created_at',
+            ]);
+
+        $creditBuckets = [];
+        foreach ($creditApplications as $application) {
+            if (!$application instanceof COCApplication) {
+                continue;
+            }
+
+            $creditedHours = $this->resolveApplicationCreditedHours($application);
+            if ($creditedHours <= 0) {
+                continue;
+            }
+
+            $creditedAtRaw = $application->cto_credited_at ?? $application->reviewed_at ?? $application->created_at;
+            if ($creditedAtRaw === null) {
+                continue;
+            }
+
+            $creditedOn = CarbonImmutable::parse((string) $creditedAtRaw)->startOfDay();
+            $creditBuckets[] = [
+                'expires_on' => $this->resolveCocExpiryDate($creditedOn),
+                'remaining_hours' => $creditedHours,
+            ];
+        }
+
+        if ($creditBuckets === []) {
+            return 0.0;
+        }
+
+        $deductionApplications = LeaveApplication::query()
+            ->where('status', LeaveApplication::STATUS_APPROVED)
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->where('leave_type_id', $resolvedLeaveTypeId)
+            ->where(function ($query): void {
+                $query->where('is_monetization', true)
+                    ->orWhereRaw(
+                        'UPPER(LTRIM(RTRIM(COALESCE(pay_mode, ?)))) <> ?',
+                        [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY]
+                    );
+            })
+            ->orderBy('hr_approved_at')
+            ->orderBy('created_at')
+            ->orderBy('id')
+            ->get([
+                'id',
+                'total_days',
+                'deductible_days',
+                'hr_approved_at',
+                'created_at',
+            ]);
+
+        foreach ($deductionApplications as $application) {
+            if (!$application instanceof LeaveApplication) {
+                continue;
+            }
+
+            $creditsToDeductHours = round(
+                max((float) ($application->deductible_days ?? $application->total_days ?? 0), 0) * self::CTO_HOURS_PER_DAY,
+                2
+            );
+            if ($creditsToDeductHours <= 0) {
+                continue;
+            }
+
+            $deductedAtRaw = $application->hr_approved_at ?? $application->created_at;
+            if ($deductedAtRaw === null) {
+                continue;
+            }
+            $deductedOn = CarbonImmutable::parse((string) $deductedAtRaw)->startOfDay();
+
+            $creditBuckets = array_values(array_filter(
+                $creditBuckets,
+                static fn(array $bucket): bool => $bucket['remaining_hours'] > 0 && $bucket['expires_on']->gte($deductedOn)
+            ));
+
+            if ($creditBuckets === []) {
+                continue;
+            }
+
+            $remainingToDeduct = $creditsToDeductHours;
+            foreach ($creditBuckets as &$bucket) {
+                if ($remainingToDeduct <= 0) {
+                    break;
+                }
+
+                $consumed = min((float) $bucket['remaining_hours'], $remainingToDeduct);
+                $bucket['remaining_hours'] = round((float) $bucket['remaining_hours'] - $consumed, 2);
+                $remainingToDeduct = round($remainingToDeduct - $consumed, 2);
+            }
+            unset($bucket);
+        }
+
+        $availableHours = 0.0;
+        foreach ($creditBuckets as $bucket) {
+            if (($bucket['expires_on'] ?? null) instanceof CarbonImmutable && $bucket['expires_on']->lt($asOf)) {
+                continue;
+            }
+
+            $availableHours += round((float) ($bucket['remaining_hours'] ?? 0), 2);
+        }
+
+        return round(max($availableHours, 0.0), 2);
     }
 
     private function departmentScope(DepartmentAdmin $admin)
@@ -566,9 +1055,19 @@ class COCApplicationController extends Controller
         return $minutes > 0 ? round($minutes / self::MINUTES_PER_WORKDAY, 2) : 0.0;
     }
 
+    private function hoursToLeaveDays(float $hours): float
+    {
+        return $hours > 0 ? round($hours / self::CTO_HOURS_PER_DAY, 2) : 0.0;
+    }
+
     private function minutesToHours(int $minutes): float
     {
         return $minutes > 0 ? round($minutes / 60, 2) : 0.0;
+    }
+
+    private function resolveCocExpiryDate(CarbonImmutable $creditedOn): CarbonImmutable
+    {
+        return CarbonImmutable::create($creditedOn->year + 1, 12, 31)->endOfDay();
     }
 
     private function formatHours(float $hours): string
@@ -587,6 +1086,11 @@ class COCApplicationController extends Controller
             'EMPLOYEE_NOT_FOUND' => response()->json(['message' => 'Employee record not found for this COC application.'], 422),
             'CTO_MISSING' => response()->json(['message' => 'CTO Leave type is missing. Seed or create CTO Leave first.'], 422),
             'INVALID_CREDIT' => response()->json(['message' => 'Invalid COC credit amount.'], 422),
+            'INVALID_PERIOD' => response()->json(['message' => 'Unable to determine the COC application month.'], 422),
+            'MISSING_CREDIT_CATEGORY' => response()->json(['message' => 'HR must classify each COC row as Regular or Special before approval.'], 422),
+            'INVALID_REVIEW_ROWS' => response()->json(['message' => 'The submitted COC review rows do not match this application.'], 422),
+            'MONTHLY_CAP_EXCEEDED' => response()->json(['message' => 'Approving this application would exceed the 40-hour monthly COC limit.'], 422),
+            'BALANCE_CAP_EXCEEDED' => response()->json(['message' => 'Approving this application would exceed the 120-hour maximum COC balance.'], 422),
             default => throw $exception,
         };
     }
@@ -630,8 +1134,7 @@ class COCApplicationController extends Controller
         }
 
         return str_contains($normalized, 'CONTRACTUAL')
-            || str_contains($normalized, 'HONORARIUM')
-            || str_contains($normalized, 'JOB ORDER');
+            || str_contains($normalized, 'HONORARIUM');
     }
 
     private function formatApplication(COCApplication $app, array $leaveBalanceDirectory = []): array
@@ -665,7 +1168,12 @@ class COCApplicationController extends Controller
         $remarks = trim((string) ($app->remarks ?? ''));
         $isCancelled = (bool) preg_match('/^cancelled\b/i', $remarks);
         $durationHours = $this->minutesToHours((int) $app->total_minutes);
+        $creditedHours = $this->resolveApplicationCreditedHours($app);
         $currentLeaveBalances = $this->getCurrentLeaveBalancesForApp($app, $leaveBalanceDirectory);
+        $creditedAt = $app->cto_credited_at ?? $app->reviewed_at ?? $app->created_at;
+        $expiresOn = $app->status === COCApplication::STATUS_APPROVED && $creditedAt
+            ? $this->resolveCocExpiryDate(CarbonImmutable::parse((string) $creditedAt)->startOfDay())->toDateString()
+            : null;
 
         return [
             'id' => $app->id,
@@ -723,11 +1231,14 @@ class COCApplicationController extends Controller
             'reviewed_by_hr_id' => $app->reviewed_by_hr_id,
             'reviewed_at_hr' => $app->reviewed_at?->toIso8601String(),
             'total_no_of_coc_applied_minutes' => (int) $app->total_minutes,
+            'application_year' => $app->application_year !== null ? (int) $app->application_year : null,
+            'application_month' => $app->application_month !== null ? (int) $app->application_month : null,
+            'credited_hours' => $creditedHours > 0 ? $creditedHours : null,
             'cto_leave_type_id' => $app->cto_leave_type_id,
             'cto_leave_type_name' => $app->ctoLeaveType?->name,
             'cto_credited_days' => $app->cto_credited_days !== null ? (float) $app->cto_credited_days : null,
             'cto_credited_at' => $app->cto_credited_at?->toIso8601String(),
-            'cto_expires_on' => $app->cto_credited_at?->copy()->addYearNoOverflow()->toDateString(),
+            'cto_expires_on' => $expiresOn,
             'dateFiled' => $app->created_at?->toDateString(),
             'date_filed' => $app->created_at?->toDateString(),
             'filedAt' => $app->created_at?->toIso8601String(),
@@ -748,6 +1259,10 @@ class COCApplicationController extends Controller
                 'time_to' => $row->time_to,
                 'no_of_hours_and_minutes' => (int) $row->minutes,
                 'total_no_of_hours_and_minutes' => (int) $row->cumulative_minutes,
+                'credit_category' => $row->credit_category,
+                'credit_multiplier' => $row->credit_multiplier !== null ? (float) $row->credit_multiplier : null,
+                'creditable_minutes' => $row->creditable_minutes !== null ? (int) $row->creditable_minutes : null,
+                'credited_hours' => $row->credited_hours !== null ? (float) $row->credited_hours : null,
             ])->values(),
         ];
     }

@@ -1115,13 +1115,13 @@ class EmployeeController extends Controller
             'control_no' => trim((string) ($employee->control_no ?? '')),
             'firstname' => trim((string) ($employee->firstname ?? '')),
             'surname' => trim((string) ($employee->surname ?? '')),
-            'middlename' => $this->trimNullable($employee->middlename ?? null),
-            'designation' => $this->trimNullable($employee->designation ?? null),
+            'middlename' => $this->trimOrBlank($employee->middlename ?? null),
+            'designation' => $this->trimOrBlank($employee->designation ?? null),
             'office' => trim((string) ($employee->office ?? '')),
-            'officeAcronym' => $this->trimNullable($employee->officeAcronym ?? null),
-            'hris_office' => $this->trimNullable($employee->hris_office ?? null),
-            'hrisOfficeAcronym' => $this->trimNullable($employee->hrisOfficeAcronym ?? null),
-            'assigned_department_name' => $this->trimNullable($employee->assigned_department_name ?? null),
+            'officeAcronym' => $this->trimOrBlank($employee->officeAcronym ?? null),
+            'hris_office' => $this->trimOrBlank($employee->hris_office ?? null),
+            'hrisOfficeAcronym' => $this->trimOrBlank($employee->hrisOfficeAcronym ?? null),
+            'assigned_department_name' => $this->trimOrBlank($employee->assigned_department_name ?? null),
             'assigned_department_id' => $employee->assigned_department_id !== null
                 ? (int) $employee->assigned_department_id
                 : null,
@@ -1139,10 +1139,10 @@ class EmployeeController extends Controller
             'control_no' => $departmentHead->control_no,
             'surname' => $departmentHead->surname,
             'firstname' => $departmentHead->firstname,
-            'middlename' => $departmentHead->middlename,
-            'office' => $departmentHead->office,
-            'status' => $departmentHead->status,
-            'designation' => $departmentHead->designation,
+            'middlename' => $this->trimOrBlank($departmentHead->middlename),
+            'office' => $this->trimOrBlank($departmentHead->office),
+            'status' => $this->trimOrBlank($departmentHead->status),
+            'designation' => $this->trimOrBlank($departmentHead->designation),
             'rate_mon' => $departmentHead->rate_mon !== null ? (float) $departmentHead->rate_mon : null,
             'full_name' => $departmentHead->full_name,
             'position' => $departmentHead->position,
@@ -1298,7 +1298,11 @@ class EmployeeController extends Controller
         $normalizedDepartmentName = trim((string) ($departmentName ?? ''));
         $normalizedSearchTerm = trim((string) ($searchTerm ?? ''));
 
-        $rows = HrisEmployee::allCached($activeOnly)
+        $employees = $normalizedDepartmentName !== ''
+            ? HrisEmployee::allByOffice($normalizedDepartmentName, $activeOnly)
+            : HrisEmployee::allCached($activeOnly);
+
+        $rows = $employees
             ->filter(function (object $employee) use (
                 $normalizedDepartmentName,
                 $excludeContractual,
@@ -1619,6 +1623,11 @@ class EmployeeController extends Controller
 
         $text = trim((string) $value);
         return $text === '' ? null : $text;
+    }
+
+    private function trimOrBlank(mixed $value): string
+    {
+        return trim((string) ($value ?? ''));
     }
 
     private function buildLedgerControlNoCandidates(string $controlNo, ?object $employee = null): array

@@ -53,12 +53,18 @@ class HRDashboardController extends Controller
             + $cocApplications->where('status', COCApplication::STATUS_REJECTED)->count();
         $totalRecalled = $applications->where('status', LeaveApplication::STATUS_RECALLED)->count();
         $totalApplications = $applications->count() + $cocApplications->count();
-        $employeeStatusByControlNo = $this->buildEmployeeStatusDirectory(
+        $employeeDirectoryByControlNo = $this->buildEmployeeDirectory(
             $applications
                 ->pluck('employee_control_no')
                 ->concat($cocApplications->pluck('employee_control_no'))
                 ->all()
         );
+        $employeeStatusByControlNo = $this->buildEmployeeStatusDirectory($employeeDirectoryByControlNo);
+        $leaveBalanceDirectory = $this->buildLeaveBalanceDirectory($applications);
+        $activeEmployeeCount = HrisEmployee::countSnapshot(true);
+        if ($activeEmployeeCount <= 0) {
+            $activeEmployeeCount = HrisEmployee::countCached(true);
+        }
 
         // Count employees/admins currently on approved leave today
         $today = now()->toDateString();
@@ -75,7 +81,14 @@ class HRDashboardController extends Controller
             return $startStr <= $today && $endStr >= $today;
         })->count();
 
-        $formatted = $applications->map(fn($app) => $this->formatApplication($app, $employeeStatusByControlNo));
+        $formatted = $applications->map(
+            fn($app) => $this->formatApplication(
+                $app,
+                $employeeDirectoryByControlNo,
+                $employeeStatusByControlNo,
+                $leaveBalanceDirectory
+            )
+        );
         $analytics = $this->buildDashboardTrendAnalytics($applications);
 
         return response()->json([
@@ -92,7 +105,7 @@ class HRDashboardController extends Controller
             ],
             'analytics' => $analytics,
             'on_leave_today' => $onLeaveToday,
-            'active_employees' => HrisEmployee::countCached(true),
+            'active_employees' => $activeEmployeeCount,
             'applications' => $formatted,
         ]);
     }
@@ -131,8 +144,6 @@ class HRDashboardController extends Controller
             ])
             ->all();
 
-        $officeByControlNo = $this->buildDepartmentStatisticsOfficeDirectory();
-
         $applications = LeaveApplication::query()
             ->with([
                 'leaveType:id,name',
@@ -150,6 +161,10 @@ class HRDashboardController extends Controller
                 'is_monetization',
                 'created_at',
             ]);
+
+        $officeByControlNo = $this->buildDepartmentStatisticsOfficeDirectory(
+            $applications->pluck('employee_control_no')->all()
+        );
 
         foreach ($applications as $application) {
             if ((bool) $application->is_monetization) {
@@ -250,12 +265,12 @@ class HRDashboardController extends Controller
         ];
     }
 
-    private function buildDepartmentStatisticsOfficeDirectory(): array
+    private function buildDepartmentStatisticsOfficeDirectory(array $controlNos): array
     {
         $directory = [];
 
-        foreach (HrisEmployee::allCached() as $employee) {
-            $normalizedControlNo = $this->normalizeControlNo($employee->control_no ?? null);
+        foreach ($this->buildEmployeeDirectory($controlNos) as $controlNo => $employee) {
+            $normalizedControlNo = $this->normalizeControlNo($controlNo);
             $office = trim((string) ($employee->office ?? ''));
 
             if ($normalizedControlNo === '' || $office === '') {
@@ -375,7 +390,12 @@ class HRDashboardController extends Controller
         return $name !== '' ? $name : 'Unknown';
     }
 
-    private function formatApplication(LeaveApplication $app, array $employeeStatusByControlNo = []): array
+    private function formatApplication(
+        LeaveApplication $app,
+        array $employeeDirectoryByControlNo = [],
+        array $employeeStatusByControlNo = [],
+        array $leaveBalanceDirectory = []
+    ): array
     {
         $statusMap = [
             LeaveApplication::STATUS_PENDING_ADMIN => 'Pending Admin',
@@ -386,7 +406,7 @@ class HRDashboardController extends Controller
         ];
 
         // Determine applicant name & office
-        $resolvedEmployee = $this->resolveApplicationEmployee($app);
+        $resolvedEmployee = $this->resolveApplicationEmployee($app, $employeeDirectoryByControlNo);
         $employeeName = trim((string) ($app->employee_name ?? ''));
         if ($employeeName === '') {
             $employeeName = $resolvedEmployee
@@ -462,34 +482,22 @@ class HRDashboardController extends Controller
             'deductible_days' => $deductibleDays,
             'is_monetization' => (bool) $app->is_monetization,
             'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
-            'leaveBalance' => $this->getBalanceForApp($app),
+            'leaveBalance' => $this->getBalanceForApp($app, $leaveBalanceDirectory),
         ];
     }
 
-    private function buildEmployeeStatusDirectory(array $controlNos): array
+    private function buildEmployeeDirectory(array $controlNos): array
     {
-        $normalizedControlNos = collect($controlNos)
-            ->map(fn (mixed $value): string => $this->normalizeControlNo($value))
-            ->filter(fn (string $value): bool => $value !== '')
-            ->unique()
-            ->values()
+        return HrisEmployee::directoryByControlNos($controlNos);
+    }
+
+    private function buildEmployeeStatusDirectory(array $employeeDirectoryByControlNo): array
+    {
+        return collect($employeeDirectoryByControlNo)
+            ->mapWithKeys(fn (object $employee, string $controlNo): array => [
+                $controlNo => trim((string) ($employee->status ?? '')) ?: null,
+            ])
             ->all();
-
-        if ($normalizedControlNos === []) {
-            return [];
-        }
-
-        $directory = [];
-        foreach (HrisEmployee::allCached() as $employee) {
-            $normalizedControlNo = $this->normalizeControlNo($employee->control_no ?? null);
-            if ($normalizedControlNo === '' || !in_array($normalizedControlNo, $normalizedControlNos, true)) {
-                continue;
-            }
-
-            $directory[$normalizedControlNo] = trim((string) ($employee->status ?? '')) ?: null;
-        }
-
-        return $directory;
     }
 
     private function buildEmploymentStatusBreakdown(iterable $applications, array $employeeStatusByControlNo): array
@@ -669,41 +677,103 @@ class HRDashboardController extends Controller
         return $trimmed === '' ? null : $trimmed;
     }
 
-    private function getBalanceForApp(LeaveApplication $app): ?float
+    private function buildLeaveBalanceDirectory(iterable $applications): array
     {
-        if ($app->employee_control_no) {
-            $employeeControlNo = trim((string) $app->employee_control_no);
-            $candidateEmployeeControlNos = $this->controlNoCandidates($employeeControlNo);
-            if ($candidateEmployeeControlNos === []) {
-                return null;
+        $leaveTypeIds = [];
+        $candidateControlNos = [];
+
+        foreach ($applications as $application) {
+            if (!$application instanceof LeaveApplication) {
+                continue;
             }
 
-            $balance = LeaveBalance::query()
-                ->where('leave_type_id', $app->leave_type_id)
-                ->whereIn('employee_control_no', $candidateEmployeeControlNos)
-                ->first();
-            return $balance ? (float) $balance->balance : null;
+            $leaveTypeId = (int) ($application->leave_type_id ?? 0);
+            if ($leaveTypeId <= 0) {
+                continue;
+            }
+
+            $controlNoCandidates = $this->resolveApplicationBalanceControlCandidates($application);
+            if ($controlNoCandidates === []) {
+                continue;
+            }
+
+            $leaveTypeIds[$leaveTypeId] = true;
+
+            foreach ($controlNoCandidates as $controlNoCandidate) {
+                $candidateControlNos[$controlNoCandidate] = true;
+            }
         }
 
-        if ($app->applicant_admin_id) {
-            $adminControlNo = $this->resolveAdminEmployeeControlNo((int) $app->applicant_admin_id);
-            if ($adminControlNo === null) {
-                return null;
+        if ($leaveTypeIds === [] || $candidateControlNos === []) {
+            return [];
+        }
+
+        $directory = [];
+
+        foreach (
+            LeaveBalance::query()
+                ->whereIn('leave_type_id', array_keys($leaveTypeIds))
+                ->whereIn('employee_control_no', array_keys($candidateControlNos))
+                ->get(['leave_type_id', 'employee_control_no', 'balance']) as $balance
+        ) {
+            $leaveTypeId = (int) ($balance->leave_type_id ?? 0);
+            $rawControlNo = trim((string) ($balance->employee_control_no ?? ''));
+
+            if ($leaveTypeId <= 0 || $rawControlNo === '') {
+                continue;
             }
 
-            $candidateEmployeeControlNos = $this->controlNoCandidates($adminControlNo);
-            if ($candidateEmployeeControlNos === []) {
-                return null;
-            }
+            $resolvedBalance = (float) ($balance->balance ?? 0);
+            $directory[$leaveTypeId][$rawControlNo] = $resolvedBalance;
 
-            $balance = LeaveBalance::query()
-                ->where('leave_type_id', $app->leave_type_id)
-                ->whereIn('employee_control_no', $candidateEmployeeControlNos)
-                ->first();
-            return $balance ? (float) $balance->balance : null;
+            $normalizedControlNo = $this->normalizeControlNo($rawControlNo);
+            if ($normalizedControlNo !== '') {
+                $directory[$leaveTypeId][$normalizedControlNo] = $resolvedBalance;
+            }
+        }
+
+        return $directory;
+    }
+
+    private function getBalanceForApp(LeaveApplication $app, array $leaveBalanceDirectory = []): ?float
+    {
+        $leaveTypeId = (int) ($app->leave_type_id ?? 0);
+        if ($leaveTypeId <= 0) {
+            return null;
+        }
+
+        foreach ($this->resolveApplicationBalanceControlCandidates($app) as $controlNoCandidate) {
+            if (array_key_exists($controlNoCandidate, $leaveBalanceDirectory[$leaveTypeId] ?? [])) {
+                return (float) $leaveBalanceDirectory[$leaveTypeId][$controlNoCandidate];
+            }
         }
 
         return null;
+    }
+
+    private function resolveApplicationBalanceControlCandidates(LeaveApplication $app): array
+    {
+        $employeeControlNo = trim((string) ($app->employee_control_no ?? ''));
+        if ($employeeControlNo !== '') {
+            return $this->controlNoCandidates($employeeControlNo);
+        }
+
+        $adminControlNo = trim((string) ($app->applicantAdmin?->employee_control_no ?? ''));
+        if ($adminControlNo !== '') {
+            return $this->controlNoCandidates($adminControlNo);
+        }
+
+        if (!$app->applicant_admin_id) {
+            return [];
+        }
+
+        $fallbackAdminControlNo = trim((string) (
+            DepartmentAdmin::query()->whereKey((int) $app->applicant_admin_id)->value('employee_control_no') ?? ''
+        ));
+
+        return $fallbackAdminControlNo !== ''
+            ? $this->controlNoCandidates($fallbackAdminControlNo)
+            : [];
     }
 
     private function resolveAdminEmployeeControlNo(int $adminId): ?string
@@ -726,11 +796,16 @@ class HRDashboardController extends Controller
         return trim((string) ($employee?->control_no ?? $rawControlNo));
     }
 
-    private function resolveApplicationEmployee(LeaveApplication $application): ?object
+    private function resolveApplicationEmployee(LeaveApplication $application, array $employeeDirectoryByControlNo = []): ?object
     {
         $controlNo = trim((string) ($application->employee_control_no ?? ''));
         if ($controlNo === '') {
             return null;
+        }
+
+        $normalizedControlNo = $this->normalizeControlNo($controlNo);
+        if ($normalizedControlNo !== '' && array_key_exists($normalizedControlNo, $employeeDirectoryByControlNo)) {
+            return $employeeDirectoryByControlNo[$normalizedControlNo];
         }
 
         return HrisEmployee::findByControlNo($controlNo);
@@ -748,14 +823,10 @@ class HRDashboardController extends Controller
             $normalizedControlNo = '0';
         }
 
-        $candidates = [$rawControlNo, $normalizedControlNo];
-
-        $employee = HrisEmployee::findByControlNo($rawControlNo);
-        if ($employee && trim((string) $employee->control_no) !== '') {
-            $candidates[] = trim((string) $employee->control_no);
-        }
-
-        return array_values(array_unique(array_filter($candidates, fn(string $value): bool => $value !== '')));
+        return array_values(array_unique(array_filter(
+            [$rawControlNo, $normalizedControlNo],
+            fn(string $value): bool => $value !== ''
+        )));
     }
 
     /**
@@ -802,8 +873,12 @@ class HRDashboardController extends Controller
 
         $applications = $query->orderBy('start_date')->get();
 
-        $formatted = $applications->map(function ($app): array {
-            $employee = $this->resolveApplicationEmployee($app);
+        $employeeDirectoryByControlNo = $this->buildEmployeeDirectory(
+            $applications->pluck('employee_control_no')->all()
+        );
+
+        $formatted = $applications->map(function ($app) use ($employeeDirectoryByControlNo): array {
+            $employee = $this->resolveApplicationEmployee($app, $employeeDirectoryByControlNo);
             $resolvedEmployeeName = trim((string) ($app->employee_name ?? ''));
             if ($resolvedEmployeeName === '') {
                 $resolvedEmployeeName = $employee

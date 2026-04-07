@@ -599,14 +599,14 @@ class HRUserManagementController extends Controller
             'control_no' => trim((string) $employee->control_no),
             'surname' => trim((string) $employee->surname),
             'firstname' => trim((string) $employee->firstname),
-            'middlename' => trim((string) $employee->middlename) !== '' ? trim((string) $employee->middlename) : null,
+            'middlename' => trim((string) ($employee->middlename ?? '')),
             'full_name' => $this->buildEmployeeDisplayName($employee),
             'birth_date' => $employee->birth_date instanceof \DateTimeInterface
                 ? $employee->birth_date->format('Y-m-d')
-                : (trim((string) ($employee->birth_date ?? '')) !== '' ? trim((string) $employee->birth_date) : null),
+                : trim((string) ($employee->birth_date ?? '')),
             'office' => trim((string) $employee->office),
-            'status' => $status !== '' ? $status : null,
-            'designation' => trim((string) $employee->designation) !== '' ? trim((string) $employee->designation) : null,
+            'status' => $status,
+            'designation' => trim((string) ($employee->designation ?? '')),
         ];
     }
 

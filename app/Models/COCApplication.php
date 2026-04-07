@@ -32,6 +32,9 @@ class COCApplication extends Model
         'cto_credited_days',
         'cto_credited_at',
         'total_minutes',
+        'application_year',
+        'application_month',
+        'credited_hours',
         'remarks',
         'submitted_at',
     ];
@@ -47,6 +50,9 @@ class COCApplication extends Model
             'cto_credited_days' => 'decimal:2',
             'cto_credited_at' => 'datetime',
             'total_minutes' => 'integer',
+            'application_year' => 'integer',
+            'application_month' => 'integer',
+            'credited_hours' => 'decimal:2',
             'submitted_at' => 'datetime',
         ];
     }

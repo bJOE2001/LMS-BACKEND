@@ -782,13 +782,15 @@ class HRReportController extends Controller
                 ];
             }
 
-            $aggregate['earned_hours'] += $this->minutesToHours((int) ($cocApplication->total_minutes ?? 0));
+            $aggregate['earned_hours'] += $this->resolveApprovedCocEarnedHours($cocApplication);
             $aggregate['has_exact_history'] = true;
 
             $creditedAt = $cocApplication->cto_credited_at ?? $cocApplication->reviewed_at ?? $cocApplication->created_at;
             if ($creditedAt) {
                 $aggregate['earned_dates'][] = $creditedAt->copy();
-                $aggregate['expiry_dates'][] = $creditedAt->copy()->addYearNoOverflow();
+                $aggregate['expiry_dates'][] = $this->resolveCocExpiryDate(
+                    \Carbon\CarbonImmutable::parse((string) $creditedAt)->startOfDay()
+                );
 
                 if (!$aggregate['latest_earned_at'] || $creditedAt->gt($aggregate['latest_earned_at'])) {
                     $aggregate['latest_earned_at'] = $creditedAt->copy();
@@ -1537,6 +1539,26 @@ class HRReportController extends Controller
         } catch (\Throwable) {
             return null;
         }
+    }
+
+    private function resolveApprovedCocEarnedHours(COCApplication $application): float
+    {
+        $creditedHours = round((float) ($application->credited_hours ?? 0), 2);
+        if ($creditedHours > 0) {
+            return $creditedHours;
+        }
+
+        $creditedDays = round((float) ($application->cto_credited_days ?? 0), 2);
+        if ($creditedDays > 0) {
+            return round($creditedDays * self::HOURS_PER_WORKDAY, 2);
+        }
+
+        return $this->minutesToHours((int) ($application->total_minutes ?? 0));
+    }
+
+    private function resolveCocExpiryDate(\Carbon\CarbonImmutable $creditedOn): \Carbon\CarbonImmutable
+    {
+        return \Carbon\CarbonImmutable::create($creditedOn->year + 1, 12, 31)->endOfDay();
     }
 
     private function resolveCtoLeaveTypeId(): ?int

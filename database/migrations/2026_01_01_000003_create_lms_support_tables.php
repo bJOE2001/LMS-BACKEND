@@ -102,6 +102,9 @@ return new class extends Migration {
             $table->decimal('cto_credited_days', 8, 2)->nullable();
             $table->timestamp('cto_credited_at')->nullable();
             $table->unsignedInteger('total_minutes');
+            $table->unsignedSmallInteger('application_year')->nullable();
+            $table->unsignedTinyInteger('application_month')->nullable();
+            $table->decimal('credited_hours', 8, 2)->nullable();
             $table->text('remarks')->nullable();
             $table->timestamp('submitted_at')->useCurrent();
             $table->timestamps();
@@ -110,6 +113,7 @@ return new class extends Migration {
             $table->index(['employee_control_no', 'created_at'], 'IX_tblCOCApplications_employee_control_no_created_at');
             $table->index(['status', 'created_at'], 'ix_tblcocapplications_status_created_at');
             $table->index(['reviewed_by_admin_id', 'admin_reviewed_at'], 'ix_tblcocapplications_admin_review');
+            $table->index(['employee_control_no', 'application_year', 'application_month'], 'ix_tblcocapplications_employee_period');
         });
 
         Schema::create('tblCOCApplicationRows', function (Blueprint $table): void {
@@ -126,6 +130,10 @@ return new class extends Migration {
             $table->string('time_to', 5);
             $table->unsignedInteger('minutes');
             $table->unsignedInteger('cumulative_minutes');
+            $table->string('credit_category', 16)->nullable();
+            $table->decimal('credit_multiplier', 4, 2)->nullable();
+            $table->unsignedInteger('creditable_minutes')->nullable();
+            $table->decimal('credited_hours', 8, 2)->nullable();
             $table->timestamps();
 
             $table->index(['coc_application_id', 'line_no']);
