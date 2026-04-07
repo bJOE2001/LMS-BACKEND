@@ -51,11 +51,14 @@ Route::prefix('erms')->middleware('erms.auth')->group(function () {
     Route::post('/apply-leave', [LeaveApplicationController::class, 'ermsStore']);
     Route::post('/apply-leave/request-update', [LeaveApplicationController::class, 'ermsRequestUpdate']);
     Route::post('/apply-leave/{id}/request-update', [LeaveApplicationController::class, 'ermsRequestUpdate']);
+    Route::post('/apply-leave/request-cancel', [LeaveApplicationController::class, 'ermsRequestCancel']);
+    Route::post('/apply-leave/{id}/request-cancel', [LeaveApplicationController::class, 'ermsRequestCancel']);
     Route::get('/coc-records', [COCApplicationController::class, 'ermsIndex']);
     Route::get('/apply-coc', [COCApplicationController::class, 'ermsIndex']);
     Route::post('/apply-coc', [COCApplicationController::class, 'ermsStore']);
     Route::post('/leave-applications/{id}/cancel', [LeaveApplicationController::class, 'ermsCancel']);
     Route::post('/leave-applications/{id}/request-update', [LeaveApplicationController::class, 'ermsRequestUpdate']);
+    Route::post('/leave-applications/{id}/request-cancel', [LeaveApplicationController::class, 'ermsRequestCancel']);
     Route::post('/leave-applications/{id}/edit-request', [LeaveApplicationController::class, 'ermsRequestUpdate']);
     Route::post('/leave-applications/{id}/request-edit', [LeaveApplicationController::class, 'ermsRequestEdit']);
 });
@@ -170,6 +173,8 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::get('/leave-applications/{id}/attachment', [LeaveApplicationController::class, 'hrViewAttachment']);
         Route::post('/leave-applications/{id}/receive', [LeaveApplicationController::class, 'hrReceive']);
         Route::post('/leave-applications/{id}/release', [LeaveApplicationController::class, 'hrRelease']);
+        Route::post('/leave-applications/{id}/update-receive', [LeaveApplicationController::class, 'hrReceiveUpdate']);
+        Route::post('/leave-applications/{id}/update-release', [LeaveApplicationController::class, 'hrReleaseUpdate']);
         Route::post('/leave-applications/{id}/approve', [LeaveApplicationController::class, 'hrApprove']);
         Route::post('/leave-applications/{id}/reject', [LeaveApplicationController::class, 'hrReject']);
         Route::post('/leave-applications/{id}/recall', [LeaveApplicationController::class, 'hrRecall']);
