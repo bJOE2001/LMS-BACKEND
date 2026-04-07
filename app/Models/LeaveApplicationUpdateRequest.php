@@ -15,6 +15,8 @@ class LeaveApplicationUpdateRequest extends Model
     public const STATUS_PENDING = 'PENDING';
     public const STATUS_APPROVED = 'APPROVED';
     public const STATUS_REJECTED = 'REJECTED';
+    public const ACTION_TYPE_UPDATE = 'REQUEST_UPDATE';
+    public const ACTION_TYPE_CANCEL = 'REQUEST_CANCEL';
 
     protected $fillable = [
         'leave_application_id',
