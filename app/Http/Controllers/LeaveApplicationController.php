@@ -211,7 +211,8 @@ class LeaveApplicationController extends Controller
             ])
             ->orderBy('name')
             ->get()
-            ->filter(fn(LeaveType $leaveType): bool => $leaveType->allowsEmploymentStatus($employee->status ?? null))
+            ->filter(fn(LeaveType $leaveType): bool => !$this->employeeHasResolvedEmploymentStatus($employee)
+                || $leaveType->allowsEmploymentStatus($employee->status ?? null))
             ->values();
 
         $typesByName = $types
@@ -3162,7 +3163,7 @@ class LeaveApplicationController extends Controller
             'raw_status' => $this->trimNullableString($employee->status ?? null),
             'employment_status_key' => $statusKey,
             'ui_variant' => $statusKey === LeaveType::EMPLOYMENT_STATUS_CONTRACTUAL ? 'contractual' : 'default',
-            'allowed_leave_scope' => 'configured',
+            'allowed_leave_scope' => $this->employeeHasResolvedEmploymentStatus($employee) ? 'configured' : 'unverified',
             'is_contractual' => $statusKey === LeaveType::EMPLOYMENT_STATUS_CONTRACTUAL,
         ];
     }
@@ -3181,7 +3182,8 @@ class LeaveApplicationController extends Controller
                 'requires_documents',
                 'allowed_status',
             ])
-            ->filter(fn(LeaveType $leaveType): bool => $leaveType->allowsEmploymentStatus($employee->status ?? null))
+            ->filter(fn(LeaveType $leaveType): bool => !$this->employeeHasResolvedEmploymentStatus($employee)
+                || $leaveType->allowsEmploymentStatus($employee->status ?? null))
             ->map(fn(LeaveType $leaveType): array => [
                 'id' => (int) $leaveType->id,
                 'name' => $leaveType->name,
@@ -3218,6 +3220,10 @@ class LeaveApplicationController extends Controller
         LeaveType $leaveType,
         string $fallbackMessage
     ): ?JsonResponse {
+        if (!$this->employeeHasResolvedEmploymentStatus($employee)) {
+            return null;
+        }
+
         if ($leaveType->allowsEmploymentStatus($employee->status ?? null)) {
             return null;
         }
@@ -3246,6 +3252,11 @@ class LeaveApplicationController extends Controller
                 'leave_type_id' => [$message],
             ],
         ], 422);
+    }
+
+    private function employeeHasResolvedEmploymentStatus(object $employee): bool
+    {
+        return $this->resolveEmploymentStatusKey($employee->status ?? null) !== null;
     }
 
     private function resolveEmploymentStatusKey(?string $status): ?string
@@ -3564,8 +3575,8 @@ class LeaveApplicationController extends Controller
                 'transaction_type' => 'CREDIT',
                 'label' => 'COC converted to CTO',
                 'description' => 'Approved COC application converted to CTO credits',
-                'expires_on' => $creditedAt->copy()->addYearNoOverflow()->toDateString(),
-                'is_expired' => $creditedAt->copy()->addYearNoOverflow()->lt(\Carbon\CarbonImmutable::today()),
+                'expires_on' => $this->resolveCocExpiryDate(\Carbon\CarbonImmutable::parse((string) $creditedAt)->startOfDay())->toDateString(),
+                'is_expired' => $this->resolveCocExpiryDate(\Carbon\CarbonImmutable::parse((string) $creditedAt)->startOfDay())->lt(\Carbon\CarbonImmutable::today()),
                 'application_id' => 'COC-' . (int) $application->id,
                 'coc_application_id' => (int) $application->id,
                 'source' => 'COC_APPLICATION',
@@ -5354,7 +5365,7 @@ class LeaveApplicationController extends Controller
             $creditedOn = \Carbon\CarbonImmutable::parse($creditedAtRaw)->startOfDay();
             $creditBuckets[] = [
                 'credited_on' => $creditedOn,
-                'expires_on' => $creditedOn->addYearNoOverflow(),
+                'expires_on' => $this->resolveCocExpiryDate($creditedOn),
                 'remaining' => $creditedDays,
             ];
         }
@@ -5444,6 +5455,11 @@ class LeaveApplicationController extends Controller
         }
 
         return round(max($available, 0.0), 2);
+    }
+
+    private function resolveCocExpiryDate(\Carbon\CarbonImmutable $creditedOn): \Carbon\CarbonImmutable
+    {
+        return \Carbon\CarbonImmutable::create($creditedOn->year + 1, 12, 31)->endOfDay();
     }
 
     private function resolveForcedLeaveTypeId(): ?int

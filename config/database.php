@@ -2,6 +2,32 @@
 
 use Illuminate\Support\Str;
 
+$envOrDefault = static function (string $key, mixed $default): mixed {
+    $value = env($key);
+
+    if ($value === null) {
+        return $default;
+    }
+
+    if (is_string($value) && trim($value) === '') {
+        return $default;
+    }
+
+    return $value;
+};
+
+$sqlsrvOptions = static function (string $queryTimeoutKey) use ($envOrDefault): array {
+    $queryTimeout = (int) $envOrDefault($queryTimeoutKey, 5);
+
+    if (!defined('\PDO::SQLSRV_ATTR_QUERY_TIMEOUT') || $queryTimeout <= 0) {
+        return [];
+    }
+
+    return [
+        \PDO::SQLSRV_ATTR_QUERY_TIMEOUT => $queryTimeout,
+    ];
+};
+
 return [
 
     /*
@@ -121,13 +147,15 @@ return [
         'hr' => [
             'driver' => env('HR_DB_CONNECTION', 'sqlsrv'),
             'host' => env('HR_DB_HOST', 'localhost'),
-            'port' => env('HR_DB_PORT', '1433'),
+            'port' => $envOrDefault('HR_DB_PORT', '1433'),
             'database' => env('HR_DB_DATABASE', 'pmis2003'),
             'username' => env('HR_DB_USERNAME', ''),
             'password' => env('HR_DB_PASSWORD', ''),
             'charset' => 'utf8',
             'prefix' => '',
             'prefix_indexes' => true,
+            'login_timeout' => (int) $envOrDefault('HR_DB_LOGIN_TIMEOUT', 5),
+            'options' => $sqlsrvOptions('HR_DB_QUERY_TIMEOUT'),
         ],
 
         /*

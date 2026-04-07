@@ -20,6 +20,10 @@ class COCApplicationRow extends Model
         'time_to',
         'minutes',
         'cumulative_minutes',
+        'credit_category',
+        'credit_multiplier',
+        'creditable_minutes',
+        'credited_hours',
     ];
 
     protected function casts(): array
@@ -31,6 +35,10 @@ class COCApplicationRow extends Model
             'overtime_date' => 'date',
             'minutes' => 'integer',
             'cumulative_minutes' => 'integer',
+            'credit_category' => 'string',
+            'credit_multiplier' => 'decimal:2',
+            'creditable_minutes' => 'integer',
+            'credited_hours' => 'decimal:2',
         ];
     }
 
