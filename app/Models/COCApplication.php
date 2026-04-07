@@ -35,6 +35,8 @@ class COCApplication extends Model
         'application_year',
         'application_month',
         'credited_hours',
+        'certificate_number',
+        'certificate_issued_at',
         'remarks',
         'submitted_at',
     ];
@@ -53,6 +55,7 @@ class COCApplication extends Model
             'application_year' => 'integer',
             'application_month' => 'integer',
             'credited_hours' => 'decimal:2',
+            'certificate_issued_at' => 'date',
             'submitted_at' => 'datetime',
         ];
     }

@@ -37,6 +37,7 @@ class LeaveApplication extends Model
                 $application->selected_date_pay_status = null;
                 $application->selected_date_coverage = null;
                 $application->deductible_days = round((float) ($application->total_days ?? 0), 2);
+                $application->cto_deducted_hours = null;
                 return;
             }
 
@@ -57,11 +58,10 @@ class LeaveApplication extends Model
                 $deductibleDays = 0.0;
             }
 
-            if ($totalDays > 0 && $deductibleDays > $totalDays) {
-                $deductibleDays = $totalDays;
-            }
-
             $application->deductible_days = $deductibleDays;
+            $application->cto_deducted_hours = $application->cto_deducted_hours !== null
+                ? round(max((float) $application->cto_deducted_hours, 0.0), 2)
+                : null;
         });
     }
 
@@ -78,6 +78,7 @@ class LeaveApplication extends Model
         'total_days',
         'reason',
         'deductible_days',
+        'cto_deducted_hours',
         'status',
         'admin_id',
         'hr_id',
@@ -109,6 +110,7 @@ class LeaveApplication extends Model
             'end_date' => 'date',
             'total_days' => 'decimal:2',
             'deductible_days' => 'decimal:2',
+            'cto_deducted_hours' => 'decimal:2',
             'admin_approved_at' => 'datetime',
             'hr_approved_at' => 'datetime',
             'recall_effective_date' => 'date',

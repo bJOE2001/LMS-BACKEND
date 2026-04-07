@@ -105,6 +105,8 @@ return new class extends Migration {
             $table->unsignedSmallInteger('application_year')->nullable();
             $table->unsignedTinyInteger('application_month')->nullable();
             $table->decimal('credited_hours', 8, 2)->nullable();
+            $table->string('certificate_number')->nullable();
+            $table->date('certificate_issued_at')->nullable();
             $table->text('remarks')->nullable();
             $table->timestamp('submitted_at')->useCurrent();
             $table->timestamps();
@@ -128,7 +130,9 @@ return new class extends Migration {
             $table->text('nature_of_overtime');
             $table->string('time_from', 5);
             $table->string('time_to', 5);
+            $table->boolean('is_overnight')->default(false);
             $table->unsignedInteger('minutes');
+            $table->unsignedInteger('break_minutes')->default(0);
             $table->unsignedInteger('cumulative_minutes');
             $table->string('credit_category', 16)->nullable();
             $table->decimal('credit_multiplier', 4, 2)->nullable();
@@ -138,6 +142,29 @@ return new class extends Migration {
 
             $table->index(['coc_application_id', 'line_no']);
             $table->index(['employee_control_no', 'overtime_date'], 'IX_tblCOCApplicationRows_employee_control_no_overtime_date');
+        });
+
+        Schema::create('tblCOCLedgerEntries', function (Blueprint $table): void {
+            $table->id();
+            $table->string('employee_control_no');
+            $table->foreignId('leave_type_id')
+                ->constrained('tblLeaveTypes')
+                ->noActionOnDelete();
+            $table->unsignedInteger('sequence_no');
+            $table->string('entry_type', 24);
+            $table->string('reference_type', 32)->nullable();
+            $table->unsignedBigInteger('coc_application_id')->nullable();
+            $table->unsignedBigInteger('leave_application_id')->nullable();
+            $table->decimal('hours', 10, 2);
+            $table->decimal('balance_after_hours', 10, 2);
+            $table->timestamp('effective_at');
+            $table->date('expires_on')->nullable();
+            $table->text('remarks')->nullable();
+            $table->timestamps();
+
+            $table->index(['employee_control_no', 'leave_type_id'], 'ix_tblcocledgerentries_employee_leave_type');
+            $table->index(['employee_control_no', 'effective_at'], 'ix_tblcocledgerentries_employee_effective_at');
+            $table->index(['leave_type_id', 'entry_type'], 'ix_tblcocledgerentries_leave_type_entry_type');
         });
 
         if (Schema::hasTable('tblNotifications') && !Schema::hasColumn('tblNotifications', 'coc_application_id')) {
@@ -164,6 +191,7 @@ return new class extends Migration {
 
         Schema::dropIfExists('tblEmployeeWorkScheduleOverrides');
         Schema::dropIfExists('tblWorkScheduleSettings');
+        Schema::dropIfExists('tblCOCLedgerEntries');
         Schema::dropIfExists('tblCOCApplicationRows');
         Schema::dropIfExists('tblCOCApplications');
         Schema::dropIfExists('tblDepartmentHeads');
