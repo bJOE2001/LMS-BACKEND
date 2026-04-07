@@ -2,7 +2,6 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\COCApplication;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
@@ -13,6 +12,7 @@ use App\Models\LeaveBalance;
 use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveType;
 use App\Models\Notification;
+use App\Services\CocLedgerService;
 use App\Services\WorkScheduleService;
 
 use Illuminate\Filesystem\FilesystemAdapter;
@@ -20,6 +20,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 
 /**
@@ -32,6 +33,8 @@ use Illuminate\Support\Facades\Storage;
  */
 class LeaveApplicationController extends Controller
 {
+    private const CTO_STANDARD_DAY_HOURS = WorkScheduleService::STANDARD_WORKDAY_HOURS;
+
     public function __construct()
     {
     }
@@ -39,6 +42,24 @@ class LeaveApplicationController extends Controller
     private function workScheduleService(): WorkScheduleService
     {
         return app(WorkScheduleService::class);
+    }
+
+    private function cocLedgerService(): CocLedgerService
+    {
+        return app(CocLedgerService::class);
+    }
+
+    private function hasLeaveApplicationCtoHoursColumn(): bool
+    {
+        static $resolved = false;
+        static $hasColumn = false;
+
+        if (!$resolved) {
+            $hasColumn = Schema::hasColumn('tblLeaveApplications', 'cto_deducted_hours');
+            $resolved = true;
+        }
+
+        return $hasColumn;
     }
     // ─── Employee: List own applications ──────────────────────────────
 
@@ -104,6 +125,9 @@ class LeaveApplicationController extends Controller
             'leave_type_id' => $leaveType->id,
             'leave_type_name' => $leaveType->name,
             'balance' => $balance ? (float) $balance->balance : 0,
+            'balance_hours' => $this->isCtoLeaveType($leaveType, (int) $leaveType->id)
+                ? $this->resolveCtoDeductedHours((float) ($balance?->balance ?? 0.0))
+                : null,
         ]);
     }
 
@@ -421,6 +445,7 @@ class LeaveApplicationController extends Controller
         $requestedPayMode = $policyResolution['pay_mode'];
         $selectedDatePayStatus = $policyResolution['selected_date_pay_status'];
         $deductibleDays = (float) ($policyResolution['deductible_days'] ?? 0);
+        $ctoDeductedHours = (float) ($policyResolution['cto_deducted_hours'] ?? 0);
         $attachmentRequired = (bool) ($policyResolution['attachment_required'] ?? false);
         $attachmentSubmitted = (bool) ($policyResolution['attachment_submitted'] ?? false);
         $attachmentReference = $policyResolution['attachment_reference'] ?? null;
@@ -441,12 +466,17 @@ class LeaveApplicationController extends Controller
             (int) $validated['leave_type_id'],
             (float) $validated['total_days'],
             $requestedPayMode,
-            $deductibleDays
+            $deductibleDays,
+            $ctoDeductedHours > 0 ? $ctoDeductedHours : null
         );
         if ($eligibility instanceof JsonResponse) {
             return $eligibility;
         }
         if (($eligibility['insufficient_balance'] ?? false) === true) {
+            if ($this->isCtoLeaveType($leaveType, (int) $validated['leave_type_id'])) {
+                return $this->buildInsufficientCtoBalanceResponse($eligibility);
+            }
+
             $allocation = $this->resolveCreditBasedPayAllocation(
                 $resolvedSelectedDates,
                 $selectedDateCoverage,
@@ -469,6 +499,7 @@ class LeaveApplicationController extends Controller
             $selectedDateCoverage,
             $resolvedSelectedDates,
             $deductibleDays,
+            $ctoDeductedHours,
             $attachmentRequired,
             $attachmentSubmitted,
             $attachmentReference
@@ -480,6 +511,7 @@ class LeaveApplicationController extends Controller
                 'end_date' => $validated['end_date'],
                 'total_days' => $validated['total_days'],
                 'deductible_days' => $deductibleDays,
+                'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn() && $ctoDeductedHours > 0 ? $ctoDeductedHours : null,
                 'reason' => $validated['reason'] ?? null,
                 'selected_dates' => $resolvedSelectedDates,
                 'selected_date_pay_status' => $selectedDatePayStatus,
@@ -1214,6 +1246,7 @@ class LeaveApplicationController extends Controller
         $requestedPayMode = $policyResolution['pay_mode'];
         $selectedDatePayStatus = $policyResolution['selected_date_pay_status'];
         $deductibleDays = (float) ($policyResolution['deductible_days'] ?? 0);
+        $ctoDeductedHours = (float) ($policyResolution['cto_deducted_hours'] ?? 0);
         $attachmentRequired = (bool) ($policyResolution['attachment_required'] ?? false);
         $attachmentSubmitted = (bool) ($policyResolution['attachment_submitted'] ?? false);
         $attachmentReference = $policyResolution['attachment_reference'] ?? null;
@@ -1234,12 +1267,17 @@ class LeaveApplicationController extends Controller
             (int) $validated['leave_type_id'],
             (float) $validated['total_days'],
             $requestedPayMode,
-            $deductibleDays
+            $deductibleDays,
+            $ctoDeductedHours > 0 ? $ctoDeductedHours : null
         );
         if ($eligibility instanceof JsonResponse) {
             return $eligibility;
         }
         if (($eligibility['insufficient_balance'] ?? false) === true) {
+            if ($this->isCtoLeaveType($leaveType, (int) $validated['leave_type_id'])) {
+                return $this->buildInsufficientCtoBalanceResponse($eligibility);
+            }
+
             $allocation = $this->resolveCreditBasedPayAllocation(
                 $resolvedSelectedDates,
                 $selectedDateCoverage,
@@ -1262,6 +1300,7 @@ class LeaveApplicationController extends Controller
             $selectedDateCoverage,
             $resolvedSelectedDates,
             $deductibleDays,
+            $ctoDeductedHours,
             $attachmentRequired,
             $attachmentSubmitted,
             $attachmentReference
@@ -1273,6 +1312,7 @@ class LeaveApplicationController extends Controller
                 'end_date' => $validated['end_date'],
                 'total_days' => $validated['total_days'],
                 'deductible_days' => $deductibleDays,
+                'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn() && $ctoDeductedHours > 0 ? $ctoDeductedHours : null,
                 'reason' => $validated['reason'] ?? null,
                 'selected_dates' => $resolvedSelectedDates,
                 'selected_date_pay_status' => $selectedDatePayStatus,
@@ -2215,6 +2255,7 @@ class LeaveApplicationController extends Controller
         $normalizedPayMode = $policyResolution['pay_mode'];
         $resolvedSelectedDatePayStatus = $policyResolution['selected_date_pay_status'];
         $daysToDeduct = (float) ($policyResolution['deductible_days'] ?? 0);
+        $ctoDeductedHours = (float) ($policyResolution['cto_deducted_hours'] ?? 0);
         $attachmentRequired = (bool) ($policyResolution['attachment_required'] ?? false);
         $attachmentSubmitted = (bool) ($policyResolution['attachment_submitted'] ?? false);
         $attachmentReference = $policyResolution['attachment_reference'] ?? null;
@@ -2327,6 +2368,7 @@ class LeaveApplicationController extends Controller
                 $shouldDeductForcedLeave,
                 $shouldDeductVacationLeave,
                 $daysToDeduct,
+                $ctoDeductedHours,
                 $isCtoDeduction,
                 $normalizedPayMode,
                 $resolvedSelectedDatePayStatus,
@@ -2362,6 +2404,7 @@ class LeaveApplicationController extends Controller
                     'pay_mode' => $normalizedPayMode,
                     'selected_date_pay_status' => $resolvedSelectedDatePayStatus,
                     'deductible_days' => $daysToDeduct,
+                    'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn() && $isCtoDeduction && $ctoDeductedHours > 0 ? $ctoDeductedHours : null,
                     'linked_forced_leave_deducted_days' => $linkedForcedLeaveDeductedDays,
                     'linked_vacation_leave_deducted_days' => $linkedVacationLeaveDeductedDays,
                     'attachment_required' => $attachmentRequired,
@@ -2449,6 +2492,10 @@ class LeaveApplicationController extends Controller
             return response()->json([
                 'message' => "Insufficient leave balance. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($daysToDeduct) . ".",
             ], 422);
+        }
+
+        if ($isCtoDeduction && $app->employee_control_no) {
+            $this->syncEmployeeCtoBalance((string) $app->employee_control_no, true);
         }
 
         // Notify the applicant
@@ -2898,6 +2945,7 @@ class LeaveApplicationController extends Controller
         $requestedPayMode = $policyResolution['pay_mode'];
         $selectedDatePayStatus = $policyResolution['selected_date_pay_status'];
         $deductibleDays = (float) ($policyResolution['deductible_days'] ?? 0);
+        $ctoDeductedHours = (float) ($policyResolution['cto_deducted_hours'] ?? 0);
         $attachmentRequired = (bool) ($policyResolution['attachment_required'] ?? false);
         $attachmentSubmitted = (bool) ($policyResolution['attachment_submitted'] ?? false);
         $attachmentReference = $policyResolution['attachment_reference'] ?? null;
@@ -2932,12 +2980,17 @@ class LeaveApplicationController extends Controller
             (int) $validated['leave_type_id'],
             (float) $validated['total_days'],
             $requestedPayMode,
-            $deductibleDays
+            $deductibleDays,
+            $ctoDeductedHours > 0 ? $ctoDeductedHours : null
         );
         if ($eligibility instanceof JsonResponse) {
             return $eligibility;
         }
         if (($eligibility['insufficient_balance'] ?? false) === true) {
+            if ($this->isCtoLeaveType($leaveType, (int) $validated['leave_type_id'])) {
+                return $this->buildInsufficientCtoBalanceResponse($eligibility);
+            }
+
             $allocation = $this->resolveCreditBasedPayAllocation(
                 $resolvedSelectedDates,
                 $selectedDateCoverage,
@@ -2960,6 +3013,7 @@ class LeaveApplicationController extends Controller
             $selectedDateCoverage,
             $resolvedSelectedDates,
             $deductibleDays,
+            $ctoDeductedHours,
             $attachmentRequired,
             $attachmentSubmitted,
             $attachmentReference
@@ -2971,6 +3025,7 @@ class LeaveApplicationController extends Controller
                 'end_date' => $validated['end_date'],
                 'total_days' => $validated['total_days'],
                 'deductible_days' => $deductibleDays,
+                'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn() && $ctoDeductedHours > 0 ? $ctoDeductedHours : null,
                 'reason' => $validated['reason'] ?? null,
                 'selected_dates' => $resolvedSelectedDates,
                 'selected_date_pay_status' => $selectedDatePayStatus,
@@ -3663,6 +3718,9 @@ class LeaveApplicationController extends Controller
             'leave_type_id' => (int) $leaveType->id,
             'leave_type_name' => $leaveType->name,
             'balance' => $balance ? (float) $balance->balance : 0.0,
+            'balance_hours' => $this->isCtoLeaveType($leaveType, (int) $leaveType->id)
+                ? $this->resolveCtoDeductedHours((float) ($balance?->balance ?? 0.0))
+                : null,
             'is_credit_based' => (bool) $leaveType->is_credit_based,
             'is_accrued' => $leaveType->category === LeaveType::CATEGORY_ACCRUED,
             'accrual_rate' => $leaveType->accrual_rate !== null ? (float) $leaveType->accrual_rate : null,
@@ -3824,6 +3882,10 @@ class LeaveApplicationController extends Controller
                 continue;
             }
 
+            if ($this->isCtoLeaveType($application->leaveType, $typeId)) {
+                continue;
+            }
+
             $deductsEmployeeBalance = $this->applicationDeductsEmployeeBalance(
                 (bool) $application->is_monetization,
                 $application->leaveType,
@@ -3861,67 +3923,7 @@ class LeaveApplicationController extends Controller
 
     private function loadEmployeeCOCCreditHistoryByType(string $controlNo, ?int $leaveTypeId = null): array
     {
-        $applications = COCApplication::query()
-            ->where('status', COCApplication::STATUS_APPROVED)
-            ->whereIn('employee_control_no', $this->controlNoCandidates($controlNo))
-            ->whereNotNull('cto_leave_type_id')
-            ->whereNotNull('cto_credited_days')
-            ->where('cto_credited_days', '>', 0)
-            ->when($leaveTypeId !== null, function ($query) use ($leaveTypeId): void {
-                $query->where('cto_leave_type_id', $leaveTypeId);
-            })
-            ->orderByDesc('cto_credited_at')
-            ->orderByDesc('reviewed_at')
-            ->orderByDesc('id')
-            ->get([
-                'id',
-                'cto_leave_type_id',
-                'cto_credited_days',
-                'cto_credited_at',
-                'reviewed_at',
-                'created_at',
-            ]);
-
-        $historyByType = [];
-
-        foreach ($applications as $application) {
-            if (!$application instanceof COCApplication) {
-                continue;
-            }
-
-            $typeId = (int) ($application->cto_leave_type_id ?? 0);
-            if ($typeId <= 0) {
-                continue;
-            }
-
-            $creditsAdded = round((float) ($application->cto_credited_days ?? 0), 2);
-            if ($creditsAdded <= 0) {
-                continue;
-            }
-
-            $creditedAt = $application->cto_credited_at ?? $application->reviewed_at ?? $application->created_at;
-            if ($creditedAt === null) {
-                continue;
-            }
-
-            $historyByType[$typeId][] = [
-                'accrual_date' => $creditedAt->toDateString(),
-                'transaction_date' => $creditedAt->toDateString(),
-                'credits_added' => $creditsAdded,
-                'entry_type' => 'CREDIT',
-                'transaction_type' => 'CREDIT',
-                'label' => 'COC converted to CTO',
-                'description' => 'Approved COC application converted to CTO credits',
-                'expires_on' => $this->resolveCocExpiryDate(\Carbon\CarbonImmutable::parse((string) $creditedAt)->startOfDay())->toDateString(),
-                'is_expired' => $this->resolveCocExpiryDate(\Carbon\CarbonImmutable::parse((string) $creditedAt)->startOfDay())->lt(\Carbon\CarbonImmutable::today()),
-                'application_id' => 'COC-' . (int) $application->id,
-                'coc_application_id' => (int) $application->id,
-                'source' => 'COC_APPLICATION',
-                'created_at' => $creditedAt->toIso8601String(),
-            ];
-        }
-
-        return $historyByType;
+        return $this->cocLedgerService()->getHistoryByLeaveType($controlNo, $leaveTypeId);
     }
 
     private function ermsStatusLabel(string $status): string
@@ -4359,6 +4361,7 @@ class LeaveApplicationController extends Controller
         $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
         $withoutPay = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
         $deductibleDays = $this->resolveApplicationDeductibleDays($app);
+        $ctoDeductedHours = $this->resolveApplicationCtoDeductedHours($app);
 
         return [
             'id' => $app->id,
@@ -4372,6 +4375,7 @@ class LeaveApplicationController extends Controller
             'selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
             'total_days' => (float) $app->total_days,
             'deductible_days' => $deductibleDays,
+            'cto_deducted_hours' => $ctoDeductedHours,
             'pay_mode' => $normalizedPayMode,
             'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
             'without_pay' => $withoutPay,
@@ -4566,7 +4570,7 @@ class LeaveApplicationController extends Controller
             (bool) ($attachmentState['attachment_submitted'] ?? false),
             $attachmentState['attachment_reference'] ?? null,
             true,
-            $app->created_at ?? null,
+            $request->input('date_filed') ?? $request->input('dateOfFiling') ?? now(),
             $resolvedStartDate,
             $resolvedEndDate,
             (string) ($app->employee_control_no ?? '')
@@ -4578,6 +4582,7 @@ class LeaveApplicationController extends Controller
         $resolvedPayMode = $policyResolution['pay_mode'];
         $requestedSelectedDatePayStatus = $policyResolution['selected_date_pay_status'];
         $resolvedDeductibleDays = (float) ($policyResolution['deductible_days'] ?? 0);
+        $resolvedCtoDeductedHours = (float) ($policyResolution['cto_deducted_hours'] ?? 0);
         $attachmentRequired = (bool) ($policyResolution['attachment_required'] ?? false);
         $attachmentSubmitted = (bool) ($policyResolution['attachment_submitted'] ?? false);
         $attachmentReference = $policyResolution['attachment_reference'] ?? null;
@@ -4591,6 +4596,7 @@ class LeaveApplicationController extends Controller
             'selected_date_coverage' => $requestedSelectedDateCoverage,
             'total_days' => $resolvedTotalDays,
             'deductible_days' => $resolvedDeductibleDays,
+            'cto_deducted_hours' => $resolvedCtoDeductedHours,
             'reason' => $requestedReason,
             'commutation' => array_key_exists('commutation', $validated)
                 ? $validated['commutation']
@@ -4643,6 +4649,7 @@ class LeaveApplicationController extends Controller
             'selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
             'total_days' => (float) $app->total_days,
             'deductible_days' => $this->resolveApplicationDeductibleDays($app),
+            'cto_deducted_hours' => $this->resolveApplicationCtoDeductedHours($app),
             'reason' => $app->reason,
             'commutation' => $app->commutation ?? 'Not Requested',
             'pay_mode' => $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization),
@@ -4695,6 +4702,10 @@ class LeaveApplicationController extends Controller
         }
 
         if (round((float) ($currentPayload['deductible_days'] ?? 0), 2) !== round((float) ($normalizedRequestedPayload['deductible_days'] ?? 0), 2)) {
+            return true;
+        }
+
+        if (round((float) ($currentPayload['cto_deducted_hours'] ?? 0), 2) !== round((float) ($normalizedRequestedPayload['cto_deducted_hours'] ?? 0), 2)) {
             return true;
         }
 
@@ -4914,7 +4925,7 @@ class LeaveApplicationController extends Controller
             (bool) ($targetAttachmentState['attachment_submitted'] ?? false),
             $targetAttachmentState['attachment_reference'] ?? null,
             true,
-            $app->created_at ?? null,
+            $pendingUpdateRequest?->created_at ?? now(),
             $targetStartDate,
             $targetEndDate,
             (string) ($app->employee_control_no ?? '')
@@ -4926,6 +4937,7 @@ class LeaveApplicationController extends Controller
         $targetPayMode = $policyResolution['pay_mode'];
         $targetSelectedDatePayStatus = $policyResolution['selected_date_pay_status'];
         $targetDeductibleDays = (float) ($policyResolution['deductible_days'] ?? 0);
+        $targetCtoDeductedHours = (float) ($policyResolution['cto_deducted_hours'] ?? 0);
         $targetAttachmentRequired = (bool) ($policyResolution['attachment_required'] ?? false);
         $targetAttachmentSubmitted = (bool) ($policyResolution['attachment_submitted'] ?? false);
         $targetAttachmentReference = $policyResolution['attachment_reference'] ?? null;
@@ -5019,6 +5031,7 @@ class LeaveApplicationController extends Controller
                 $targetSelectedDateCoverage,
                 $targetTotalDays,
                 $targetDeductibleDays,
+                $targetCtoDeductedHours,
                 $targetIsMonetization,
                 $targetPayMode,
                 $targetAttachmentRequired,
@@ -5069,6 +5082,7 @@ class LeaveApplicationController extends Controller
                     'end_date' => $targetIsMonetization ? null : $targetEndDate,
                     'total_days' => $targetTotalDays,
                     'deductible_days' => $targetDeductibleDays,
+                    'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn() && $targetIsCtoDeduction && $targetCtoDeductedHours > 0 ? $targetCtoDeductedHours : null,
                     'reason' => $this->trimNullableString($payload['reason'] ?? null),
                     'selected_dates' => $targetIsMonetization ? null : $targetSelectedDates,
                     'selected_date_pay_status' => $targetIsMonetization ? null : $targetSelectedDatePayStatus,
@@ -5696,6 +5710,7 @@ class LeaveApplicationController extends Controller
                 $payMode = $policyResolution['pay_mode'];
                 $selectedDatePayStatus = $policyResolution['selected_date_pay_status'];
                 $deductibleDays = (float) ($policyResolution['deductible_days'] ?? 0);
+                $ctoDeductedHours = (float) ($policyResolution['cto_deducted_hours'] ?? 0);
                 $attachmentRequired = (bool) ($policyResolution['attachment_required'] ?? false);
                 $attachmentSubmitted = (bool) ($policyResolution['attachment_submitted'] ?? false);
                 $attachmentReference = $policyResolution['attachment_reference'] ?? null;
@@ -5709,6 +5724,9 @@ class LeaveApplicationController extends Controller
                     $payMode,
                     isset($payload['employee_control_no']) ? (string) $payload['employee_control_no'] : null
                 );
+                $ctoDeductedHours = $leaveType && $this->isCtoLeaveType($leaveType, $leaveTypeId)
+                    ? $this->resolveCtoDeductedHours($deductibleDays)
+                    : 0.0;
             }
         } else {
             $deductibleDays = $this->computeDeductibleDays(
@@ -5720,6 +5738,7 @@ class LeaveApplicationController extends Controller
                 $payMode,
                 isset($payload['employee_control_no']) ? (string) $payload['employee_control_no'] : null
             );
+            $ctoDeductedHours = 0.0;
         }
 
         $withoutPay = $payMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
@@ -5734,6 +5753,7 @@ class LeaveApplicationController extends Controller
             'selected_date_coverage' => $selectedDateCoverage,
             'total_days' => $totalDays,
             'deductible_days' => $deductibleDays,
+            'cto_deducted_hours' => round(max((float) ($ctoDeductedHours ?? 0.0), 0.0), 2),
             'reason' => $this->trimNullableString($payload['reason'] ?? null),
             'commutation' => $commutation,
             'pay_mode' => $payMode,
@@ -5809,6 +5829,13 @@ class LeaveApplicationController extends Controller
         $primaryBalance = $this->lockEmployeeLeaveBalance($employeeControlNo, $primaryLeaveTypeId);
         if (!$primaryBalance || (float) $primaryBalance->balance < $primaryDaysToDeduct) {
             throw new \RuntimeException($balanceConflictError);
+        }
+
+        if ($isCtoDeduction) {
+            return [
+                'linked_forced_leave_deducted_days' => 0.0,
+                'linked_vacation_leave_deducted_days' => 0.0,
+            ];
         }
 
         $primaryBalance->decrement('balance', $primaryDaysToDeduct);
@@ -5998,8 +6025,10 @@ class LeaveApplicationController extends Controller
             return null;
         }
 
-        $effectiveBalance = $this->computeEmployeeCtoAvailableBalance($employeeControlNo, $ctoLeaveTypeId, $asOfDate);
-        $effectiveBalance = round(max($effectiveBalance, 0.0), 2);
+        $effectiveBalance = round(max(
+            $this->cocLedgerService()->getAvailableDays($employeeControlNo, $ctoLeaveTypeId, $asOfDate),
+            0.0
+        ), 2);
 
         $query = LeaveBalance::query()
             ->whereIn('employee_control_no', $controlNoCandidates)
@@ -6051,139 +6080,10 @@ class LeaveApplicationController extends Controller
             return 0.0;
         }
 
-        $controlNoCandidates = $this->controlNoCandidates($employeeControlNo);
-        if ($controlNoCandidates === []) {
-            return 0.0;
-        }
-
-        $asOf = ($asOfDate ?? \Carbon\CarbonImmutable::now())->startOfDay();
-
-        $creditApplications = COCApplication::query()
-            ->where('status', COCApplication::STATUS_APPROVED)
-            ->whereIn('employee_control_no', $controlNoCandidates)
-            ->where('cto_leave_type_id', $ctoLeaveTypeId)
-            ->whereNotNull('cto_credited_days')
-            ->where('cto_credited_days', '>', 0)
-            ->orderBy('cto_credited_at')
-            ->orderBy('reviewed_at')
-            ->orderBy('id')
-            ->get([
-                'id',
-                'cto_credited_days',
-                'cto_credited_at',
-                'reviewed_at',
-                'created_at',
-            ]);
-
-        $creditBuckets = [];
-        foreach ($creditApplications as $application) {
-            if (!$application instanceof COCApplication) {
-                continue;
-            }
-
-            $creditedDays = round((float) ($application->cto_credited_days ?? 0), 2);
-            if ($creditedDays <= 0) {
-                continue;
-            }
-
-            $creditedAtRaw = $application->cto_credited_at ?? $application->reviewed_at ?? $application->created_at;
-            if ($creditedAtRaw === null) {
-                continue;
-            }
-
-            $creditedOn = \Carbon\CarbonImmutable::parse($creditedAtRaw)->startOfDay();
-            $creditBuckets[] = [
-                'credited_on' => $creditedOn,
-                'expires_on' => $this->resolveCocExpiryDate($creditedOn),
-                'remaining' => $creditedDays,
-            ];
-        }
-
-        if ($creditBuckets === []) {
-            return 0.0;
-        }
-
-        $deductionApplications = LeaveApplication::query()
-            ->where('status', LeaveApplication::STATUS_APPROVED)
-            ->whereIn('employee_control_no', $controlNoCandidates)
-            ->where('leave_type_id', $ctoLeaveTypeId)
-            ->where(function ($query): void {
-                $query->where('is_monetization', true)
-                    ->orWhereRaw(
-                        'UPPER(LTRIM(RTRIM(COALESCE(pay_mode, ?)))) <> ?',
-                        [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY]
-                    );
-            })
-            ->orderBy('hr_approved_at')
-            ->orderBy('created_at')
-            ->orderBy('id')
-            ->get([
-                'id',
-                'total_days',
-                'deductible_days',
-                'hr_approved_at',
-                'created_at',
-                'is_monetization',
-                'pay_mode',
-            ]);
-
-        foreach ($deductionApplications as $application) {
-            if (!$application instanceof LeaveApplication) {
-                continue;
-            }
-
-            $creditsToDeduct = round((float) ($application->deductible_days ?? $application->total_days ?? 0), 2);
-            if ($creditsToDeduct <= 0) {
-                continue;
-            }
-
-            $deductedAtRaw = $application->hr_approved_at ?? $application->created_at;
-            if ($deductedAtRaw === null) {
-                continue;
-            }
-            $deductedOn = \Carbon\CarbonImmutable::parse($deductedAtRaw)->startOfDay();
-
-            // Credits remain usable through their expiration date.
-            $creditBuckets = array_values(array_filter(
-                $creditBuckets,
-                static fn(array $bucket): bool => $bucket['remaining'] > 0 && $bucket['expires_on']->gte($deductedOn)
-            ));
-
-            if ($creditBuckets === []) {
-                continue;
-            }
-
-            $remainingToDeduct = $creditsToDeduct;
-            foreach ($creditBuckets as &$bucket) {
-                if ($remainingToDeduct <= 0) {
-                    break;
-                }
-                if ($bucket['remaining'] <= 0) {
-                    continue;
-                }
-
-                $consumed = min((float) $bucket['remaining'], $remainingToDeduct);
-                $bucket['remaining'] = round((float) $bucket['remaining'] - $consumed, 2);
-                $remainingToDeduct = round($remainingToDeduct - $consumed, 2);
-            }
-            unset($bucket);
-        }
-
-        $available = 0.0;
-        foreach ($creditBuckets as $bucket) {
-            $remaining = round((float) ($bucket['remaining'] ?? 0), 2);
-            if ($remaining <= 0) {
-                continue;
-            }
-
-            if (($bucket['expires_on'] ?? null) instanceof \Carbon\CarbonImmutable && $bucket['expires_on']->lt($asOf)) {
-                continue;
-            }
-
-            $available += $remaining;
-        }
-
-        return round(max($available, 0.0), 2);
+        return round(max(
+            $this->cocLedgerService()->getAvailableDays($employeeControlNo, $ctoLeaveTypeId, $asOfDate),
+            0.0
+        ), 2);
     }
 
     private function resolveCocExpiryDate(\Carbon\CarbonImmutable $creditedOn): \Carbon\CarbonImmutable
@@ -6437,6 +6337,7 @@ class LeaveApplicationController extends Controller
                 'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
                 'selected_date_pay_status' => null,
                 'deductible_days' => $normalizedTotalDays,
+                'cto_deducted_hours' => null,
                 'attachment_required' => false,
                 'attachment_submitted' => false,
                 'attachment_reference' => null,
@@ -6452,6 +6353,7 @@ class LeaveApplicationController extends Controller
             : null;
 
         $isSickLeave = $this->isSickLeaveType($leaveType, (int) $leaveType->id);
+        $isCtoLeave = $this->isCtoLeaveType($leaveType, (int) $leaveType->id);
         $attachmentRequired = $isSickLeave
             ? $normalizedTotalDays >= 5.0
             : (bool) ($leaveType->requires_documents ?? false);
@@ -6468,7 +6370,45 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
-        if ($isSickLeave) {
+        if ($isCtoLeave) {
+            if ($normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY || $this->hasWithoutPaySelectedDates($normalizedSelectedDatePayStatus)) {
+                return response()->json([
+                    'message' => 'CTO applications must be availed with pay only.',
+                    'errors' => [
+                        'selected_date_pay_status' => ['CTO applications must be availed with pay only.'],
+                    ],
+                ], 422);
+            }
+
+            $ctoValidation = $this->validateCtoAvailmentPolicy(
+                $normalizedTotalDays,
+                $selectedDates,
+                $normalizedSelectedDateCoverage,
+                $filedAt
+            );
+            if ($ctoValidation instanceof JsonResponse) {
+                return $ctoValidation;
+            }
+
+            $normalizedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
+            $normalizedSelectedDatePayStatus = null;
+            $deductibleDays = $this->computeDeductibleDays(
+                $normalizedTotalDays,
+                $selectedDates,
+                null,
+                $normalizedSelectedDateCoverage,
+                false,
+                $normalizedPayMode,
+                $employeeControlNo
+            );
+
+            if (!$attachmentRequired) {
+                $attachmentSubmitted = false;
+                $attachmentReference = null;
+            }
+
+            $ctoDeductedHours = $this->resolveCtoDeductedHours($deductibleDays);
+        } elseif ($isSickLeave) {
             $graceWindowPayMode = $this->resolveSickLeavePayModeFromFilingWindow(
                 $selectedDates,
                 $filedAt,
@@ -6496,6 +6436,7 @@ class LeaveApplicationController extends Controller
                 $normalizedPayMode,
                 $employeeControlNo
             );
+            $ctoDeductedHours = null;
         } else {
             $normalizedSelectedDatePayStatus = $this->compactSelectedDatePayStatusMap(
                 $normalizedSelectedDatePayStatus,
@@ -6517,6 +6458,8 @@ class LeaveApplicationController extends Controller
                 $attachmentSubmitted = false;
                 $attachmentReference = null;
             }
+
+            $ctoDeductedHours = null;
         }
 
         if (!$attachmentSubmitted) {
@@ -6527,6 +6470,7 @@ class LeaveApplicationController extends Controller
             'pay_mode' => $normalizedPayMode,
             'selected_date_pay_status' => $normalizedSelectedDatePayStatus,
             'deductible_days' => round(max((float) $deductibleDays, 0.0), 2),
+            'cto_deducted_hours' => $ctoDeductedHours !== null ? round(max((float) $ctoDeductedHours, 0.0), 2) : null,
             'attachment_required' => $attachmentRequired,
             'attachment_submitted' => $attachmentSubmitted,
             'attachment_reference' => $this->trimNullableString($attachmentReference),
@@ -6559,6 +6503,86 @@ class LeaveApplicationController extends Controller
         return $workingDaysElapsed <= 5
             ? LeaveApplication::PAY_MODE_WITH_PAY
             : LeaveApplication::PAY_MODE_WITHOUT_PAY;
+    }
+
+    private function hasWithoutPaySelectedDates(?array $selectedDatePayStatus): bool
+    {
+        if (!is_array($selectedDatePayStatus) || $selectedDatePayStatus === []) {
+            return false;
+        }
+
+        foreach ($selectedDatePayStatus as $status) {
+            if ($this->resolvePayModeFromStatusValue($status) === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function validateCtoAvailmentPolicy(
+        float $totalDays,
+        ?array $selectedDates,
+        ?array $selectedDateCoverage,
+        mixed $filedAt = null
+    ): ?JsonResponse {
+        $normalizedDateKeys = $this->normalizeSelectedDateKeys($selectedDates);
+        if ($normalizedDateKeys === []) {
+            return response()->json([
+                'message' => 'CTO applications require at least one selected availment date.',
+                'errors' => [
+                    'selected_dates' => ['CTO applications require at least one selected availment date.'],
+                ],
+            ], 422);
+        }
+
+        $coverageTotalDays = $this->computeCoverageDayTotal($normalizedDateKeys, $selectedDateCoverage);
+        if (abs($coverageTotalDays - round(max($totalDays, 0.0), 2)) > 0.01) {
+            return response()->json([
+                'message' => 'CTO applications must use whole-day or half-day blocks only.',
+                'errors' => [
+                    'total_days' => ['CTO applications must use whole-day or half-day blocks only.'],
+                ],
+            ], 422);
+        }
+
+        $firstAvailmentDate = $this->resolveIsoDate($normalizedDateKeys[0]);
+        if ($firstAvailmentDate === null) {
+            return response()->json([
+                'message' => 'The first CTO availment date is invalid.',
+                'errors' => [
+                    'selected_dates' => ['The first CTO availment date is invalid.'],
+                ],
+            ], 422);
+        }
+
+        $filedDate = $this->resolvePolicyFilingDate($filedAt);
+        $workingDaysBeforeAvailment = $this->countWorkingDaysBeforeDate($filedDate, $firstAvailmentDate);
+        if ($workingDaysBeforeAvailment < 5) {
+            return response()->json([
+                'message' => 'CTO applications must be submitted at least 5 working days before the first availment date.',
+                'errors' => [
+                    'start_date' => ['CTO applications must be submitted at least 5 working days before the first availment date.'],
+                ],
+            ], 422);
+        }
+
+        $maxConsecutiveWorkingDays = $this->calculateMaxConsecutiveWorkingDateSpan($normalizedDateKeys);
+        if ($maxConsecutiveWorkingDays > 5) {
+            return response()->json([
+                'message' => 'CTO may only be availed for up to 5 consecutive working days per application.',
+                'errors' => [
+                    'selected_dates' => ['CTO may only be availed for up to 5 consecutive working days per application.'],
+                ],
+            ], 422);
+        }
+
+        return null;
+    }
+
+    private function resolveCtoDeductedHours(float $deductibleDays): float
+    {
+        return round(max($deductibleDays, 0.0) * self::CTO_STANDARD_DAY_HOURS, 2);
     }
 
     private function resolveSickLeaveAbsenceDateRange(?array $selectedDates): array
@@ -6647,6 +6671,125 @@ class LeaveApplicationController extends Controller
         }
 
         return $count;
+    }
+
+    private function normalizeSelectedDateKeys(?array $selectedDates): array
+    {
+        if (!is_array($selectedDates) || $selectedDates === []) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeDateKey($rawDate);
+            if ($dateKey === null) {
+                $dateKey = trim((string) $rawDate);
+            }
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $normalized[$dateKey] = true;
+        }
+
+        $normalizedKeys = array_keys($normalized);
+        sort($normalizedKeys);
+
+        return $normalizedKeys;
+    }
+
+    private function computeCoverageDayTotal(array $selectedDateKeys, ?array $selectedDateCoverage): float
+    {
+        if ($selectedDateKeys === []) {
+            return 0.0;
+        }
+
+        $normalizedCoverage = $this->compactSelectedDateCoverageMap($selectedDateCoverage, $selectedDateKeys);
+        $total = 0.0;
+        foreach ($selectedDateKeys as $dateKey) {
+            $coverage = strtolower(trim((string) ($normalizedCoverage[$dateKey] ?? 'whole')));
+            $total += $coverage === 'half' ? 0.5 : 1.0;
+        }
+
+        return round($total, 2);
+    }
+
+    private function countWorkingDaysBeforeDate(
+        \Carbon\CarbonImmutable $filedDate,
+        \Carbon\CarbonImmutable $targetDate
+    ): int {
+        $normalizedFiledDate = $filedDate->startOfDay();
+        $normalizedTargetDate = $targetDate->startOfDay();
+        if ($normalizedTargetDate->lte($normalizedFiledDate)) {
+            return 0;
+        }
+
+        $count = 0;
+        $cursor = $normalizedFiledDate->addDay();
+
+        while ($cursor->lt($normalizedTargetDate)) {
+            if ($cursor->isWeekday()) {
+                $count++;
+            }
+
+            $cursor = $cursor->addDay();
+        }
+
+        return $count;
+    }
+
+    private function nextWorkingDate(\Carbon\CarbonImmutable $date): \Carbon\CarbonImmutable
+    {
+        $cursor = $date->addDay()->startOfDay();
+        while (!$cursor->isWeekday()) {
+            $cursor = $cursor->addDay();
+        }
+
+        return $cursor;
+    }
+
+    private function calculateMaxConsecutiveWorkingDateSpan(array $selectedDateKeys): int
+    {
+        if ($selectedDateKeys === []) {
+            return 0;
+        }
+
+        $parsedDates = [];
+        foreach ($selectedDateKeys as $dateKey) {
+            $parsed = $this->resolveIsoDate($dateKey);
+            if ($parsed === null) {
+                continue;
+            }
+
+            $parsedDates[] = $parsed->startOfDay();
+        }
+
+        if ($parsedDates === []) {
+            return 0;
+        }
+
+        usort(
+            $parsedDates,
+            static fn(\Carbon\CarbonImmutable $left, \Carbon\CarbonImmutable $right): int => $left->getTimestamp() <=> $right->getTimestamp()
+        );
+
+        $maxStreak = 1;
+        $currentStreak = 1;
+
+        for ($index = 1, $count = count($parsedDates); $index < $count; $index++) {
+            $expectedNextDate = $this->nextWorkingDate($parsedDates[$index - 1]);
+            if ($parsedDates[$index]->equalTo($expectedNextDate)) {
+                $currentStreak++;
+            } else {
+                $currentStreak = 1;
+            }
+
+            if ($currentStreak > $maxStreak) {
+                $maxStreak = $currentStreak;
+            }
+        }
+
+        return $maxStreak;
     }
 
     private function buildSickLeavePayStatusOverrides(
@@ -7439,9 +7582,28 @@ class LeaveApplicationController extends Controller
             return $totalDays;
         }
 
+        $storedCtoHours = round((float) ($app->cto_deducted_hours ?? 0), 2);
+        if ($storedCtoHours > 0 && $this->isCtoLeaveType($app->leaveType, (int) $app->leave_type_id)) {
+            return round($storedCtoHours / self::CTO_STANDARD_DAY_HOURS, 2);
+        }
+
         return $this->normalizePayMode($app->pay_mode ?? null, false) === LeaveApplication::PAY_MODE_WITHOUT_PAY
             ? 0.0
             : $totalDays;
+    }
+
+    private function resolveApplicationCtoDeductedHours(LeaveApplication $app): float
+    {
+        $storedHours = round((float) ($app->cto_deducted_hours ?? 0), 2);
+        if ($storedHours > 0) {
+            return $storedHours;
+        }
+
+        if (!$this->isCtoLeaveType($app->leaveType, (int) $app->leave_type_id)) {
+            return 0.0;
+        }
+
+        return $this->resolveCtoDeductedHours($this->resolveApplicationDeductibleDays($app));
     }
 
     private function resolveRecallRestorableDetails(
@@ -7708,7 +7870,8 @@ class LeaveApplicationController extends Controller
         int $leaveTypeId,
         float $requestedDays,
         string $payMode = LeaveApplication::PAY_MODE_WITH_PAY,
-        ?float $requestedDeductibleDays = null
+        ?float $requestedDeductibleDays = null,
+        ?float $requestedCtoHours = null
     ): array|JsonResponse {
         $leaveType = LeaveType::find($leaveTypeId);
         if (!$leaveType) {
@@ -7780,8 +7943,12 @@ class LeaveApplicationController extends Controller
                 'leave_type' => $leaveType,
                 'balance' => null,
                 'available_balance' => null,
+                'balance_hours' => null,
+                'available_balance_hours' => null,
                 'pending_reserved_days' => 0.0,
+                'pending_reserved_hours' => 0.0,
                 'required_balance_days' => $requiredBalanceDays,
+                'required_balance_hours' => $requestedCtoHours !== null ? round(max($requestedCtoHours, 0.0), 2) : null,
                 'insufficient_balance' => false,
             ];
         }
@@ -7794,16 +7961,58 @@ class LeaveApplicationController extends Controller
         $currentBalance = (float) ($balanceSnapshot['current_balance'] ?? 0.0);
         $pendingReservedDays = (float) ($balanceSnapshot['pending_reserved_days'] ?? 0.0);
         $availableBalance = (float) ($balanceSnapshot['available_balance'] ?? 0.0);
-        $insufficientBalance = $availableBalance + 1e-9 < $requiredBalanceDays;
+        $currentBalanceHours = (float) ($balanceSnapshot['current_balance_hours'] ?? 0.0);
+        $pendingReservedHours = (float) ($balanceSnapshot['pending_reserved_hours'] ?? 0.0);
+        $availableBalanceHours = (float) ($balanceSnapshot['available_balance_hours'] ?? 0.0);
+        $requiredBalanceHours = $this->isCtoLeaveType($leaveType, $leaveTypeId)
+            ? round(max((float) ($requestedCtoHours ?? $this->resolveCtoDeductedHours($requiredBalanceDays)), 0.0), 2)
+            : null;
+        $insufficientBalance = $requiredBalanceHours !== null
+            ? ($availableBalanceHours + 1e-9 < $requiredBalanceHours)
+            : ($availableBalance + 1e-9 < $requiredBalanceDays);
 
         return [
             'leave_type' => $leaveType,
             'balance' => $currentBalance,
             'available_balance' => $availableBalance,
+            'balance_hours' => $currentBalanceHours,
+            'available_balance_hours' => $availableBalanceHours,
             'pending_reserved_days' => $pendingReservedDays,
+            'pending_reserved_hours' => $pendingReservedHours,
             'required_balance_days' => $requiredBalanceDays,
+            'required_balance_hours' => $requiredBalanceHours,
             'insufficient_balance' => $insufficientBalance,
         ];
+    }
+
+    private function buildInsufficientCtoBalanceResponse(array $eligibility): JsonResponse
+    {
+        $availableBalance = round(max((float) ($eligibility['available_balance'] ?? 0.0), 0.0), 2);
+        $requiredBalance = round(max((float) ($eligibility['required_balance_days'] ?? 0.0), 0.0), 2);
+        $availableBalanceHours = round(max((float) ($eligibility['available_balance_hours'] ?? 0.0), 0.0), 2);
+        $requiredBalanceHours = round(max((float) ($eligibility['required_balance_hours'] ?? 0.0), 0.0), 2);
+
+        return response()->json([
+            'message' => 'Insufficient CTO balance. CTO applications must stay with pay and can only use available, unexpired CTO credits.',
+            'errors' => [
+                'leave_type_id' => [
+                    'Insufficient CTO balance. CTO applications must stay with pay and can only use available, unexpired CTO credits.',
+                ],
+                'available_cto_balance' => [
+                    'Available CTO balance is '
+                    . self::formatDays($availableBalance)
+                    . ($availableBalanceHours > 0 ? ' (' . number_format($availableBalanceHours, 2) . ' hour(s))' : '')
+                    . ', but '
+                    . self::formatDays($requiredBalance)
+                    . ($requiredBalanceHours > 0 ? ' (' . number_format($requiredBalanceHours, 2) . ' hour(s))' : '')
+                    . ' is required.',
+                ],
+            ],
+            'available_cto_balance' => $availableBalance,
+            'required_cto_balance' => $requiredBalance,
+            'available_cto_balance_hours' => $availableBalanceHours,
+            'required_cto_balance_hours' => $requiredBalanceHours,
+        ], 422);
     }
 
     private function resolveEmployeeLeaveBalanceSnapshot(string $employeeControlNo, int $leaveTypeId): array
@@ -7811,6 +8020,44 @@ class LeaveApplicationController extends Controller
         $controlNoCandidates = $this->controlNoCandidates($employeeControlNo);
         $lookupLeaveTypeIds = $this->resolveBalanceLookupLeaveTypeIds($leaveTypeId);
         $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+
+        $isCtoSnapshot = $this->isCtoLeaveType(null, $canonicalLeaveTypeId);
+
+        if ($isCtoSnapshot) {
+            $pendingReservedHoursExpression = $this->hasLeaveApplicationCtoHoursColumn()
+                ? 'COALESCE(cto_deducted_hours, COALESCE(deductible_days, total_days) * 8.0)'
+                : 'COALESCE(deductible_days, total_days) * 8.0';
+            $currentBalanceHours = round($this->cocLedgerService()->getAvailableHours($employeeControlNo, $canonicalLeaveTypeId), 2);
+            $pendingReservedHours = round((float) LeaveApplication::query()
+                ->whereIn('leave_type_id', $lookupLeaveTypeIds === [] ? [$canonicalLeaveTypeId] : $lookupLeaveTypeIds)
+                ->whereIn('status', [
+                    LeaveApplication::STATUS_PENDING_ADMIN,
+                    LeaveApplication::STATUS_PENDING_HR,
+                ])
+                ->where(function ($query): void {
+                    $query->where('is_monetization', true)
+                        ->orWhereRaw(
+                            'UPPER(LTRIM(RTRIM(COALESCE(pay_mode, ?)))) <> ?',
+                            [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY]
+                        );
+                })
+                ->whereIn('employee_control_no', $controlNoCandidates)
+                ->sum(DB::raw($pendingReservedHoursExpression)), 2);
+
+            $availableBalanceHours = max(round($currentBalanceHours - $pendingReservedHours, 2), 0.0);
+            $currentBalance = round($currentBalanceHours / self::CTO_STANDARD_DAY_HOURS, 2);
+            $pendingReservedDays = round($pendingReservedHours / self::CTO_STANDARD_DAY_HOURS, 2);
+            $availableBalance = round($availableBalanceHours / self::CTO_STANDARD_DAY_HOURS, 2);
+
+            return [
+                'current_balance' => $currentBalance,
+                'current_balance_hours' => $currentBalanceHours,
+                'pending_reserved_days' => $pendingReservedDays,
+                'pending_reserved_hours' => $pendingReservedHours,
+                'available_balance' => $availableBalance,
+                'available_balance_hours' => $availableBalanceHours,
+            ];
+        }
 
         $balance = $this->findPreferredEmployeeLeaveBalanceRecord($employeeControlNo, $canonicalLeaveTypeId);
         $currentBalance = $balance ? (float) $balance->balance : 0.0;
@@ -7835,8 +8082,11 @@ class LeaveApplicationController extends Controller
 
         return [
             'current_balance' => $currentBalance,
+            'current_balance_hours' => 0.0,
             'pending_reserved_days' => $pendingReservedDays,
+            'pending_reserved_hours' => 0.0,
             'available_balance' => $availableBalance,
+            'available_balance_hours' => 0.0,
         ];
     }
 
@@ -7862,6 +8112,7 @@ class LeaveApplicationController extends Controller
         $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
         $withoutPay = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
         $deductibleDays = $this->resolveApplicationDeductibleDays($app);
+        $ctoDeductedHours = $this->resolveApplicationCtoDeductedHours($app);
         $hasPendingApprovedUpdateRequest = $this->hasPendingApprovedUpdateRequest($app);
         $displayStatus = $hasPendingApprovedUpdateRequest
             ? $this->statusToFrontend(LeaveApplication::STATUS_APPROVED)
@@ -7920,6 +8171,7 @@ class LeaveApplicationController extends Controller
             'is_monetization' => (bool) $app->is_monetization,
             'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
             'deductible_days' => $deductibleDays,
+            'cto_deducted_hours' => $ctoDeductedHours,
             'leaveBalance' => $currentLeaveBalance,
             'leaveBalances' => $leaveBalanceSnapshot,
             'leave_balances' => $leaveBalanceSnapshot,

@@ -75,6 +75,7 @@ return new class extends Migration {
 
             $table->decimal('total_days', 5, 2);
             $table->decimal('deductible_days', 5, 2)->nullable();
+            $table->decimal('cto_deducted_hours', 8, 2)->nullable();
             $table->string('pay_mode', 8)->default('WP');
             $table->decimal('linked_forced_leave_deducted_days', 5, 2)->nullable();
             $table->decimal('linked_vacation_leave_deducted_days', 5, 2)->nullable();
