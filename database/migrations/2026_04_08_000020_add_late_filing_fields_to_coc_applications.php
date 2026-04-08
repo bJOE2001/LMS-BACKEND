@@ -38,9 +38,14 @@ return new class extends Migration
             }
         });
 
-        Schema::table('tblCOCApplications', function (Blueprint $table): void {
-            $table->index(['is_late_filed', 'late_filing_status', 'created_at'], 'ix_tblcocapplications_late_filing');
-        });
+        if (
+            Schema::hasTable('tblCOCApplications')
+            && !Schema::hasIndex('tblCOCApplications', 'ix_tblcocapplications_late_filing')
+        ) {
+            Schema::table('tblCOCApplications', function (Blueprint $table): void {
+                $table->index(['is_late_filed', 'late_filing_status', 'created_at'], 'ix_tblcocapplications_late_filing');
+            });
+        }
     }
 
     public function down(): void
@@ -50,16 +55,19 @@ return new class extends Migration
         }
 
         Schema::table('tblCOCApplications', function (Blueprint $table): void {
-            try {
-                $table->dropIndex('ix_tblcocapplications_late_filing');
-            } catch (\Throwable) {
-                // Ignore if the index was never created in this environment.
-            }
-
             if (Schema::hasColumn('tblCOCApplications', 'late_filing_reviewed_by_hr_id')) {
                 $table->dropConstrainedForeignId('late_filing_reviewed_by_hr_id');
             }
         });
+
+        if (
+            Schema::hasTable('tblCOCApplications')
+            && Schema::hasIndex('tblCOCApplications', 'ix_tblcocapplications_late_filing')
+        ) {
+            Schema::table('tblCOCApplications', function (Blueprint $table): void {
+                $table->dropIndex('ix_tblcocapplications_late_filing');
+            });
+        }
 
         Schema::table('tblCOCApplications', function (Blueprint $table): void {
             foreach ([
