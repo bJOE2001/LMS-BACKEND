@@ -22,12 +22,17 @@ return new class extends Migration
             }
         });
 
-        Schema::table('tblCOCApplications', function (Blueprint $table): void {
-            $table->index(
-                ['employee_control_no', 'application_year', 'application_month'],
-                'ix_tblcocapplications_employee_period'
-            );
-        });
+        if (
+            Schema::hasTable('tblCOCApplications')
+            && !Schema::hasIndex('tblCOCApplications', 'ix_tblcocapplications_employee_period')
+        ) {
+            Schema::table('tblCOCApplications', function (Blueprint $table): void {
+                $table->index(
+                    ['employee_control_no', 'application_year', 'application_month'],
+                    'ix_tblcocapplications_employee_period'
+                );
+            });
+        }
 
         Schema::table('tblCOCApplicationRows', function (Blueprint $table): void {
             if (!Schema::hasColumn('tblCOCApplicationRows', 'credit_category')) {
@@ -50,6 +55,15 @@ return new class extends Migration
 
     public function down(): void
     {
+        if (
+            Schema::hasTable('tblCOCApplications')
+            && Schema::hasIndex('tblCOCApplications', 'ix_tblcocapplications_employee_period')
+        ) {
+            Schema::table('tblCOCApplications', function (Blueprint $table): void {
+                $table->dropIndex('ix_tblcocapplications_employee_period');
+            });
+        }
+
         Schema::table('tblCOCApplications', function (Blueprint $table): void {
             if (Schema::hasColumn('tblCOCApplications', 'credited_hours')) {
                 $table->dropColumn('credited_hours');
@@ -62,8 +76,6 @@ return new class extends Migration
             if (Schema::hasColumn('tblCOCApplications', 'application_year')) {
                 $table->dropColumn('application_year');
             }
-
-            $table->dropIndex('ix_tblcocapplications_employee_period');
         });
 
         Schema::table('tblCOCApplicationRows', function (Blueprint $table): void {
