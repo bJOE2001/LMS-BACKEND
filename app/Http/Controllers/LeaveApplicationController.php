@@ -112,8 +112,18 @@ class LeaveApplicationController extends Controller
             return $leaveTypeBalanceAccess;
         }
 
+        $ctoBalanceHours = null;
         if ($this->isCtoLeaveType($leaveType, (int) $leaveType->id)) {
             $this->syncEmployeeCtoBalance((string) $employee->control_no);
+            $ctoSnapshot = $this->cocLedgerService()->syncEmployeeLedger(
+                (string) $employee->control_no,
+                (int) $leaveType->id,
+                null,
+                false
+            );
+            $ctoBalanceHours = isset($ctoSnapshot['availableHours'])
+                ? (float) $ctoSnapshot['availableHours']
+                : null;
         }
 
         $balance = $this->findPreferredEmployeeLeaveBalanceRecord((string) $employee->control_no, (int) $leaveType->id);
@@ -202,7 +212,12 @@ class LeaveApplicationController extends Controller
 
         return response()->json(array_merge(
             $this->employeeControlNoResponse((string) $employee->control_no),
-            $this->formatErmsLeaveBalancePayload($leaveType, $balance, $creditHistoryByType[(int) $leaveType->id] ?? [])
+            $this->formatErmsLeaveBalancePayload(
+                $leaveType,
+                $balance,
+                $creditHistoryByType[(int) $leaveType->id] ?? [],
+                $ctoBalanceHours
+            )
         ));
     }
 
@@ -244,6 +259,19 @@ class LeaveApplicationController extends Controller
             ->all();
 
         $this->syncEmployeeCtoBalance((string) $employee->control_no);
+        $ctoLeaveTypeId = $this->resolveCtoLeaveTypeId();
+        $ctoBalanceHours = null;
+        if ($ctoLeaveTypeId !== null) {
+            $ctoSnapshot = $this->cocLedgerService()->syncEmployeeLedger(
+                (string) $employee->control_no,
+                $ctoLeaveTypeId,
+                null,
+                false
+            );
+            $ctoBalanceHours = isset($ctoSnapshot['availableHours'])
+                ? (float) $ctoSnapshot['availableHours']
+                : null;
+        }
 
         $balanceRecordsByType = $this->mapLeaveBalancesByCanonicalTypeId(LeaveBalance::query()
             ->with('accrualHistories')
@@ -257,12 +285,13 @@ class LeaveApplicationController extends Controller
             $cocCreditHistoryByType
         );
 
-        $balances = $types->map(function (LeaveType $type) use ($balanceRecordsByType, $creditHistoryByType) {
+        $balances = $types->map(function (LeaveType $type) use ($balanceRecordsByType, $creditHistoryByType, $ctoLeaveTypeId, $ctoBalanceHours) {
             $balance = $balanceRecordsByType[(int) $type->id] ?? null;
             return $this->formatErmsLeaveBalancePayload(
                 $type,
                 $balance instanceof LeaveBalance ? $balance : null,
-                $creditHistoryByType[(int) $type->id] ?? []
+                $creditHistoryByType[(int) $type->id] ?? [],
+                $ctoLeaveTypeId !== null && (int) $type->id === $ctoLeaveTypeId ? $ctoBalanceHours : null
             );
         })->values();
 
@@ -3543,6 +3572,9 @@ class LeaveApplicationController extends Controller
     private function formatErmsEmployeeContext(object $employee): array
     {
         $statusKey = $this->resolveEmploymentStatusKey($employee->status ?? null);
+        $resolvedSchedule = $this->workScheduleService()->resolveScheduleForEmployee(
+            (string) ($employee->control_no ?? '')
+        );
 
         return [
             'control_no' => (string) ($employee->control_no ?? ''),
@@ -3557,6 +3589,9 @@ class LeaveApplicationController extends Controller
             'ui_variant' => $statusKey === LeaveType::EMPLOYMENT_STATUS_CONTRACTUAL ? 'contractual' : 'default',
             'allowed_leave_scope' => $this->employeeHasResolvedEmploymentStatus($employee) ? 'configured' : 'unverified',
             'is_contractual' => $statusKey === LeaveType::EMPLOYMENT_STATUS_CONTRACTUAL,
+            'working_hours_per_day' => round((float) ($resolvedSchedule['working_hours_per_day'] ?? WorkScheduleService::STANDARD_WORKDAY_HOURS), 2),
+            'whole_day_leave_deduction' => round((float) ($resolvedSchedule['whole_day_leave_deduction'] ?? 1.0), 3),
+            'half_day_leave_deduction' => round((float) ($resolvedSchedule['half_day_leave_deduction'] ?? 0.5), 3),
         ];
     }
 
@@ -3670,7 +3705,8 @@ class LeaveApplicationController extends Controller
     private function formatErmsLeaveBalancePayload(
         LeaveType $leaveType,
         ?LeaveBalance $balance,
-        array $deductionHistory = []
+        array $deductionHistory = [],
+        ?float $ctoBalanceHours = null
     ): array
     {
         $accrualHistory = [];
@@ -3714,13 +3750,20 @@ class LeaveApplicationController extends Controller
             return ((int) ($right['leave_application_id'] ?? 0)) <=> ((int) ($left['leave_application_id'] ?? 0));
         });
 
+        $resolvedBalanceHours = $this->isCtoLeaveType($leaveType, (int) $leaveType->id)
+            ? (
+                $ctoBalanceHours !== null
+                    ? round(max((float) $ctoBalanceHours, 0.0), 2)
+                    : $this->resolveCtoDeductedHours((float) ($balance?->balance ?? 0.0))
+            )
+            : null;
+
         return [
             'leave_type_id' => (int) $leaveType->id,
             'leave_type_name' => $leaveType->name,
             'balance' => $balance ? (float) $balance->balance : 0.0,
-            'balance_hours' => $this->isCtoLeaveType($leaveType, (int) $leaveType->id)
-                ? $this->resolveCtoDeductedHours((float) ($balance?->balance ?? 0.0))
-                : null,
+            'balance_hours' => $resolvedBalanceHours,
+            'available_balance_hours' => $resolvedBalanceHours,
             'is_credit_based' => (bool) $leaveType->is_credit_based,
             'is_accrued' => $leaveType->category === LeaveType::CATEGORY_ACCRUED,
             'accrual_rate' => $leaveType->accrual_rate !== null ? (float) $leaveType->accrual_rate : null,
@@ -7991,12 +8034,19 @@ class LeaveApplicationController extends Controller
         $requiredBalance = round(max((float) ($eligibility['required_balance_days'] ?? 0.0), 0.0), 2);
         $availableBalanceHours = round(max((float) ($eligibility['available_balance_hours'] ?? 0.0), 0.0), 2);
         $requiredBalanceHours = round(max((float) ($eligibility['required_balance_hours'] ?? 0.0), 0.0), 2);
+        $message = 'Insufficient CTO balance. Available CTO is '
+            . number_format($availableBalanceHours, 2)
+            . ' hour(s)'
+            . ($availableBalance > 0 ? ' (' . self::formatDays($availableBalance) . ' display balance)' : '')
+            . ', but this request needs '
+            . number_format($requiredBalanceHours, 2)
+            . ' hour(s). CTO applications must stay with pay and can only use available, unexpired CTO credits.';
 
         return response()->json([
-            'message' => 'Insufficient CTO balance. CTO applications must stay with pay and can only use available, unexpired CTO credits.',
+            'message' => $message,
             'errors' => [
                 'leave_type_id' => [
-                    'Insufficient CTO balance. CTO applications must stay with pay and can only use available, unexpired CTO credits.',
+                    $message,
                 ],
                 'available_cto_balance' => [
                     'Available CTO balance is '
