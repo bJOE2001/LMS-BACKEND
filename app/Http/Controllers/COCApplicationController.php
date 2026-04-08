@@ -375,8 +375,6 @@ class COCApplicationController extends Controller
 
         $validated = $request->validate([
             'remarks' => ['nullable', 'string', 'max:2000'],
-            'certificate_number' => ['required', 'string', 'max:255'],
-            'certificate_issued_at' => ['required', 'date'],
             'rows' => ['required', 'array', 'min:1', 'max:100'],
             'rows.*.line_no' => ['required', 'integer', 'min:1'],
             'rows.*.credit_category' => ['required', 'string', 'in:REGULAR,SPECIAL'],
@@ -425,8 +423,8 @@ class COCApplicationController extends Controller
 
                 $creditedDays = $this->hoursToLeaveDays($creditedHours);
                 if ($creditedDays <= 0) throw new RuntimeException('INVALID_CREDIT');
-                $certificateNumber = trim((string) ($validated['certificate_number'] ?? ''));
-                $certificateIssuedAt = CarbonImmutable::parse((string) ($validated['certificate_issued_at'] ?? ''))->startOfDay();
+                $approvalTimestamp = now();
+                $certificateIssuedAt = CarbonImmutable::parse($approvalTimestamp->toDateString())->startOfDay();
 
                 $reviewedRowsByLineNo = collect($policySummary['rows'])->keyBy('line_no');
                 foreach ($app->rows as $row) {
@@ -454,15 +452,15 @@ class COCApplicationController extends Controller
                 $app->update([
                     'status' => COCApplication::STATUS_APPROVED,
                     'reviewed_by_hr_id' => $hr->id,
-                    'reviewed_at' => now(),
+                    'reviewed_at' => $approvalTimestamp,
                     'cto_leave_type_id' => (int) $ctoLeaveType->id,
                     'cto_credited_days' => $creditedDays,
-                    'cto_credited_at' => now(),
+                    'cto_credited_at' => $approvalTimestamp,
                     'total_minutes' => (int) ($policySummary['total_minutes'] ?? $app->total_minutes),
                     'credited_hours' => $creditedHours,
                     'application_year' => $applicationYear,
                     'application_month' => $applicationMonth,
-                    'certificate_number' => $certificateNumber,
+                    'certificate_number' => null,
                     'certificate_issued_at' => $certificateIssuedAt->toDateString(),
                     'remarks' => trim((string) ($validated['remarks'] ?? '')) ?: $app->remarks,
                 ]);
@@ -475,7 +473,7 @@ class COCApplicationController extends Controller
                 return [
                     'days' => $creditedDays,
                     'hours' => $creditedHours,
-                    'certificate_number' => $certificateNumber,
+                    'certificate_number' => null,
                     'certificate_issued_at' => $certificateIssuedAt->toDateString(),
                     'balance' => (float) ($ledgerSnapshot['availableDays'] ?? 0.0),
                     'leave_type' => $ctoLeaveType,
