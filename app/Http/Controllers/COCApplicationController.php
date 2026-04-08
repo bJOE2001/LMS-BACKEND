@@ -32,6 +32,9 @@ class COCApplicationController extends Controller
     private const BALANCE_COC_HOURS_CAP = 120.0;
     private const CREDIT_CATEGORY_REGULAR = 'REGULAR';
     private const CREDIT_CATEGORY_SPECIAL = 'SPECIAL';
+    private const LATE_FILING_STATUS_PENDING = 'PENDING';
+    private const LATE_FILING_STATUS_APPROVED = 'APPROVED';
+    private const LATE_FILING_STATUS_REJECTED = 'REJECTED';
 
     private function cocLedgerService(): CocLedgerService
     {
@@ -64,7 +67,7 @@ class COCApplicationController extends Controller
         }
 
         $applications = COCApplication::query()
-            ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
+            ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'lateFilingReviewedByHr', 'ctoLeaveType'])
             ->matchingControlNo($controlNo)
             ->orderByDesc('created_at')
             ->get();
@@ -118,7 +121,14 @@ class COCApplicationController extends Controller
             ], 422);
         }
 
-        $application = DB::transaction(function () use ($employee, $policySummary): COCApplication {
+        $submittedAt = now();
+        $lateFilingDeadline = $this->resolveLateFilingDeadline(
+            (int) $policySummary['application_year'],
+            (int) $policySummary['application_month']
+        );
+        $isLateFiled = CarbonImmutable::instance($submittedAt)->greaterThan($lateFilingDeadline);
+
+        $application = DB::transaction(function () use ($employee, $policySummary, $submittedAt, $isLateFiled): COCApplication {
             $app = COCApplication::create([
                 'employee_control_no' => (string) $employee->control_no,
                 'employee_name' => trim(implode(' ', array_filter([
@@ -127,11 +137,13 @@ class COCApplicationController extends Controller
                     trim((string) ($employee->surname ?? '')),
                 ]))) ?: null,
                 'status' => COCApplication::STATUS_PENDING,
+                'is_late_filed' => $isLateFiled,
+                'late_filing_status' => $isLateFiled ? self::LATE_FILING_STATUS_PENDING : null,
                 'total_minutes' => (int) $policySummary['total_minutes'],
                 'application_year' => (int) $policySummary['application_year'],
                 'application_month' => (int) $policySummary['application_month'],
                 'credited_hours' => null,
-                'submitted_at' => now(),
+                'submitted_at' => $submittedAt,
             ]);
 
             foreach ($policySummary['rows'] as $row) {
@@ -145,12 +157,20 @@ class COCApplicationController extends Controller
             return $app;
         });
 
-        $application->load(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType']);
+        $application->load(['rows', 'reviewedByAdmin', 'reviewedByHr', 'lateFilingReviewedByHr', 'ctoLeaveType']);
 
-        $this->notifyDepartmentAdminsOfSubmittedCoc($employee, $application);
+        if ($isLateFiled) {
+            $this->notifyHrOfPendingLateCocReview($application);
+        } else {
+            $this->notifyDepartmentAdminsOfSubmittedCoc($employee, $application);
+        }
+
+        $message = $isLateFiled
+            ? 'This COC application was filed beyond the allowed deadline and is pending CHRMO late-filing review. Please proceed to HR for evaluation.'
+            : 'COC application submitted successfully.';
 
         return response()->json([
-            'message' => 'COC application submitted successfully.',
+            'message' => $message,
             'application' => $this->formatApplication($application),
         ], 201);
     }
@@ -174,8 +194,10 @@ class COCApplicationController extends Controller
 
         $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
 
-        $applications = $this->departmentScope($admin)
-            ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
+        $applications = $this->excludePendingLateFilingReview(
+                $this->departmentScope($admin)
+            )
+            ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'lateFilingReviewedByHr', 'ctoLeaveType'])
             ->when($controlNo !== '', function ($q) use ($controlNo): void {
                 $q->matchingControlNo($controlNo);
             })
@@ -199,8 +221,10 @@ class COCApplicationController extends Controller
             return response()->json(['message' => 'Only department admins can view COC applications.'], 403);
         }
 
-        $application = $this->departmentScope($admin)
-            ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
+        $application = $this->excludePendingLateFilingReview(
+                $this->departmentScope($admin)
+            )
+            ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'lateFilingReviewedByHr', 'ctoLeaveType'])
             ->where('id', $id)
             ->first();
 
@@ -224,7 +248,10 @@ class COCApplicationController extends Controller
 
         try {
             DB::transaction(function () use ($admin, $id, $validated): void {
-                $app = $this->departmentScope($admin)->lockForUpdate()->where('id', $id)->first();
+                $app = $this->excludePendingLateFilingReview($this->departmentScope($admin))
+                    ->lockForUpdate()
+                    ->where('id', $id)
+                    ->first();
                 if (!$app) {
                     throw new RuntimeException('NOT_FOUND');
                 }
@@ -245,7 +272,7 @@ class COCApplicationController extends Controller
             return $this->handleRuntimeException($exception);
         }
 
-        $app = COCApplication::query()->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])->find($id);
+        $app = COCApplication::query()->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'lateFilingReviewedByHr', 'ctoLeaveType'])->find($id);
         if ($app) {
             $this->notifyHrOfPendingCocReview($app);
         }
@@ -267,7 +294,10 @@ class COCApplicationController extends Controller
 
         try {
             DB::transaction(function () use ($admin, $id, $validated): void {
-                $app = $this->departmentScope($admin)->lockForUpdate()->where('id', $id)->first();
+                $app = $this->excludePendingLateFilingReview($this->departmentScope($admin))
+                    ->lockForUpdate()
+                    ->where('id', $id)
+                    ->first();
                 if (!$app) {
                     throw new RuntimeException('NOT_FOUND');
                 }
@@ -291,7 +321,7 @@ class COCApplicationController extends Controller
             return $this->handleRuntimeException($exception);
         }
 
-        $app = COCApplication::query()->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])->find($id);
+        $app = COCApplication::query()->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'lateFilingReviewedByHr', 'ctoLeaveType'])->find($id);
 
         return response()->json([
             'message' => 'COC application rejected by department admin.',
@@ -319,7 +349,7 @@ class COCApplicationController extends Controller
         $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
 
         $applications = COCApplication::query()
-            ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
+            ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'lateFilingReviewedByHr', 'ctoLeaveType'])
             ->where(function ($query): void {
                 $query
                     ->where('status', '!=', COCApplication::STATUS_PENDING)
@@ -349,7 +379,7 @@ class COCApplicationController extends Controller
         }
 
         $application = COCApplication::query()
-            ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
+            ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'lateFilingReviewedByHr', 'ctoLeaveType'])
             ->where(function ($query): void {
                 $query
                     ->where('status', '!=', COCApplication::STATUS_PENDING)
@@ -363,6 +393,139 @@ class COCApplicationController extends Controller
 
         return response()->json([
             'application' => $this->formatApplication($application),
+        ]);
+    }
+
+    public function hrLateFilingIndex(Request $request): JsonResponse
+    {
+        $hr = $request->user();
+        if (!$hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can view late-filed COC applications.'], 403);
+        }
+
+        $validated = $request->validate([
+            'status' => ['nullable', 'string', 'max:50'],
+            'employee_control_no' => ['nullable', 'string', 'regex:/^\d+$/'],
+        ]);
+
+        $statusFilter = $this->normalizeStatusFilter($validated['status'] ?? null);
+        if (($validated['status'] ?? null) !== null && $statusFilter === null) {
+            return response()->json(['message' => 'Invalid status filter.'], 422);
+        }
+
+        $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
+
+        $applications = COCApplication::query()
+            ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'lateFilingReviewedByHr', 'ctoLeaveType'])
+            ->where('is_late_filed', true)
+            ->when($controlNo !== '', function ($query) use ($controlNo): void {
+                $query->matchingControlNo($controlNo);
+            })
+            ->orderByDesc('created_at')
+            ->get();
+
+        $applications = $this->filterByRawStatus($applications, $statusFilter);
+        $leaveBalanceDirectory = $this->buildLeaveBalanceDirectory($applications);
+
+        return response()->json([
+            'applications' => $applications
+                ->map(fn(COCApplication $app) => $this->formatApplication($app, $leaveBalanceDirectory))
+                ->values(),
+        ]);
+    }
+
+    public function hrApproveLateFiling(Request $request, int $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (!$hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can approve late-filed COC applications.'], 403);
+        }
+
+        $validated = $request->validate(['remarks' => ['nullable', 'string', 'max:2000']]);
+
+        try {
+            DB::transaction(function () use ($id, $hr, $validated): void {
+                $app = COCApplication::query()->lockForUpdate()->find($id);
+                if (!$app) {
+                    throw new RuntimeException('NOT_FOUND');
+                }
+
+                if (!$this->isPendingLateFilingReview($app)) {
+                    throw new RuntimeException('LATE_FILING_NOT_PENDING');
+                }
+
+                $app->update([
+                    'late_filing_status' => self::LATE_FILING_STATUS_APPROVED,
+                    'late_filing_reviewed_by_hr_id' => $hr->id,
+                    'late_filing_reviewed_at' => now(),
+                    'late_filing_review_remarks' => trim((string) ($validated['remarks'] ?? '')) ?: $app->late_filing_review_remarks,
+                    'remarks' => trim((string) ($validated['remarks'] ?? '')) ?: $app->remarks,
+                ]);
+            });
+        } catch (RuntimeException $exception) {
+            return $this->handleRuntimeException($exception);
+        }
+
+        $app = COCApplication::query()->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'lateFilingReviewedByHr', 'ctoLeaveType'])->find($id);
+        if ($app) {
+            $employee = HrisEmployee::findByControlNo((string) ($app->employee_control_no ?? ''));
+            if ($employee) {
+                $this->notifyDepartmentAdminsOfSubmittedCoc($employee, $app);
+            }
+        }
+
+        return response()->json([
+            'message' => 'Late COC filing approved and forwarded to department admin review.',
+            'application' => $app ? $this->formatApplication($app) : null,
+        ]);
+    }
+
+    public function hrRejectLateFiling(Request $request, int $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (!$hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can reject late-filed COC applications.'], 403);
+        }
+
+        $validated = $request->validate(['remarks' => ['nullable', 'string', 'max:2000']]);
+
+        try {
+            DB::transaction(function () use ($id, $hr, $validated): void {
+                $app = COCApplication::query()->lockForUpdate()->find($id);
+                if (!$app) {
+                    throw new RuntimeException('NOT_FOUND');
+                }
+
+                if (!$this->isPendingLateFilingReview($app)) {
+                    throw new RuntimeException('LATE_FILING_NOT_PENDING');
+                }
+
+                $app->update([
+                    'status' => COCApplication::STATUS_REJECTED,
+                    'late_filing_status' => self::LATE_FILING_STATUS_REJECTED,
+                    'late_filing_reviewed_by_hr_id' => $hr->id,
+                    'late_filing_reviewed_at' => now(),
+                    'late_filing_review_remarks' => trim((string) ($validated['remarks'] ?? '')) ?: $app->late_filing_review_remarks,
+                    'remarks' => trim((string) ($validated['remarks'] ?? '')) ?: $app->remarks,
+                    'reviewed_by_admin_id' => null,
+                    'admin_reviewed_at' => null,
+                    'reviewed_by_hr_id' => $hr->id,
+                    'reviewed_at' => now(),
+                    'cto_leave_type_id' => null,
+                    'cto_credited_days' => null,
+                    'cto_credited_at' => null,
+                    'credited_hours' => null,
+                ]);
+            });
+        } catch (RuntimeException $exception) {
+            return $this->handleRuntimeException($exception);
+        }
+
+        $app = COCApplication::query()->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'lateFilingReviewedByHr', 'ctoLeaveType'])->find($id);
+
+        return response()->json([
+            'message' => 'Late COC filing rejected.',
+            'application' => $app ? $this->formatApplication($app) : null,
         ]);
     }
 
@@ -483,7 +646,7 @@ class COCApplicationController extends Controller
             return $this->handleRuntimeException($exception);
         }
 
-        $app = COCApplication::query()->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])->find($id);
+        $app = COCApplication::query()->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'lateFilingReviewedByHr', 'ctoLeaveType'])->find($id);
         if ($app) {
             $creditedDays = isset($result['days']) ? (float) $result['days'] : null;
             $this->notifyAdminOfHrCocDecision($app, true, $creditedDays);
@@ -535,7 +698,7 @@ class COCApplicationController extends Controller
             return $this->handleRuntimeException($exception);
         }
 
-        $app = COCApplication::query()->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])->find($id);
+        $app = COCApplication::query()->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'lateFilingReviewedByHr', 'ctoLeaveType'])->find($id);
         if ($app) {
             $this->notifyAdminOfHrCocDecision($app, false);
         }
@@ -755,7 +918,7 @@ class COCApplicationController extends Controller
             ? $excessMinutes
             : 0;
 
-        return $wholeHoursMinutes + $creditableExcessMinutes;
+        return min(self::MINUTES_PER_WORKDAY, $wholeHoursMinutes + $creditableExcessMinutes);
     }
 
     private function calculateMandatoryBreakMinutes(int $minutes): int
@@ -923,7 +1086,7 @@ class COCApplicationController extends Controller
         if ($normalized === '') return null;
         $normalized = str_replace([' ', '-'], '_', $normalized);
 
-        return in_array($normalized, ['PENDING', 'PENDING_ADMIN', 'PENDING_HR', 'APPROVED', 'REJECTED'], true)
+        return in_array($normalized, ['PENDING', 'PENDING_ADMIN', 'PENDING_HR', 'PENDING_LATE_HR', 'APPROVED', 'REJECTED'], true)
             ? $normalized
             : null;
     }
@@ -934,7 +1097,7 @@ class COCApplicationController extends Controller
 
         return $applications->filter(function (COCApplication $app) use ($statusFilter): bool {
             $raw = $this->deriveRawStatus($app);
-            if ($statusFilter === 'PENDING') return in_array($raw, ['PENDING_ADMIN', 'PENDING_HR'], true);
+            if ($statusFilter === 'PENDING') return in_array($raw, ['PENDING_ADMIN', 'PENDING_HR', 'PENDING_LATE_HR'], true);
             return $raw === $statusFilter;
         })->values();
     }
@@ -942,7 +1105,36 @@ class COCApplicationController extends Controller
     private function deriveRawStatus(COCApplication $app): string
     {
         if ($app->status !== COCApplication::STATUS_PENDING) return $app->status;
+        if ($this->isPendingLateFilingReview($app)) return 'PENDING_LATE_HR';
         return $app->admin_reviewed_at ? 'PENDING_HR' : 'PENDING_ADMIN';
+    }
+
+    private function isPendingLateFilingReview(COCApplication $application): bool
+    {
+        return (bool) ($application->is_late_filed ?? false)
+            && strtoupper(trim((string) ($application->late_filing_status ?? ''))) === self::LATE_FILING_STATUS_PENDING
+            && $application->status === COCApplication::STATUS_PENDING;
+    }
+
+    private function excludePendingLateFilingReview($query)
+    {
+        return $query->where(function ($nestedQuery): void {
+            $nestedQuery
+                ->where('is_late_filed', false)
+                ->orWhereNull('is_late_filed')
+                ->orWhere('late_filing_status', '!=', self::LATE_FILING_STATUS_PENDING)
+                ->orWhereNull('late_filing_status');
+        });
+    }
+
+    private function resolveLateFilingDeadline(int $applicationYear, int $applicationMonth): CarbonImmutable
+    {
+        return CarbonImmutable::create($applicationYear, $applicationMonth, 1)
+            ->startOfDay()
+            ->addMonthNoOverflow()
+            ->startOfMonth()
+            ->addDays(9)
+            ->endOfDay();
     }
 
     private function resolveCTOLeaveType(): ?LeaveType
@@ -992,6 +1184,7 @@ class COCApplicationController extends Controller
             'MONTHLY_CAP_EXCEEDED' => response()->json(['message' => 'Approving this application would exceed the 40-hour monthly COC limit.'], 422),
             'BALANCE_CAP_EXCEEDED' => response()->json(['message' => 'Approving this application would exceed the 120-hour maximum COC balance.'], 422),
             'OVERNIGHT_LIMIT_EXCEEDED' => response()->json(['message' => 'No employee shall render overnight overtime for more than two consecutive nights.'], 422),
+            'LATE_FILING_NOT_PENDING' => response()->json(['message' => 'This COC late filing is no longer pending HR late-filing review.'], 422),
             default => throw $exception,
         };
     }
@@ -1053,6 +1246,7 @@ class COCApplicationController extends Controller
         $status = match ($rawStatus) {
             'PENDING_ADMIN' => 'Pending Admin',
             'PENDING_HR' => 'Pending HR',
+            'PENDING_LATE_HR' => 'Pending HR Late Filing',
             'APPROVED' => 'Approved',
             'REJECTED' => 'Rejected',
             default => $rawStatus,
@@ -1074,6 +1268,10 @@ class COCApplicationController extends Controller
         $creditedAt = $app->cto_credited_at ?? $app->reviewed_at ?? $app->created_at;
         $expiresOn = $app->status === COCApplication::STATUS_APPROVED && $creditedAt
             ? $this->resolveCocExpiryDate(CarbonImmutable::parse((string) $creditedAt)->startOfDay())->toDateString()
+            : null;
+        [$applicationYear, $applicationMonth] = $this->resolveApplicationPeriod($app);
+        $lateFilingDeadline = ($applicationYear > 0 && $applicationMonth > 0)
+            ? $this->resolveLateFilingDeadline($applicationYear, $applicationMonth)->toDateString()
             : null;
 
         return [
@@ -1103,6 +1301,18 @@ class COCApplicationController extends Controller
             'status' => $status,
             'rawStatus' => $rawStatus,
             'raw_status' => $rawStatus,
+            'isLateFiled' => (bool) ($app->is_late_filed ?? false),
+            'is_late_filed' => (bool) ($app->is_late_filed ?? false),
+            'lateFilingStatus' => strtoupper(trim((string) ($app->late_filing_status ?? ''))) ?: null,
+            'late_filing_status' => strtoupper(trim((string) ($app->late_filing_status ?? ''))) ?: null,
+            'lateFilingDeadline' => $lateFilingDeadline,
+            'late_filing_deadline' => $lateFilingDeadline,
+            'lateFilingReviewedBy' => $app->lateFilingReviewedByHr?->full_name,
+            'late_filing_reviewed_by' => $app->lateFilingReviewedByHr?->full_name,
+            'lateFilingReviewedAt' => $app->late_filing_reviewed_at?->toIso8601String(),
+            'late_filing_reviewed_at' => $app->late_filing_reviewed_at?->toIso8601String(),
+            'lateFilingReviewRemarks' => trim((string) ($app->late_filing_review_remarks ?? '')) ?: null,
+            'late_filing_review_remarks' => trim((string) ($app->late_filing_review_remarks ?? '')) ?: null,
             'remarks' => $app->remarks,
             'cancelled' => $isCancelled,
             'cancellation_reason' => $isCancelled ? $remarks : null,
@@ -1378,6 +1588,34 @@ class COCApplicationController extends Controller
                 Notification::TYPE_COC_REQUEST,
                 'New COC Application',
                 "{$employeeName} submitted a COC application ({$durationLabel}).",
+                null,
+                (int) $application->id
+            );
+        }
+    }
+
+    private function notifyHrOfPendingLateCocReview(COCApplication $application): void
+    {
+        $hrAccounts = HRAccount::query()->get();
+        if ($hrAccounts->isEmpty()) {
+            return;
+        }
+
+        $employee = HrisEmployee::findByControlNo((string) ($application->employee_control_no ?? ''));
+        $employeeName = $this->resolveEmployeeDisplayName($employee, $application);
+        $durationLabel = $this->formatHours($this->minutesToHours((int) ($application->total_minutes ?? 0)));
+        [$applicationYear, $applicationMonth] = $this->resolveApplicationPeriod($application);
+        $lateFilingDeadline = ($applicationYear > 0 && $applicationMonth > 0)
+            ? $this->resolveLateFilingDeadline($applicationYear, $applicationMonth)->toDateString()
+            : null;
+        $deadlineText = $lateFilingDeadline ? " Deadline was {$lateFilingDeadline}." : '';
+
+        foreach ($hrAccounts as $hrAccount) {
+            Notification::send(
+                $hrAccount,
+                Notification::TYPE_COC_PENDING,
+                'Late COC Filing Pending HR Review',
+                "{$employeeName} submitted a late COC application ({$durationLabel}).{$deadlineText}",
                 null,
                 (int) $application->id
             );

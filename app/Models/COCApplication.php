@@ -24,6 +24,11 @@ class COCApplication extends Model
         'employee_control_no',
         'employee_name',
         'status',
+        'is_late_filed',
+        'late_filing_status',
+        'late_filing_reviewed_by_hr_id',
+        'late_filing_reviewed_at',
+        'late_filing_review_remarks',
         'reviewed_by_admin_id',
         'admin_reviewed_at',
         'reviewed_by_hr_id',
@@ -45,6 +50,9 @@ class COCApplication extends Model
     {
         return [
             'reviewed_by_admin_id' => 'integer',
+            'is_late_filed' => 'boolean',
+            'late_filing_reviewed_by_hr_id' => 'integer',
+            'late_filing_reviewed_at' => 'datetime',
             'admin_reviewed_at' => 'datetime',
             'reviewed_by_hr_id' => 'integer',
             'reviewed_at' => 'datetime',
@@ -107,6 +115,11 @@ class COCApplication extends Model
     public function reviewedByHr(): BelongsTo
     {
         return $this->belongsTo(HRAccount::class, 'reviewed_by_hr_id');
+    }
+
+    public function lateFilingReviewedByHr(): BelongsTo
+    {
+        return $this->belongsTo(HRAccount::class, 'late_filing_reviewed_by_hr_id');
     }
 
     public function reviewedByAdmin(): BelongsTo

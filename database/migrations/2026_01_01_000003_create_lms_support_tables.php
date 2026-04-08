@@ -85,6 +85,14 @@ return new class extends Migration {
                 ->on('tblEmployees')
                 ->noActionOnDelete();
             $table->string('status', 16)->default('PENDING');
+            $table->boolean('is_late_filed')->default(false);
+            $table->string('late_filing_status', 16)->nullable();
+            $table->foreignId('late_filing_reviewed_by_hr_id')
+                ->nullable()
+                ->constrained('tblHRAccounts')
+                ->noActionOnDelete();
+            $table->timestamp('late_filing_reviewed_at')->nullable();
+            $table->text('late_filing_review_remarks')->nullable();
             $table->foreignId('reviewed_by_admin_id')
                 ->nullable()
                 ->constrained('tblDepartmentAdmins')
@@ -116,6 +124,7 @@ return new class extends Migration {
             $table->index(['status', 'created_at'], 'ix_tblcocapplications_status_created_at');
             $table->index(['reviewed_by_admin_id', 'admin_reviewed_at'], 'ix_tblcocapplications_admin_review');
             $table->index(['employee_control_no', 'application_year', 'application_month'], 'ix_tblcocapplications_employee_period');
+            $table->index(['is_late_filed', 'late_filing_status', 'created_at'], 'ix_tblcocapplications_late_filing');
         });
 
         Schema::create('tblCOCApplicationRows', function (Blueprint $table): void {
