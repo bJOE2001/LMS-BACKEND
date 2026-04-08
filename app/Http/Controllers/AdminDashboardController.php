@@ -8,6 +8,7 @@ use App\Models\HRAccount;
 use App\Models\HrisEmployee;
 use App\Models\LeaveApplication;
 use App\Models\LeaveApplicationLog;
+use App\Models\LeaveApplicationUpdateRequest;
 use App\Models\LeaveBalance;
 use App\Models\LeaveType;
 use App\Models\Notification;
@@ -48,7 +49,7 @@ class AdminDashboardController extends Controller
         $deptName = $admin->department?->name;
         $departmentEmployeeControlNos = $this->departmentEmployeeControlNoCandidates($deptName);
 
-        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin', 'logs'])
+        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin', 'logs', 'updateRequests'])
             ->where(function ($query) use ($departmentEmployeeControlNos, $admin) {
                 // Include employee leaves for this department (matched by office)
                 $query->when(
@@ -1393,6 +1394,54 @@ class AdminDashboardController extends Controller
         }
         $deductibleDays = round(max($deductibleDays, 0.0), 2);
         $withoutPayDays = round(max($durationDays - $deductibleDays, 0.0), 2);
+        $pendingApprovedUpdateRequest = $this->resolvePendingApprovedUpdateRequestRecord($app);
+        $latestApprovedUpdateRequest = $this->resolveLatestApprovedUpdateRequestRecord($app);
+        $pendingUpdatePayload = $this->normalizeUpdateRequestPayload(
+            $pendingApprovedUpdateRequest?->requested_payload
+        );
+        $latestUpdatePayload = $this->normalizeUpdateRequestPayload(
+            $latestApprovedUpdateRequest?->requested_payload
+        );
+        $pendingUpdateActionType = $this->resolveUpdateRequestActionTypeFromPayload($pendingUpdatePayload);
+        $latestUpdateActionType = $this->resolveUpdateRequestActionTypeFromPayload($latestUpdatePayload);
+        $pendingUpdatePreviousStatus = $pendingApprovedUpdateRequest
+            ? strtoupper(trim((string) ($pendingApprovedUpdateRequest->previous_status ?? '')))
+            : null;
+        $latestUpdatePreviousStatus = $latestApprovedUpdateRequest
+            ? strtoupper(trim((string) ($latestApprovedUpdateRequest->previous_status ?? '')))
+            : null;
+        $pendingUpdateRequestedBy = $this->trimNullableString(
+            $pendingApprovedUpdateRequest?->requested_by_control_no ?? null
+        );
+        $latestUpdateRequestedBy = $this->trimNullableString(
+            $latestApprovedUpdateRequest?->requested_by_control_no ?? null
+        );
+        $pendingUpdateReason = $this->trimNullableString(
+            $pendingApprovedUpdateRequest?->requested_reason ?? null
+        );
+        $latestUpdateReason = $this->trimNullableString(
+            $latestApprovedUpdateRequest?->requested_reason ?? null
+        );
+        $latestUpdateStatus = $latestApprovedUpdateRequest
+            ? strtoupper(trim((string) ($latestApprovedUpdateRequest->status ?? '')))
+            : null;
+        $latestUpdateReviewRemarks = $this->trimNullableString(
+            $latestApprovedUpdateRequest?->review_remarks ?? null
+        );
+        $statusHistory = $logs->map(function (LeaveApplicationLog $log) use ($actorDirectory, $employeeName) {
+            $actorName = $this->resolvePerformerName($log, $actorDirectory, $employeeName);
+
+            return [
+                'action' => $log->action,
+                'stage' => $log->action,
+                'actor_name' => $actorName,
+                'action_by_name' => $actorName,
+                'action_by' => $actorName,
+                'performed_by_type' => strtoupper((string) $log->performed_by_type),
+                'remarks' => $log->remarks,
+                'created_at' => $log->created_at?->toIso8601String(),
+            ];
+        })->values();
 
         return [
             'id' => $app->id,
@@ -1420,6 +1469,22 @@ class AdminDashboardController extends Controller
             'createdAt' => $app->created_at?->toIso8601String(),
             'created_at' => $app->created_at?->toIso8601String(),
             'remarks' => $app->remarks,
+            'pending_update' => $pendingUpdatePayload,
+            'pending_update_action_type' => $pendingUpdateActionType,
+            'pending_update_reason' => $pendingUpdateReason,
+            'pending_update_previous_status' => $pendingUpdatePreviousStatus,
+            'pending_update_requested_by' => $pendingUpdateRequestedBy,
+            'pending_update_requested_at' => $pendingApprovedUpdateRequest?->requested_at?->toIso8601String(),
+            'has_pending_update_request' => $pendingApprovedUpdateRequest !== null,
+            'latest_update_request_status' => $latestUpdateStatus,
+            'latest_update_request_payload' => $latestUpdatePayload,
+            'latest_update_request_action_type' => $latestUpdateActionType,
+            'latest_update_request_reason' => $latestUpdateReason,
+            'latest_update_request_previous_status' => $latestUpdatePreviousStatus,
+            'latest_update_requested_by' => $latestUpdateRequestedBy,
+            'latest_update_requested_at' => $latestApprovedUpdateRequest?->requested_at?->toIso8601String(),
+            'latest_update_reviewed_at' => $latestApprovedUpdateRequest?->reviewed_at?->toIso8601String(),
+            'latest_update_review_remarks' => $latestUpdateReviewRemarks,
             'selected_dates' => $selectedDates,
             'selected_date_pay_status' => $selectedDatePayStatus,
             'selected_date_coverage' => $selectedDateCoverage,
@@ -1461,7 +1526,131 @@ class AdminDashboardController extends Controller
             'leaveBalances' => $currentLeaveBalances,
             'employee_leave_balances' => $currentLeaveBalances,
             'certificationLeaveCredits' => $this->getCertificationLeaveCredits($app, $leaveBalanceDirectory),
+            'status_history' => $statusHistory,
         ];
+    }
+
+    private function resolvePendingApprovedUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
+    {
+        if (!$app->id) {
+            return null;
+        }
+
+        if ($app->relationLoaded('updateRequests')) {
+            $record = $app->updateRequests
+                ->filter(fn($item) => $item instanceof LeaveApplicationUpdateRequest)
+                ->sortByDesc(fn(LeaveApplicationUpdateRequest $item) => (int) $item->id)
+                ->first(function (LeaveApplicationUpdateRequest $item): bool {
+                    return strtoupper(trim((string) ($item->status ?? ''))) === LeaveApplicationUpdateRequest::STATUS_PENDING
+                        && strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED;
+                });
+
+            return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
+        }
+
+        return LeaveApplicationUpdateRequest::query()
+            ->where('leave_application_id', (int) $app->id)
+            ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
+            ->where('previous_status', LeaveApplication::STATUS_APPROVED)
+            ->latest('id')
+            ->first();
+    }
+
+    private function resolveLatestApprovedUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
+    {
+        if (!$app->id) {
+            return null;
+        }
+
+        if ($app->relationLoaded('updateRequests')) {
+            $record = $app->updateRequests
+                ->filter(fn($item) => $item instanceof LeaveApplicationUpdateRequest)
+                ->sortByDesc(fn(LeaveApplicationUpdateRequest $item) => (int) $item->id)
+                ->first(function (LeaveApplicationUpdateRequest $item): bool {
+                    return strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED;
+                });
+
+            return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
+        }
+
+        $record = LeaveApplicationUpdateRequest::query()
+            ->where('leave_application_id', (int) $app->id)
+            ->latest('id')
+            ->first();
+
+        if (!$record) {
+            return null;
+        }
+
+        return strtoupper(trim((string) ($record->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED
+            ? $record
+            : null;
+    }
+
+    private function normalizeUpdateRequestPayload(mixed $payload): ?array
+    {
+        if (is_string($payload)) {
+            $decoded = json_decode($payload, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $payload = $decoded;
+            }
+        }
+
+        if (!is_array($payload) || $payload === []) {
+            return null;
+        }
+
+        return $payload;
+    }
+
+    private function resolveUpdateRequestActionTypeFromPayload(?array $payload): ?string
+    {
+        if (!is_array($payload) || $payload === []) {
+            return null;
+        }
+
+        $candidates = [
+            $payload['request_action_type'] ?? null,
+            $payload['requestActionType'] ?? null,
+            $payload['update_action_type'] ?? null,
+            $payload['updateActionType'] ?? null,
+            $payload['action_type'] ?? null,
+            $payload['actionType'] ?? null,
+        ];
+
+        foreach ($candidates as $candidate) {
+            $normalized = strtoupper(trim((string) $candidate));
+            $normalized = str_replace([' ', '-'], '_', $normalized);
+            if ($normalized === '') {
+                continue;
+            }
+
+            if (in_array($normalized, [
+                LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE,
+                'UPDATE_REQUEST',
+                'EDIT_REQUEST',
+                'REQUEST_EDIT',
+            ], true)) {
+                return LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE;
+            }
+
+            if (in_array($normalized, [
+                LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL,
+                'CANCEL_REQUEST',
+                'REQUEST_CANCELLATION',
+                'CANCELLATION_REQUEST',
+            ], true)) {
+                return LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL;
+            }
+        }
+
+        return null;
+    }
+
+    private function trimNullableString(mixed $value): ?string
+    {
+        $trimmed = trim((string) ($value ?? ''));
+        return $trimmed !== '' ? $trimmed : null;
     }
 
     private function formatEmployeeFullName(?object $employee): string
