@@ -180,6 +180,8 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::post('/leave-applications/{id}/recall', [LeaveApplicationController::class, 'hrRecall']);
         Route::get('/coc-applications', [COCApplicationController::class, 'hrIndex']);
         Route::get('/coc-applications/{id}', [COCApplicationController::class, 'hrShow']);
+        Route::post('/coc-applications/{id}/receive', [COCApplicationController::class, 'hrReceive']);
+        Route::post('/coc-applications/{id}/release', [COCApplicationController::class, 'hrRelease']);
         Route::post('/coc-applications/{id}/approve', [COCApplicationController::class, 'hrApprove']);
         Route::post('/coc-applications/{id}/reject', [COCApplicationController::class, 'hrReject']);
 

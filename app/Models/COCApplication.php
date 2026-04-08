@@ -27,6 +27,10 @@ class COCApplication extends Model
         'reviewed_by_admin_id',
         'admin_reviewed_at',
         'reviewed_by_hr_id',
+        'hr_received_by_id',
+        'hr_received_at',
+        'hr_released_by_id',
+        'hr_released_at',
         'reviewed_at',
         'cto_leave_type_id',
         'cto_credited_days',
@@ -47,6 +51,10 @@ class COCApplication extends Model
             'reviewed_by_admin_id' => 'integer',
             'admin_reviewed_at' => 'datetime',
             'reviewed_by_hr_id' => 'integer',
+            'hr_received_by_id' => 'integer',
+            'hr_received_at' => 'datetime',
+            'hr_released_by_id' => 'integer',
+            'hr_released_at' => 'datetime',
             'reviewed_at' => 'datetime',
             'cto_leave_type_id' => 'integer',
             'cto_credited_days' => 'decimal:2',
@@ -112,6 +120,16 @@ class COCApplication extends Model
     public function reviewedByAdmin(): BelongsTo
     {
         return $this->belongsTo(DepartmentAdmin::class, 'reviewed_by_admin_id');
+    }
+
+    public function receivedByHr(): BelongsTo
+    {
+        return $this->belongsTo(HRAccount::class, 'hr_received_by_id');
+    }
+
+    public function releasedByHr(): BelongsTo
+    {
+        return $this->belongsTo(HRAccount::class, 'hr_released_by_id');
     }
 
     public function ctoLeaveType(): BelongsTo
