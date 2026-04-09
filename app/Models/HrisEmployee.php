@@ -136,6 +136,13 @@ class HrisEmployee
         return self::snapshotCount($activeOnly);
     }
 
+    public static function allSnapshot(?bool $activeOnly = null): Collection
+    {
+        $rows = self::applyDepartmentAssignments(self::snapshotAllRows($activeOnly));
+
+        return collect($rows)->map(static fn (array $row): object => (object) $row);
+    }
+
     /**
      * Build an employee directory keyed by normalized control number.
      *

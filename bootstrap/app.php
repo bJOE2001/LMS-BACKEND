@@ -1,8 +1,10 @@
 <?php
 
+use Illuminate\Auth\AuthenticationException;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
+use Illuminate\Http\Request;
 
 return Application::configure(basePath: dirname(__DIR__))
     ->withRouting(
@@ -22,5 +24,23 @@ return Application::configure(basePath: dirname(__DIR__))
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
-        //
+        $exceptions->render(function (AuthenticationException $exception, Request $request) {
+            if (!$request->is('api/*')) {
+                return null;
+            }
+
+            $reason = trim((string) $request->attributes->get('sanctum_auth_failure_reason', ''));
+            $message = match ($reason) {
+                'concurrent_login' => 'This account was logged in on another device.',
+                'idle_timeout' => 'Your session expired after 1 hour of inactivity.',
+                default => 'Unauthenticated.',
+            };
+
+            $payload = ['message' => $message];
+            if ($reason !== '') {
+                $payload['reason'] = $reason;
+            }
+
+            return response()->json($payload, 401);
+        });
     })->create();

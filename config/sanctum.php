@@ -51,7 +51,32 @@ return [
     |
     */
 
-    'expiration' => env('SANCTUM_TOKEN_EXPIRATION', 120),
+    'expiration' => null,
+
+    /*
+    |--------------------------------------------------------------------------
+    | Single Device Login
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, HR and department admin accounts may only keep one active
+    | API token at a time. Logging in on a new device invalidates the
+    | previously active device on its next API request.
+    |
+    */
+
+    'single_device_login' => true,
+
+    /*
+    |--------------------------------------------------------------------------
+    | Idle Timeout Minutes
+    |--------------------------------------------------------------------------
+    |
+    | This value controls how long HR and department admin API tokens may
+    | remain unused before they are treated as expired due to inactivity.
+    |
+    */
+
+    'idle_timeout' => 60,
 
     /*
     |--------------------------------------------------------------------------

@@ -224,6 +224,8 @@ class NotificationController extends Controller
             'end_date' => $application->end_date?->toDateString(),
             'total_days' => (float) $application->total_days,
             'reason' => $application->reason,
+            'details_of_leave' => $application->details_of_leave,
+            'selected_date_half_day_portion' => is_array($application->selected_date_half_day_portion) ? $application->selected_date_half_day_portion : null,
             'status' => $this->toReadableStatus($application->status),
             'raw_status' => $application->status,
             'remarks' => $application->remarks,

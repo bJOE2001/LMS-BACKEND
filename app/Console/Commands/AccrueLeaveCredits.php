@@ -8,6 +8,7 @@ use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveType;
 use Illuminate\Console\Command;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -21,7 +22,9 @@ class AccrueLeaveCredits extends Command
     private const SQL_SERVER_SAFE_PARAMETER_LIMIT = 2000;
     private const EXCLUDED_ACCRUAL_STATUS_KEYWORDS = ['HONORARIUM', 'CONTRACTUAL'];
 
-    protected $signature = 'leave:accrue {--date= : Override accrual date (Y-m-d) for testing}';
+    protected $signature = 'leave:accrue
+        {--date= : Override accrual date (Y-m-d) for testing}
+        {--hr-timeout=8 : SQL Server login/query timeout in seconds before falling back to tblEmployees}';
 
     protected $description = 'Accrue monthly leave credits for ACCRUED leave types (run on 1st of month)';
 
@@ -30,6 +33,7 @@ class AccrueLeaveCredits extends Command
         $dateStr = $this->option('date');
         $now = $dateStr ? Carbon::parse($dateStr) : Carbon::now();
         $accrualMonth = $now->format('Y-m');
+        $hrTimeout = max(3, (int) ($this->option('hr-timeout') ?? 8));
 
         $this->info("Running leave accrual for month: {$accrualMonth}");
 
@@ -43,7 +47,7 @@ class AccrueLeaveCredits extends Command
             return self::SUCCESS;
         }
 
-        $employeeDirectory = $this->buildEmployeeDirectory();
+        $employeeDirectory = $this->buildEmployeeDirectory($hrTimeout);
         if ($employeeDirectory['employees'] === []) {
             $this->warn('No employee records found. Nothing to accrue.');
             return self::SUCCESS;
@@ -135,12 +139,12 @@ class AccrueLeaveCredits extends Command
      *     lookup: array<string, array{name: string, status: mixed}>
      * }
      */
-    private function buildEmployeeDirectory(): array
+    private function buildEmployeeDirectory(int $hrTimeout): array
     {
         $employees = [];
         $lookup = [];
 
-        $records = HrisEmployee::query(true)->get();
+        $records = $this->resolveAccrualEmployeeRecords($hrTimeout);
 
         foreach ($records as $employee) {
             if (!is_object($employee)) {
@@ -179,6 +183,54 @@ class AccrueLeaveCredits extends Command
             'employees' => $employees,
             'lookup' => $lookup,
         ];
+    }
+
+    private function resolveAccrualEmployeeRecords(int $hrTimeout): Collection
+    {
+        $snapshotCount = HrisEmployee::countSnapshot(true);
+
+        $this->configureHrTimeout($hrTimeout);
+        HrisEmployee::flushCache();
+
+        $this->line(
+            "Trying live HRIS first with {$hrTimeout}s timeout"
+            .($snapshotCount > 0 ? "; tblEmployees fallback is available." : '; no local snapshot fallback rows detected.')
+        );
+
+        $records = HrisEmployee::allCached(true);
+
+        if ($records->isNotEmpty()) {
+            return $records;
+        }
+
+        if ($snapshotCount > 0) {
+            $this->warn("Live HRIS returned no active employee rows. Using tblEmployees snapshot ({$snapshotCount} active row(s)).");
+
+            return HrisEmployee::allSnapshot(true);
+        }
+
+        return $records;
+    }
+
+    private function configureHrTimeout(int $seconds): void
+    {
+        if ($seconds <= 0) {
+            return;
+        }
+
+        $connection = config('database.connections.hr', []);
+        $options = is_array($connection['options'] ?? null) ? $connection['options'] : [];
+
+        if (defined('\PDO::SQLSRV_ATTR_QUERY_TIMEOUT')) {
+            $options[\PDO::SQLSRV_ATTR_QUERY_TIMEOUT] = $seconds;
+        }
+
+        config([
+            'database.connections.hr.login_timeout' => $seconds,
+            'database.connections.hr.options' => $options,
+        ]);
+
+        DB::purge('hr');
     }
 
     /**

@@ -10,6 +10,7 @@ use App\Models\HrisEmployee;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Laravel\Sanctum\NewAccessToken;
 
 class AuthController extends Controller
 {
@@ -22,14 +23,7 @@ class AuthController extends Controller
     public function login(LoginRequest $request): JsonResponse
     {
         $account = $request->authenticate();
-        $tokenExpirationMinutes = (int) config('sanctum.expiration', 120);
-        $tokenExpiresAt = $tokenExpirationMinutes > 0
-            ? now()->addMinutes($tokenExpirationMinutes)
-            : null;
-
-        $token = DB::transaction(function () use ($account, $tokenExpiresAt) {
-            return $account->createToken('auth-token', ['*'], $tokenExpiresAt)->plainTextToken;
-        });
+        $token = $this->issueSingleDeviceToken($account);
 
         [$userPayload, $dashboardRoute] = $this->formatAccount($account);
 
@@ -49,7 +43,22 @@ class AuthController extends Controller
      */
     public function logout(Request $request): JsonResponse
     {
-        $request->user()->currentAccessToken()->delete();
+        $account = $request->user();
+        $currentToken = $account?->currentAccessToken();
+
+        if (($account instanceof HRAccount || $account instanceof DepartmentAdmin) && $currentToken !== null) {
+            DB::transaction(function () use ($account, $currentToken): void {
+                if ((int) ($account->active_personal_access_token_id ?? 0) === (int) $currentToken->getKey()) {
+                    $account->forceFill([
+                        'active_personal_access_token_id' => null,
+                    ])->save();
+                }
+
+                $currentToken->delete();
+            });
+        } elseif ($currentToken !== null) {
+            $currentToken->delete();
+        }
 
         return response()->json([
             'message' => 'Logged out successfully.',
@@ -140,5 +149,27 @@ class AuthController extends Controller
         }
 
         return HrisEmployee::findByControlNo($controlNo);
+    }
+
+    private function issueSingleDeviceToken(HRAccount|DepartmentAdmin $account): string
+    {
+        $issuedToken = DB::transaction(function () use ($account): NewAccessToken {
+            $previousActiveTokenId = (int) ($account->active_personal_access_token_id ?? 0);
+
+            $staleTokenQuery = $account->tokens();
+            if ($previousActiveTokenId > 0) {
+                $staleTokenQuery->where('id', '!=', $previousActiveTokenId);
+            }
+            $staleTokenQuery->delete();
+
+            $newAccessToken = $account->createToken('auth-token', ['*']);
+            $account->forceFill([
+                'active_personal_access_token_id' => (int) $newAccessToken->accessToken->getKey(),
+            ])->save();
+
+            return $newAccessToken;
+        });
+
+        return $issuedToken->plainTextToken;
     }
 }

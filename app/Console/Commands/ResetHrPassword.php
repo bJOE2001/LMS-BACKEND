@@ -52,6 +52,7 @@ class ResetHrPassword extends Command
                 $account->forceFill([
                     'password' => Hash::make($temporaryPassword),
                     'must_change_password' => true,
+                    'active_personal_access_token_id' => null,
                 ])->save();
 
                 $account->tokens()->delete();

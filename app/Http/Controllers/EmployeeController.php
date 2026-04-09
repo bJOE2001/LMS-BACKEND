@@ -30,6 +30,9 @@ use Illuminate\Validation\Rule;
  */
 class EmployeeController extends Controller
 {
+    private const LEDGER_HOURS_PER_DAY = 8;
+    private const LEDGER_MINUTES_PER_HOUR = 60;
+
     /**
      * List departments for the filter dropdown.
      */
@@ -564,6 +567,8 @@ class EmployeeController extends Controller
                     'status' => $this->statusLabel($application->status),
                     'raw_status' => $application->status,
                     'reason' => $application->reason,
+                    'details_of_leave' => $application->details_of_leave,
+                    'selected_date_half_day_portion' => is_array($application->selected_date_half_day_portion) ? $application->selected_date_half_day_portion : null,
                     'remarks' => $application->remarks,
                     'date_filed' => $application->created_at?->toDateString(),
                     'admin_approved_at' => $application->admin_approved_at?->toIso8601String(),
@@ -669,7 +674,7 @@ class EmployeeController extends Controller
 
                     $source = strtoupper(trim((string) ($entry->source ?? '')));
                     $isManualAddSource = $source === 'HR_ADD' || str_starts_with($source, 'HR_ADD:');
-                    $particulars = match (true) {
+                    $actionTaken = match (true) {
                         $isManualAddSource => 'Leave credits added',
                         default => 'Monthly accrual',
                     };
@@ -680,8 +685,14 @@ class EmployeeController extends Controller
                         'transaction_date' => $accrualDate,
                         'sort_date' => $accrualDate,
                         'sort_timestamp' => (string) ($entry->created_at?->toIso8601String() ?? $accrualDate),
-                        'particulars' => $particulars,
-                        'action_taken' => $particulars,
+                        'particulars' => $this->buildLedgerParticulars(
+                            'earned',
+                            $typeKey,
+                            0.0,
+                            false,
+                            false
+                        ),
+                        'action_taken' => $actionTaken,
                         'category' => 'earned',
                         'amount' => $creditsAdded,
                         'balance_delta' => $creditsAdded,
@@ -770,14 +781,16 @@ class EmployeeController extends Controller
                     continue;
                 }
 
-                $particulars = $isMonetization
-                    ? 'Monetization'
-                    : match (true) {
-                        $isForcedLeave => 'Forced Leave',
-                        is_int($vacationLeaveTypeId) && $typeId === $vacationLeaveTypeId => 'Vacation Leave',
-                        is_int($sickLeaveTypeId) && $typeId === $sickLeaveTypeId => 'Sick Leave',
-                        default => 'Leave application',
-                    };
+                // Ledger particulars should reflect the requested leave duration,
+                // not schedule-inflated credit deductions. A whole-day leave stays
+                // `1-0-0` here even when a 10-hour schedule deducts 1.25 credits.
+                $particulars = $this->buildLedgerParticulars(
+                    'deduction',
+                    $typeKey,
+                    $totalDays,
+                    $isMonetization,
+                    $isForcedLeave
+                );
                 $applicationId = (int) $application->id;
                 $actionTaken = sprintf(
                     'Application #%d%s',
@@ -879,12 +892,13 @@ class EmployeeController extends Controller
                                     ?? $recallEffectiveAt?->toIso8601String()
                                     ?? $recallDate
                                 ),
-                                'particulars' => match (true) {
-                                    $isForcedLeave => 'Forced Leave recalled',
-                                    $typeKey === 'vacation' => 'Vacation Leave recalled',
-                                    $typeKey === 'sick' => 'Sick Leave recalled',
-                                    default => 'Leave recalled',
-                                },
+                                'particulars' => $this->buildLedgerParticulars(
+                                    'recall',
+                                    $typeKey,
+                                    $restoredAmount,
+                                    false,
+                                    $isForcedLeave
+                                ),
                                 'action_taken' => 'Recalled by HR',
                                 'inclusive_dates' => $restoredDates,
                                 'category' => 'earned',
@@ -1777,6 +1791,63 @@ class EmployeeController extends Controller
         } catch (\Throwable) {
             return '';
         }
+    }
+
+    private function buildLedgerParticulars(
+        string $entryKind,
+        ?string $typeKey,
+        float $days,
+        bool $isMonetization = false,
+        bool $isForcedLeave = false
+    ): string {
+        if ($entryKind === 'earned') {
+            return '0-0-0';
+        }
+
+        $formattedDuration = $this->formatLedgerDaysHoursMinutes($days);
+        if ($isMonetization) {
+            return $formattedDuration . ' Monetization';
+        }
+
+        $prefix = match (true) {
+            $isForcedLeave => 'FL',
+            $typeKey === 'vacation' => 'VL',
+            $typeKey === 'sick' => 'SL',
+            default => null,
+        };
+
+        $baseParticulars = $prefix !== null
+            ? $prefix . ' ' . $formattedDuration
+            : $formattedDuration;
+
+        return $entryKind === 'recall'
+            ? $baseParticulars . ' Recalled'
+            : $baseParticulars;
+    }
+
+    private function formatLedgerDaysHoursMinutes(float $days): string
+    {
+        $normalizedDays = round(max($days, 0.0), 4);
+        if ($normalizedDays <= 0.0) {
+            return '0-0-0';
+        }
+
+        $totalMinutes = (int) round(
+            $normalizedDays
+            * self::LEDGER_HOURS_PER_DAY
+            * self::LEDGER_MINUTES_PER_HOUR
+        );
+        if ($totalMinutes <= 0) {
+            return '0-0-0';
+        }
+
+        $minutesPerDay = self::LEDGER_HOURS_PER_DAY * self::LEDGER_MINUTES_PER_HOUR;
+        $dayCount = intdiv($totalMinutes, $minutesPerDay);
+        $remainingMinutes = $totalMinutes % $minutesPerDay;
+        $hourCount = intdiv($remainingMinutes, self::LEDGER_MINUTES_PER_HOUR);
+        $minuteCount = $remainingMinutes % self::LEDGER_MINUTES_PER_HOUR;
+
+        return "{$dayCount}-{$hourCount}-{$minuteCount}";
     }
 
     private function resolveLedgerInclusiveDates(

@@ -33,6 +33,7 @@ class HRAccount extends Model implements AuthenticatableContract
         return [
             'password' => 'hashed',
             'must_change_password' => 'boolean',
+            'active_personal_access_token_id' => 'integer',
         ];
     }
 

@@ -450,6 +450,8 @@ class HRDashboardController extends Controller
                 ? ((int) $durationDays) . ' ' . ((int) $durationDays === 1 ? 'day' : 'days')
                 : $durationDays . ' days',
             'reason' => $app->reason,
+            'details_of_leave' => $app->details_of_leave,
+            'detailsOfLeave' => $app->details_of_leave,
             'status' => $statusMap[$app->status] ?? $app->status,
             'rawStatus' => $app->status,
             'remarks' => $app->remarks,
@@ -471,6 +473,8 @@ class HRDashboardController extends Controller
             'selected_dates' => $app->resolvedSelectedDates(),
             'selected_date_pay_status' => $selectedDatePayStatus,
             'selected_date_coverage' => $selectedDateCoverage,
+            'selected_date_half_day_portion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selectedDateHalfDayPortion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
             'recallEffectiveDate' => $app->recall_effective_date?->toDateString(),
             'recall_effective_date' => $app->recall_effective_date?->toDateString(),
             'recallSelectedDates' => is_array($app->recall_selected_dates) ? array_values($app->recall_selected_dates) : null,

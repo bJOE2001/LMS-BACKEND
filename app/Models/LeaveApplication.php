@@ -18,6 +18,9 @@ class LeaveApplication extends Model
 
     public const PAY_MODE_WITH_PAY = 'WP';
     public const PAY_MODE_WITHOUT_PAY = 'WOP';
+    public const MONETIZATION_REQUIRED_COMMUTATION = 'Requested';
+    public const MONETIZATION_MINIMUM_VACATION_LEAVE_BALANCE_DAYS = 15.0;
+    public const MONETIZATION_MINIMUM_REQUEST_DAYS = 10.0;
 
     protected static function booted(): void
     {
@@ -33,9 +36,11 @@ class LeaveApplication extends Model
 
             if ((bool) $application->is_monetization) {
                 $application->pay_mode = self::PAY_MODE_WITH_PAY;
+                $application->commutation = self::MONETIZATION_REQUIRED_COMMUTATION;
                 $application->selected_dates = null;
                 $application->selected_date_pay_status = null;
                 $application->selected_date_coverage = null;
+                $application->selected_date_half_day_portion = null;
                 $application->deductible_days = round((float) ($application->total_days ?? 0), 2);
                 $application->cto_deducted_hours = null;
                 return;
@@ -77,6 +82,7 @@ class LeaveApplication extends Model
         'end_date',
         'total_days',
         'reason',
+        'details_of_leave',
         'deductible_days',
         'cto_deducted_hours',
         'status',
@@ -90,6 +96,7 @@ class LeaveApplication extends Model
         'selected_dates',
         'selected_date_pay_status',
         'selected_date_coverage',
+        'selected_date_half_day_portion',
         'commutation',
         'pay_mode',
         'linked_forced_leave_deducted_days',
@@ -118,6 +125,7 @@ class LeaveApplication extends Model
             'selected_dates' => 'array',
             'selected_date_pay_status' => 'array',
             'selected_date_coverage' => 'array',
+            'selected_date_half_day_portion' => 'array',
             'pay_mode' => 'string',
             'linked_forced_leave_deducted_days' => 'decimal:2',
             'linked_vacation_leave_deducted_days' => 'decimal:2',
