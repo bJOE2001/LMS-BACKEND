@@ -16,18 +16,6 @@ $envOrDefault = static function (string $key, mixed $default): mixed {
     return $value;
 };
 
-$sqlsrvOptions = static function (string $queryTimeoutKey) use ($envOrDefault): array {
-    $queryTimeout = (int) $envOrDefault($queryTimeoutKey, 5);
-
-    if (!defined('\PDO::SQLSRV_ATTR_QUERY_TIMEOUT') || $queryTimeout <= 0) {
-        return [];
-    }
-
-    return [
-        \PDO::SQLSRV_ATTR_QUERY_TIMEOUT => $queryTimeout,
-    ];
-};
-
 return [
 
     /*
@@ -154,8 +142,6 @@ return [
             'charset' => 'utf8',
             'prefix' => '',
             'prefix_indexes' => true,
-            'login_timeout' => (int) $envOrDefault('HR_DB_LOGIN_TIMEOUT', 5),
-            'options' => $sqlsrvOptions('HR_DB_QUERY_TIMEOUT'),
         ],
 
         /*
