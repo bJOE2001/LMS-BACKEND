@@ -363,6 +363,7 @@ class LeaveApplicationController extends Controller
     public function ermsStore(Request $request): JsonResponse
     {
         $this->normalizeSelectedDatesInput($request);
+        $this->normalizeSelectedDatePolicyInput($request);
         $this->mergeEmployeeControlNoInput($request);
 
         $baseValidated = $request->validate([
@@ -391,12 +392,15 @@ class LeaveApplicationController extends Controller
             'end_date' => ['required', 'date', 'after_or_equal:start_date'],
             'total_days' => ['required', 'numeric', 'min:0.5', 'max:365'],
             'reason' => ['nullable', 'string', 'max:2000'],
+            'details_of_leave' => ['nullable', 'string', 'max:2000'],
             'selected_dates' => ['nullable', 'array'],
             'selected_dates.*' => ['date'],
             'selected_date_pay_status' => ['nullable', 'array'],
             'selected_date_pay_status.*' => ['nullable', 'string', 'in:WP,WOP'],
             'selected_date_coverage' => ['nullable', 'array'],
             'selected_date_coverage.*' => ['nullable', 'string', 'in:whole,half'],
+            'selected_date_half_day_portion' => ['nullable', 'array'],
+            'selected_date_half_day_portion.*' => ['nullable', 'string', 'in:AM,PM'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
             'attachment' => ['nullable', 'file', 'max:10240'],
@@ -423,6 +427,11 @@ class LeaveApplicationController extends Controller
                 ? $validated['selected_date_coverage']
                 : $request->input('selected_date_coverage')
         );
+        $selectedDateHalfDayPortion = $this->normalizeSelectedDateHalfDayPortionMap(
+            array_key_exists('selected_date_half_day_portion', $validated)
+                ? $validated['selected_date_half_day_portion']
+                : $request->input('selected_date_half_day_portion')
+        );
         $resolvedSelectedDates = LeaveApplication::resolveSelectedDates(
             $validated['start_date'],
             $validated['end_date'],
@@ -434,10 +443,13 @@ class LeaveApplicationController extends Controller
             $resolvedSelectedDates,
             $requestedPayMode
         );
-        $selectedDateCoverage = $this->compactSelectedDateCoverageMap(
+        $selectedDateCoverageMetadata = $this->synchronizeSelectedDateCoverageMetadata(
             $selectedDateCoverage,
+            $selectedDateHalfDayPortion,
             $resolvedSelectedDates
         );
+        $selectedDateCoverage = $selectedDateCoverageMetadata['selectedDateCoverage'];
+        $selectedDateHalfDayPortion = $selectedDateCoverageMetadata['selectedDateHalfDayPortion'];
         $validated['leave_type_id'] = $this->resolveCanonicalLeaveTypeId((int) $validated['leave_type_id'])
             ?? (int) $validated['leave_type_id'];
         $leaveType = LeaveType::find((int) $validated['leave_type_id']);
@@ -526,6 +538,7 @@ class LeaveApplicationController extends Controller
             $requestedPayMode,
             $selectedDatePayStatus,
             $selectedDateCoverage,
+            $selectedDateHalfDayPortion,
             $resolvedSelectedDates,
             $deductibleDays,
             $ctoDeductedHours,
@@ -542,9 +555,11 @@ class LeaveApplicationController extends Controller
                 'deductible_days' => $deductibleDays,
                 'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn() && $ctoDeductedHours > 0 ? $ctoDeductedHours : null,
                 'reason' => $validated['reason'] ?? null,
+                'details_of_leave' => $validated['details_of_leave'] ?? null,
                 'selected_dates' => $resolvedSelectedDates,
                 'selected_date_pay_status' => $selectedDatePayStatus,
                 'selected_date_coverage' => $selectedDateCoverage,
+                'selected_date_half_day_portion' => $selectedDateHalfDayPortion,
                 'commutation' => $validated['commutation'] ?? 'Not Requested',
                 'pay_mode' => $requestedPayMode,
                 'attachment_required' => $attachmentRequired,
@@ -889,6 +904,7 @@ class LeaveApplicationController extends Controller
     public function ermsRequestUpdate(Request $request, ?int $id = null): JsonResponse
     {
         $this->normalizeSelectedDatesInput($request);
+        $this->normalizeSelectedDatePolicyInput($request);
 
         $routeId = $id;
 
@@ -908,6 +924,7 @@ class LeaveApplicationController extends Controller
             'remarks' => ['nullable', 'string', 'max:2000'],
             'reason' => ['nullable', 'string', 'max:2000'],
             'reason_purpose' => ['nullable', 'string', 'max:2000'],
+            'details_of_leave' => ['nullable', 'string', 'max:2000'],
             'leave_type_id' => ['nullable', 'integer', 'exists:tblLeaveTypes,id'],
             'start_date' => ['nullable', 'date'],
             'end_date' => ['nullable', 'date', 'after_or_equal:start_date'],
@@ -917,6 +934,8 @@ class LeaveApplicationController extends Controller
             'selected_date_pay_status.*' => ['nullable', 'string', 'in:WP,WOP'],
             'selected_date_coverage' => ['nullable', 'array'],
             'selected_date_coverage.*' => ['nullable', 'string', 'in:whole,half'],
+            'selected_date_half_day_portion' => ['nullable', 'array'],
+            'selected_date_half_day_portion.*' => ['nullable', 'string', 'in:AM,PM'],
             'total_days' => ['nullable', 'numeric', 'min:0.5', 'max:365'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
@@ -1019,7 +1038,14 @@ class LeaveApplicationController extends Controller
         }
         $requestedUpdatePayload['leave_type_id'] = $targetLeaveTypeId;
 
-        $leaveTypeRestriction = $this->assertEmployeeCanApplyForLeaveType($employee, $targetLeaveType);
+        $currentLeaveTypeId = $this->resolveCanonicalLeaveTypeId((int) ($app->leave_type_id ?? 0))
+            ?? (int) ($app->leave_type_id ?? 0);
+        $skipEventBasedReuseRule = $currentLeaveTypeId > 0 && $currentLeaveTypeId === $targetLeaveTypeId;
+        $leaveTypeRestriction = $this->assertEmployeeCanApplyForLeaveType(
+            $employee,
+            $targetLeaveType,
+            $skipEventBasedReuseRule
+        );
         if ($leaveTypeRestriction instanceof JsonResponse) {
             return $leaveTypeRestriction;
         }
@@ -1157,6 +1183,7 @@ class LeaveApplicationController extends Controller
     public function store(Request $request): JsonResponse
     {
         $this->normalizeSelectedDatesInput($request);
+        $this->normalizeSelectedDatePolicyInput($request);
 
         $account = $request->user();
         if (!is_object($account)) {
@@ -1192,12 +1219,15 @@ class LeaveApplicationController extends Controller
             'end_date' => ['required', 'date', 'after_or_equal:start_date'],
             'total_days' => ['required', 'numeric', 'min:0.5', 'max:365'],
             'reason' => ['nullable', 'string', 'max:2000'],
+            'details_of_leave' => ['nullable', 'string', 'max:2000'],
             'selected_dates' => ['nullable', 'array'],
             'selected_dates.*' => ['date'],
             'selected_date_pay_status' => ['nullable', 'array'],
             'selected_date_pay_status.*' => ['nullable', 'string', 'in:WP,WOP'],
             'selected_date_coverage' => ['nullable', 'array'],
             'selected_date_coverage.*' => ['nullable', 'string', 'in:whole,half'],
+            'selected_date_half_day_portion' => ['nullable', 'array'],
+            'selected_date_half_day_portion.*' => ['nullable', 'string', 'in:AM,PM'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
             'attachment' => ['nullable', 'file', 'max:10240'],
@@ -1224,6 +1254,11 @@ class LeaveApplicationController extends Controller
                 ? $validated['selected_date_coverage']
                 : $request->input('selected_date_coverage')
         );
+        $selectedDateHalfDayPortion = $this->normalizeSelectedDateHalfDayPortionMap(
+            array_key_exists('selected_date_half_day_portion', $validated)
+                ? $validated['selected_date_half_day_portion']
+                : $request->input('selected_date_half_day_portion')
+        );
         $resolvedSelectedDates = LeaveApplication::resolveSelectedDates(
             $validated['start_date'],
             $validated['end_date'],
@@ -1235,10 +1270,13 @@ class LeaveApplicationController extends Controller
             $resolvedSelectedDates,
             $requestedPayMode
         );
-        $selectedDateCoverage = $this->compactSelectedDateCoverageMap(
+        $selectedDateCoverageMetadata = $this->synchronizeSelectedDateCoverageMetadata(
             $selectedDateCoverage,
+            $selectedDateHalfDayPortion,
             $resolvedSelectedDates
         );
+        $selectedDateCoverage = $selectedDateCoverageMetadata['selectedDateCoverage'];
+        $selectedDateHalfDayPortion = $selectedDateCoverageMetadata['selectedDateHalfDayPortion'];
         $validated['leave_type_id'] = $this->resolveCanonicalLeaveTypeId((int) $validated['leave_type_id'])
             ?? (int) $validated['leave_type_id'];
         $leaveType = LeaveType::find((int) $validated['leave_type_id']);
@@ -1327,6 +1365,7 @@ class LeaveApplicationController extends Controller
             $requestedPayMode,
             $selectedDatePayStatus,
             $selectedDateCoverage,
+            $selectedDateHalfDayPortion,
             $resolvedSelectedDates,
             $deductibleDays,
             $ctoDeductedHours,
@@ -1343,9 +1382,11 @@ class LeaveApplicationController extends Controller
                 'deductible_days' => $deductibleDays,
                 'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn() && $ctoDeductedHours > 0 ? $ctoDeductedHours : null,
                 'reason' => $validated['reason'] ?? null,
+                'details_of_leave' => $validated['details_of_leave'] ?? null,
                 'selected_dates' => $resolvedSelectedDates,
                 'selected_date_pay_status' => $selectedDatePayStatus,
                 'selected_date_coverage' => $selectedDateCoverage,
+                'selected_date_half_day_portion' => $selectedDateHalfDayPortion,
                 'commutation' => $validated['commutation'] ?? 'Not Requested',
                 'pay_mode' => $requestedPayMode,
                 'attachment_required' => $attachmentRequired,
@@ -1388,7 +1429,8 @@ class LeaveApplicationController extends Controller
 
     /**
      * Handle monetization submission with specific validation rules.
-     * City Hall of Tagum policy: minimum 10 accumulated credits required.
+     * City Hall of Tagum policy: Vacation Leave only, at least 15 credits available,
+     * and a minimum request of 10 days.
      */
     private function storeMonetization(Request $request, object $employee, object $account): JsonResponse
     {
@@ -1397,8 +1439,9 @@ class LeaveApplicationController extends Controller
         $validated = $request->validate([
             'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
-            'total_days' => ['required', 'numeric', 'min:1', 'max:999'],
+            'total_days' => ['required', 'numeric', 'min:' . LeaveApplication::MONETIZATION_MINIMUM_REQUEST_DAYS, 'max:999'],
             'reason' => ['nullable', 'string', 'max:2000'],
+            'details_of_leave' => ['nullable', 'string', 'max:2000'],
             'salary' => ['nullable', 'numeric', 'min:0'],
         ]);
 
@@ -1411,15 +1454,6 @@ class LeaveApplicationController extends Controller
             return $leaveTypeRestriction;
         }
 
-        if (!$leaveType || !in_array($leaveType->name, ['Vacation Leave', 'Sick Leave'], true)) {
-            return response()->json([
-                'message' => 'Monetization is only allowed for Vacation Leave or Sick Leave.',
-                'errors' => [
-                    'leave_type_id' => ['Monetization is only allowed for Vacation Leave or Sick Leave.'],
-                ],
-            ], 422);
-        }
-
         // Retrieve current balance (always re-check in backend)
         $balance = LeaveBalance::where('employee_control_no', $employee->control_no)
             ->where('leave_type_id', $validated['leave_type_id'])
@@ -1427,26 +1461,15 @@ class LeaveApplicationController extends Controller
 
         $currentBalance = $balance ? (float) $balance->balance : 0;
 
-        // Minimum 10 credits required for monetization
-        if ($currentBalance < 10) {
-            return response()->json([
-                'message' => 'Minimum of 10 leave credits required for monetization.',
-                'errors' => [
-                    'total_days' => ['Minimum of 10 leave credits required for monetization. Current balance: ' . self::formatDays($currentBalance) . '.'],
-                ],
-            ], 422);
+        $requestedDays = (float) $validated['total_days'];
+        $monetizationPolicyRestriction = $this->validateMonetizationPolicyRules($leaveType, $requestedDays);
+        if ($monetizationPolicyRestriction instanceof JsonResponse) {
+            return $monetizationPolicyRestriction;
         }
 
-        $requestedDays = (float) $validated['total_days'];
-
-        // Cannot exceed available balance
-        if ($requestedDays > $currentBalance) {
-            return response()->json([
-                'message' => 'Requested monetization days exceed available leave credits.',
-                'errors' => [
-                    'total_days' => ["Requested monetization days ({$requestedDays}) exceed available balance (" . self::formatDays($currentBalance) . ")."],
-                ],
-            ], 422);
+        $monetizationBalanceRestriction = $this->validateMonetizationBalanceRules($currentBalance, $requestedDays);
+        if ($monetizationBalanceRestriction instanceof JsonResponse) {
+            return $monetizationBalanceRestriction;
         }
 
         // Compute equivalent amount if salary provided
@@ -1466,8 +1489,10 @@ class LeaveApplicationController extends Controller
                 'total_days' => $validated['total_days'],
                 'deductible_days' => (float) $validated['total_days'],
                 'reason' => $validated['reason'] ?? null,
+                'details_of_leave' => $validated['details_of_leave'] ?? null,
                 'status' => LeaveApplication::STATUS_PENDING_ADMIN,
                 'is_monetization' => true,
+                'commutation' => LeaveApplication::MONETIZATION_REQUIRED_COMMUTATION,
                 'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
                 'equivalent_amount' => $equivalentAmount,
             ]);
@@ -2297,6 +2322,31 @@ class LeaveApplicationController extends Controller
             $forcedLeaveTypeId,
             $vacationLeaveTypeId
         );
+        $usesVacationLeaveTopUpForScheduleExcess = $this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
+            $leaveType,
+            (int) $app->leave_type_id,
+            (bool) $app->is_monetization,
+            $vacationLeaveTypeId
+        );
+        $requestedTotalDays = round((float) ($app->total_days ?? $daysToDeduct), 2);
+        $requiredPrimaryLeaveDays = $this->resolvePrimaryLeaveTrackedDeductionDays(
+            $leaveType,
+            (int) $app->leave_type_id,
+            (bool) $app->is_monetization,
+            $requestedTotalDays,
+            $daysToDeduct,
+            $forcedLeaveTypeId,
+            $vacationLeaveTypeId
+        );
+        $requiredVacationLeaveDays = $this->resolveLeaveTypeVacationLeaveDeductionDays(
+            $leaveType,
+            (int) $app->leave_type_id,
+            (bool) $app->is_monetization,
+            $requestedTotalDays,
+            $daysToDeduct,
+            $forcedLeaveTypeId,
+            $vacationLeaveTypeId
+        );
 
         // Determine if balance deduction is needed
         $needsDeduction = $this->applicationDeductsEmployeeBalance(
@@ -2310,9 +2360,19 @@ class LeaveApplicationController extends Controller
             $this->syncEmployeeCtoBalance((string) $app->employee_control_no);
         }
 
+        if ((bool) $app->is_monetization) {
+            $monetizationPolicyRestriction = $this->validateMonetizationPolicyRules(
+                $leaveType,
+                (float) ($app->total_days ?? 0.0)
+            );
+            if ($monetizationPolicyRestriction instanceof JsonResponse) {
+                return $monetizationPolicyRestriction;
+            }
+        }
+
         if ($needsDeduction) {
             if ($app->employee_control_no) {
-                // For monetization, deduct from the selected leave type (VL or SL)
+                // For monetization, deduct from the selected leave type balance.
                 $deductTypeId = $this->resolveCanonicalLeaveTypeId((int) $app->leave_type_id)
                     ?? (int) $app->leave_type_id;
 
@@ -2321,33 +2381,57 @@ class LeaveApplicationController extends Controller
                     $deductTypeId
                 );
 
-                if (!$balance || (float) $balance->balance < $daysToDeduct) {
+                if (!$balance || (float) $balance->balance < $requiredPrimaryLeaveDays) {
                     $currentBalance = $balance ? (float) $balance->balance : 0;
+                    if ($usesVacationLeaveTopUpForScheduleExcess) {
+                        return $this->buildInsufficientPrimaryLeaveBalanceResponse(
+                            $leaveType,
+                            $currentBalance,
+                            $requiredPrimaryLeaveDays,
+                            true
+                        );
+                    }
+
                     $label = $app->is_monetization ? 'monetization' : 'leave';
                     return response()->json([
-                        'message' => "Insufficient leave balance for {$label}. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($daysToDeduct) . ".",
+                        'message' => "Insufficient leave balance for {$label}. Current: "
+                            . self::formatDays($currentBalance)
+                            . ', Requested: '
+                            . self::formatDays($requiredPrimaryLeaveDays)
+                        . '.',
                     ], 422);
                 }
 
-                // Extra check for monetization: minimum 10 credits
-                if ($app->is_monetization && (float) $balance->balance < 10) {
-                    return response()->json([
-                        'message' => 'Minimum of 10 leave credits required for monetization.',
-                    ], 422);
+                if ($app->is_monetization) {
+                    $monetizationBalanceRestriction = $this->validateMonetizationBalanceRules(
+                        (float) $balance->balance,
+                        (float) ($app->total_days ?? 0.0)
+                    );
+                    if ($monetizationBalanceRestriction instanceof JsonResponse) {
+                        return $monetizationBalanceRestriction;
+                    }
                 }
 
                 // Business rule: approving Forced Leave also consumes Vacation Leave credits.
-                if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null) {
+                if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null && $requiredVacationLeaveDays > 0.0) {
                     $vacationBalance = $this->findPreferredEmployeeLeaveBalanceRecord(
                         (string) $app->employee_control_no,
                         $vacationLeaveTypeId
                     );
                     $currentVacationBalance = $vacationBalance ? (float) $vacationBalance->balance : 0.0;
-                    if ($currentVacationBalance + 1e-9 < $daysToDeduct) {
+                    if ($currentVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
+                        if ($usesVacationLeaveTopUpForScheduleExcess) {
+                            return $this->buildInsufficientVacationLeaveTopUpResponse(
+                                $leaveType,
+                                $currentVacationBalance,
+                                $requiredVacationLeaveDays
+                            );
+                        }
+
                         return response()->json([
                             'message' => 'Insufficient Vacation Leave balance for Mandatory / Forced Leave approval.'
                                 . ' Current: ' . self::formatDays($currentVacationBalance)
-                                . ', Required: ' . self::formatDays($daysToDeduct) . '.',
+                                . ', Required: ' . self::formatDays($requiredVacationLeaveDays) . '.',
                         ], 422);
                     }
                 }
@@ -2357,24 +2441,55 @@ class LeaveApplicationController extends Controller
                     (int) $app->leave_type_id
                 );
 
-                if (!$balance || (float) $balance->balance < $daysToDeduct) {
+                if (!$balance || (float) $balance->balance < $requiredPrimaryLeaveDays) {
                     $currentBalance = $balance ? (float) $balance->balance : 0;
+                    if ($usesVacationLeaveTopUpForScheduleExcess) {
+                        return $this->buildInsufficientPrimaryLeaveBalanceResponse(
+                            $leaveType,
+                            $currentBalance,
+                            $requiredPrimaryLeaveDays,
+                            true
+                        );
+                    }
+
                     return response()->json([
-                        'message' => "Insufficient leave balance. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($daysToDeduct) . ".",
+                        'message' => 'Insufficient leave balance. Current: '
+                            . self::formatDays($currentBalance)
+                            . ', Requested: '
+                            . self::formatDays($requiredPrimaryLeaveDays)
+                        . '.',
                     ], 422);
                 }
 
-                if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null) {
+                if ($app->is_monetization) {
+                    $monetizationBalanceRestriction = $this->validateMonetizationBalanceRules(
+                        (float) $balance->balance,
+                        (float) ($app->total_days ?? 0.0)
+                    );
+                    if ($monetizationBalanceRestriction instanceof JsonResponse) {
+                        return $monetizationBalanceRestriction;
+                    }
+                }
+
+                if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null && $requiredVacationLeaveDays > 0.0) {
                     $vacationBalance = $this->findAdminEmployeeLeaveBalance(
                         (int) $app->applicant_admin_id,
                         $vacationLeaveTypeId
                     );
                     $currentVacationBalance = $vacationBalance ? (float) $vacationBalance->balance : 0.0;
-                    if ($currentVacationBalance + 1e-9 < $daysToDeduct) {
+                    if ($currentVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
+                        if ($usesVacationLeaveTopUpForScheduleExcess) {
+                            return $this->buildInsufficientVacationLeaveTopUpResponse(
+                                $leaveType,
+                                $currentVacationBalance,
+                                $requiredVacationLeaveDays
+                            );
+                        }
+
                         return response()->json([
                             'message' => 'Insufficient Vacation Leave balance for Mandatory / Forced Leave approval.'
                                 . ' Current: ' . self::formatDays($currentVacationBalance)
-                                . ', Required: ' . self::formatDays($daysToDeduct) . '.',
+                                . ', Required: ' . self::formatDays($requiredVacationLeaveDays) . '.',
                         ], 422);
                     }
                 }
@@ -2414,6 +2529,7 @@ class LeaveApplicationController extends Controller
                         $app,
                         (int) $app->leave_type_id,
                         $daysToDeduct,
+                        $requestedTotalDays,
                         $isCtoDeduction,
                         $shouldDeductForcedLeave,
                         $forcedLeaveTypeId,
@@ -2467,31 +2583,56 @@ class LeaveApplicationController extends Controller
                     )?->balance ?? 0
                 );
 
-                if ($app->is_monetization && $currentBalance < 10) {
-                    return response()->json([
-                        'message' => 'Minimum of 10 leave credits required for monetization.',
-                    ], 422);
+                if ($app->is_monetization) {
+                    $monetizationBalanceRestriction = $this->validateMonetizationBalanceRules(
+                        $currentBalance,
+                        (float) ($app->total_days ?? 0.0)
+                    );
+                    if ($monetizationBalanceRestriction instanceof JsonResponse) {
+                        return $monetizationBalanceRestriction;
+                    }
                 }
 
-                if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null) {
+                if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null && $requiredVacationLeaveDays > 0.0) {
                     $currentVacationBalance = (float) (
                         $this->findPreferredEmployeeLeaveBalanceRecord(
                             (string) $app->employee_control_no,
                             $vacationLeaveTypeId
                         )?->balance ?? 0.0
                     );
-                    if ($currentVacationBalance + 1e-9 < $daysToDeduct) {
+                    if ($currentVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
+                        if ($usesVacationLeaveTopUpForScheduleExcess) {
+                            return $this->buildInsufficientVacationLeaveTopUpResponse(
+                                $leaveType,
+                                $currentVacationBalance,
+                                $requiredVacationLeaveDays
+                            );
+                        }
+
                         return response()->json([
                             'message' => 'Insufficient Vacation Leave balance for Mandatory / Forced Leave approval.'
                                 . ' Current: ' . self::formatDays($currentVacationBalance)
-                                . ', Required: ' . self::formatDays($daysToDeduct) . '.',
+                                . ', Required: ' . self::formatDays($requiredVacationLeaveDays) . '.',
                         ], 422);
                     }
                 }
 
+                if ($usesVacationLeaveTopUpForScheduleExcess && $currentBalance + 1e-9 < $requiredPrimaryLeaveDays) {
+                    return $this->buildInsufficientPrimaryLeaveBalanceResponse(
+                        $leaveType,
+                        $currentBalance,
+                        $requiredPrimaryLeaveDays,
+                        true
+                    );
+                }
+
                 $label = $app->is_monetization ? 'monetization' : 'leave';
                 return response()->json([
-                    'message' => "Insufficient leave balance for {$label}. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($daysToDeduct) . ".",
+                    'message' => "Insufficient leave balance for {$label}. Current: "
+                        . self::formatDays($currentBalance)
+                        . ', Requested: '
+                        . self::formatDays($requiredPrimaryLeaveDays)
+                        . '.',
                 ], 422);
             }
 
@@ -2502,24 +2643,55 @@ class LeaveApplicationController extends Controller
                 )?->balance ?? 0
             );
 
-            if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null) {
+            if ($app->is_monetization) {
+                $monetizationBalanceRestriction = $this->validateMonetizationBalanceRules(
+                    $currentBalance,
+                    (float) ($app->total_days ?? 0.0)
+                );
+                if ($monetizationBalanceRestriction instanceof JsonResponse) {
+                    return $monetizationBalanceRestriction;
+                }
+            }
+
+            if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null && $requiredVacationLeaveDays > 0.0) {
                 $currentVacationBalance = (float) (
                     $this->findAdminEmployeeLeaveBalance(
                         (int) $app->applicant_admin_id,
                         $vacationLeaveTypeId
                     )?->balance ?? 0.0
                 );
-                if ($currentVacationBalance + 1e-9 < $daysToDeduct) {
+                if ($currentVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
+                    if ($usesVacationLeaveTopUpForScheduleExcess) {
+                        return $this->buildInsufficientVacationLeaveTopUpResponse(
+                            $leaveType,
+                            $currentVacationBalance,
+                            $requiredVacationLeaveDays
+                        );
+                    }
+
                     return response()->json([
                         'message' => 'Insufficient Vacation Leave balance for Mandatory / Forced Leave approval.'
                             . ' Current: ' . self::formatDays($currentVacationBalance)
-                            . ', Required: ' . self::formatDays($daysToDeduct) . '.',
+                            . ', Required: ' . self::formatDays($requiredVacationLeaveDays) . '.',
                     ], 422);
                 }
             }
 
+            if ($usesVacationLeaveTopUpForScheduleExcess && $currentBalance + 1e-9 < $requiredPrimaryLeaveDays) {
+                return $this->buildInsufficientPrimaryLeaveBalanceResponse(
+                    $leaveType,
+                    $currentBalance,
+                    $requiredPrimaryLeaveDays,
+                    true
+                );
+            }
+
             return response()->json([
-                'message' => "Insufficient leave balance. Current: " . self::formatDays($currentBalance) . ", Requested: " . self::formatDays($daysToDeduct) . ".",
+                'message' => 'Insufficient leave balance. Current: '
+                    . self::formatDays($currentBalance)
+                    . ', Requested: '
+                    . self::formatDays($requiredPrimaryLeaveDays)
+                    . '.',
             ], 422);
         }
 
@@ -2871,6 +3043,7 @@ class LeaveApplicationController extends Controller
     public function adminStore(Request $request): JsonResponse
     {
         $this->normalizeSelectedDatesInput($request);
+        $this->normalizeSelectedDatePolicyInput($request);
 
         $admin = $request->user();
         if (!$admin instanceof DepartmentAdmin) {
@@ -2891,12 +3064,15 @@ class LeaveApplicationController extends Controller
             'end_date' => ['required', 'date', 'after_or_equal:start_date'],
             'total_days' => ['required', 'numeric', 'min:0.5', 'max:365'],
             'reason' => ['nullable', 'string', 'max:2000'],
+            'details_of_leave' => ['nullable', 'string', 'max:2000'],
             'selected_dates' => ['nullable', 'array'],
             'selected_dates.*' => ['date'],
             'selected_date_pay_status' => ['nullable', 'array'],
             'selected_date_pay_status.*' => ['nullable', 'string', 'in:WP,WOP'],
             'selected_date_coverage' => ['nullable', 'array'],
             'selected_date_coverage.*' => ['nullable', 'string', 'in:whole,half'],
+            'selected_date_half_day_portion' => ['nullable', 'array'],
+            'selected_date_half_day_portion.*' => ['nullable', 'string', 'in:AM,PM'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
             'attachment' => ['nullable', 'file', 'max:10240'],
@@ -2923,6 +3099,11 @@ class LeaveApplicationController extends Controller
                 ? $validated['selected_date_coverage']
                 : $request->input('selected_date_coverage')
         );
+        $selectedDateHalfDayPortion = $this->normalizeSelectedDateHalfDayPortionMap(
+            array_key_exists('selected_date_half_day_portion', $validated)
+                ? $validated['selected_date_half_day_portion']
+                : $request->input('selected_date_half_day_portion')
+        );
         $resolvedSelectedDates = LeaveApplication::resolveSelectedDates(
             $validated['start_date'],
             $validated['end_date'],
@@ -2934,10 +3115,13 @@ class LeaveApplicationController extends Controller
             $resolvedSelectedDates,
             $requestedPayMode
         );
-        $selectedDateCoverage = $this->compactSelectedDateCoverageMap(
+        $selectedDateCoverageMetadata = $this->synchronizeSelectedDateCoverageMetadata(
             $selectedDateCoverage,
+            $selectedDateHalfDayPortion,
             $resolvedSelectedDates
         );
+        $selectedDateCoverage = $selectedDateCoverageMetadata['selectedDateCoverage'];
+        $selectedDateHalfDayPortion = $selectedDateCoverageMetadata['selectedDateHalfDayPortion'];
         $validated['leave_type_id'] = $this->resolveCanonicalLeaveTypeId((int) $validated['leave_type_id'])
             ?? (int) $validated['leave_type_id'];
         $leaveType = LeaveType::find((int) $validated['leave_type_id']);
@@ -3040,6 +3224,7 @@ class LeaveApplicationController extends Controller
             $requestedPayMode,
             $selectedDatePayStatus,
             $selectedDateCoverage,
+            $selectedDateHalfDayPortion,
             $resolvedSelectedDates,
             $deductibleDays,
             $ctoDeductedHours,
@@ -3056,9 +3241,11 @@ class LeaveApplicationController extends Controller
                 'deductible_days' => $deductibleDays,
                 'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn() && $ctoDeductedHours > 0 ? $ctoDeductedHours : null,
                 'reason' => $validated['reason'] ?? null,
+                'details_of_leave' => $validated['details_of_leave'] ?? null,
                 'selected_dates' => $resolvedSelectedDates,
                 'selected_date_pay_status' => $selectedDatePayStatus,
                 'selected_date_coverage' => $selectedDateCoverage,
+                'selected_date_half_day_portion' => $selectedDateHalfDayPortion,
                 'commutation' => $validated['commutation'] ?? 'Not Requested',
                 'pay_mode' => $requestedPayMode,
                 'attachment_required' => $attachmentRequired,
@@ -3122,8 +3309,9 @@ class LeaveApplicationController extends Controller
         $validated = $request->validate([
             'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
-            'total_days' => ['required', 'numeric', 'min:1', 'max:999'],
+            'total_days' => ['required', 'numeric', 'min:' . LeaveApplication::MONETIZATION_MINIMUM_REQUEST_DAYS, 'max:999'],
             'reason' => ['nullable', 'string', 'max:2000'],
+            'details_of_leave' => ['nullable', 'string', 'max:2000'],
             'salary' => ['nullable', 'numeric', 'min:0'],
         ]);
 
@@ -3148,32 +3336,21 @@ class LeaveApplicationController extends Controller
             return $leaveTypeRestriction;
         }
 
-        if (!$leaveType || !in_array($leaveType->name, ['Vacation Leave', 'Sick Leave'], true)) {
-            return response()->json([
-                'message' => 'Monetization is only allowed for Vacation Leave or Sick Leave.',
-                'errors' => ['leave_type_id' => ['Monetization is only allowed for Vacation Leave or Sick Leave.']],
-            ], 422);
-        }
-
         $balance = LeaveBalance::where('employee_control_no', $employee->control_no)
             ->where('leave_type_id', $validated['leave_type_id'])
             ->first();
 
         $currentBalance = $balance ? (float) $balance->balance : 0;
 
-        if ($currentBalance < 10) {
-            return response()->json([
-                'message' => 'Minimum of 10 leave credits required for monetization.',
-                'errors' => ['total_days' => ['Minimum of 10 leave credits required. Current: ' . self::formatDays($currentBalance) . '.']],
-            ], 422);
+        $requestedDays = (float) $validated['total_days'];
+        $monetizationPolicyRestriction = $this->validateMonetizationPolicyRules($leaveType, $requestedDays);
+        if ($monetizationPolicyRestriction instanceof JsonResponse) {
+            return $monetizationPolicyRestriction;
         }
 
-        $requestedDays = (float) $validated['total_days'];
-        if ($requestedDays > $currentBalance) {
-            return response()->json([
-                'message' => 'Requested monetization days exceed available leave credits.',
-                'errors' => ['total_days' => ["Requested ({$requestedDays}) exceeds balance (" . self::formatDays($currentBalance) . ")."]],
-            ], 422);
+        $monetizationBalanceRestriction = $this->validateMonetizationBalanceRules($currentBalance, $requestedDays);
+        if ($monetizationBalanceRestriction instanceof JsonResponse) {
+            return $monetizationBalanceRestriction;
         }
 
         $equivalentAmount = null;
@@ -3192,10 +3369,12 @@ class LeaveApplicationController extends Controller
                 'total_days' => $validated['total_days'],
                 'deductible_days' => (float) $validated['total_days'],
                 'reason' => $validated['reason'] ?? null,
+                'details_of_leave' => $validated['details_of_leave'] ?? null,
                 'status' => LeaveApplication::STATUS_PENDING_HR,
                 'admin_id' => $admin->id,
                 'admin_approved_at' => now(),
                 'is_monetization' => true,
+                'commutation' => LeaveApplication::MONETIZATION_REQUIRED_COMMUTATION,
                 'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
                 'equivalent_amount' => $equivalentAmount,
             ]);
@@ -3624,13 +3803,26 @@ class LeaveApplicationController extends Controller
             ->values();
     }
 
-    private function assertEmployeeCanApplyForLeaveType(object $employee, LeaveType $leaveType): ?JsonResponse
+    private function assertEmployeeCanApplyForLeaveType(
+        object $employee,
+        LeaveType $leaveType,
+        bool $skipEventBasedReuseRule = false
+    ): ?JsonResponse
     {
-        return $this->assertEmployeeCanUseConfiguredLeaveTypeRule(
+        $configuredRuleRestriction = $this->assertEmployeeCanUseConfiguredLeaveTypeRule(
             $employee,
             $leaveType,
             'This leave type is not available for the selected employee status.'
         );
+        if ($configuredRuleRestriction instanceof JsonResponse) {
+            return $configuredRuleRestriction;
+        }
+
+        if ($skipEventBasedReuseRule) {
+            return null;
+        }
+
+        return $this->assertEmployeeCanReuseEventBasedLeaveType($employee, $leaveType);
     }
 
     private function assertEmployeeCanAccessLeaveTypeBalance(object $employee, LeaveType $leaveType): ?JsonResponse
@@ -3679,6 +3871,111 @@ class LeaveApplicationController extends Controller
                 'leave_type_id' => [$message],
             ],
         ], 422);
+    }
+
+    private function assertEmployeeCanReuseEventBasedLeaveType(object $employee, LeaveType $leaveType): ?JsonResponse
+    {
+        if (!$this->shouldEnforceEventBasedMaxDaysReuseRule($leaveType)) {
+            return null;
+        }
+
+        $activeApprovedApplication = $this->findActiveApprovedEventBasedLeaveApplication($employee, (int) $leaveType->id);
+        if (!$activeApprovedApplication instanceof LeaveApplication) {
+            return null;
+        }
+
+        $activeThroughDate = $this->resolveApplicationLastLeaveDate($activeApprovedApplication);
+        if ($activeThroughDate === null) {
+            return null;
+        }
+
+        $message = sprintf(
+            '%s cannot be filed again until the current approved leave period ends on %s.',
+            $leaveType->name,
+            $activeThroughDate
+        );
+
+        return response()->json([
+            'message' => $message,
+            'errors' => [
+                'leave_type_id' => [$message],
+            ],
+            'active_approved_application_id' => (int) $activeApprovedApplication->id,
+            'active_through_date' => $activeThroughDate,
+        ], 422);
+    }
+
+    private function shouldEnforceEventBasedMaxDaysReuseRule(LeaveType $leaveType): bool
+    {
+        $category = strtoupper(trim((string) ($leaveType->category ?? '')));
+        $maxDays = round((float) ($leaveType->max_days ?? 0), 2);
+
+        return $category === LeaveType::CATEGORY_EVENT && $maxDays > 0.0;
+    }
+
+    private function findActiveApprovedEventBasedLeaveApplication(object $employee, int $leaveTypeId): ?LeaveApplication
+    {
+        $employeeControlNo = $this->resolveEmployeeControlNoForLeaveTypeRule($employee);
+        if ($employeeControlNo === null || $leaveTypeId <= 0) {
+            return null;
+        }
+
+        $controlNoCandidates = $this->controlNoCandidates($employeeControlNo);
+        if ($controlNoCandidates === []) {
+            return null;
+        }
+
+        $lookupLeaveTypeIds = $this->resolveBalanceLookupLeaveTypeIds($leaveTypeId);
+        if ($lookupLeaveTypeIds === []) {
+            $lookupLeaveTypeIds = [$leaveTypeId];
+        }
+
+        $today = now()->toDateString();
+
+        return LeaveApplication::query()
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->whereIn('leave_type_id', $lookupLeaveTypeIds)
+            ->where('status', LeaveApplication::STATUS_APPROVED)
+            ->orderByDesc('end_date')
+            ->orderByDesc('id')
+            ->get()
+            ->first(function (LeaveApplication $application) use ($today): bool {
+                $lastLeaveDate = $this->resolveApplicationLastLeaveDate($application);
+
+                return $lastLeaveDate !== null && $lastLeaveDate >= $today;
+            });
+    }
+
+    private function resolveEmployeeControlNoForLeaveTypeRule(object $employee): ?string
+    {
+        $rawControlNo = trim((string) (
+            $employee->control_no
+            ?? $employee->employee_control_no
+            ?? $employee->erms_control_no
+            ?? ''
+        ));
+
+        return $rawControlNo !== '' ? $rawControlNo : null;
+    }
+
+    private function resolveApplicationLastLeaveDate(LeaveApplication $application): ?string
+    {
+        $resolvedSelectedDates = $application->resolvedSelectedDates();
+        if (is_array($resolvedSelectedDates) && $resolvedSelectedDates !== []) {
+            $lastSelectedDate = max($resolvedSelectedDates);
+            $normalizedLastSelectedDate = $this->resolveIsoDate($lastSelectedDate);
+            if ($normalizedLastSelectedDate !== null) {
+                return $normalizedLastSelectedDate->toDateString();
+            }
+        }
+
+        $endDate = $application->end_date?->toDateString();
+        if (is_string($endDate) && $endDate !== '') {
+            return $endDate;
+        }
+
+        $startDate = $application->start_date?->toDateString();
+        return is_string($startDate) && $startDate !== '' ? $startDate : null;
     }
 
     private function employeeHasResolvedEmploymentStatus(object $employee): bool
@@ -4416,6 +4713,8 @@ class LeaveApplicationController extends Controller
             'selected_dates' => $selectedDates,
             'selected_date_pay_status' => is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null,
             'selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
+            'selected_date_half_day_portion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selectedDateHalfDayPortion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
             'total_days' => (float) $app->total_days,
             'deductible_days' => $deductibleDays,
             'cto_deducted_hours' => $ctoDeductedHours,
@@ -4499,9 +4798,11 @@ class LeaveApplicationController extends Controller
             'selected_dates' => $app->resolvedSelectedDates(),
             'selected_date_pay_status' => is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null,
             'selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
+            'selected_date_half_day_portion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
             'total_days' => round((float) ($app->total_days ?? 0), 2),
             'deductible_days' => $this->resolveApplicationDeductibleDays($app),
             'reason' => $this->trimNullableString($requestReason) ?? $this->trimNullableString($app->reason ?? null),
+            'details_of_leave' => $this->trimNullableString($app->details_of_leave ?? null),
             'cancel_reason' => $this->trimNullableString($requestReason),
             'commutation' => $this->trimNullableString($app->commutation ?? null) ?? 'Not Requested',
             'pay_mode' => $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization),
@@ -4528,20 +4829,39 @@ class LeaveApplicationController extends Controller
         $requestedReason = array_key_exists('reason', $validated) || array_key_exists('reason_purpose', $validated)
             ? $this->trimNullableString($validated['reason'] ?? $validated['reason_purpose'] ?? null)
             : $this->trimNullableString($app->reason);
+        $requestedDetailsOfLeave = array_key_exists('details_of_leave', $validated)
+            ? $this->trimNullableString($validated['details_of_leave'] ?? null)
+            : $this->trimNullableString($app->details_of_leave);
 
         $requestedSelectedDatePayStatus = $requestedIsMonetization
             ? null
             : $this->normalizeSelectedDatePayStatusMap(
                 array_key_exists('selected_date_pay_status', $validated)
                     ? $validated['selected_date_pay_status']
-                    : $request->input('selected_date_pay_status')
+                    : (
+                        $request->input('selected_date_pay_status')
+                        ?? (is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null)
+                    )
             );
         $requestedSelectedDateCoverage = $requestedIsMonetization
             ? null
             : $this->normalizeSelectedDateCoverageMap(
                 array_key_exists('selected_date_coverage', $validated)
                     ? $validated['selected_date_coverage']
-                    : $request->input('selected_date_coverage')
+                    : (
+                        $request->input('selected_date_coverage')
+                        ?? (is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null)
+                    )
+            );
+        $requestedSelectedDateHalfDayPortion = $requestedIsMonetization
+            ? null
+            : $this->normalizeSelectedDateHalfDayPortionMap(
+                array_key_exists('selected_date_half_day_portion', $validated)
+                    ? $validated['selected_date_half_day_portion']
+                    : (
+                        $request->input('selected_date_half_day_portion')
+                        ?? (is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null)
+                    )
             );
 
         $resolvedStartDate = $requestedIsMonetization
@@ -4576,12 +4896,18 @@ class LeaveApplicationController extends Controller
                 $resolvedSelectedDates,
                 $resolvedPayMode
             );
-        $requestedSelectedDateCoverage = $requestedIsMonetization
-            ? null
-            : $this->compactSelectedDateCoverageMap(
+        $selectedDateCoverageMetadata = $requestedIsMonetization
+            ? [
+                'selectedDateCoverage' => null,
+                'selectedDateHalfDayPortion' => null,
+            ]
+            : $this->synchronizeSelectedDateCoverageMetadata(
                 $requestedSelectedDateCoverage,
+                $requestedSelectedDateHalfDayPortion,
                 $resolvedSelectedDates
             );
+        $requestedSelectedDateCoverage = $selectedDateCoverageMetadata['selectedDateCoverage'];
+        $requestedSelectedDateHalfDayPortion = $selectedDateCoverageMetadata['selectedDateHalfDayPortion'];
 
         $targetLeaveTypeId = $this->resolveCanonicalLeaveTypeId((int) ($validated['leave_type_id'] ?? $app->leave_type_id))
             ?? (int) ($validated['leave_type_id'] ?? $app->leave_type_id);
@@ -4593,6 +4919,13 @@ class LeaveApplicationController extends Controller
                     'leave_type_id' => ['Selected leave type is not available.'],
                 ],
             ], 422);
+        }
+
+        if ($requestedIsMonetization) {
+            $monetizationPolicyRestriction = $this->validateMonetizationPolicyRules($targetLeaveType, $resolvedTotalDays);
+            if ($monetizationPolicyRestriction instanceof JsonResponse) {
+                return $monetizationPolicyRestriction;
+            }
         }
 
         $attachmentState = $this->resolveAttachmentStateFromRequest(
@@ -4637,13 +4970,19 @@ class LeaveApplicationController extends Controller
             'selected_dates' => $resolvedSelectedDates,
             'selected_date_pay_status' => $requestedSelectedDatePayStatus,
             'selected_date_coverage' => $requestedSelectedDateCoverage,
+            'selected_date_half_day_portion' => $requestedSelectedDateHalfDayPortion,
             'total_days' => $resolvedTotalDays,
             'deductible_days' => $resolvedDeductibleDays,
             'cto_deducted_hours' => $resolvedCtoDeductedHours,
             'reason' => $requestedReason,
-            'commutation' => array_key_exists('commutation', $validated)
-                ? $validated['commutation']
-                : ($app->commutation ?? 'Not Requested'),
+            'details_of_leave' => $requestedDetailsOfLeave,
+            'commutation' => $requestedIsMonetization
+                ? LeaveApplication::MONETIZATION_REQUIRED_COMMUTATION
+                : (
+                    array_key_exists('commutation', $validated)
+                        ? $validated['commutation']
+                        : ($app->commutation ?? 'Not Requested')
+                ),
             'pay_mode' => $resolvedPayMode,
             'is_monetization' => $requestedIsMonetization,
             'attachment_required' => $attachmentRequired,
@@ -4690,10 +5029,12 @@ class LeaveApplicationController extends Controller
             'selected_dates' => $app->resolvedSelectedDates(),
             'selected_date_pay_status' => is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null,
             'selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
+            'selected_date_half_day_portion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
             'total_days' => (float) $app->total_days,
             'deductible_days' => $this->resolveApplicationDeductibleDays($app),
             'cto_deducted_hours' => $this->resolveApplicationCtoDeductedHours($app),
             'reason' => $app->reason,
+            'details_of_leave' => $app->details_of_leave,
             'commutation' => $app->commutation ?? 'Not Requested',
             'pay_mode' => $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization),
             'is_monetization' => (bool) $app->is_monetization,
@@ -4740,7 +5081,18 @@ class LeaveApplicationController extends Controller
             return true;
         }
 
+        if (($currentPayload['selected_date_half_day_portion'] ?? null) !== ($normalizedRequestedPayload['selected_date_half_day_portion'] ?? null)) {
+            return true;
+        }
+
         if ($this->trimNullableString($currentPayload['reason'] ?? null) !== $this->trimNullableString($normalizedRequestedPayload['reason'] ?? null)) {
+            return true;
+        }
+
+        if (
+            $this->trimNullableString($currentPayload['details_of_leave'] ?? null)
+            !== $this->trimNullableString($normalizedRequestedPayload['details_of_leave'] ?? null)
+        ) {
             return true;
         }
 
@@ -4945,12 +5297,21 @@ class LeaveApplicationController extends Controller
                 $targetSelectedDates,
                 $targetPayMode
             );
-        $targetSelectedDateCoverage = $targetIsMonetization
-            ? null
-            : $this->compactSelectedDateCoverageMap(
+        $targetSelectedDateCoverageMetadata = $targetIsMonetization
+            ? [
+                'selectedDateCoverage' => null,
+                'selectedDateHalfDayPortion' => null,
+            ]
+            : $this->synchronizeSelectedDateCoverageMetadata(
                 $this->normalizeSelectedDateCoverageMap($payload['selected_date_coverage'] ?? null),
+                $this->mergeSelectedDateHalfDayPortionMaps(
+                    $this->normalizeSelectedDateHalfDayPortionMap($payload['selected_date_half_day_portion'] ?? null),
+                    $this->normalizeSelectedDateHalfDayPortionMap($payload['selected_date_coverage'] ?? null)
+                ),
                 $targetSelectedDates
             );
+        $targetSelectedDateCoverage = $targetSelectedDateCoverageMetadata['selectedDateCoverage'];
+        $targetSelectedDateHalfDayPortion = $targetSelectedDateCoverageMetadata['selectedDateHalfDayPortion'];
 
         $targetAttachmentState = $this->resolveAttachmentStateFromPayload(
             is_array($payload) ? $payload : [],
@@ -5016,7 +5377,14 @@ class LeaveApplicationController extends Controller
 
         $applicationEmployee = $this->resolveApplicationEmployee($app);
         if ($applicationEmployee) {
-            $leaveTypeRestriction = $this->assertEmployeeCanApplyForLeaveType($applicationEmployee, $targetLeaveType);
+            $currentLeaveTypeId = $this->resolveCanonicalLeaveTypeId((int) ($app->leave_type_id ?? 0))
+                ?? (int) ($app->leave_type_id ?? 0);
+            $skipEventBasedReuseRule = $currentLeaveTypeId > 0 && $currentLeaveTypeId === $targetLeaveTypeId;
+            $leaveTypeRestriction = $this->assertEmployeeCanApplyForLeaveType(
+                $applicationEmployee,
+                $targetLeaveType,
+                $skipEventBasedReuseRule
+            );
             if ($leaveTypeRestriction instanceof JsonResponse) {
                 return $leaveTypeRestriction;
             }
@@ -5034,6 +5402,29 @@ class LeaveApplicationController extends Controller
             $targetLeaveType,
             $targetPayMode
         );
+
+        if ($targetIsMonetization) {
+            $monetizationPolicyRestriction = $this->validateMonetizationPolicyRules($targetLeaveType, $targetTotalDays);
+            if ($monetizationPolicyRestriction instanceof JsonResponse) {
+                return $monetizationPolicyRestriction;
+            }
+
+            $effectiveMonetizationBalance = $this->resolveMonetizationApprovalAvailableBalance(
+                $app,
+                $targetLeaveTypeId,
+                $sourceLeaveType,
+                $sourceDeductibleDays,
+                $sourceDeductsBalance
+            );
+            $monetizationBalanceRestriction = $this->validateMonetizationBalanceRules(
+                $effectiveMonetizationBalance,
+                $targetTotalDays
+            );
+            if ($monetizationBalanceRestriction instanceof JsonResponse) {
+                return $monetizationBalanceRestriction;
+            }
+        }
+
         $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
         $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
         $targetShouldDeductForcedLeave = $this->shouldLeaveTypeDeductForcedLeave(
@@ -5072,6 +5463,7 @@ class LeaveApplicationController extends Controller
                 $targetSelectedDates,
                 $targetSelectedDatePayStatus,
                 $targetSelectedDateCoverage,
+                $targetSelectedDateHalfDayPortion,
                 $targetTotalDays,
                 $targetDeductibleDays,
                 $targetCtoDeductedHours,
@@ -5108,6 +5500,7 @@ class LeaveApplicationController extends Controller
                         $app,
                         $targetLeaveTypeId,
                         $targetDeductibleDays,
+                        $targetTotalDays,
                         $targetIsCtoDeduction,
                         $targetShouldDeductForcedLeave,
                         $forcedLeaveTypeId,
@@ -5127,9 +5520,11 @@ class LeaveApplicationController extends Controller
                     'deductible_days' => $targetDeductibleDays,
                     'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn() && $targetIsCtoDeduction && $targetCtoDeductedHours > 0 ? $targetCtoDeductedHours : null,
                     'reason' => $this->trimNullableString($payload['reason'] ?? null),
+                    'details_of_leave' => $this->trimNullableString($payload['details_of_leave'] ?? null),
                     'selected_dates' => $targetIsMonetization ? null : $targetSelectedDates,
                     'selected_date_pay_status' => $targetIsMonetization ? null : $targetSelectedDatePayStatus,
                     'selected_date_coverage' => $targetIsMonetization ? null : $targetSelectedDateCoverage,
+                    'selected_date_half_day_portion' => $targetIsMonetization ? null : $targetSelectedDateHalfDayPortion,
                     'commutation' => (string) ($payload['commutation'] ?? 'Not Requested'),
                     'pay_mode' => $targetPayMode,
                     'linked_forced_leave_deducted_days' => $linkedForcedLeaveDeductedDays,
@@ -5649,9 +6044,14 @@ class LeaveApplicationController extends Controller
                 'start_date' => $startDate,
                 'end_date' => $endDate,
                 'selected_dates' => $selectedDates,
+                'selected_date_half_day_portion' => $this->mergeSelectedDateHalfDayPortionMaps(
+                    $this->normalizeSelectedDateHalfDayPortionMap($payload['selected_date_half_day_portion'] ?? null),
+                    $this->normalizeSelectedDateHalfDayPortionMap($payload['selected_date_coverage'] ?? null)
+                ),
                 'total_days' => $totalDays,
                 'deductible_days' => round((float) ($payload['deductible_days'] ?? $totalDays), 2),
                 'reason' => $cancelReason,
+                'details_of_leave' => $this->trimNullableString($payload['details_of_leave'] ?? $payload['detailsOfLeave'] ?? null),
                 'cancel_reason' => $cancelReason,
                 'pay_mode' => $payMode,
                 'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
@@ -5672,11 +6072,19 @@ class LeaveApplicationController extends Controller
         $selectedDateCoverage = $isMonetization
             ? null
             : $this->normalizeSelectedDateCoverageMap($payload['selected_date_coverage'] ?? null);
+        $selectedDateHalfDayPortion = $isMonetization
+            ? null
+            : $this->mergeSelectedDateHalfDayPortionMaps(
+                $this->normalizeSelectedDateHalfDayPortionMap($payload['selected_date_half_day_portion'] ?? null),
+                $this->normalizeSelectedDateHalfDayPortionMap($payload['selected_date_coverage'] ?? null)
+            );
 
         $startDate = $isMonetization ? null : $this->trimNullableString($payload['start_date'] ?? null);
         $endDate = $isMonetization ? null : $this->trimNullableString($payload['end_date'] ?? null);
 
-        $commutation = $this->trimNullableString($payload['commutation'] ?? null) ?? 'Not Requested';
+        $commutation = $isMonetization
+            ? LeaveApplication::MONETIZATION_REQUIRED_COMMUTATION
+            : ($this->trimNullableString($payload['commutation'] ?? null) ?? 'Not Requested');
         $leaveTypeId = $this->resolveCanonicalLeaveTypeId((int) ($payload['leave_type_id'] ?? 0))
             ?? (int) ($payload['leave_type_id'] ?? 0);
         $totalDays = round((float) ($payload['total_days'] ?? 0), 2);
@@ -5701,12 +6109,18 @@ class LeaveApplicationController extends Controller
                 $selectedDates,
                 $payMode
             );
-        $selectedDateCoverage = $isMonetization
-            ? null
-            : $this->compactSelectedDateCoverageMap(
+        $selectedDateCoverageMetadata = $isMonetization
+            ? [
+                'selectedDateCoverage' => null,
+                'selectedDateHalfDayPortion' => null,
+            ]
+            : $this->synchronizeSelectedDateCoverageMetadata(
                 $selectedDateCoverage,
+                $selectedDateHalfDayPortion,
                 $selectedDates
             );
+        $selectedDateCoverage = $selectedDateCoverageMetadata['selectedDateCoverage'];
+        $selectedDateHalfDayPortion = $selectedDateCoverageMetadata['selectedDateHalfDayPortion'];
         $attachmentState = $this->resolveAttachmentStateFromPayload(
             is_array($payload) ? $payload : [],
             (bool) ($payload['attachment_submitted'] ?? false),
@@ -5794,10 +6208,12 @@ class LeaveApplicationController extends Controller
             'selected_dates' => $selectedDates,
             'selected_date_pay_status' => $selectedDatePayStatus,
             'selected_date_coverage' => $selectedDateCoverage,
+            'selected_date_half_day_portion' => $selectedDateHalfDayPortion,
             'total_days' => $totalDays,
             'deductible_days' => $deductibleDays,
             'cto_deducted_hours' => round(max((float) ($ctoDeductedHours ?? 0.0), 0.0), 2),
             'reason' => $this->trimNullableString($payload['reason'] ?? null),
+            'details_of_leave' => $this->trimNullableString($payload['details_of_leave'] ?? $payload['detailsOfLeave'] ?? null),
             'commutation' => $commutation,
             'pay_mode' => $payMode,
             'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
@@ -5822,7 +6238,11 @@ class LeaveApplicationController extends Controller
             throw new \RuntimeException($balanceConflictError);
         }
 
-        $primaryRefundDays = round(max($sourceDeductibleDays, 0.0), 2);
+        $primaryRefundDays = $this->resolveStoredPrimaryLeaveDeduction(
+            $app,
+            $sourceLeaveType,
+            $sourceDeductibleDays
+        );
         if ((int) $app->leave_type_id > 0 && $primaryRefundDays > 0.0) {
             $this->incrementEmployeeLeaveBalance($employeeControlNo, (int) $app->leave_type_id, $primaryRefundDays);
         }
@@ -5844,6 +6264,7 @@ class LeaveApplicationController extends Controller
         LeaveApplication $app,
         int $primaryLeaveTypeId,
         float $daysToDeduct,
+        ?float $requestedTotalDays,
         bool $isCtoDeduction,
         bool $shouldDeductForcedLeave,
         ?int $forcedLeaveTypeId,
@@ -5857,13 +6278,46 @@ class LeaveApplicationController extends Controller
         }
 
         $primaryLeaveTypeId = $this->resolveCanonicalLeaveTypeId($primaryLeaveTypeId) ?? $primaryLeaveTypeId;
-        $primaryDaysToDeduct = round(max($daysToDeduct, 0.0), 2);
-        if ($primaryLeaveTypeId <= 0 || $primaryDaysToDeduct <= 0.0) {
+        $normalizedDaysToDeduct = round(max($daysToDeduct, 0.0), 2);
+        if ($primaryLeaveTypeId <= 0 || $normalizedDaysToDeduct <= 0.0) {
             return [
                 'linked_forced_leave_deducted_days' => 0.0,
                 'linked_vacation_leave_deducted_days' => 0.0,
             ];
         }
+
+        $resolvedRequestedTotalDays = round(
+            max((float) ($requestedTotalDays ?? $app->total_days ?? $normalizedDaysToDeduct), 0.0),
+            2
+        );
+        $primaryLeaveType = $app->leaveType;
+        if (
+            !$primaryLeaveType instanceof LeaveType
+            || (int) ($this->resolveCanonicalLeaveTypeId((int) $primaryLeaveType->id) ?? (int) $primaryLeaveType->id) !== $primaryLeaveTypeId
+        ) {
+            $primaryLeaveType = LeaveType::query()->find($primaryLeaveTypeId);
+        }
+
+        $primaryDaysToDeduct = $this->resolvePrimaryLeaveTrackedDeductionDays(
+            $primaryLeaveType,
+            $primaryLeaveTypeId,
+            (bool) $app->is_monetization,
+            $resolvedRequestedTotalDays,
+            $normalizedDaysToDeduct,
+            $forcedLeaveTypeId,
+            $vacationLeaveTypeId
+        );
+        $linkedVacationLeaveRequiredDays = $shouldDeductVacationLeave && $primaryLeaveType instanceof LeaveType
+            ? $this->resolveLeaveTypeVacationLeaveDeductionDays(
+                $primaryLeaveType,
+                $primaryLeaveTypeId,
+                (bool) $app->is_monetization,
+                $resolvedRequestedTotalDays,
+                $normalizedDaysToDeduct,
+                $forcedLeaveTypeId,
+                $vacationLeaveTypeId
+            )
+            : 0.0;
 
         if ($isCtoDeduction) {
             $this->syncEmployeeCtoBalance($employeeControlNo, true);
@@ -5895,14 +6349,14 @@ class LeaveApplicationController extends Controller
         }
 
         $linkedVacationLeaveDeductedDays = 0.0;
-        if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null) {
+        if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null && $linkedVacationLeaveRequiredDays > 0.0) {
             $vacationBalance = $this->lockEmployeeLeaveBalance($employeeControlNo, $vacationLeaveTypeId);
-            if (!$vacationBalance || (float) $vacationBalance->balance < $primaryDaysToDeduct) {
+            if (!$vacationBalance || (float) $vacationBalance->balance < $linkedVacationLeaveRequiredDays) {
                 throw new \RuntimeException($balanceConflictError);
             }
 
-            $vacationBalance->decrement('balance', $primaryDaysToDeduct);
-            $linkedVacationLeaveDeductedDays = $primaryDaysToDeduct;
+            $vacationBalance->decrement('balance', $linkedVacationLeaveRequiredDays);
+            $linkedVacationLeaveDeductedDays = $linkedVacationLeaveRequiredDays;
         }
 
         return [
@@ -5970,6 +6424,37 @@ class LeaveApplicationController extends Controller
         return $fullName !== '' ? $fullName : null;
     }
 
+    private function resolveStoredPrimaryLeaveDeduction(
+        LeaveApplication $app,
+        ?LeaveType $sourceLeaveType,
+        float $fallbackDeductibleDays
+    ): float {
+        $normalizedFallbackDeductibleDays = round(max($fallbackDeductibleDays, 0.0), 2);
+        if (!$sourceLeaveType instanceof LeaveType) {
+            return $normalizedFallbackDeductibleDays;
+        }
+
+        $leaveTypeId = $this->resolveCanonicalLeaveTypeId((int) $app->leave_type_id)
+            ?? (int) $app->leave_type_id;
+        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+        if (!$this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
+            $sourceLeaveType,
+            $leaveTypeId,
+            (bool) $app->is_monetization,
+            $vacationLeaveTypeId
+        )) {
+            return $normalizedFallbackDeductibleDays;
+        }
+
+        $linkedVacationRefundDays = $this->resolveStoredLinkedVacationLeaveDeduction(
+            $app,
+            $sourceLeaveType,
+            $fallbackDeductibleDays
+        );
+
+        return round(max($normalizedFallbackDeductibleDays - $linkedVacationRefundDays, 0.0), 2);
+    }
+
     private function resolveStoredLinkedForcedLeaveDeduction(
         LeaveApplication $app,
         ?LeaveType $sourceLeaveType,
@@ -6013,7 +6498,15 @@ class LeaveApplicationController extends Controller
             return 0.0;
         }
 
-        return round(max($fallbackDeductibleDays, 0.0), 2);
+        return $this->resolveLeaveTypeVacationLeaveDeductionDays(
+            $sourceLeaveType,
+            (int) $app->leave_type_id,
+            (bool) $app->is_monetization,
+            round((float) ($app->total_days ?? $fallbackDeductibleDays), 2),
+            $fallbackDeductibleDays,
+            $forcedLeaveTypeId,
+            $vacationLeaveTypeId
+        );
     }
 
     private function resolveCtoLeaveTypeId(): ?int
@@ -6205,6 +6698,123 @@ class LeaveApplicationController extends Controller
         return strcasecmp(trim((string) ($leaveType->name ?? '')), 'Vacation Leave') === 0;
     }
 
+    private function isWellnessLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
+    {
+        static $leaveTypeNameCache = [];
+
+        $leaveTypeName = null;
+        if ($leaveType instanceof LeaveType) {
+            $leaveTypeName = trim((string) ($leaveType->name ?? ''));
+        } elseif ($leaveTypeId !== null && $leaveTypeId > 0) {
+            if (!array_key_exists($leaveTypeId, $leaveTypeNameCache)) {
+                $leaveTypeNameCache[$leaveTypeId] = LeaveType::query()
+                    ->whereKey((int) $leaveTypeId)
+                    ->value('name');
+            }
+
+            $resolvedName = $leaveTypeNameCache[$leaveTypeId];
+            $leaveTypeName = is_string($resolvedName) ? trim($resolvedName) : null;
+        }
+
+        return strcasecmp((string) ($leaveTypeName ?? ''), 'Wellness Leave') === 0;
+    }
+
+    private function shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
+        LeaveType $leaveType,
+        int $leaveTypeId,
+        bool $isMonetization,
+        ?int $vacationLeaveTypeId
+    ): bool {
+        if ($vacationLeaveTypeId === null || $isMonetization) {
+            return false;
+        }
+
+        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+
+        return $this->isWellnessLeaveType($leaveType, $canonicalLeaveTypeId)
+            || LeaveType::isSpecialPrivilegeType($leaveType, $canonicalLeaveTypeId);
+    }
+
+    private function resolveLeaveTypeVacationLeaveDeductionDays(
+        LeaveType $leaveType,
+        int $leaveTypeId,
+        bool $isMonetization,
+        float $requestedTotalDays,
+        float $deductibleDays,
+        ?int $forcedLeaveTypeId,
+        ?int $vacationLeaveTypeId
+    ): float {
+        $normalizedDeductibleDays = round(max($deductibleDays, 0.0), 2);
+        if ($normalizedDeductibleDays <= 0.0) {
+            return 0.0;
+        }
+
+        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+        if (!$this->shouldLeaveTypeDeductVacationLeave(
+            $leaveType,
+            $canonicalLeaveTypeId,
+            $isMonetization,
+            $forcedLeaveTypeId,
+            $vacationLeaveTypeId
+        )) {
+            return 0.0;
+        }
+
+        if ($forcedLeaveTypeId !== null && $canonicalLeaveTypeId === $forcedLeaveTypeId) {
+            return $normalizedDeductibleDays;
+        }
+
+        if (!$this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
+            $leaveType,
+            $canonicalLeaveTypeId,
+            $isMonetization,
+            $vacationLeaveTypeId
+        )) {
+            return 0.0;
+        }
+
+        $normalizedRequestedTotalDays = round(max($requestedTotalDays, 0.0), 2);
+
+        return round(max($normalizedDeductibleDays - $normalizedRequestedTotalDays, 0.0), 2);
+    }
+
+    private function resolvePrimaryLeaveTrackedDeductionDays(
+        ?LeaveType $leaveType,
+        int $leaveTypeId,
+        bool $isMonetization,
+        float $requestedTotalDays,
+        float $deductibleDays,
+        ?int $forcedLeaveTypeId,
+        ?int $vacationLeaveTypeId
+    ): float {
+        $normalizedDeductibleDays = round(max($deductibleDays, 0.0), 2);
+        if (!$leaveType instanceof LeaveType) {
+            return $normalizedDeductibleDays;
+        }
+
+        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+        if (!$this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
+            $leaveType,
+            $canonicalLeaveTypeId,
+            $isMonetization,
+            $vacationLeaveTypeId
+        )) {
+            return $normalizedDeductibleDays;
+        }
+
+        $linkedVacationLeaveDays = $this->resolveLeaveTypeVacationLeaveDeductionDays(
+            $leaveType,
+            $canonicalLeaveTypeId,
+            $isMonetization,
+            $requestedTotalDays,
+            $normalizedDeductibleDays,
+            $forcedLeaveTypeId,
+            $vacationLeaveTypeId
+        );
+
+        return round(max($normalizedDeductibleDays - $linkedVacationLeaveDays, 0.0), 2);
+    }
+
     private function shouldLeaveTypeDeductVacationLeave(
         LeaveType $leaveType,
         int $leaveTypeId,
@@ -6212,11 +6822,21 @@ class LeaveApplicationController extends Controller
         ?int $forcedLeaveTypeId,
         ?int $vacationLeaveTypeId
     ): bool {
-        if ($forcedLeaveTypeId === null || $vacationLeaveTypeId === null || $isMonetization) {
+        if ($vacationLeaveTypeId === null || $isMonetization) {
             return false;
         }
 
-        return $leaveTypeId === $forcedLeaveTypeId;
+        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+        if ($forcedLeaveTypeId !== null && $canonicalLeaveTypeId === $forcedLeaveTypeId) {
+            return true;
+        }
+
+        return $this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
+            $leaveType,
+            $canonicalLeaveTypeId,
+            $isMonetization,
+            $vacationLeaveTypeId
+        );
     }
 
     private function isSickLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
@@ -6238,6 +6858,137 @@ class LeaveApplicationController extends Controller
         }
 
         return strcasecmp((string) ($leaveTypeName ?? ''), 'Sick Leave') === 0;
+    }
+
+    private function isVacationLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
+    {
+        static $leaveTypeNameCache = [];
+
+        $leaveTypeName = null;
+        if ($leaveType instanceof LeaveType) {
+            $leaveTypeName = trim((string) ($leaveType->name ?? ''));
+        } elseif ($leaveTypeId !== null && $leaveTypeId > 0) {
+            if (!array_key_exists($leaveTypeId, $leaveTypeNameCache)) {
+                $leaveTypeNameCache[$leaveTypeId] = LeaveType::query()
+                    ->whereKey((int) $leaveTypeId)
+                    ->value('name');
+            }
+
+            $resolvedName = $leaveTypeNameCache[$leaveTypeId];
+            $leaveTypeName = is_string($resolvedName) ? trim($resolvedName) : null;
+        }
+
+        return strcasecmp((string) ($leaveTypeName ?? ''), 'Vacation Leave') === 0;
+    }
+
+    private function validateMonetizationPolicyRules(?LeaveType $leaveType, float $requestedDays): ?JsonResponse
+    {
+        if (!$leaveType instanceof LeaveType || !$this->isVacationLeaveType($leaveType, (int) $leaveType->id)) {
+            return response()->json([
+                'message' => 'Monetization is only allowed for Vacation Leave.',
+                'errors' => [
+                    'leave_type_id' => ['Monetization is only allowed for Vacation Leave.'],
+                ],
+            ], 422);
+        }
+
+        $normalizedRequestedDays = round(max($requestedDays, 0.0), 2);
+        if ($normalizedRequestedDays + 1e-9 < LeaveApplication::MONETIZATION_MINIMUM_REQUEST_DAYS) {
+            $minimumDays = self::formatDays(LeaveApplication::MONETIZATION_MINIMUM_REQUEST_DAYS);
+
+            return response()->json([
+                'message' => "A minimum of {$minimumDays} is required for monetization.",
+                'errors' => [
+                    'total_days' => ["A minimum of {$minimumDays} is required for monetization."],
+                ],
+            ], 422);
+        }
+
+        return null;
+    }
+
+    private function validateMonetizationBalanceRules(float $currentBalance, float $requestedDays): ?JsonResponse
+    {
+        $normalizedCurrentBalance = round(max($currentBalance, 0.0), 2);
+        $normalizedRequestedDays = round(max($requestedDays, 0.0), 2);
+        $requiredMinimumBalance = LeaveApplication::MONETIZATION_MINIMUM_VACATION_LEAVE_BALANCE_DAYS;
+
+        if ($normalizedCurrentBalance + 1e-9 < $requiredMinimumBalance) {
+            return response()->json([
+                'message' => 'At least '
+                    . self::formatDays($requiredMinimumBalance)
+                    . ' of Vacation Leave credits are required to apply monetization.',
+                'errors' => [
+                    'total_days' => [
+                        'At least '
+                        . self::formatDays($requiredMinimumBalance)
+                        . ' of Vacation Leave credits are required. Current balance: '
+                        . self::formatDays($normalizedCurrentBalance)
+                        . '.',
+                    ],
+                ],
+            ], 422);
+        }
+
+        if ($normalizedRequestedDays > $normalizedCurrentBalance + 1e-9) {
+            return response()->json([
+                'message' => 'Requested monetization days exceed available Vacation Leave credits.',
+                'errors' => [
+                    'total_days' => [
+                        'Requested monetization days ('
+                        . self::formatDays($normalizedRequestedDays)
+                        . ') exceed available Vacation Leave credits ('
+                        . self::formatDays($normalizedCurrentBalance)
+                        . ').',
+                    ],
+                ],
+            ], 422);
+        }
+
+        return null;
+    }
+
+    private function resolveMonetizationApprovalAvailableBalance(
+        LeaveApplication $app,
+        int $targetLeaveTypeId,
+        ?LeaveType $sourceLeaveType = null,
+        float $sourceDeductibleDays = 0.0,
+        bool $sourceDeductsBalance = false
+    ): float {
+        $currentBalance = 0.0;
+        if ($app->employee_control_no) {
+            $currentBalance = (float) (
+                $this->findPreferredEmployeeLeaveBalanceRecord(
+                    (string) $app->employee_control_no,
+                    $targetLeaveTypeId
+                )?->balance ?? 0.0
+            );
+        } elseif ($app->applicant_admin_id) {
+            $currentBalance = (float) (
+                $this->findAdminEmployeeLeaveBalance(
+                    (int) $app->applicant_admin_id,
+                    $targetLeaveTypeId
+                )?->balance ?? 0.0
+            );
+        }
+
+        $sourceLeaveTypeId = $this->resolveCanonicalLeaveTypeId((int) ($app->leave_type_id ?? 0))
+            ?? (int) ($app->leave_type_id ?? 0);
+        $canonicalTargetLeaveTypeId = $this->resolveCanonicalLeaveTypeId($targetLeaveTypeId) ?? $targetLeaveTypeId;
+
+        if (
+            $sourceDeductsBalance
+            && $sourceLeaveTypeId > 0
+            && $sourceLeaveTypeId === $canonicalTargetLeaveTypeId
+        ) {
+            $currentBalance += $this->resolveStoredPrimaryLeaveDeduction(
+                $app,
+                $sourceLeaveType,
+                $sourceDeductibleDays
+            );
+        }
+
+        return round(max($currentBalance, 0.0), 2);
     }
 
     private function resolveAttachmentStateFromRequest(
@@ -7286,6 +8037,39 @@ class LeaveApplicationController extends Controller
         return $normalized;
     }
 
+    private function normalizeSelectedDateCoverageValue(mixed $value): ?string
+    {
+        $normalized = strtolower(trim((string) $value));
+        if ($normalized === '') {
+            return null;
+        }
+
+        $normalized = str_replace([' ', '-'], '_', $normalized);
+        if (in_array($normalized, ['whole', 'whole_day', 'wholeday'], true)) {
+            return 'whole';
+        }
+
+        if (in_array($normalized, ['half', 'half_day', 'halfday'], true)) {
+            return 'half';
+        }
+
+        return $this->normalizeSelectedDateHalfDayPortionValue($value) !== null ? 'half' : null;
+    }
+
+    private function normalizeSelectedDateHalfDayPortionValue(mixed $value): ?string
+    {
+        $normalized = strtoupper(str_replace([' ', '-', '_'], '', trim((string) $value)));
+        if ($normalized === '') {
+            return null;
+        }
+
+        return match ($normalized) {
+            'AM', 'MORNING' => 'AM',
+            'PM', 'AFTERNOON' => 'PM',
+            default => null,
+        };
+    }
+
     private function normalizeSelectedDateCoverageMap(mixed $value): ?array
     {
         if (is_string($value)) {
@@ -7309,15 +8093,12 @@ class LeaveApplicationController extends Controller
                 continue;
             }
 
-            $coverage = strtolower(trim((string) $rawCoverage));
-            if ($coverage === 'half') {
-                $normalized[$dateKey] = 'half';
+            $coverage = $this->normalizeSelectedDateCoverageValue($rawCoverage);
+            if ($coverage === null) {
                 continue;
             }
 
-            if ($coverage === 'whole') {
-                $normalized[$dateKey] = 'whole';
-            }
+            $normalized[$dateKey] = $coverage;
         }
 
         if ($normalized === []) {
@@ -7326,6 +8107,164 @@ class LeaveApplicationController extends Controller
 
         ksort($normalized);
         return $normalized;
+    }
+
+    private function normalizeSelectedDateHalfDayPortionMap(mixed $value): ?array
+    {
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $value = $decoded;
+            }
+        }
+
+        if (!is_array($value) || $value === []) {
+            return null;
+        }
+
+        $normalized = [];
+        foreach ($value as $rawDate => $rawPortion) {
+            $dateKey = $this->normalizeDateKey($rawDate);
+            if ($dateKey === null) {
+                $dateKey = trim((string) $rawDate);
+            }
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $portion = $this->normalizeSelectedDateHalfDayPortionValue($rawPortion);
+            if ($portion === null) {
+                continue;
+            }
+
+            $normalized[$dateKey] = $portion;
+        }
+
+        if ($normalized === []) {
+            return null;
+        }
+
+        ksort($normalized);
+        return $normalized;
+    }
+
+    private function compactSelectedDateHalfDayPortionMap(
+        ?array $selectedDateHalfDayPortion,
+        ?array $selectedDates
+    ): ?array {
+        if (!is_array($selectedDateHalfDayPortion) || $selectedDateHalfDayPortion === []) {
+            return null;
+        }
+
+        $dateSet = [];
+        $selectedDateLookup = [];
+        if (is_array($selectedDates)) {
+            foreach ($selectedDates as $index => $rawDate) {
+                $rawKey = trim((string) $rawDate);
+                if ($rawKey === '') {
+                    continue;
+                }
+
+                $dateKey = $this->normalizeDateKey($rawDate);
+                if ($dateKey === null) {
+                    $dateKey = $rawKey;
+                }
+
+                $dateSet[$dateKey] = true;
+                $selectedDateLookup[(string) $index] = $dateKey;
+                $selectedDateLookup[$rawKey] = $dateKey;
+            }
+        }
+        $restrictToSelectedDates = $dateSet !== [];
+
+        $compacted = [];
+        foreach ($selectedDateHalfDayPortion as $rawDate => $rawPortion) {
+            $rawKey = trim((string) $rawDate);
+            $dateKey = $this->normalizeDateKey($rawDate);
+            if ($dateKey === null && $rawKey !== '' && array_key_exists($rawKey, $selectedDateLookup)) {
+                $dateKey = $selectedDateLookup[$rawKey];
+            }
+            if ($dateKey === null) {
+                $dateKey = $rawKey;
+            }
+            if ($dateKey === '') {
+                continue;
+            }
+
+            if ($restrictToSelectedDates && !array_key_exists($dateKey, $dateSet)) {
+                continue;
+            }
+
+            $portion = $this->normalizeSelectedDateHalfDayPortionValue($rawPortion);
+            if ($portion === null) {
+                continue;
+            }
+
+            $compacted[$dateKey] = $portion;
+        }
+
+        if ($compacted === []) {
+            return null;
+        }
+
+        ksort($compacted);
+        return $compacted;
+    }
+
+    private function mergeSelectedDateHalfDayPortionMaps(?array $primaryMap, ?array $fallbackMap): ?array
+    {
+        $resolvedMap = [];
+        if (is_array($fallbackMap) && $fallbackMap !== []) {
+            $resolvedMap = $fallbackMap;
+        }
+
+        if (is_array($primaryMap) && $primaryMap !== []) {
+            foreach ($primaryMap as $dateKey => $portion) {
+                $resolvedMap[$dateKey] = $portion;
+            }
+        }
+
+        if ($resolvedMap === []) {
+            return null;
+        }
+
+        ksort($resolvedMap);
+        return $resolvedMap;
+    }
+
+    private function synchronizeSelectedDateCoverageMetadata(
+        ?array $selectedDateCoverage,
+        ?array $selectedDateHalfDayPortion,
+        ?array $selectedDates
+    ): array {
+        $resolvedCoverage = $this->compactSelectedDateCoverageMap($selectedDateCoverage, $selectedDates);
+        $resolvedHalfDayPortion = $this->compactSelectedDateHalfDayPortionMap($selectedDateHalfDayPortion, $selectedDates);
+
+        if (is_array($resolvedHalfDayPortion) && $resolvedHalfDayPortion !== []) {
+            $coverageMap = is_array($resolvedCoverage) ? $resolvedCoverage : [];
+            foreach (array_keys($resolvedHalfDayPortion) as $dateKey) {
+                $coverageMap[$dateKey] = 'half';
+            }
+            ksort($coverageMap);
+            $resolvedCoverage = $coverageMap === [] ? null : $coverageMap;
+        }
+
+        if (is_array($resolvedHalfDayPortion) && $resolvedHalfDayPortion !== []) {
+            foreach ($resolvedHalfDayPortion as $dateKey => $portion) {
+                if (($resolvedCoverage[$dateKey] ?? null) !== 'half') {
+                    unset($resolvedHalfDayPortion[$dateKey]);
+                }
+            }
+
+            if ($resolvedHalfDayPortion === []) {
+                $resolvedHalfDayPortion = null;
+            }
+        }
+
+        return [
+            'selectedDateCoverage' => $resolvedCoverage,
+            'selectedDateHalfDayPortion' => $resolvedHalfDayPortion,
+        ];
     }
 
     private function compactSelectedDatePayStatusMap(
@@ -7944,10 +8883,10 @@ class LeaveApplicationController extends Controller
         }
 
         $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
+        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
         if ($forcedLeaveTypeId !== null && (int) $leaveTypeId === $forcedLeaveTypeId) {
             $requiredVacationLeaveDays = round(max($requestedDays, 0.0), 2);
             if ($requiredVacationLeaveDays > 0) {
-                $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
                 if ($vacationLeaveTypeId !== null) {
                     $vacationBalanceSnapshot = $this->resolveEmployeeLeaveBalanceSnapshot(
                         $employeeControlNo,
@@ -7977,6 +8916,34 @@ class LeaveApplicationController extends Controller
 
         $normalizedPayMode = $this->normalizePayMode($payMode);
         $requiredBalanceDays = round(max((float) ($requestedDeductibleDays ?? $requestedDays), 0.0), 2);
+        $requiresVacationLeaveTopUp = $this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
+            $leaveType,
+            $leaveTypeId,
+            false,
+            $vacationLeaveTypeId
+        );
+        $requiredVacationLeaveDays = $requiresVacationLeaveTopUp
+            ? $this->resolveLeaveTypeVacationLeaveDeductionDays(
+                $leaveType,
+                $leaveTypeId,
+                false,
+                $requestedDays,
+                $requiredBalanceDays,
+                $forcedLeaveTypeId,
+                $vacationLeaveTypeId
+            )
+            : 0.0;
+        if ($requiresVacationLeaveTopUp && $requiredVacationLeaveDays > 0.0) {
+            $requiredBalanceDays = $this->resolvePrimaryLeaveTrackedDeductionDays(
+                $leaveType,
+                $leaveTypeId,
+                false,
+                $requestedDays,
+                $requiredBalanceDays,
+                $forcedLeaveTypeId,
+                $vacationLeaveTypeId
+            );
+        }
         if (
             !$leaveType->is_credit_based
             || $requiredBalanceDays <= 0
@@ -8013,6 +8980,31 @@ class LeaveApplicationController extends Controller
         $insufficientBalance = $requiredBalanceHours !== null
             ? ($availableBalanceHours + 1e-9 < $requiredBalanceHours)
             : ($availableBalance + 1e-9 < $requiredBalanceDays);
+        if ($requiresVacationLeaveTopUp) {
+            if ($insufficientBalance) {
+                return $this->buildInsufficientPrimaryLeaveBalanceResponse(
+                    $leaveType,
+                    $availableBalance,
+                    $requiredBalanceDays,
+                    true
+                );
+            }
+
+            if ($vacationLeaveTypeId !== null && $requiredVacationLeaveDays > 0.0) {
+                $vacationBalanceSnapshot = $this->resolveEmployeeLeaveBalanceSnapshot(
+                    $employeeControlNo,
+                    $vacationLeaveTypeId
+                );
+                $availableVacationBalance = (float) ($vacationBalanceSnapshot['available_balance'] ?? 0.0);
+                if ($availableVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
+                    return $this->buildInsufficientVacationLeaveTopUpResponse(
+                        $leaveType,
+                        $availableVacationBalance,
+                        $requiredVacationLeaveDays
+                    );
+                }
+            }
+        }
 
         return [
             'leave_type' => $leaveType,
@@ -8024,6 +9016,7 @@ class LeaveApplicationController extends Controller
             'pending_reserved_hours' => $pendingReservedHours,
             'required_balance_days' => $requiredBalanceDays,
             'required_balance_hours' => $requiredBalanceHours,
+            'required_vacation_leave_days' => $requiredVacationLeaveDays,
             'insufficient_balance' => $insufficientBalance,
         ];
     }
@@ -8062,6 +9055,72 @@ class LeaveApplicationController extends Controller
             'required_cto_balance' => $requiredBalance,
             'available_cto_balance_hours' => $availableBalanceHours,
             'required_cto_balance_hours' => $requiredBalanceHours,
+        ], 422);
+    }
+
+    private function buildInsufficientPrimaryLeaveBalanceResponse(
+        LeaveType $leaveType,
+        float $availableBalance,
+        float $requiredBalanceDays,
+        bool $requiresVacationLeaveTopUp = false
+    ): JsonResponse {
+        $message = $requiresVacationLeaveTopUp
+            ? "Insufficient {$leaveType->name} balance. Available {$leaveType->name} is "
+                . self::formatDays($availableBalance)
+                . ', but '
+                . self::formatDays($requiredBalanceDays)
+                . ' is required before Vacation Leave can cover the schedule-based excess deduction.'
+            : "Insufficient {$leaveType->name} balance. Available {$leaveType->name} is "
+                . self::formatDays($availableBalance)
+                . ', but '
+                . self::formatDays($requiredBalanceDays)
+                . ' is required.';
+
+        return response()->json([
+            'message' => $message,
+            'errors' => [
+                'leave_type_id' => [$message],
+                'available_leave_balance' => [
+                    'Available '
+                    . $leaveType->name
+                    . ' is '
+                    . self::formatDays($availableBalance)
+                    . ', but '
+                    . self::formatDays($requiredBalanceDays)
+                    . ' is required.',
+                ],
+            ],
+            'available_balance' => $availableBalance,
+            'required_balance_days' => $requiredBalanceDays,
+        ], 422);
+    }
+
+    private function buildInsufficientVacationLeaveTopUpResponse(
+        LeaveType $leaveType,
+        float $availableVacationBalance,
+        float $requiredVacationLeaveDays
+    ): JsonResponse {
+        $message = 'Insufficient Vacation Leave balance to cover the schedule-based excess deduction for '
+            . $leaveType->name
+            . '.';
+
+        return response()->json([
+            'message' => $message,
+            'errors' => [
+                'leave_type_id' => [
+                    $leaveType->name
+                    . ' needs Vacation Leave to cover the schedule-based excess deduction.',
+                ],
+                'vacation_leave_balance' => [
+                    'Available Vacation Leave is '
+                    . self::formatDays($availableVacationBalance)
+                    . ', but '
+                    . self::formatDays($requiredVacationLeaveDays)
+                    . ' is required.',
+                ],
+            ],
+            'available_vacation_leave_days' => $availableVacationBalance,
+            'required_vacation_leave_days' => $requiredVacationLeaveDays,
         ], 422);
     }
 
@@ -8112,8 +9171,37 @@ class LeaveApplicationController extends Controller
         $balance = $this->findPreferredEmployeeLeaveBalanceRecord($employeeControlNo, $canonicalLeaveTypeId);
         $currentBalance = $balance ? (float) $balance->balance : 0.0;
 
-        $pendingReservedDays = (float) LeaveApplication::query()
-            ->whereIn('leave_type_id', $lookupLeaveTypeIds === [] ? [$canonicalLeaveTypeId] : $lookupLeaveTypeIds)
+        $pendingReservedDays = $this->resolvePendingReservedDaysForTrackedLeaveType(
+            $employeeControlNo,
+            $canonicalLeaveTypeId
+        );
+
+        $availableBalance = max(round($currentBalance - $pendingReservedDays, 2), 0.0);
+
+        return [
+            'current_balance' => $currentBalance,
+            'current_balance_hours' => 0.0,
+            'pending_reserved_days' => $pendingReservedDays,
+            'pending_reserved_hours' => 0.0,
+            'available_balance' => $availableBalance,
+            'available_balance_hours' => 0.0,
+        ];
+    }
+
+    private function resolvePendingReservedDaysForTrackedLeaveType(string $employeeControlNo, int $leaveTypeId): float
+    {
+        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+        if ($canonicalLeaveTypeId <= 0) {
+            return 0.0;
+        }
+
+        $controlNoCandidates = $this->controlNoCandidates($employeeControlNo);
+        if ($controlNoCandidates === []) {
+            return 0.0;
+        }
+
+        $pendingApplications = LeaveApplication::query()
+            ->with('leaveType')
             ->whereIn('status', [
                 LeaveApplication::STATUS_PENDING_ADMIN,
                 LeaveApplication::STATUS_PENDING_HR,
@@ -8126,18 +9214,87 @@ class LeaveApplicationController extends Controller
                     );
             })
             ->whereIn('employee_control_no', $controlNoCandidates)
-            ->sum(DB::raw('COALESCE(deductible_days, total_days)'));
+            ->get();
 
-        $availableBalance = max(round($currentBalance - $pendingReservedDays, 2), 0.0);
+        if ($pendingApplications->isEmpty()) {
+            return 0.0;
+        }
 
-        return [
-            'current_balance' => $currentBalance,
-            'current_balance_hours' => 0.0,
-            'pending_reserved_days' => $pendingReservedDays,
-            'pending_reserved_hours' => 0.0,
-            'available_balance' => $availableBalance,
-            'available_balance_hours' => 0.0,
-        ];
+        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
+        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+        $pendingReservedDays = 0.0;
+
+        foreach ($pendingApplications as $pendingApplication) {
+            $applicationLeaveType = $pendingApplication->leaveType
+                ?? LeaveType::query()->find((int) $pendingApplication->leave_type_id);
+            if (!$applicationLeaveType instanceof LeaveType) {
+                continue;
+            }
+
+            $applicationLeaveTypeId = $this->resolveCanonicalLeaveTypeId((int) $pendingApplication->leave_type_id)
+                ?? (int) $pendingApplication->leave_type_id;
+            $applicationDeductibleDays = $this->resolveApplicationDeductibleDays($pendingApplication);
+            $applicationTotalDays = round((float) ($pendingApplication->total_days ?? $applicationDeductibleDays), 2);
+
+            $pendingReservedDays += $this->resolvePendingReservedDaysContributionForTrackedLeaveType(
+                $pendingApplication,
+                $applicationLeaveType,
+                $applicationLeaveTypeId,
+                $canonicalLeaveTypeId,
+                $applicationTotalDays,
+                $applicationDeductibleDays,
+                $forcedLeaveTypeId,
+                $vacationLeaveTypeId
+            );
+        }
+
+        return round(max($pendingReservedDays, 0.0), 2);
+    }
+
+    private function resolvePendingReservedDaysContributionForTrackedLeaveType(
+        LeaveApplication $app,
+        LeaveType $applicationLeaveType,
+        int $applicationLeaveTypeId,
+        int $targetLeaveTypeId,
+        float $applicationTotalDays,
+        float $applicationDeductibleDays,
+        ?int $forcedLeaveTypeId,
+        ?int $vacationLeaveTypeId
+    ): float {
+        if ($targetLeaveTypeId <= 0) {
+            return 0.0;
+        }
+
+        $primaryReservedDays = $this->resolvePrimaryLeaveTrackedDeductionDays(
+            $applicationLeaveType,
+            $applicationLeaveTypeId,
+            (bool) $app->is_monetization,
+            $applicationTotalDays,
+            $applicationDeductibleDays,
+            $forcedLeaveTypeId,
+            $vacationLeaveTypeId
+        );
+        if ($applicationLeaveTypeId === $targetLeaveTypeId) {
+            return $primaryReservedDays;
+        }
+
+        if ($forcedLeaveTypeId !== null && $targetLeaveTypeId === $forcedLeaveTypeId) {
+            return $this->resolveStoredLinkedForcedLeaveDeduction(
+                $app,
+                $applicationLeaveType,
+                $applicationDeductibleDays
+            );
+        }
+
+        if ($vacationLeaveTypeId !== null && $targetLeaveTypeId === $vacationLeaveTypeId) {
+            return $this->resolveStoredLinkedVacationLeaveDeduction(
+                $app,
+                $applicationLeaveType,
+                $applicationDeductibleDays
+            );
+        }
+
+        return 0.0;
     }
 
     private function formatApplication(LeaveApplication $app): array
@@ -8181,6 +9338,8 @@ class LeaveApplicationController extends Controller
             'duration_unit' => 'day',
             'duration_label' => self::formatDays($durationDays),
             'reason' => $app->reason,
+            'details_of_leave' => $app->details_of_leave,
+            'detailsOfLeave' => $app->details_of_leave,
             'status' => $displayStatus,
             'rawStatus' => $app->status,
             'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
@@ -8208,6 +9367,8 @@ class LeaveApplicationController extends Controller
             'selected_dates' => $app->resolvedSelectedDates(),
             'selected_date_pay_status' => is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null,
             'selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
+            'selected_date_half_day_portion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selectedDateHalfDayPortion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
             'commutation' => $app->commutation ?? 'Not Requested',
             'pay_mode' => $normalizedPayMode,
             'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
@@ -8423,6 +9584,45 @@ class LeaveApplicationController extends Controller
 
         if ($selectedDates !== null && $selectedDates !== '') {
             $request->merge(['selected_dates' => $selectedDates]);
+        }
+    }
+
+    private function normalizeSelectedDatePolicyInput(Request $request): void
+    {
+        $selectedDateCoverage = $request->input('selected_date_coverage');
+        if ($selectedDateCoverage === null || $selectedDateCoverage === '') {
+            $selectedDateCoverage = $request->input('selected_date_coverages');
+        }
+
+        $selectedDateHalfDayPortion = $request->input('selected_date_half_day_portion');
+        if ($selectedDateHalfDayPortion === null || $selectedDateHalfDayPortion === '') {
+            $selectedDateHalfDayPortion = $request->input('selectedDateHalfDayPortion');
+        }
+        if ($selectedDateHalfDayPortion === null || $selectedDateHalfDayPortion === '') {
+            $selectedDateHalfDayPortion = $request->input('selected_date_half_day_portions');
+        }
+
+        $normalizedCoverage = $this->normalizeSelectedDateCoverageMap($selectedDateCoverage);
+        $normalizedHalfDayPortion = $this->mergeSelectedDateHalfDayPortionMaps(
+            $this->normalizeSelectedDateHalfDayPortionMap($selectedDateHalfDayPortion),
+            $this->normalizeSelectedDateHalfDayPortionMap($selectedDateCoverage)
+        );
+
+        if (is_array($normalizedHalfDayPortion) && $normalizedHalfDayPortion !== []) {
+            $coverageMap = is_array($normalizedCoverage) ? $normalizedCoverage : [];
+            foreach (array_keys($normalizedHalfDayPortion) as $dateKey) {
+                $coverageMap[$dateKey] = 'half';
+            }
+            ksort($coverageMap);
+            $normalizedCoverage = $coverageMap;
+        }
+
+        if ($normalizedCoverage !== null) {
+            $request->merge(['selected_date_coverage' => $normalizedCoverage]);
+        }
+
+        if ($normalizedHalfDayPortion !== null) {
+            $request->merge(['selected_date_half_day_portion' => $normalizedHalfDayPortion]);
         }
     }
 }

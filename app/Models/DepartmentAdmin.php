@@ -37,6 +37,7 @@ class DepartmentAdmin extends Model implements AuthenticatableContract
             'password' => 'hashed',
             'is_default_account' => 'boolean',
             'must_change_password' => 'boolean',
+            'active_personal_access_token_id' => 'integer',
         ];
     }
 

@@ -234,6 +234,7 @@ class HRReportController extends Controller
                 'total_days',
                 'deductible_days',
                 'pay_mode',
+                'reason',
                 'remarks',
                 'created_at',
                 'admin_approved_at',
@@ -267,7 +268,7 @@ class HRReportController extends Controller
                 'typeOfLeave' => $application->leaveType?->name ?? 'Leave',
                 'totalDaysLWOP' => $withoutPayDays,
                 'dateReceivedCHRMO' => $this->formatDateForDisplay($receivedAt),
-                'remarks' => $this->trimNullableString($application->remarks) ?? '',
+                'remarks' => $this->resolveLwopReportRemarks($application),
                 'month' => $monthYear['month'],
                 'year' => $monthYear['year'],
                 '_sort_key' => $this->composeSortKey([
@@ -629,6 +630,11 @@ class HRReportController extends Controller
                 }
             }
 
+            $latestEarnedCertificateDate = $this->resolveLatestCtoEarnedDateAsOf(
+                $creditEventsByEmployee[$employeeKey] ?? [],
+                $referenceDate
+            );
+
             $priorDeductedHours = 0.0;
             foreach ($approvedCtoRowsByEmployee[$employeeKey] ?? [] as $approvedCtoRow) {
                 $isEarlierApplication = $approvedCtoRow['reference_date']->lt($referenceDate)
@@ -651,10 +657,10 @@ class HRReportController extends Controller
                 'name' => $employee['name'],
                 'designation' => $employee['designation'],
                 'office' => $employee['office'],
-                'status' => $employee['status'],
+                'status' => $this->formatCtoAvailmentEmploymentStatus($employee['status']),
                 'totalDaysApplied' => round($this->resolveReportableApplicationDays($application), 2),
                 'inclusiveDates' => $this->formatApplicationInclusiveDates($application),
-                'earnedCocHoursAsOf' => round($earnedHoursAsOf, 2),
+                'earnedCocHoursAsOf' => $this->formatDateForDisplay($latestEarnedCertificateDate),
                 'runningCocBalance' => $runningBalance,
                 'totalHoursFiled' => $hoursFiled,
                 'cocBalanceApproved' => round(max($runningBalance - $hoursFiled, 0), 2),
@@ -1395,10 +1401,43 @@ class HRReportController extends Controller
             ?? '';
     }
 
+    private function formatCtoAvailmentEmploymentStatus(mixed $status): string
+    {
+        $normalizedStatus = $this->trimNullableString($status) ?? '';
+        if (strcasecmp($normalizedStatus, 'Regular') === 0) {
+            return 'Permanent';
+        }
+
+        return $normalizedStatus;
+    }
+
+    private function resolveLatestCtoEarnedDateAsOf(array $creditEvents, Carbon $referenceDate): ?Carbon
+    {
+        $latestEarnedAt = null;
+
+        foreach ($creditEvents as $creditEvent) {
+            $creditedAt = $creditEvent['credited_at'] ?? null;
+            if (!$creditedAt instanceof Carbon || $creditedAt->gt($referenceDate)) {
+                continue;
+            }
+
+            if ($latestEarnedAt === null || $creditedAt->gt($latestEarnedAt)) {
+                $latestEarnedAt = $creditedAt->copy();
+            }
+        }
+
+        return $latestEarnedAt;
+    }
+
     private function trimNullableString(mixed $value): ?string
     {
         $trimmed = trim((string) ($value ?? ''));
         return $trimmed !== '' ? $trimmed : null;
+    }
+
+    private function resolveLwopReportRemarks(LeaveApplication $application): string
+    {
+        return $this->trimNullableString($application->reason) ?? '';
     }
 
     private function normalizeControlNoKey(mixed $controlNo): string
