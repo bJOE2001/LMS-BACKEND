@@ -2512,6 +2512,7 @@ class LeaveApplicationController extends Controller
                 $shouldDeductForcedLeave,
                 $shouldDeductVacationLeave,
                 $daysToDeduct,
+                $requestedTotalDays,
                 $ctoDeductedHours,
                 $isCtoDeduction,
                 $normalizedPayMode,
