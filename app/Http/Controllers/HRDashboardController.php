@@ -3,7 +3,6 @@
 namespace App\Http\Controllers;
 
 use App\Models\COCApplication;
-use App\Models\Department;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
@@ -112,8 +111,8 @@ class HRDashboardController extends Controller
 
     /**
      * Department Leave Statistics table for the HR dashboard.
-     * Returns leave-application counts grouped by office and leave type
-     * for the selected period based on approved leave applications only.
+     * Returns leave-application counts grouped by aggregation bucket,
+     * office, and leave type based on approved leave applications only.
      */
     public function departmentStatistics(Request $request): JsonResponse
     {
@@ -122,27 +121,12 @@ class HRDashboardController extends Controller
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
-        [$periodKey, $periodStart, $periodEnd] = $this->resolveDepartmentStatisticsPeriod(
-            (string) $request->query('period', 'daily')
+        $groupBy = $this->normalizeDepartmentStatisticsGroupBy(
+            (string) $request->query('group_by', 'daily')
         );
+        [$rangeStart, $rangeEnd] = $this->resolveDepartmentStatisticsDateRange($request, $groupBy);
 
-        $activeDepartmentNames = Department::query()
-            ->active()
-            ->orderBy('name')
-            ->pluck('name')
-            ->map(fn (mixed $value): string => trim((string) $value))
-            ->filter(fn (string $value): bool => $value !== '')
-            ->values();
-
-        if ($activeDepartmentNames->isEmpty()) {
-            return response()->json([]);
-        }
-
-        $rowsByDepartment = $activeDepartmentNames
-            ->mapWithKeys(fn (string $departmentName): array => [
-                $departmentName => $this->emptyDepartmentStatisticsRow($departmentName),
-            ])
-            ->all();
+        $rowsByGroupAndDepartment = [];
 
         $applications = LeaveApplication::query()
             ->with([
@@ -150,7 +134,7 @@ class HRDashboardController extends Controller
                 'applicantAdmin.department:id,name',
             ])
             ->where('status', LeaveApplication::STATUS_APPROVED)
-            ->whereBetween('created_at', [$periodStart, $periodEnd])
+            ->whereBetween('created_at', [$rangeStart, $rangeEnd])
             ->orderBy('created_at')
             ->get([
                 'id',
@@ -171,8 +155,13 @@ class HRDashboardController extends Controller
                 continue;
             }
 
+            $createdAt = $this->resolveDepartmentStatisticsCreatedAt($application);
+            if (!$createdAt) {
+                continue;
+            }
+
             $departmentName = $this->resolveDepartmentStatisticsDepartment($application, $officeByControlNo);
-            if ($departmentName === null || !array_key_exists($departmentName, $rowsByDepartment)) {
+            if ($departmentName === null) {
                 continue;
             }
 
@@ -181,16 +170,28 @@ class HRDashboardController extends Controller
                 continue;
             }
 
-            $rowsByDepartment[$departmentName][$leaveTypeColumn]++;
+            $groupMeta = $this->resolveDepartmentStatisticsGroupMeta($createdAt, $groupBy);
+            $rowKey = $groupMeta['groupKey'] . '|' . $departmentName;
+
+            if (!array_key_exists($rowKey, $rowsByGroupAndDepartment)) {
+                $rowsByGroupAndDepartment[$rowKey] = $this->emptyDepartmentStatisticsRow(
+                    groupBy: $groupBy,
+                    groupKey: $groupMeta['groupKey'],
+                    groupLabel: $groupMeta['groupLabel'],
+                    groupSortValue: $groupMeta['groupSortValue'],
+                    departmentName: $departmentName,
+                );
+            }
+
+            $rowsByGroupAndDepartment[$rowKey][$leaveTypeColumn]++;
         }
 
-        $rows = collect($rowsByDepartment)
+        $rows = collect($rowsByGroupAndDepartment)
             ->filter(function (array $row): bool {
                 $countKeys = [
                     'vacationLeave',
                     'sickLeave',
                     'mandatoryForcedLeave',
-                    'mco6Leave',
                     'wellnessLeave',
                     'maternityLeave',
                     'paternityLeave',
@@ -204,6 +205,19 @@ class HRDashboardController extends Controller
                 }
 
                 return $total > 0;
+            })
+            ->sort(function (array $left, array $right): int {
+                $leftSort = (string) ($left['groupSortValue'] ?? '');
+                $rightSort = (string) ($right['groupSortValue'] ?? '');
+                if ($leftSort !== $rightSort) {
+                    return strcmp($leftSort, $rightSort);
+                }
+
+                return strcasecmp((string) ($left['department'] ?? ''), (string) ($right['department'] ?? ''));
+            })
+            ->map(function (array $row): array {
+                unset($row['groupSortValue']);
+                return $row;
             })
             ->values()
             ->all();
@@ -220,49 +234,177 @@ class HRDashboardController extends Controller
         return $app->admin_reviewed_at ? 'PENDING_HR' : 'PENDING_ADMIN';
     }
 
-    private function resolveDepartmentStatisticsPeriod(string $period): array
+    private function normalizeDepartmentStatisticsGroupBy(string $groupBy): string
     {
-        $normalizedPeriod = strtolower(trim($period));
+        $normalized = strtolower(trim($groupBy));
+
+        return match ($normalized) {
+            'weekly' => 'weekly',
+            'monthly' => 'monthly',
+            'yearly' => 'yearly',
+            default => 'daily',
+        };
+    }
+
+    private function resolveDepartmentStatisticsDateRange(Request $request, string $groupBy): array
+    {
         $now = CarbonImmutable::now();
 
-        return match ($normalizedPeriod) {
-            'weekly' => [
-                'weekly',
-                $now->startOfWeek(),
-                $now->endOfWeek(),
-            ],
+        if ($groupBy === 'weekly') {
+            $selectedDate = $this->resolveDepartmentStatisticsFilterDate($request) ?? $now;
+            return [$selectedDate->startOfWeek(), $selectedDate->endOfWeek()];
+        }
+
+        if ($groupBy === 'monthly') {
+            $selectedMonth = $this->resolveDepartmentStatisticsFilterMonth($request) ?? (int) $now->month;
+            $selectedYear = $this->resolveDepartmentStatisticsFilterYear($request) ?? (int) $now->year;
+            $selectedMonthStart = CarbonImmutable::create(
+                $selectedYear,
+                $selectedMonth,
+                1,
+                0,
+                0,
+                0,
+                $now->timezone
+            );
+
+            return [$selectedMonthStart->startOfMonth(), $selectedMonthStart->endOfMonth()];
+        }
+
+        if ($groupBy === 'yearly') {
+            $selectedYear = $this->resolveDepartmentStatisticsFilterYear($request) ?? (int) $now->year;
+            $selectedYearStart = CarbonImmutable::create(
+                $selectedYear,
+                1,
+                1,
+                0,
+                0,
+                0,
+                $now->timezone
+            );
+
+            return [$selectedYearStart->startOfYear(), $selectedYearStart->endOfYear()];
+        }
+
+        $selectedDate = $this->resolveDepartmentStatisticsFilterDate($request) ?? $now;
+        return [$selectedDate->startOfDay(), $selectedDate->endOfDay()];
+    }
+
+    private function resolveDepartmentStatisticsFilterDate(Request $request): ?CarbonImmutable
+    {
+        $rawFilterDate = trim((string) $request->query('filter_date', ''));
+        if ($rawFilterDate === '') {
+            return null;
+        }
+
+        try {
+            return CarbonImmutable::createFromFormat('Y-m-d', $rawFilterDate)->startOfDay();
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function resolveDepartmentStatisticsFilterMonth(Request $request): ?int
+    {
+        $rawFilterMonth = $request->query('filter_month');
+        if ($rawFilterMonth === null || $rawFilterMonth === '') {
+            return null;
+        }
+
+        $month = (int) $rawFilterMonth;
+        return $month >= 1 && $month <= 12 ? $month : null;
+    }
+
+    private function resolveDepartmentStatisticsFilterYear(Request $request): ?int
+    {
+        $rawFilterYear = $request->query('filter_year');
+        if ($rawFilterYear === null || $rawFilterYear === '') {
+            return null;
+        }
+
+        $year = (int) $rawFilterYear;
+        return $year >= 1900 && $year <= 3000 ? $year : null;
+    }
+
+    private function resolveDepartmentStatisticsGroupMeta(CarbonImmutable $createdAt, string $groupBy): array
+    {
+        return match ($groupBy) {
+            'weekly' => $this->resolveDepartmentStatisticsWeeklyMeta($createdAt),
             'monthly' => [
-                'monthly',
-                $now->startOfMonth(),
-                $now->endOfMonth(),
+                'groupKey' => $createdAt->format('Y-m'),
+                'groupLabel' => $createdAt->format('F Y'),
+                'groupSortValue' => $createdAt->startOfMonth()->format('Y-m-d'),
             ],
             'yearly' => [
-                'yearly',
-                $now->startOfYear(),
-                $now->endOfYear(),
+                'groupKey' => $createdAt->format('Y'),
+                'groupLabel' => $createdAt->format('Y'),
+                'groupSortValue' => $createdAt->startOfYear()->format('Y-m-d'),
             ],
             default => [
-                'daily',
-                $now->startOfDay(),
-                $now->endOfDay(),
+                'groupKey' => $createdAt->toDateString(),
+                'groupLabel' => $createdAt->toDateString(),
+                'groupSortValue' => $createdAt->startOfDay()->format('Y-m-d'),
             ],
         };
     }
 
-    private function emptyDepartmentStatisticsRow(string $departmentName): array
+    private function resolveDepartmentStatisticsWeeklyMeta(CarbonImmutable $createdAt): array
     {
+        $startOfWeek = $createdAt->startOfWeek();
+        $endOfWeek = $createdAt->endOfWeek();
+
         return [
+            'groupKey' => $startOfWeek->format('o-\WW'),
+            'groupLabel' => sprintf(
+                'Week %d (%s - %s)',
+                (int) $startOfWeek->isoWeek(),
+                $startOfWeek->format('M j'),
+                $endOfWeek->format('M j, Y')
+            ),
+            'groupSortValue' => $startOfWeek->format('Y-m-d'),
+        ];
+    }
+
+    private function emptyDepartmentStatisticsRow(
+        string $groupBy,
+        string $groupKey,
+        string $groupLabel,
+        string $groupSortValue,
+        string $departmentName
+    ): array {
+        return [
+            'groupBy' => $groupBy,
+            'groupKey' => $groupKey,
+            'groupLabel' => $groupLabel,
+            'groupSortValue' => $groupSortValue,
             'department' => $departmentName,
             'vacationLeave' => 0,
             'sickLeave' => 0,
             'mandatoryForcedLeave' => 0,
-            'mco6Leave' => 0,
             'wellnessLeave' => 0,
             'maternityLeave' => 0,
             'paternityLeave' => 0,
             'specialPrivilegeLeave' => 0,
             'soloParentLeave' => 0,
         ];
+    }
+
+    private function resolveDepartmentStatisticsCreatedAt(LeaveApplication $application): ?CarbonImmutable
+    {
+        $createdAt = $application->getAttribute('created_at');
+        if ($createdAt instanceof \DateTimeInterface) {
+            return CarbonImmutable::instance($createdAt);
+        }
+
+        if ($createdAt === null || $createdAt === '') {
+            return null;
+        }
+
+        try {
+            return CarbonImmutable::parse((string) $createdAt);
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     private function buildDepartmentStatisticsOfficeDirectory(array $controlNos): array
