@@ -4798,6 +4798,9 @@ class LeaveApplicationController extends Controller
             'selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
             'selected_date_half_day_portion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
             'selectedDateHalfDayPortion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selected_date_half_day_period' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selectedDateHalfDayPeriod' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selected_date_halfday_period' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
             'total_days' => (float) $app->total_days,
             'deductible_days' => $deductibleDays,
             'cto_deducted_hours' => $ctoDeductedHours,
@@ -7229,6 +7232,7 @@ class LeaveApplicationController extends Controller
 
         $isSickLeave = $this->isSickLeaveType($leaveType, (int) $leaveType->id);
         $isCtoLeave = $this->isCtoLeaveType($leaveType, (int) $leaveType->id);
+        $isEventLeave = strtoupper(trim((string) ($leaveType->category ?? ''))) === LeaveType::CATEGORY_EVENT;
         $attachmentRequired = $isSickLeave
             ? $normalizedTotalDays >= 5.0
             : (bool) ($leaveType->requires_documents ?? false);
@@ -7283,6 +7287,26 @@ class LeaveApplicationController extends Controller
             }
 
             $ctoDeductedHours = $this->resolveCtoDeductedHours($deductibleDays);
+        } elseif ($isEventLeave) {
+            $normalizedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
+            $normalizedSelectedDatePayStatus = null;
+
+            $deductibleDays = $this->computeDeductibleDays(
+                $normalizedTotalDays,
+                $selectedDates,
+                null,
+                $normalizedSelectedDateCoverage,
+                false,
+                $normalizedPayMode,
+                $employeeControlNo
+            );
+
+            if (!$attachmentRequired) {
+                $attachmentSubmitted = false;
+                $attachmentReference = null;
+            }
+
+            $ctoDeductedHours = null;
         } elseif ($isSickLeave) {
             $graceWindowPayMode = $this->resolveSickLeavePayModeFromFilingWindow(
                 $selectedDates,
@@ -9450,6 +9474,9 @@ class LeaveApplicationController extends Controller
             'selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
             'selected_date_half_day_portion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
             'selectedDateHalfDayPortion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selected_date_half_day_period' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selectedDateHalfDayPeriod' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selected_date_halfday_period' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
             'commutation' => $app->commutation ?? 'Not Requested',
             'pay_mode' => $normalizedPayMode,
             'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
@@ -9678,6 +9705,15 @@ class LeaveApplicationController extends Controller
         $selectedDateHalfDayPortion = $request->input('selected_date_half_day_portion');
         if ($selectedDateHalfDayPortion === null || $selectedDateHalfDayPortion === '') {
             $selectedDateHalfDayPortion = $request->input('selectedDateHalfDayPortion');
+        }
+        if ($selectedDateHalfDayPortion === null || $selectedDateHalfDayPortion === '') {
+            $selectedDateHalfDayPortion = $request->input('selected_date_half_day_period');
+        }
+        if ($selectedDateHalfDayPortion === null || $selectedDateHalfDayPortion === '') {
+            $selectedDateHalfDayPortion = $request->input('selectedDateHalfDayPeriod');
+        }
+        if ($selectedDateHalfDayPortion === null || $selectedDateHalfDayPortion === '') {
+            $selectedDateHalfDayPortion = $request->input('selected_date_halfday_period');
         }
         if ($selectedDateHalfDayPortion === null || $selectedDateHalfDayPortion === '') {
             $selectedDateHalfDayPortion = $request->input('selected_date_half_day_portions');

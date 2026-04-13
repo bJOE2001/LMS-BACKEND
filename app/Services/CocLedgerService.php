@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\COCApplication;
+use App\Models\COCApplicationRow;
 use App\Models\CocLedgerEntry;
 use App\Models\HrisEmployee;
 use App\Models\LeaveApplication;
@@ -15,6 +16,9 @@ use Illuminate\Support\Facades\Schema;
 class CocLedgerService
 {
     private const HOURS_PER_DAY = 8.0;
+    private const MINUTES_PER_HOUR = 60;
+    private const MINUTES_PER_WORKDAY = 480;
+    private const MINIMUM_CREDITABLE_EXCESS_MINUTES = 20;
 
     public function syncEmployeeLedger(
         string $employeeControlNo,
@@ -504,6 +508,22 @@ class CocLedgerService
 
     private function resolveEarnedHours(COCApplication $application): float
     {
+        $applicationRows = $application->relationLoaded('rows')
+            ? $application->rows->values()
+            : $application->rows()->get()->values();
+
+        if ($applicationRows->isNotEmpty()) {
+            $rowCreditedHours = round(
+                $applicationRows->sum(
+                    fn (COCApplicationRow $row): float => $this->resolveEffectiveRowCreditedHours($row)
+                ),
+                2
+            );
+            if ($rowCreditedHours > 0) {
+                return $rowCreditedHours;
+            }
+        }
+
         $creditedHours = round((float) ($application->credited_hours ?? 0), 2);
         if ($creditedHours > 0) {
             return $creditedHours;
@@ -515,6 +535,71 @@ class CocLedgerService
         }
 
         return 0.0;
+    }
+
+    private function calculateCreditableMinutes(int $minutes): int
+    {
+        if ($minutes <= 0) {
+            return 0;
+        }
+
+        $wholeHoursMinutes = intdiv($minutes, self::MINUTES_PER_HOUR) * self::MINUTES_PER_HOUR;
+        $excessMinutes = $minutes % self::MINUTES_PER_HOUR;
+        $creditableExcessMinutes = $excessMinutes >= self::MINIMUM_CREDITABLE_EXCESS_MINUTES
+            ? $excessMinutes
+            : 0;
+
+        return min(self::MINUTES_PER_WORKDAY, $wholeHoursMinutes + $creditableExcessMinutes);
+    }
+
+    private function resolveEffectiveRowCreditableMinutes(COCApplicationRow $row): int
+    {
+        $minutes = (int) ($row->minutes ?? 0);
+        if ($minutes <= 0) {
+            return 0;
+        }
+
+        $breakMinutes = max((int) ($row->break_minutes ?? 0), 0);
+        return $this->calculateCreditableMinutes(max($minutes - $breakMinutes, 0));
+    }
+
+    private function resolveEffectiveRowCreditMultiplier(COCApplicationRow $row): float
+    {
+        $creditCategory = strtoupper(trim((string) ($row->credit_category ?? '')));
+
+        if ($creditCategory === 'SPECIAL') {
+            return 1.5;
+        }
+
+        if ($creditCategory === 'REGULAR') {
+            return 1.0;
+        }
+
+        $storedMultiplier = (float) ($row->credit_multiplier ?? 0);
+        if ($storedMultiplier >= 1.5) {
+            return 1.5;
+        }
+
+        if ($storedMultiplier > 0) {
+            return 1.0;
+        }
+
+        return 0.0;
+    }
+
+    private function resolveEffectiveRowCreditedHours(COCApplicationRow $row): float
+    {
+        $creditMultiplier = $this->resolveEffectiveRowCreditMultiplier($row);
+        if ($creditMultiplier <= 0) {
+            return 0.0;
+        }
+
+        $creditableMinutes = $this->resolveEffectiveRowCreditableMinutes($row);
+        if ($creditableMinutes <= 0) {
+            return 0.0;
+        }
+
+        return round(($creditableMinutes / self::MINUTES_PER_HOUR) * $creditMultiplier, 2);
     }
 
     private function resolveUsedHours(LeaveApplication $application): float
