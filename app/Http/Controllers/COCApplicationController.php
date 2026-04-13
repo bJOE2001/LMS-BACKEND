@@ -921,7 +921,7 @@ class COCApplicationController extends Controller
     {
         $existingRows = $application->relationLoaded('rows')
             ? $application->rows->sortBy('line_no')->values()
-            : $application->rows()->orderBy('line_no')->get()->values();
+            : $application->rows()->get()->values();
 
         if ($existingRows->isEmpty()) {
             throw new RuntimeException('INVALID_REVIEW_ROWS');
@@ -1033,7 +1033,7 @@ class COCApplicationController extends Controller
             ? $excessMinutes
             : 0;
 
-        return $wholeHoursMinutes + $creditableExcessMinutes;
+        return min(self::MINUTES_PER_WORKDAY, $wholeHoursMinutes + $creditableExcessMinutes);
     }
 
     private function calculateMandatoryBreakMinutes(int $minutes): int
@@ -1127,7 +1127,7 @@ class COCApplicationController extends Controller
 
         $rowDate = $application->relationLoaded('rows')
             ? optional($application->rows->first())->overtime_date
-            : optional($application->rows()->orderBy('line_no')->first())->overtime_date;
+            : optional($application->rows()->first())->overtime_date;
 
         if ($rowDate) {
             $resolvedDate = CarbonImmutable::parse((string) $rowDate)->startOfDay();
@@ -1139,16 +1139,25 @@ class COCApplicationController extends Controller
 
     private function resolveApplicationCreditedHours(COCApplication $application): float
     {
-        $creditedHours = round((float) ($application->credited_hours ?? 0), 2);
-        if ($creditedHours > 0) {
-            return $creditedHours;
-        }
+        $applicationRows = $application->relationLoaded('rows')
+            ? $application->rows->values()
+            : $application->rows()->get()->values();
 
-        if ($application->relationLoaded('rows')) {
-            $rowCreditedHours = round((float) $application->rows->sum('credited_hours'), 2);
+        if ($applicationRows->isNotEmpty()) {
+            $rowCreditedHours = round(
+                $applicationRows->sum(
+                    fn (COCApplicationRow $row): float => $this->resolveEffectiveRowCreditedHours($row)
+                ),
+                2
+            );
             if ($rowCreditedHours > 0) {
                 return $rowCreditedHours;
             }
+        }
+
+        $creditedHours = round((float) ($application->credited_hours ?? 0), 2);
+        if ($creditedHours > 0) {
+            return $creditedHours;
         }
 
         $creditedDays = round((float) ($application->cto_credited_days ?? 0), 2);
@@ -1502,7 +1511,14 @@ class COCApplicationController extends Controller
             'submitted_at' => $app->submitted_at?->toIso8601String(),
             'leaveBalances' => $currentLeaveBalances,
             'employee_leave_balances' => $currentLeaveBalances,
-            'rows' => $rows->map(fn(COCApplicationRow $row) => [
+            'rows' => $rows->map(function (COCApplicationRow $row): array {
+                $creditCategory = strtoupper(trim((string) ($row->credit_category ?? '')));
+                $effectiveCreditableMinutes = $this->resolveEffectiveRowCreditableMinutes($row);
+                $effectiveCreditedHours = in_array($creditCategory, [self::CREDIT_CATEGORY_REGULAR, self::CREDIT_CATEGORY_SPECIAL], true)
+                    ? $this->resolveEffectiveRowCreditedHours($row)
+                    : null;
+
+                return [
                 'employee_control_no' => (string) $row->employee_control_no,
                 'employee_name' => $row->employee_name,
                 'line_no' => (int) $row->line_no,
@@ -1516,9 +1532,10 @@ class COCApplicationController extends Controller
                 'total_no_of_hours_and_minutes' => (int) $row->cumulative_minutes,
                 'credit_category' => $row->credit_category,
                 'credit_multiplier' => $row->credit_multiplier !== null ? (float) $row->credit_multiplier : null,
-                'creditable_minutes' => $row->creditable_minutes !== null ? (int) $row->creditable_minutes : null,
-                'credited_hours' => $row->credited_hours !== null ? (float) $row->credited_hours : null,
-            ])->values(),
+                'creditable_minutes' => $effectiveCreditableMinutes > 0 ? $effectiveCreditableMinutes : null,
+                'credited_hours' => $effectiveCreditedHours !== null ? $effectiveCreditedHours : null,
+            ];
+            })->values(),
         ];
     }
 
@@ -1568,6 +1585,64 @@ class COCApplicationController extends Controller
         }
 
         return $this->calculateMandatoryBreakMinutes((int) ($row->minutes ?? 0));
+    }
+
+    private function resolveEffectiveRowCreditableMinutes(COCApplicationRow|array $row): int
+    {
+        $minutes = is_array($row)
+            ? (int) ($row['minutes'] ?? $row['no_of_hours_and_minutes'] ?? 0)
+            : (int) ($row->minutes ?? 0);
+
+        if ($minutes <= 0) {
+            return 0;
+        }
+
+        $breakMinutes = $this->resolveRowBreakMinutes($row);
+        return $this->calculateCreditableMinutes(max($minutes - $breakMinutes, 0));
+    }
+
+    private function resolveEffectiveRowCreditMultiplier(COCApplicationRow|array $row): float
+    {
+        $creditCategory = is_array($row)
+            ? strtoupper(trim((string) ($row['credit_category'] ?? '')))
+            : strtoupper(trim((string) ($row->credit_category ?? '')));
+
+        if ($creditCategory === self::CREDIT_CATEGORY_SPECIAL) {
+            return 1.5;
+        }
+
+        if ($creditCategory === self::CREDIT_CATEGORY_REGULAR) {
+            return 1.0;
+        }
+
+        $storedMultiplier = is_array($row)
+            ? (float) ($row['credit_multiplier'] ?? 0)
+            : (float) ($row->credit_multiplier ?? 0);
+
+        if ($storedMultiplier >= 1.5) {
+            return 1.5;
+        }
+
+        if ($storedMultiplier > 0) {
+            return 1.0;
+        }
+
+        return 0.0;
+    }
+
+    private function resolveEffectiveRowCreditedHours(COCApplicationRow|array $row): float
+    {
+        $creditMultiplier = $this->resolveEffectiveRowCreditMultiplier($row);
+        if ($creditMultiplier <= 0) {
+            return 0.0;
+        }
+
+        $creditableMinutes = $this->resolveEffectiveRowCreditableMinutes($row);
+        if ($creditableMinutes <= 0) {
+            return 0.0;
+        }
+
+        return round(($creditableMinutes / self::MINUTES_PER_HOUR) * $creditMultiplier, 2);
     }
 
     private function resolveOvernightLimitExceededDate(array $rows): ?string
