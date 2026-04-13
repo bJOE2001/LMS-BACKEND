@@ -34,6 +34,15 @@ use Illuminate\Support\Facades\Storage;
 class LeaveApplicationController extends Controller
 {
     private const CTO_STANDARD_DAY_HOURS = WorkScheduleService::STANDARD_WORKDAY_HOURS;
+    private const DETAILS_OF_LEAVE_FIELDS = [
+        'vacation_detail',
+        'vacation_specify',
+        'sick_detail',
+        'sick_specify',
+        'women_specify',
+        'study_detail',
+        'other_purpose',
+    ];
 
     public function __construct()
     {
@@ -410,6 +419,7 @@ class LeaveApplicationController extends Controller
             'with_attachment' => ['nullable', 'boolean'],
             'attachment_reference' => ['nullable', 'string', 'max:500'],
         ]);
+        $resolvedDetailsOfLeave = $this->resolveDetailsOfLeaveFromRequest($request, $validated);
 
         $requestedPayMode = $this->resolveRequestedPayMode(
             $request,
@@ -542,6 +552,7 @@ class LeaveApplicationController extends Controller
             $resolvedSelectedDates,
             $deductibleDays,
             $ctoDeductedHours,
+            $resolvedDetailsOfLeave,
             $attachmentRequired,
             $attachmentSubmitted,
             $attachmentReference
@@ -555,7 +566,7 @@ class LeaveApplicationController extends Controller
                 'deductible_days' => $deductibleDays,
                 'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn() && $ctoDeductedHours > 0 ? $ctoDeductedHours : null,
                 'reason' => $validated['reason'] ?? null,
-                'details_of_leave' => $validated['details_of_leave'] ?? null,
+                'details_of_leave' => $resolvedDetailsOfLeave,
                 'selected_dates' => $resolvedSelectedDates,
                 'selected_date_pay_status' => $selectedDatePayStatus,
                 'selected_date_coverage' => $selectedDateCoverage,
@@ -1237,6 +1248,7 @@ class LeaveApplicationController extends Controller
             'with_attachment' => ['nullable', 'boolean'],
             'attachment_reference' => ['nullable', 'string', 'max:500'],
         ]);
+        $resolvedDetailsOfLeave = $this->resolveDetailsOfLeaveFromRequest($request, $validated);
 
         $requestedPayMode = $this->resolveRequestedPayMode(
             $request,
@@ -1369,6 +1381,7 @@ class LeaveApplicationController extends Controller
             $resolvedSelectedDates,
             $deductibleDays,
             $ctoDeductedHours,
+            $resolvedDetailsOfLeave,
             $attachmentRequired,
             $attachmentSubmitted,
             $attachmentReference
@@ -1382,7 +1395,7 @@ class LeaveApplicationController extends Controller
                 'deductible_days' => $deductibleDays,
                 'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn() && $ctoDeductedHours > 0 ? $ctoDeductedHours : null,
                 'reason' => $validated['reason'] ?? null,
-                'details_of_leave' => $validated['details_of_leave'] ?? null,
+                'details_of_leave' => $resolvedDetailsOfLeave,
                 'selected_dates' => $resolvedSelectedDates,
                 'selected_date_pay_status' => $selectedDatePayStatus,
                 'selected_date_coverage' => $selectedDateCoverage,
@@ -3083,6 +3096,7 @@ class LeaveApplicationController extends Controller
             'with_attachment' => ['nullable', 'boolean'],
             'attachment_reference' => ['nullable', 'string', 'max:500'],
         ]);
+        $resolvedDetailsOfLeave = $this->resolveDetailsOfLeaveFromRequest($request, $validated);
 
         $requestedPayMode = $this->resolveRequestedPayMode(
             $request,
@@ -3229,6 +3243,7 @@ class LeaveApplicationController extends Controller
             $resolvedSelectedDates,
             $deductibleDays,
             $ctoDeductedHours,
+            $resolvedDetailsOfLeave,
             $attachmentRequired,
             $attachmentSubmitted,
             $attachmentReference
@@ -3242,7 +3257,7 @@ class LeaveApplicationController extends Controller
                 'deductible_days' => $deductibleDays,
                 'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn() && $ctoDeductedHours > 0 ? $ctoDeductedHours : null,
                 'reason' => $validated['reason'] ?? null,
-                'details_of_leave' => $validated['details_of_leave'] ?? null,
+                'details_of_leave' => $resolvedDetailsOfLeave,
                 'selected_dates' => $resolvedSelectedDates,
                 'selected_date_pay_status' => $selectedDatePayStatus,
                 'selected_date_coverage' => $selectedDateCoverage,
@@ -3992,6 +4007,73 @@ class LeaveApplicationController extends Controller
     private function formatEmploymentStatusLabel(?string $status): ?string
     {
         return LeaveType::formatEmploymentStatusLabel($status) ?? $this->trimNullableString($status);
+    }
+
+    private function normalizeDetailsOfLeavePayload(mixed $value): ?array
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        if (is_string($value)) {
+            $decodedValue = json_decode(trim($value), true);
+            if (json_last_error() !== JSON_ERROR_NONE || !is_array($decodedValue)) {
+                return null;
+            }
+            $value = $decodedValue;
+        }
+
+        if (!is_array($value)) {
+            return null;
+        }
+
+        $normalizedPayload = [];
+        foreach (self::DETAILS_OF_LEAVE_FIELDS as $fieldName) {
+            $fieldValue = $this->trimNullableString($value[$fieldName] ?? null);
+            if ($fieldValue !== null) {
+                $normalizedPayload[$fieldName] = $fieldValue;
+            }
+        }
+
+        return $normalizedPayload === [] ? null : $normalizedPayload;
+    }
+
+    private function encodeDetailsOfLeavePayload(array $payload): ?string
+    {
+        $encodedPayload = json_encode($payload, JSON_UNESCAPED_UNICODE);
+        return $encodedPayload === false ? null : $encodedPayload;
+    }
+
+    private function resolveDetailsOfLeaveFromRequest(Request $request, array $validated): ?string
+    {
+        $validatedDetailsOfLeave = $this->trimNullableString($validated['details_of_leave'] ?? null);
+        if ($validatedDetailsOfLeave !== null) {
+            $normalizedValidatedPayload = $this->normalizeDetailsOfLeavePayload($validatedDetailsOfLeave);
+            if ($normalizedValidatedPayload !== null) {
+                return $this->encodeDetailsOfLeavePayload($normalizedValidatedPayload);
+            }
+
+            return $validatedDetailsOfLeave;
+        }
+
+        $normalizedRequestPayload = $this->normalizeDetailsOfLeavePayload($request->input('details'));
+        if ($normalizedRequestPayload !== null) {
+            return $this->encodeDetailsOfLeavePayload($normalizedRequestPayload);
+        }
+
+        return null;
+    }
+
+    private function resolveRequestedDetailsOfLeaveForUpdate(
+        Request $request,
+        array $validated,
+        LeaveApplication $app
+    ): ?string {
+        if (array_key_exists('details_of_leave', $validated) || $request->exists('details')) {
+            return $this->resolveDetailsOfLeaveFromRequest($request, $validated);
+        }
+
+        return $this->trimNullableString($app->details_of_leave);
     }
 
     private function trimNullableString(mixed $value): ?string
@@ -4830,9 +4912,7 @@ class LeaveApplicationController extends Controller
         $requestedReason = array_key_exists('reason', $validated) || array_key_exists('reason_purpose', $validated)
             ? $this->trimNullableString($validated['reason'] ?? $validated['reason_purpose'] ?? null)
             : $this->trimNullableString($app->reason);
-        $requestedDetailsOfLeave = array_key_exists('details_of_leave', $validated)
-            ? $this->trimNullableString($validated['details_of_leave'] ?? null)
-            : $this->trimNullableString($app->details_of_leave);
+        $requestedDetailsOfLeave = $this->resolveRequestedDetailsOfLeaveForUpdate($request, $validated, $app);
 
         $requestedSelectedDatePayStatus = $requestedIsMonetization
             ? null
