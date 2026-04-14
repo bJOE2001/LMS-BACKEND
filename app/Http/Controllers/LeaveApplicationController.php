@@ -44,6 +44,29 @@ class LeaveApplicationController extends Controller
         'study_detail',
         'other_purpose',
     ];
+    private const QUEUE_GROUP_PENDING = 'PENDING';
+    private const QUEUE_GROUP_APPROVED = 'APPROVED';
+    private const QUEUE_GROUP_REJECTED = 'REJECTED';
+    private const QUEUE_GROUP_RECALLED = 'RECALLED';
+    private const QUEUE_GROUP_OTHER = 'OTHER';
+    private const QUEUE_GROUP_PRIORITY = [
+        self::QUEUE_GROUP_PENDING => 0,
+        self::QUEUE_GROUP_APPROVED => 1,
+        self::QUEUE_GROUP_REJECTED => 2,
+        self::QUEUE_GROUP_RECALLED => 3,
+        self::QUEUE_GROUP_OTHER => 4,
+    ];
+    private const QUEUE_STAGE_PRIORITY = [
+        'PENDING_LATE_HR' => 1,
+        'PENDING_HR_RECEIVE' => 2,
+        'PENDING_HR_REVIEW' => 3,
+        'PENDING_HR_CLASSIFICATION' => 4,
+        'PENDING_ADMIN' => 5,
+        'PENDING_ADMIN_REVIEW' => 6,
+        'PENDING_RELEASE' => 7,
+        'PENDING' => 8,
+    ];
+    private const QUEUE_NON_PENDING_STAGE_PRIORITY = 999;
 
     public function __construct()
     {
@@ -1883,29 +1906,140 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
-        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin.department', 'updateRequests'])
-            ->where(function ($query): void {
-                $query
-                    ->where('status', LeaveApplication::STATUS_PENDING_HR)
-                    ->orWhere(function ($nestedQuery): void {
-                        $nestedQuery
-                            ->where('status', LeaveApplication::STATUS_PENDING_ADMIN)
-                            ->whereHas('updateRequests', function ($updateRequestQuery): void {
-                                $updateRequestQuery
-                                    ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
-                                    ->whereRaw(
-                                        'UPPER(LTRIM(RTRIM(COALESCE(previous_status, ?)))) = ?',
-                                        ['', LeaveApplication::STATUS_APPROVED]
-                                    );
-                            });
-                    });
-            })
-            ->orderByDesc('created_at')
+        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin.department', 'updateRequests', 'logs'])
+            ->whereIn('status', [
+                LeaveApplication::STATUS_PENDING_ADMIN,
+                LeaveApplication::STATUS_PENDING_HR,
+                LeaveApplication::STATUS_APPROVED,
+                LeaveApplication::STATUS_REJECTED,
+                LeaveApplication::STATUS_RECALLED,
+            ])
+            ->orderBy('created_at')
+            ->orderBy('id')
             ->get();
+        $applications = $this->sortLeaveApplicationsForHrQueue($applications);
 
         return response()->json([
             'applications' => $applications->map(fn($app) => $this->formatApplication($app)),
         ]);
+    }
+
+    private function hasHrReceivedForQueue(LeaveApplication $application): bool
+    {
+        $cycleRequestedAt = $this->hasPendingApprovedUpdateRequest($application)
+            ? $this->resolvePendingApprovedUpdateCycleRequestedAt($application)
+            : null;
+
+        return $this->resolveLatestHrActionLogForCycle(
+            $application,
+            LeaveApplicationLog::ACTION_HR_RECEIVED,
+            $cycleRequestedAt
+        ) instanceof LeaveApplicationLog;
+    }
+
+    private function hasHrReleasedForQueue(LeaveApplication $application): bool
+    {
+        return $this->resolveLatestHrActionLogForCycle(
+            $application,
+            LeaveApplicationLog::ACTION_HR_RELEASED,
+            $this->resolveLatestApprovedUpdateCycleRequestedAt($application)
+        ) instanceof LeaveApplicationLog;
+    }
+
+    private function resolveLeaveQueueCreatedTimestamp(LeaveApplication $application): int
+    {
+        $createdAt = $application->created_at;
+        if ($createdAt instanceof \DateTimeInterface) {
+            return (int) $createdAt->getTimestamp();
+        }
+
+        $rawCreatedAt = trim((string) ($createdAt ?? ''));
+        if ($rawCreatedAt !== '') {
+            $parsed = strtotime($rawCreatedAt);
+            if ($parsed !== false) {
+                return (int) $parsed;
+            }
+        }
+
+        return PHP_INT_MAX;
+    }
+
+    private function resolveLeaveHrQueueMeta(LeaveApplication $application): array
+    {
+        $rawStatus = strtoupper(trim((string) ($application->status ?? '')));
+        $groupStatus = self::QUEUE_GROUP_OTHER;
+        $stageKey = '';
+
+        if ($rawStatus === LeaveApplication::STATUS_PENDING_HR) {
+            $groupStatus = self::QUEUE_GROUP_PENDING;
+            $stageKey = $this->hasHrReceivedForQueue($application)
+                ? 'PENDING_HR_REVIEW'
+                : 'PENDING_HR_RECEIVE';
+        } elseif ($rawStatus === LeaveApplication::STATUS_PENDING_ADMIN) {
+            $groupStatus = self::QUEUE_GROUP_PENDING;
+            $stageKey = $this->hasPendingApprovedUpdateRequest($application)
+                ? 'PENDING_ADMIN_REVIEW'
+                : 'PENDING_ADMIN';
+        } elseif ($rawStatus === LeaveApplication::STATUS_APPROVED) {
+            if ($this->hasHrReleasedForQueue($application)) {
+                $groupStatus = self::QUEUE_GROUP_APPROVED;
+            } else {
+                $groupStatus = self::QUEUE_GROUP_PENDING;
+                $stageKey = 'PENDING_RELEASE';
+            }
+        } elseif ($rawStatus === LeaveApplication::STATUS_REJECTED) {
+            $groupStatus = self::QUEUE_GROUP_REJECTED;
+        } elseif ($rawStatus === LeaveApplication::STATUS_RECALLED) {
+            $groupStatus = self::QUEUE_GROUP_RECALLED;
+        } elseif (str_contains($rawStatus, 'PENDING')) {
+            $groupStatus = self::QUEUE_GROUP_PENDING;
+            $stageKey = 'PENDING';
+        }
+
+        $groupPriority = self::QUEUE_GROUP_PRIORITY[$groupStatus] ?? self::QUEUE_GROUP_PRIORITY[self::QUEUE_GROUP_OTHER];
+        $stagePriority = $groupStatus === self::QUEUE_GROUP_PENDING
+            ? (self::QUEUE_STAGE_PRIORITY[$stageKey !== '' ? $stageKey : 'PENDING'] ?? self::QUEUE_STAGE_PRIORITY['PENDING'])
+            : self::QUEUE_NON_PENDING_STAGE_PRIORITY;
+
+        return [
+            'group_status' => $groupStatus,
+            'group_priority' => $groupPriority,
+            'stage_key' => $stageKey,
+            'stage_priority' => $stagePriority,
+            'created_at_timestamp' => $this->resolveLeaveQueueCreatedTimestamp($application),
+        ];
+    }
+
+    private function sortLeaveApplicationsForHrQueue(Collection $applications): Collection
+    {
+        return $applications
+            ->sort(function (LeaveApplication $left, LeaveApplication $right): int {
+                $leftQueueMeta = $this->resolveLeaveHrQueueMeta($left);
+                $rightQueueMeta = $this->resolveLeaveHrQueueMeta($right);
+
+                $groupPriorityDiff = ((int) $leftQueueMeta['group_priority']) <=> ((int) $rightQueueMeta['group_priority']);
+                if ($groupPriorityDiff !== 0) {
+                    return $groupPriorityDiff;
+                }
+
+                if (
+                    (string) $leftQueueMeta['group_status'] === self::QUEUE_GROUP_PENDING
+                    && (string) $rightQueueMeta['group_status'] === self::QUEUE_GROUP_PENDING
+                ) {
+                    $stagePriorityDiff = ((int) $leftQueueMeta['stage_priority']) <=> ((int) $rightQueueMeta['stage_priority']);
+                    if ($stagePriorityDiff !== 0) {
+                        return $stagePriorityDiff;
+                    }
+                }
+
+                $createdAtDiff = ((int) $leftQueueMeta['created_at_timestamp']) <=> ((int) $rightQueueMeta['created_at_timestamp']);
+                if ($createdAtDiff !== 0) {
+                    return $createdAtDiff;
+                }
+
+                return ((int) ($left->id ?? 0)) <=> ((int) ($right->id ?? 0));
+            })
+            ->values();
     }
 
     public function hrShow(Request $request, int $id): JsonResponse
@@ -9437,6 +9571,7 @@ class LeaveApplicationController extends Controller
         $displayStatus = $hasPendingApprovedUpdateRequest
             ? $this->statusToFrontend(LeaveApplication::STATUS_APPROVED)
             : $this->statusToFrontend($app->status);
+        $queueMeta = $this->resolveLeaveHrQueueMeta($app);
 
         $data = [
             'id' => $app->id,
@@ -9455,6 +9590,14 @@ class LeaveApplicationController extends Controller
             'detailsOfLeave' => $app->details_of_leave,
             'status' => $displayStatus,
             'rawStatus' => $app->status,
+            'queue_group_status' => $queueMeta['group_status'],
+            'queueGroupStatus' => $queueMeta['group_status'],
+            'queue_group_priority' => $queueMeta['group_priority'],
+            'queueGroupPriority' => $queueMeta['group_priority'],
+            'queue_stage_key' => $queueMeta['stage_key'],
+            'queueStageKey' => $queueMeta['stage_key'],
+            'queue_stage_priority' => $queueMeta['stage_priority'],
+            'queueStagePriority' => $queueMeta['stage_priority'],
             'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
             'filedAt' => $app->created_at?->toIso8601String(),
             'filed_at' => $app->created_at?->toIso8601String(),
