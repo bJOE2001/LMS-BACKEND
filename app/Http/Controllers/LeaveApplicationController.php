@@ -232,8 +232,18 @@ class LeaveApplicationController extends Controller
             return $leaveTypeBalanceAccess;
         }
 
+        $ctoBalanceHours = null;
         if ($this->isCtoLeaveType($leaveType, (int) $leaveType->id)) {
             $this->syncEmployeeCtoBalance((string) $employee->control_no);
+            $ctoSnapshot = $this->cocLedgerService()->syncEmployeeLedger(
+                (string) $employee->control_no,
+                (int) $leaveType->id,
+                null,
+                false
+            );
+            $ctoBalanceHours = isset($ctoSnapshot['availableHours'])
+                ? (float) $ctoSnapshot['availableHours']
+                : null;
         }
 
         $balance = $this->findPreferredEmployeeLeaveBalanceRecord((string) $employee->control_no, (int) $leaveType->id);
@@ -373,8 +383,10 @@ class LeaveApplicationController extends Controller
         $applications = LeaveApplication::query()
             ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
             ->where(fn($query) => $this->applyApplicationOwnershipFilter($query, $controlNo))
-            ->orderByDesc('created_at')
+            ->orderBy('created_at')
+            ->orderBy('id')
             ->get();
+        $applications = $this->sortLeaveApplicationsForHrQueue($applications);
 
         $actorDirectory = $this->buildWorkflowActorDirectory($applications);
 
@@ -1658,8 +1670,10 @@ class LeaveApplicationController extends Controller
                     $query->whereRaw('1 = 0');
                 }
             })
-            ->orderByDesc('created_at')
+            ->orderBy('created_at')
+            ->orderBy('id')
             ->get();
+        $applications = $this->sortLeaveApplicationsForHrQueue($applications);
 
         return response()->json([
             'applications' => $applications->map(fn($app) => $this->formatApplication($app)),
@@ -2016,6 +2030,8 @@ class LeaveApplicationController extends Controller
             ->sort(function (LeaveApplication $left, LeaveApplication $right): int {
                 $leftQueueMeta = $this->resolveLeaveHrQueueMeta($left);
                 $rightQueueMeta = $this->resolveLeaveHrQueueMeta($right);
+                $leftGroupStatus = (string) $leftQueueMeta['group_status'];
+                $rightGroupStatus = (string) $rightQueueMeta['group_status'];
 
                 $groupPriorityDiff = ((int) $leftQueueMeta['group_priority']) <=> ((int) $rightQueueMeta['group_priority']);
                 if ($groupPriorityDiff !== 0) {
@@ -2023,8 +2039,8 @@ class LeaveApplicationController extends Controller
                 }
 
                 if (
-                    (string) $leftQueueMeta['group_status'] === self::QUEUE_GROUP_PENDING
-                    && (string) $rightQueueMeta['group_status'] === self::QUEUE_GROUP_PENDING
+                    $leftGroupStatus === self::QUEUE_GROUP_PENDING
+                    && $rightGroupStatus === self::QUEUE_GROUP_PENDING
                 ) {
                     $stagePriorityDiff = ((int) $leftQueueMeta['stage_priority']) <=> ((int) $rightQueueMeta['stage_priority']);
                     if ($stagePriorityDiff !== 0) {
@@ -2034,10 +2050,29 @@ class LeaveApplicationController extends Controller
 
                 $createdAtDiff = ((int) $leftQueueMeta['created_at_timestamp']) <=> ((int) $rightQueueMeta['created_at_timestamp']);
                 if ($createdAtDiff !== 0) {
-                    return $createdAtDiff;
+                    $isLifoGroup = in_array($leftGroupStatus, [
+                        self::QUEUE_GROUP_APPROVED,
+                        self::QUEUE_GROUP_REJECTED,
+                        self::QUEUE_GROUP_RECALLED,
+                    ], true)
+                        && $leftGroupStatus === $rightGroupStatus;
+
+                    return $isLifoGroup ? (-1 * $createdAtDiff) : $createdAtDiff;
                 }
 
-                return ((int) ($left->id ?? 0)) <=> ((int) ($right->id ?? 0));
+                $idDiff = ((int) ($left->id ?? 0)) <=> ((int) ($right->id ?? 0));
+                if ($idDiff === 0) {
+                    return 0;
+                }
+
+                $isLifoGroup = in_array($leftGroupStatus, [
+                    self::QUEUE_GROUP_APPROVED,
+                    self::QUEUE_GROUP_REJECTED,
+                    self::QUEUE_GROUP_RECALLED,
+                ], true)
+                    && $leftGroupStatus === $rightGroupStatus;
+
+                return $isLifoGroup ? (-1 * $idDiff) : $idDiff;
             })
             ->values();
     }
