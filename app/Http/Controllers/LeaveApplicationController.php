@@ -13,6 +13,7 @@ use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveType;
 use App\Models\Notification;
 use App\Services\CocLedgerService;
+use App\Services\SmsGatewayService;
 use App\Services\WorkScheduleService;
 
 use Illuminate\Filesystem\FilesystemAdapter;
@@ -79,6 +80,11 @@ class LeaveApplicationController extends Controller
     private function cocLedgerService(): CocLedgerService
     {
         return app(CocLedgerService::class);
+    }
+
+    private function smsGatewayService(): SmsGatewayService
+    {
+        return app(SmsGatewayService::class);
     }
 
     private function hasLeaveApplicationCtoHoursColumn(): bool
@@ -2855,6 +2861,7 @@ class LeaveApplicationController extends Controller
         if ($app->applicant_admin_id) {
             Notification::send($app->applicantAdmin, Notification::TYPE_LEAVE_APPROVED, $titleLabel, $msg, $app->id);
         }
+        $this->smsGatewayService()->sendLeaveApprovedMessage($app);
 
         return response()->json([
             'message' => 'Application approved by HR.',
@@ -5790,6 +5797,7 @@ class LeaveApplicationController extends Controller
         }
 
         $app = $app->fresh(['leaveType', 'applicantAdmin']);
+        $this->smsGatewayService()->sendLeaveApprovedMessage($app);
 
         return response()->json([
             'message' => 'Leave update request approved by HR and changes were applied.',

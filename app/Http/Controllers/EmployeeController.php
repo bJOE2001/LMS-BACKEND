@@ -593,7 +593,7 @@ class EmployeeController extends Controller
     }
 
     /**
-     * Return leave credits ledger (Vacation/Sick) for one employee (HR only).
+     * Return leave credits ledger (Vacation/Sick/Other) for one employee (HR only).
      */
     public function leaveCreditsLedger(Request $request, string $controlNo): JsonResponse
     {
@@ -617,6 +617,34 @@ class EmployeeController extends Controller
             }
         }
 
+        $otherTypeIds = [];
+        $otherTypeCodeById = [];
+        $mc06RelatedTypeIds = $trackedTypeIdsByKey['mc06_related'] ?? [];
+        if (is_array($mc06RelatedTypeIds)) {
+            foreach ($mc06RelatedTypeIds as $typeId) {
+                $normalizedTypeId = (int) $typeId;
+                if ($normalizedTypeId > 0) {
+                    $otherTypeIds[] = $normalizedTypeId;
+                    $otherTypeCodeById[$normalizedTypeId] = 'MC06';
+                }
+            }
+        }
+        $otherTypeCodeFallbackByKey = [
+            'mc06' => 'MC06',
+            'wellness' => 'WL',
+        ];
+        foreach (['mc06', 'wellness'] as $otherTypeKey) {
+            $otherTypeId = $trackedTypeIdsByKey[$otherTypeKey] ?? null;
+            if (is_int($otherTypeId) && $otherTypeId > 0) {
+                $otherTypeIds[] = $otherTypeId;
+                $otherTypeCodeById[$otherTypeId] = $otherTypeCodeFallbackByKey[$otherTypeKey] ?? null;
+            }
+        }
+        $otherTypeIds = array_values(array_unique($otherTypeIds));
+        foreach ($otherTypeIds as $otherTypeId) {
+            $typeIdToKey[$otherTypeId] = 'other';
+        }
+
         $trackedTypeIds = array_keys($typeIdToKey);
         $vacationLeaveTypeId = $trackedTypeIdsByKey['vacation'] ?? null;
         $sickLeaveTypeId = $trackedTypeIdsByKey['sick'] ?? null;
@@ -627,9 +655,15 @@ class EmployeeController extends Controller
             $queryTrackedTypeIds = array_values(array_unique($queryTrackedTypeIds));
         }
         $balancesByType = $this->loadPreferredLedgerBalancesByType($controlNoCandidates, $trackedTypeIds);
+        $otherRunningBalance = 0.0;
+        foreach ($otherTypeIds as $otherTypeId) {
+            $otherRunningBalance += $this->resolveLedgerBalance($balancesByType, $otherTypeId);
+        }
+        $otherRunningBalance = round($otherRunningBalance, 2);
         $runningBalances = [
             'vacation' => $this->resolveLedgerBalance($balancesByType, $trackedTypeIdsByKey['vacation'] ?? null),
             'sick' => $this->resolveLedgerBalance($balancesByType, $trackedTypeIdsByKey['sick'] ?? null),
+            'other' => $otherRunningBalance,
         ];
 
         $transactions = [];
@@ -678,6 +712,9 @@ class EmployeeController extends Controller
                         $isManualAddSource => 'Leave credits added',
                         default => 'Monthly accrual',
                     };
+                    $otherTypeCode = $typeKey === 'other'
+                        ? ($otherTypeCodeById[(int) $typeId] ?? null)
+                        : null;
 
                     $transactions[] = [
                         'row_id' => 'accrual-' . (int) $entry->id,
@@ -690,7 +727,8 @@ class EmployeeController extends Controller
                             $typeKey,
                             0.0,
                             false,
-                            false
+                            false,
+                            is_string($otherTypeCode) ? $otherTypeCode : null
                         ),
                         'action_taken' => $actionTaken,
                         'category' => 'earned',
@@ -784,12 +822,16 @@ class EmployeeController extends Controller
                 // Ledger particulars should reflect the requested leave duration,
                 // not schedule-inflated credit deductions. A whole-day leave stays
                 // `1-0-0` here even when a 10-hour schedule deducts 1.25 credits.
+                $otherTypeCode = $typeKey === 'other'
+                    ? ($otherTypeCodeById[$typeId] ?? null)
+                    : null;
                 $particulars = $this->buildLedgerParticulars(
                     'deduction',
                     $typeKey,
                     $totalDays,
                     $isMonetization,
-                    $isForcedLeave
+                    $isForcedLeave,
+                    is_string($otherTypeCode) ? $otherTypeCode : null
                 );
                 $applicationId = (int) $application->id;
                 $actionTaken = sprintf(
@@ -897,7 +939,8 @@ class EmployeeController extends Controller
                                     $typeKey,
                                     $restoredAmount,
                                     false,
-                                    $isForcedLeave
+                                    $isForcedLeave,
+                                    is_string($otherTypeCode) ? $otherTypeCode : null
                                 ),
                                 'action_taken' => 'Recalled by HR',
                                 'inclusive_dates' => $restoredDates,
@@ -1027,6 +1070,26 @@ class EmployeeController extends Controller
                 } elseif ($category === 'deduction_without_pay') {
                     $ledgerRows[$rowIndex]['sick_abs_und_wop'] = round(
                         (float) ($ledgerRows[$rowIndex]['sick_abs_und_wop'] ?? 0) + $amount,
+                        2
+                    );
+                }
+            } elseif ($typeKey === 'other') {
+                if (!array_key_exists('other_balance', $ledgerRows[$rowIndex])) {
+                    $ledgerRows[$rowIndex]['other_balance'] = $currentBalance;
+                }
+                if ($category === 'earned') {
+                    $ledgerRows[$rowIndex]['other_earned'] = round(
+                        (float) ($ledgerRows[$rowIndex]['other_earned'] ?? 0) + $amount,
+                        2
+                    );
+                } elseif ($category === 'deduction_with_pay') {
+                    $ledgerRows[$rowIndex]['other_abs_und'] = round(
+                        (float) ($ledgerRows[$rowIndex]['other_abs_und'] ?? 0) + $amount,
+                        2
+                    );
+                } elseif ($category === 'deduction_without_pay') {
+                    $ledgerRows[$rowIndex]['other_abs_und_wop'] = round(
+                        (float) ($ledgerRows[$rowIndex]['other_abs_und_wop'] ?? 0) + $amount,
                         2
                     );
                 }
@@ -1691,6 +1754,9 @@ class EmployeeController extends Controller
             'vacation' => null,
             'sick' => null,
             'forced' => null,
+            'mc06' => null,
+            'wellness' => null,
+            'mc06_related' => [],
         ];
 
         $leaveTypes = LeaveType::query()
@@ -1724,6 +1790,38 @@ class EmployeeController extends Controller
             ) {
                 $typeIds['forced'] = $typeId;
             }
+
+            if (
+                $typeIds['wellness'] === null
+                && in_array($normalizedName, ['wellness leave', 'wellness'], true)
+            ) {
+                $typeIds['wellness'] = $typeId;
+            }
+
+            if (LeaveType::isSpecialPrivilegeAliasName($leaveType->name ?? null)) {
+                if ($typeIds['mc06'] === null) {
+                    $typeIds['mc06'] = $typeId;
+                }
+                $typeIds['mc06_related'][] = $typeId;
+            }
+        }
+
+        foreach (LeaveType::resolveSpecialPrivilegeRelatedTypeIds() as $typeId) {
+            $normalizedTypeId = (int) $typeId;
+            if ($normalizedTypeId > 0) {
+                $typeIds['mc06_related'][] = $normalizedTypeId;
+            }
+        }
+
+        $typeIds['mc06_related'] = array_values(array_unique(array_filter(
+            array_map(
+                static fn(mixed $typeId): int => (int) $typeId,
+                $typeIds['mc06_related']
+            ),
+            static fn(int $typeId): bool => $typeId > 0
+        )));
+        if ($typeIds['mc06'] === null && $typeIds['mc06_related'] !== []) {
+            $typeIds['mc06'] = (int) $typeIds['mc06_related'][0];
         }
 
         return $typeIds;
@@ -1798,23 +1896,25 @@ class EmployeeController extends Controller
         ?string $typeKey,
         float $days,
         bool $isMonetization = false,
-        bool $isForcedLeave = false
+        bool $isForcedLeave = false,
+        ?string $otherTypeCode = null
     ): string {
+        $prefix = match (true) {
+            $isForcedLeave => 'FL',
+            $typeKey === 'vacation' => 'VL',
+            $typeKey === 'sick' => 'SL',
+            $typeKey === 'other' && trim((string) $otherTypeCode) !== '' => strtoupper(trim((string) $otherTypeCode)),
+            default => null,
+        };
+
         if ($entryKind === 'earned') {
-            return '0-0-0';
+            return $prefix !== null ? $prefix . ' 0-0-0' : '0-0-0';
         }
 
         $formattedDuration = $this->formatLedgerDaysHoursMinutes($days);
         if ($isMonetization) {
             return $formattedDuration . ' Monetization';
         }
-
-        $prefix = match (true) {
-            $isForcedLeave => 'FL',
-            $typeKey === 'vacation' => 'VL',
-            $typeKey === 'sick' => 'SL',
-            default => null,
-        };
 
         $baseParticulars = $prefix !== null
             ? $prefix . ' ' . $formattedDuration
