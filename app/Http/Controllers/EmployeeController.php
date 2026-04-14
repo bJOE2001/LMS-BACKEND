@@ -1379,42 +1379,65 @@ class EmployeeController extends Controller
             ? HrisEmployee::allByOffice($normalizedDepartmentName, $activeOnly)
             : HrisEmployee::allCached($activeOnly);
 
+        $matchesEmployeeFilters = function (object $employee) use (
+            $normalizedDepartmentName,
+            $excludeContractual,
+            $activeOnly,
+            $normalizedSearchTerm
+        ): bool {
+            $employeeOffice = trim((string) ($employee->office ?? ''));
+            $employeeStatus = strtoupper(trim((string) ($employee->status ?? '')));
+            $isActive = filter_var($employee->is_active ?? false, FILTER_VALIDATE_BOOLEAN);
+
+            if (
+                $normalizedDepartmentName !== ''
+                && strcasecmp($employeeOffice, $normalizedDepartmentName) !== 0
+            ) {
+                return false;
+            }
+
+            if ($excludeContractual && $employeeStatus === 'CONTRACTUAL') {
+                return false;
+            }
+
+            if ($activeOnly === false && in_array($employeeStatus, ['HONORARIUM', 'CONTRACTUAL'], true)) {
+                return false;
+            }
+
+            if (
+                $activeOnly === null
+                && !$isActive
+                && in_array($employeeStatus, ['HONORARIUM', 'CONTRACTUAL'], true)
+            ) {
+                return false;
+            }
+
+            return $this->matchesHrisEmployeeSearch($employee, $normalizedSearchTerm);
+        };
+
+        if ($limit !== null && $limit > 0) {
+            $limitedRows = [];
+
+            foreach ($employees as $employee) {
+                if (!is_object($employee)) {
+                    continue;
+                }
+
+                if (!$matchesEmployeeFilters($employee)) {
+                    continue;
+                }
+
+                $limitedRows[] = $this->serializeEmployee($employee);
+                if (count($limitedRows) >= $limit) {
+                    break;
+                }
+            }
+
+            return collect($limitedRows)->values();
+        }
+
         $rows = $employees
-            ->filter(function (object $employee) use (
-                $normalizedDepartmentName,
-                $excludeContractual,
-                $activeOnly,
-                $normalizedSearchTerm
-            ): bool {
-                $employeeOffice = trim((string) ($employee->office ?? ''));
-                $employeeStatus = strtoupper(trim((string) ($employee->status ?? '')));
-                $isActive = filter_var($employee->is_active ?? false, FILTER_VALIDATE_BOOLEAN);
-
-                if (
-                    $normalizedDepartmentName !== ''
-                    && strcasecmp($employeeOffice, $normalizedDepartmentName) !== 0
-                ) {
-                    return false;
-                }
-
-                if ($excludeContractual && $employeeStatus === 'CONTRACTUAL') {
-                    return false;
-                }
-
-                if ($activeOnly === false && in_array($employeeStatus, ['HONORARIUM', 'CONTRACTUAL'], true)) {
-                    return false;
-                }
-
-                if (
-                    $activeOnly === null
-                    && !$isActive
-                    && in_array($employeeStatus, ['HONORARIUM', 'CONTRACTUAL'], true)
-                ) {
-                    return false;
-                }
-
-                return $this->matchesHrisEmployeeSearch($employee, $normalizedSearchTerm);
-            })
+            ->filter($matchesEmployeeFilters)
             ->map(fn(object $employee): array => $this->serializeEmployee($employee))
             ->pipe(fn(Collection $employeeRows): Collection => $this->sortEmployeeRows($employeeRows))
             ->values();
