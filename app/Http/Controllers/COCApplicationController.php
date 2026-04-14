@@ -12,6 +12,7 @@ use App\Models\LeaveBalance;
 use App\Models\LeaveType;
 use App\Models\Notification;
 use App\Services\CocLedgerService;
+use App\Services\SmsGatewayService;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -48,6 +49,11 @@ class COCApplicationController extends Controller
     private function cocLedgerService(): CocLedgerService
     {
         return app(CocLedgerService::class);
+    }
+
+    private function smsGatewayService(): SmsGatewayService
+    {
+        return app(SmsGatewayService::class);
     }
 
     public function ermsIndex(Request $request): JsonResponse
@@ -765,6 +771,7 @@ class COCApplicationController extends Controller
         if ($app) {
             $creditedDays = isset($result['days']) ? (float) $result['days'] : null;
             $this->notifyAdminOfHrCocDecision($app, true, $creditedDays);
+            $this->smsGatewayService()->sendCocApprovedMessage($app, $creditedDays);
         }
 
         return response()->json([

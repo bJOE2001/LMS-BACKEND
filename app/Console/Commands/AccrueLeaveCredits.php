@@ -10,6 +10,7 @@ use Illuminate\Console\Command;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 /**
  * Monthly accrual: add accrual_rate to ACCRUED leave balances on the 1st of every month.
@@ -19,12 +20,14 @@ use Illuminate\Support\Facades\DB;
  */
 class AccrueLeaveCredits extends Command
 {
+    // SQL Server hard limit is 2100 bound parameters per statement.
+    // Keep a safety margin so Laravel upsert() never exceeds the limit.
     private const SQL_SERVER_SAFE_PARAMETER_LIMIT = 2000;
     private const EXCLUDED_ACCRUAL_STATUS_KEYWORDS = ['HONORARIUM', 'CONTRACTUAL'];
 
     protected $signature = 'leave:accrue
         {--date= : Override accrual date (Y-m-d) for testing}
-        {--hr-timeout=8 : SQL Server login/query timeout in seconds before falling back to tblEmployees}';
+        {--hr-timeout=0 : Optional SQL Server login/query timeout in seconds for live HRIS lookup (0 = no forced timeout)}';
 
     protected $description = 'Accrue monthly leave credits for ACCRUED leave types (run on 1st of month)';
 
@@ -33,7 +36,7 @@ class AccrueLeaveCredits extends Command
         $dateStr = $this->option('date');
         $now = $dateStr ? Carbon::parse($dateStr) : Carbon::now();
         $accrualMonth = $now->format('Y-m');
-        $hrTimeout = max(3, (int) ($this->option('hr-timeout') ?? 8));
+        $hrTimeout = max(0, (int) ($this->option('hr-timeout') ?? 0));
 
         $this->info("Running leave accrual for month: {$accrualMonth}");
 
@@ -187,29 +190,44 @@ class AccrueLeaveCredits extends Command
 
     private function resolveAccrualEmployeeRecords(int $hrTimeout): Collection
     {
-        $snapshotCount = HrisEmployee::countSnapshot(true);
+        if ($hrTimeout > 0) {
+            $this->configureHrTimeout($hrTimeout);
+            $this->line("Trying live HRIS first with {$hrTimeout}s timeout (tblEmployees auto-sync disabled).");
+        } else {
+            $this->line('Trying live HRIS first with no forced timeout (tblEmployees auto-sync disabled).');
+        }
 
-        $this->configureHrTimeout($hrTimeout);
-        HrisEmployee::flushCache();
-
-        $this->line(
-            "Trying live HRIS first with {$hrTimeout}s timeout"
-            .($snapshotCount > 0 ? "; tblEmployees fallback is available." : '; no local snapshot fallback rows detected.')
-        );
-
-        $records = HrisEmployee::allCached(true);
+        try {
+            // Use direct live query so leave accrual never auto-upserts tblEmployees.
+            $records = HrisEmployee::query(true, false)->get();
+        } catch (Throwable $exception) {
+            report($exception);
+            $this->warn('Live HRIS lookup failed or timed out. Skipping live HRIS source for this run.');
+            $records = collect();
+        }
 
         if ($records->isNotEmpty()) {
             return $records;
         }
 
-        if ($snapshotCount > 0) {
-            $this->warn("Live HRIS returned no active employee rows. Using tblEmployees snapshot ({$snapshotCount} active row(s)).");
+        try {
+            $snapshotRecords = HrisEmployee::allSnapshot(true);
+        } catch (Throwable $exception) {
+            report($exception);
+            $this->warn('tblEmployees fallback lookup failed. Skipping snapshot source for this run.');
 
-            return HrisEmployee::allSnapshot(true);
+            return collect();
         }
 
-        return $records;
+        if ($snapshotRecords->isEmpty()) {
+            $this->warn('tblEmployees snapshot has no active rows. Skipping snapshot source for this run.');
+
+            return collect();
+        }
+
+        $this->warn("Live HRIS returned no active employee rows. Using tblEmployees snapshot ({$snapshotRecords->count()} active row(s)).");
+
+        return $snapshotRecords;
     }
 
     private function configureHrTimeout(int $seconds): void
