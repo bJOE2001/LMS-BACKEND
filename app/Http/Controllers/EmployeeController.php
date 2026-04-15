@@ -1193,6 +1193,7 @@ class EmployeeController extends Controller
             'firstname' => trim((string) ($employee->firstname ?? '')),
             'surname' => trim((string) ($employee->surname ?? '')),
             'middlename' => $this->trimOrBlank($employee->middlename ?? null),
+            'full_name' => $this->buildEmployeeFullName($employee),
             'designation' => $this->trimOrBlank($employee->designation ?? null),
             'office' => trim((string) ($employee->office ?? '')),
             'officeAcronym' => $this->trimOrBlank($employee->officeAcronym ?? null),
@@ -1728,6 +1729,21 @@ class EmployeeController extends Controller
     private function trimOrBlank(mixed $value): string
     {
         return trim((string) ($value ?? ''));
+    }
+
+    private function buildEmployeeFullName(object $employee): string
+    {
+        $parts = array_values(array_filter([
+            trim((string) ($employee->firstname ?? '')),
+            trim((string) ($employee->middlename ?? '')),
+            trim((string) ($employee->surname ?? '')),
+        ], static fn(string $part): bool => $part !== ''));
+
+        if ($parts === []) {
+            return trim((string) ($employee->control_no ?? ''));
+        }
+
+        return trim(implode(' ', $parts));
     }
 
     private function buildLedgerControlNoCandidates(string $controlNo, ?object $employee = null): array

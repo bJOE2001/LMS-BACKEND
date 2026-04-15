@@ -605,6 +605,10 @@ class HRUserManagementController extends Controller
                 ? $employee->birth_date->format('Y-m-d')
                 : trim((string) ($employee->birth_date ?? '')),
             'office' => trim((string) $employee->office),
+            'officeAcronym' => trim((string) ($employee->officeAcronym ?? '')),
+            'office_acronym' => trim((string) ($employee->officeAcronym ?? '')),
+            'hrisOfficeAcronym' => trim((string) ($employee->hrisOfficeAcronym ?? '')),
+            'hris_office_acronym' => trim((string) ($employee->hrisOfficeAcronym ?? '')),
             'status' => $status,
             'designation' => trim((string) ($employee->designation ?? '')),
         ];

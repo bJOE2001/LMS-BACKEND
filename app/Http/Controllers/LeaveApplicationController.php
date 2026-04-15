@@ -9832,6 +9832,10 @@ class LeaveApplicationController extends Controller
             'applicantName' => $applicantName,
             'applicant_name' => $applicantName,
             'office' => $office,
+            'officeAcronym' => $resolvedEmployee?->officeAcronym,
+            'office_acronym' => $resolvedEmployee?->officeAcronym,
+            'hrisOfficeAcronym' => $resolvedEmployee?->hrisOfficeAcronym,
+            'hris_office_acronym' => $resolvedEmployee?->hrisOfficeAcronym,
         ];
 
         if ($resolvedEmployee) {
@@ -9843,6 +9847,10 @@ class LeaveApplicationController extends Controller
                 'full_name' => $this->formatEmployeeFullName($resolvedEmployee),
                 'designation' => $resolvedEmployee->designation,
                 'office' => $resolvedEmployee->office,
+                'officeAcronym' => $resolvedEmployee->officeAcronym,
+                'office_acronym' => $resolvedEmployee->officeAcronym,
+                'hrisOfficeAcronym' => $resolvedEmployee->hrisOfficeAcronym,
+                'hris_office_acronym' => $resolvedEmployee->hrisOfficeAcronym,
             ];
         }
 
