@@ -852,6 +852,7 @@ class COCApplicationController extends Controller
         $app = COCApplication::query()->with(self::COC_RELATIONS)->find($id);
         if ($app) {
             $this->notifyAdminOfHrCocDecision($app, false);
+            $this->smsGatewayService()->sendCocRejectedMessage($app);
         }
 
         return response()->json([
