@@ -58,6 +58,48 @@ class SmsGatewayService
         );
     }
 
+    public function sendLeaveRejectedMessage(LeaveApplication $application): bool
+    {
+        $controlNo = $this->resolveApplicationControlNo($application);
+        if ($controlNo === null) {
+            Log::warning('Unable to resolve employee control number for leave rejection SMS.', [
+                'leave_application_id' => (int) ($application->id ?? 0),
+            ]);
+
+            return false;
+        }
+
+        return $this->sendToEmployeeControlNo(
+            $controlNo,
+            $this->buildLeaveRejectedMessage($application),
+            [
+                'leave_application_id' => (int) ($application->id ?? 0),
+                'employee_control_no' => $controlNo,
+            ]
+        );
+    }
+
+    public function sendCocRejectedMessage(COCApplication $application): bool
+    {
+        $controlNo = trim((string) ($application->employee_control_no ?? ''));
+        if ($controlNo === '') {
+            Log::warning('Unable to resolve employee control number for COC rejection SMS.', [
+                'coc_application_id' => (int) ($application->id ?? 0),
+            ]);
+
+            return false;
+        }
+
+        return $this->sendToEmployeeControlNo(
+            $controlNo,
+            $this->buildCocRejectedMessage($application),
+            [
+                'coc_application_id' => (int) ($application->id ?? 0),
+                'employee_control_no' => $controlNo,
+            ]
+        );
+    }
+
     /**
      * @param array<string, scalar|null> $params
      * @return array{success: bool, status: int, body: string, error: string|null}
@@ -298,6 +340,29 @@ class SmsGatewayService
     private function buildCocApprovedMessage(COCApplication $application, ?float $creditedDays = null): string
     {
         return 'Good day! This is CHRMO. Your COC application has been approved.';
+    }
+
+    private function buildLeaveRejectedMessage(LeaveApplication $application): string
+    {
+        $application->loadMissing('leaveType');
+
+        $leaveTypeName = trim((string) ($application->leaveType?->name ?? 'Leave'));
+        $isMonetization = (bool) ($application->is_monetization ?? false);
+        $actionLabel = $isMonetization ? 'monetization request' : 'application';
+        $daysLabel = $this->formatDays((float) ($application->total_days ?? 0));
+        $dateLabel = $isMonetization
+            ? ''
+            : $this->buildApplicationDateLabel($application);
+
+        $dayPhrase = "for {$daysLabel}";
+        $dateSegment = $dateLabel !== '' ? " {$dateLabel}" : '';
+
+        return "Good day! This is CHRMO. Your {$leaveTypeName} {$actionLabel} {$dayPhrase}{$dateSegment} has been rejected.";
+    }
+
+    private function buildCocRejectedMessage(COCApplication $application): string
+    {
+        return 'Good day! This is CHRMO. Your COC application has been rejected.';
     }
 
     private function formatDays(float $days): string

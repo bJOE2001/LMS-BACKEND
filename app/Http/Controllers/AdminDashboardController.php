@@ -63,7 +63,9 @@ class AdminDashboardController extends Controller
             ->orderByDesc('created_at')
             ->get();
 
-        $cocApplications = COCApplication::query()
+        $cocApplications = $this->excludePendingLateFilingReview(
+                COCApplication::query()
+            )
             ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
             ->when(
                 $departmentEmployeeControlNos !== [],
@@ -142,7 +144,29 @@ class AdminDashboardController extends Controller
             return (string) $app->status;
         }
 
+        if ($this->isPendingLateFilingReview($app)) {
+            return 'PENDING_LATE_HR';
+        }
+
         return $app->admin_reviewed_at ? 'PENDING_HR' : 'PENDING_ADMIN';
+    }
+
+    private function isPendingLateFilingReview(COCApplication $application): bool
+    {
+        return (bool) ($application->is_late_filed ?? false)
+            && strtoupper(trim((string) ($application->late_filing_status ?? ''))) === 'PENDING'
+            && $application->status === COCApplication::STATUS_PENDING;
+    }
+
+    private function excludePendingLateFilingReview($query)
+    {
+        return $query->where(function ($nestedQuery): void {
+            $nestedQuery
+                ->where('is_late_filed', false)
+                ->orWhereNull('is_late_filed')
+                ->orWhere('late_filing_status', '!=', 'PENDING')
+                ->orWhereNull('late_filing_status');
+        });
     }
 
     // ─── Admin's own leave credits ────────────────────────────────────
@@ -1041,10 +1065,13 @@ class AdminDashboardController extends Controller
 
     private function validateMonetizationPolicyRules(?LeaveType $leaveType, float $requestedDays): ?JsonResponse
     {
-        if (!$leaveType instanceof LeaveType || !$this->isVacationLeaveType($leaveType)) {
+        $isEligibleMonetizationType = $leaveType instanceof LeaveType
+            && ($this->isVacationLeaveType($leaveType) || $this->isSickLeaveType($leaveType));
+
+        if (!$isEligibleMonetizationType) {
             return response()->json([
-                'message' => 'Monetization is only allowed for Vacation Leave.',
-                'errors' => ['leave_type_id' => ['Monetization is only allowed for Vacation Leave.']],
+                'message' => 'Monetization is only allowed for Vacation Leave or Sick Leave.',
+                'errors' => ['leave_type_id' => ['Monetization is only allowed for Vacation Leave or Sick Leave.']],
             ], 422);
         }
 
@@ -1071,12 +1098,12 @@ class AdminDashboardController extends Controller
             return response()->json([
                 'message' => 'At least '
                     . self::formatDays($requiredMinimumBalance)
-                    . ' of Vacation Leave credits are required to apply monetization.',
+                    . ' of leave credits are required to apply monetization.',
                 'errors' => [
                     'total_days' => [
                         'At least '
                         . self::formatDays($requiredMinimumBalance)
-                        . ' of Vacation Leave credits are required. Current balance: '
+                        . ' of leave credits are required. Current balance: '
                         . self::formatDays($normalizedCurrentBalance)
                         . '.',
                     ],
@@ -1086,12 +1113,12 @@ class AdminDashboardController extends Controller
 
         if ($normalizedRequestedDays > $normalizedCurrentBalance + 1e-9) {
             return response()->json([
-                'message' => 'Requested monetization days exceed available Vacation Leave credits.',
+                'message' => 'Requested monetization days exceed available leave credits.',
                 'errors' => [
                     'total_days' => [
                         'Requested monetization days ('
                         . self::formatDays($normalizedRequestedDays)
-                        . ') exceed available Vacation Leave credits ('
+                        . ') exceed available leave credits ('
                         . self::formatDays($normalizedCurrentBalance)
                         . ').',
                     ],

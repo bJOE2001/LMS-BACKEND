@@ -1483,7 +1483,7 @@ class LeaveApplicationController extends Controller
 
     /**
      * Handle monetization submission with specific validation rules.
-     * City Hall of Tagum policy: Vacation Leave only, at least 15 credits available,
+     * City Hall of Tagum policy: Vacation Leave or Sick Leave only, at least 15 credits available,
      * and a minimum request of 10 days.
      */
     private function storeMonetization(Request $request, object $employee, object $account): JsonResponse
@@ -1896,9 +1896,6 @@ class LeaveApplicationController extends Controller
 
         // Notify the employee that admin rejected
         $app->load('leaveType');
-        $isMonetization = (bool) $app->is_monetization;
-        $actionLabel = $isMonetization ? 'monetization request' : 'leave application';
-        $titleLabel = $isMonetization ? 'Monetization' : 'Leave Application';
 
         return response()->json([
             'message' => 'Application rejected by admin.',
@@ -2964,6 +2961,7 @@ class LeaveApplicationController extends Controller
                 $app->id
             );
         }
+        $this->smsGatewayService()->sendLeaveRejectedMessage($app);
 
         return response()->json([
             'message' => 'Application rejected by HR.',
@@ -7144,11 +7142,17 @@ class LeaveApplicationController extends Controller
 
     private function validateMonetizationPolicyRules(?LeaveType $leaveType, float $requestedDays): ?JsonResponse
     {
-        if (!$leaveType instanceof LeaveType || !$this->isVacationLeaveType($leaveType, (int) $leaveType->id)) {
+        $isEligibleMonetizationType = $leaveType instanceof LeaveType
+            && (
+                $this->isVacationLeaveType($leaveType, (int) $leaveType->id)
+                || $this->isSickLeaveType($leaveType, (int) $leaveType->id)
+            );
+
+        if (!$isEligibleMonetizationType) {
             return response()->json([
-                'message' => 'Monetization is only allowed for Vacation Leave.',
+                'message' => 'Monetization is only allowed for Vacation Leave or Sick Leave.',
                 'errors' => [
-                    'leave_type_id' => ['Monetization is only allowed for Vacation Leave.'],
+                    'leave_type_id' => ['Monetization is only allowed for Vacation Leave or Sick Leave.'],
                 ],
             ], 422);
         }
@@ -7178,12 +7182,12 @@ class LeaveApplicationController extends Controller
             return response()->json([
                 'message' => 'At least '
                     . self::formatDays($requiredMinimumBalance)
-                    . ' of Vacation Leave credits are required to apply monetization.',
+                    . ' of leave credits are required to apply monetization.',
                 'errors' => [
                     'total_days' => [
                         'At least '
                         . self::formatDays($requiredMinimumBalance)
-                        . ' of Vacation Leave credits are required. Current balance: '
+                        . ' of leave credits are required. Current balance: '
                         . self::formatDays($normalizedCurrentBalance)
                         . '.',
                     ],
@@ -7193,12 +7197,12 @@ class LeaveApplicationController extends Controller
 
         if ($normalizedRequestedDays > $normalizedCurrentBalance + 1e-9) {
             return response()->json([
-                'message' => 'Requested monetization days exceed available Vacation Leave credits.',
+                'message' => 'Requested monetization days exceed available leave credits.',
                 'errors' => [
                     'total_days' => [
                         'Requested monetization days ('
                         . self::formatDays($normalizedRequestedDays)
-                        . ') exceed available Vacation Leave credits ('
+                        . ') exceed available leave credits ('
                         . self::formatDays($normalizedCurrentBalance)
                         . ').',
                     ],
@@ -7633,22 +7637,22 @@ class LeaveApplicationController extends Controller
         }
 
         $filedDate = $this->resolvePolicyFilingDate($filedAt);
-        $workingDaysBeforeAvailment = $this->countWorkingDaysBeforeDate($filedDate, $firstAvailmentDate);
-        if ($workingDaysBeforeAvailment < 5) {
+        $daysBeforeAvailment = $this->countDaysBeforeDate($filedDate, $firstAvailmentDate);
+        if ($daysBeforeAvailment < 5) {
             return response()->json([
-                'message' => 'CTO applications must be submitted at least 5 working days before the first availment date.',
+                'message' => 'CTO applications must be submitted at least 5 days before the first availment date.',
                 'errors' => [
-                    'start_date' => ['CTO applications must be submitted at least 5 working days before the first availment date.'],
+                    'start_date' => ['CTO applications must be submitted at least 5 days before the first availment date.'],
                 ],
             ], 422);
         }
 
-        $maxConsecutiveWorkingDays = $this->calculateMaxConsecutiveWorkingDateSpan($normalizedDateKeys);
-        if ($maxConsecutiveWorkingDays > 5) {
+        $maxConsecutiveDays = $this->calculateMaxConsecutiveDateSpan($normalizedDateKeys);
+        if ($maxConsecutiveDays > 5) {
             return response()->json([
-                'message' => 'CTO may only be availed for up to 5 consecutive working days per application.',
+                'message' => 'CTO may only be availed for up to 5 consecutive days per application.',
                 'errors' => [
-                    'selected_dates' => ['CTO may only be availed for up to 5 consecutive working days per application.'],
+                    'selected_dates' => ['CTO may only be availed for up to 5 consecutive days per application.'],
                 ],
             ], 422);
         }
@@ -7790,7 +7794,7 @@ class LeaveApplicationController extends Controller
         return round($total, 2);
     }
 
-    private function countWorkingDaysBeforeDate(
+    private function countDaysBeforeDate(
         \Carbon\CarbonImmutable $filedDate,
         \Carbon\CarbonImmutable $targetDate
     ): int {
@@ -7800,31 +7804,15 @@ class LeaveApplicationController extends Controller
             return 0;
         }
 
-        $count = 0;
-        $cursor = $normalizedFiledDate->addDay();
-
-        while ($cursor->lt($normalizedTargetDate)) {
-            if ($cursor->isWeekday()) {
-                $count++;
-            }
-
-            $cursor = $cursor->addDay();
-        }
-
-        return $count;
+        return $normalizedFiledDate->addDay()->diffInDays($normalizedTargetDate);
     }
 
-    private function nextWorkingDate(\Carbon\CarbonImmutable $date): \Carbon\CarbonImmutable
+    private function nextDate(\Carbon\CarbonImmutable $date): \Carbon\CarbonImmutable
     {
-        $cursor = $date->addDay()->startOfDay();
-        while (!$cursor->isWeekday()) {
-            $cursor = $cursor->addDay();
-        }
-
-        return $cursor;
+        return $date->addDay()->startOfDay();
     }
 
-    private function calculateMaxConsecutiveWorkingDateSpan(array $selectedDateKeys): int
+    private function calculateMaxConsecutiveDateSpan(array $selectedDateKeys): int
     {
         if ($selectedDateKeys === []) {
             return 0;
@@ -7853,7 +7841,7 @@ class LeaveApplicationController extends Controller
         $currentStreak = 1;
 
         for ($index = 1, $count = count($parsedDates); $index < $count; $index++) {
-            $expectedNextDate = $this->nextWorkingDate($parsedDates[$index - 1]);
+            $expectedNextDate = $this->nextDate($parsedDates[$index - 1]);
             if ($parsedDates[$index]->equalTo($expectedNextDate)) {
                 $currentStreak++;
             } else {
