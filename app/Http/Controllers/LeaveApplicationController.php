@@ -407,6 +407,49 @@ class LeaveApplicationController extends Controller
     }
 
     /**
+     * GET /erms/apply-leave/{id}
+     * GET /erms/leave-applications/{id}
+     * Protected endpoint for ERMS/HRPDS leave application detail payload.
+     */
+    public function ermsShow(Request $request, int $id): JsonResponse
+    {
+        $this->mergeEmployeeControlNoInput($request);
+
+        $validated = $request->validate([
+            'employee_control_no' => ['nullable', 'string', 'regex:/^\d+$/'],
+        ]);
+
+        $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
+        if ($controlNo === '') {
+            return response()->json([
+                'message' => 'The employee_control_no query parameter is required.',
+            ], 422);
+        }
+
+        $employee = $this->findEmployeeByControlNo($controlNo);
+        if (!$employee) {
+            return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+
+        $application = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->where('id', $id)
+            ->where(fn($query) => $this->applyApplicationOwnershipFilter($query, $controlNo))
+            ->first();
+
+        if (!$application) {
+            return response()->json(['message' => 'Leave application not found for this employee.'], 404);
+        }
+
+        $actorDirectory = $this->buildWorkflowActorDirectory(collect([$application]));
+
+        return response()->json([
+            ...$this->employeeControlNoResponse((string) $employee->control_no),
+            'application' => $this->formatErmsApplication($application, $actorDirectory),
+        ]);
+    }
+
+    /**
      * POST /erms/apply-leave
      * Protected endpoint for ERMS-to-LMS leave application submission.
      */
@@ -4955,10 +4998,18 @@ class LeaveApplicationController extends Controller
         $selectedDates = $app->resolvedSelectedDates();
         $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
         $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
+        $pendingPayload = is_array($pendingUpdateMeta['payload'] ?? null) ? $pendingUpdateMeta['payload'] : [];
+        $latestPayload = is_array($latestUpdateMeta['payload'] ?? null) ? $latestUpdateMeta['payload'] : [];
         $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
         $withoutPay = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
         $deductibleDays = $this->resolveApplicationDeductibleDays($app);
         $ctoDeductedHours = $this->resolveApplicationCtoDeductedHours($app);
+        $resolvedReason = $this->trimNullableString($app->reason)
+            ?? $this->trimNullableString($latestPayload['reason'] ?? null)
+            ?? $this->trimNullableString($pendingPayload['reason'] ?? null);
+        $resolvedDetailsOfLeave = $this->trimNullableString($app->details_of_leave)
+            ?? $this->trimNullableString($latestPayload['details_of_leave'] ?? $latestPayload['detailsOfLeave'] ?? null)
+            ?? $this->trimNullableString($pendingPayload['details_of_leave'] ?? $pendingPayload['detailsOfLeave'] ?? null);
 
         return [
             'id' => $app->id,
@@ -4978,6 +5029,10 @@ class LeaveApplicationController extends Controller
             'total_days' => (float) $app->total_days,
             'deductible_days' => $deductibleDays,
             'cto_deducted_hours' => $ctoDeductedHours,
+            'reason' => $resolvedReason,
+            'reason_purpose' => $resolvedReason,
+            'details_of_leave' => $resolvedDetailsOfLeave,
+            'detailsOfLeave' => $resolvedDetailsOfLeave,
             'pay_mode' => $normalizedPayMode,
             'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
             'without_pay' => $withoutPay,
