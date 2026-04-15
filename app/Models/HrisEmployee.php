@@ -95,7 +95,7 @@ class HrisEmployee
         $rows = self::rememberResilient(
             $cacheKey,
             static function () use ($activeOnly): array {
-                $rows = self::orderedQuery($activeOnly, false)
+                $rows = self::orderedQuery($activeOnly, true)
                     ->get()
                     ->map(static fn (object $employee): array => (array) $employee)
                     ->values()
@@ -525,7 +525,23 @@ class HrisEmployee
             ->all();
 
         $partitionQuery = self::partitionQuery(null)
-            ->select('vp.ControlNo as raw_control_no', 'vp.Office as office', 'vp.Status as status', 'vp.Designation as designation', 'vp.RateMon as rate_mon', 'vp.FromDate as from_date', 'vp.ToDate as to_date');
+            ->leftJoin(self::OFFICE_TABLE.' as yo', function ($join): void {
+                $join->on(
+                    DB::raw('LTRIM(RTRIM(vp.OffCode))'),
+                    '=',
+                    DB::raw('LTRIM(RTRIM(yo.Codes))')
+                );
+            })
+            ->select(
+                'vp.ControlNo as raw_control_no',
+                'vp.Office as office',
+                'vp.Status as status',
+                'vp.Designation as designation',
+                'vp.RateMon as rate_mon',
+                'vp.FromDate as from_date',
+                'vp.ToDate as to_date'
+            )
+            ->selectRaw('NULLIF(LTRIM(RTRIM(CONVERT(VARCHAR(255), yo.Abbr))), \'\') as officeAcronym');
 
         self::applyLiteralControlNoFilter($partitionQuery, 'vp.ControlNo', $lookupValues);
         $partitionLookupFailed = false;
@@ -671,6 +687,13 @@ class HrisEmployee
     private static function fetchLiveDirectoryRowsByOffice(string $officeName, ?bool $activeOnly = null): array
     {
         $partitionRows = self::partitionQuery($activeOnly)
+            ->leftJoin(self::OFFICE_TABLE.' as yo', function ($join): void {
+                $join->on(
+                    DB::raw('LTRIM(RTRIM(vp.OffCode))'),
+                    '=',
+                    DB::raw('LTRIM(RTRIM(yo.Codes))')
+                );
+            })
             ->select(
                 'vp.ControlNo as raw_control_no',
                 'vp.Office as office',
@@ -680,6 +703,7 @@ class HrisEmployee
                 'vp.FromDate as from_date',
                 'vp.ToDate as to_date'
             )
+            ->selectRaw('NULLIF(LTRIM(RTRIM(CONVERT(VARCHAR(255), yo.Abbr))), \'\') as officeAcronym')
             ->tap(static function (Builder $query) use ($officeName): void {
                 self::applyOfficeFilter($query, $officeName);
             })
@@ -1244,7 +1268,7 @@ class HrisEmployee
                 'middlename' => $personalRow['middlename'] ?? null,
                 'birth_date' => $personalRow['birth_date'] ?? null,
                 'office' => $partitionRow['office'] ?? null,
-                'officeAcronym' => null,
+                'officeAcronym' => $partitionRow['officeAcronym'] ?? null,
                 'status' => $partitionRow['status'] ?? null,
                 'designation' => $partitionRow['designation'] ?? null,
                 'rate_mon' => $partitionRow['rate_mon'] ?? null,
