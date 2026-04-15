@@ -3047,7 +3047,7 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
-        if ($this->isPendingApprovedUpdateRequest($app)) {
+        if ($this->hasPendingApprovedUpdateRequest($app)) {
             return response()->json([
                 'message' => 'Cannot recall while there is a pending approved update request for this application.',
             ], 422);
@@ -3085,9 +3085,7 @@ class LeaveApplicationController extends Controller
                 'message' => 'Selected recall dates must match the application leave dates.',
             ], 422);
         }
-        $existingRecallDateKeys = $this->normalizeRecallDateKeys(
-            is_array($app->recall_selected_dates) ? $app->recall_selected_dates : []
-        );
+        $existingRecallDateKeys = $this->resolveEffectiveStoredRecallDateKeys($app);
         $mergedRecallDateKeys = $this->normalizeRecallDateKeys(array_merge(
             $existingRecallDateKeys,
             $selectedRecallDateKeys
@@ -4916,7 +4914,11 @@ class LeaveApplicationController extends Controller
         $hasPendingApprovedUpdateRequest = $this->hasPendingApprovedUpdateRequest($app);
         $displayStatus = $isCancelled
             ? 'Cancelled'
-            : ($hasPendingApprovedUpdateRequest ? 'Approved' : $this->ermsStatusLabel($app->status));
+            : (
+                $this->shouldPresentApprovedWhilePendingUpdate($app, $hasPendingApprovedUpdateRequest)
+                    ? 'Approved'
+                    : $this->ermsStatusLabel($app->status)
+            );
         $cancellationReason = $this->extractCancellationReason($app->remarks);
         $cancelledBy = $cancelledLog
             ? ($this->resolveWorkflowPerformerName($cancelledLog, $actorDirectory, $employeeName) ?? $employeeName)
@@ -5000,6 +5002,7 @@ class LeaveApplicationController extends Controller
         $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
         $pendingPayload = is_array($pendingUpdateMeta['payload'] ?? null) ? $pendingUpdateMeta['payload'] : [];
         $latestPayload = is_array($latestUpdateMeta['payload'] ?? null) ? $latestUpdateMeta['payload'] : [];
+        $effectiveRecallDateKeys = $this->resolveEffectiveStoredRecallDateKeys($app);
         $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
         $withoutPay = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
         $deductibleDays = $this->resolveApplicationDeductibleDays($app);
@@ -5090,6 +5093,10 @@ class LeaveApplicationController extends Controller
             'releasedAt' => $releasedActionAt?->toIso8601String(),
             'hr_released_at' => $releasedActionAt?->toIso8601String(),
             'recall_action_at' => $recallActionAt?->toIso8601String(),
+            'recallEffectiveDate' => $app->recall_effective_date?->toDateString(),
+            'recall_effective_date' => $app->recall_effective_date?->toDateString(),
+            'recallSelectedDates' => $effectiveRecallDateKeys !== [] ? $effectiveRecallDateKeys : null,
+            'recall_selected_dates' => $effectiveRecallDateKeys !== [] ? $effectiveRecallDateKeys : null,
             'disapproved_at' => $disapprovedAt?->toIso8601String(),
             'cancelled_at' => $cancelledAt?->toIso8601String(),
             'has_hr_received' => $hrReceivedLog !== null,
@@ -5447,6 +5454,20 @@ class LeaveApplicationController extends Controller
             && strtoupper(trim((string) ($pendingUpdateMeta['previous_status'] ?? ''))) === LeaveApplication::STATUS_APPROVED;
     }
 
+    private function shouldPresentApprovedWhilePendingUpdate(
+        LeaveApplication $app,
+        bool $hasPendingApprovedUpdateRequest
+    ): bool {
+        if (!$hasPendingApprovedUpdateRequest) {
+            return false;
+        }
+
+        return in_array($app->status, [
+            LeaveApplication::STATUS_PENDING_ADMIN,
+            LeaveApplication::STATUS_PENDING_HR,
+        ], true);
+    }
+
     private function normalizeRequestedLeaveActionTypeToken(mixed $value): string
     {
         $normalized = strtoupper(trim((string) ($value ?? '')));
@@ -5625,6 +5646,15 @@ class LeaveApplicationController extends Controller
             );
         $targetSelectedDateCoverage = $targetSelectedDateCoverageMetadata['selectedDateCoverage'];
         $targetSelectedDateHalfDayPortion = $targetSelectedDateCoverageMetadata['selectedDateHalfDayPortion'];
+        $existingRecallDateKeys = $this->resolveEffectiveStoredRecallDateKeys($app);
+        $targetSelectedDateKeys = $this->normalizeRecallDateKeys(
+            is_array($targetSelectedDates) ? $targetSelectedDates : []
+        );
+        $updatedRecallDateKeys = array_values(array_diff($existingRecallDateKeys, $targetSelectedDateKeys));
+        sort($updatedRecallDateKeys);
+        $updatedRecallEffectiveDate = $updatedRecallDateKeys !== []
+            ? $updatedRecallDateKeys[0]
+            : null;
 
         $targetAttachmentState = $this->resolveAttachmentStateFromPayload(
             is_array($payload) ? $payload : [],
@@ -5796,6 +5826,8 @@ class LeaveApplicationController extends Controller
                 $targetShouldDeductVacationLeave,
                 $targetIsCtoDeduction,
                 $balanceConflictError,
+                $updatedRecallDateKeys,
+                $updatedRecallEffectiveDate,
                 &$linkedForcedLeaveDeductedDays,
                 &$linkedVacationLeaveDeductedDays
             ): void {
@@ -5849,6 +5881,8 @@ class LeaveApplicationController extends Controller
                     'status' => LeaveApplication::STATUS_APPROVED,
                     'hr_id' => $hr->id,
                     'hr_approved_at' => now(),
+                    'recall_effective_date' => $updatedRecallEffectiveDate,
+                    'recall_selected_dates' => $updatedRecallDateKeys !== [] ? $updatedRecallDateKeys : null,
                     'remarks' => $request->input('remarks'),
                 ]);
 
@@ -9030,9 +9064,7 @@ class LeaveApplicationController extends Controller
         }
 
         $storedRecallDateSet = array_fill_keys(
-            $this->normalizeRecallDateKeys(
-                is_array($app->recall_selected_dates) ? $app->recall_selected_dates : []
-            ),
+            $this->resolveEffectiveStoredRecallDateKeys($app),
             true
         );
 
@@ -9056,6 +9088,67 @@ class LeaveApplicationController extends Controller
         sort($normalizedDateKeys);
 
         return $normalizedDateKeys;
+    }
+
+    private function resolveEffectiveStoredRecallDateKeys(LeaveApplication $app): array
+    {
+        $storedRecallDateKeys = $this->normalizeRecallDateKeys(
+            is_array($app->recall_selected_dates) ? $app->recall_selected_dates : []
+        );
+        if ($storedRecallDateKeys === []) {
+            return [];
+        }
+
+        $selectedDateKeys = $this->normalizeRecallDateKeys(
+            is_array($app->resolvedSelectedDates()) ? $app->resolvedSelectedDates() : []
+        );
+        if ($selectedDateKeys === []) {
+            return $storedRecallDateKeys;
+        }
+
+        $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
+        $latestUpdateStatus = strtoupper(trim((string) ($latestUpdateMeta['status'] ?? '')));
+        $latestUpdateReviewedAt = $latestUpdateMeta['reviewed_at'] ?? null;
+        $latestRecallLoggedAt = $this->resolveLatestRecallLoggedAt($app);
+
+        if (
+            $latestUpdateStatus === LeaveApplicationUpdateRequest::STATUS_APPROVED
+            && $latestUpdateReviewedAt instanceof \DateTimeInterface
+            && $latestRecallLoggedAt instanceof \DateTimeInterface
+            && $latestUpdateReviewedAt->getTimestamp() > $latestRecallLoggedAt->getTimestamp()
+        ) {
+            $selectedDateSet = array_fill_keys($selectedDateKeys, true);
+            $storedRecallDateKeys = array_values(array_filter(
+                $storedRecallDateKeys,
+                static fn (string $dateKey): bool => !isset($selectedDateSet[$dateKey])
+            ));
+        }
+
+        $storedRecallDateKeys = array_values(array_unique($storedRecallDateKeys));
+        sort($storedRecallDateKeys);
+
+        return $storedRecallDateKeys;
+    }
+
+    private function resolveLatestRecallLoggedAt(LeaveApplication $app): ?\DateTimeInterface
+    {
+        $logs = $app->relationLoaded('logs')
+            ? $app->logs
+            : $app->logs()->get();
+
+        if (!$logs instanceof Collection || $logs->isEmpty()) {
+            return null;
+        }
+
+        $latestRecallLog = $logs
+            ->filter(fn (mixed $entry): bool => $entry instanceof LeaveApplicationLog
+                && $entry->action === LeaveApplicationLog::ACTION_HR_RECALLED)
+            ->sortByDesc(fn (LeaveApplicationLog $entry) => $entry->created_at?->getTimestamp() ?? PHP_INT_MIN)
+            ->first();
+
+        return $latestRecallLog instanceof LeaveApplicationLog
+            ? $latestRecallLog->created_at
+            : null;
     }
 
     private function normalizeRecallDateKeys(array $rawDates): array
@@ -9646,10 +9739,12 @@ class LeaveApplicationController extends Controller
         $deductibleDays = $this->resolveApplicationDeductibleDays($app);
         $ctoDeductedHours = $this->resolveApplicationCtoDeductedHours($app);
         $hasPendingApprovedUpdateRequest = $this->hasPendingApprovedUpdateRequest($app);
-        $displayStatus = $hasPendingApprovedUpdateRequest
+        $displayStatus = $this->shouldPresentApprovedWhilePendingUpdate($app, $hasPendingApprovedUpdateRequest)
             ? $this->statusToFrontend(LeaveApplication::STATUS_APPROVED)
             : $this->statusToFrontend($app->status);
         $queueMeta = $this->resolveLeaveHrQueueMeta($app);
+
+        $effectiveRecallDateKeys = $this->resolveEffectiveStoredRecallDateKeys($app);
 
         $data = [
             'id' => $app->id,
@@ -9730,8 +9825,8 @@ class LeaveApplicationController extends Controller
             'hr_approved_at' => $app->hr_approved_at?->toIso8601String(),
             'recallEffectiveDate' => $app->recall_effective_date?->toDateString(),
             'recall_effective_date' => $app->recall_effective_date?->toDateString(),
-            'recallSelectedDates' => is_array($app->recall_selected_dates) ? array_values($app->recall_selected_dates) : null,
-            'recall_selected_dates' => is_array($app->recall_selected_dates) ? array_values($app->recall_selected_dates) : null,
+            'recallSelectedDates' => $effectiveRecallDateKeys !== [] ? $effectiveRecallDateKeys : null,
+            'recall_selected_dates' => $effectiveRecallDateKeys !== [] ? $effectiveRecallDateKeys : null,
             'employeeName' => $applicantName,
             'employee_name' => $applicantName,
             'applicantName' => $applicantName,
