@@ -28,17 +28,17 @@ class HRAccountSeeder extends Seeder
             $accounts = [
                 [
                     'username' => 'hr',
-                    'full_name' => 'Jake Baranda',
+                    'full_name' => 'HR ADMIN',
                     'position' => 'HR',
                 ],
                 [
                     'username' => 'hr2',
-                    'full_name' => 'Kenneth Andallaza',
+                    'full_name' => 'HR ADMIN 2',
                     'position' => 'HR',
                 ],
                 [
                     'username' => 'hr3',
-                    'full_name' => 'Christian Andallaza',
+                    'full_name' => 'HR ADMIN 3',
                     'position' => 'HR',
                 ],
             ];
