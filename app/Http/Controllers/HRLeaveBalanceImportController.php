@@ -17,6 +17,42 @@ use Illuminate\Support\Facades\DB;
  */
 class HRLeaveBalanceImportController extends Controller
 {
+    public function availableTypes(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        if (!$user instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can view available leave balance types.'], 403);
+        }
+
+        $validated = $request->validate([
+            'employee_control_no' => ['required', 'string', 'max:50', 'regex:/^\d+$/'],
+        ]);
+
+        $employeeControlNo = trim((string) ($validated['employee_control_no'] ?? ''));
+        $employee = HrisEmployee::findByControlNo($employeeControlNo);
+        if (!$employee) {
+            return response()->json(['message' => 'Employee not found.'], 422);
+        }
+
+        [$allCreditLeaveTypes, $allowedCreditLeaveTypes] = $this->resolveManualCreditLeaveTypeSetsForEmployee($employee);
+        if ($allCreditLeaveTypes->isEmpty()) {
+            return response()->json([
+                'message' => 'No credit-based leave types are configured.',
+            ], 422);
+        }
+
+        return response()->json([
+            'employee_control_no' => (string) ($employee->control_no ?? $employeeControlNo),
+            'employee_name' => $this->formatEmployeeNameForStorage($employee),
+            'employment_status' => LeaveType::formatEmploymentStatusLabel($employee->status ?? null)
+                ?? trim((string) ($employee->status ?? '')),
+            'employment_status_key' => LeaveType::normalizeEmploymentStatusKey($employee->status ?? null),
+            'leave_types' => $allowedCreditLeaveTypes
+                ->map(fn (LeaveType $leaveType): array => $this->formatManualCreditLeaveTypePayload($leaveType))
+                ->values(),
+        ]);
+    }
+
     /**
      * HR-only: manually add leave credits for an employee (one-time use per employee).
      */
@@ -45,16 +81,15 @@ class HRLeaveBalanceImportController extends Controller
             ], 422);
         }
 
-        $allCreditLeaveTypes = LeaveType::query()
-            ->where('is_credit_based', true)
-            ->orderBy('name')
-            ->get(['id', 'name', 'max_days']);
-        $creditLeaveTypes = $allCreditLeaveTypes
-            ->reject(fn (LeaveType $leaveType) => $this->isManualCreditExcludedLeaveType($leaveType))
-            ->values();
+        $employee = HrisEmployee::findByControlNo($employeeControlNo);
+        if (!$employee) {
+            return response()->json(['message' => 'Employee not found.'], 422);
+        }
+
+        [$allCreditLeaveTypes, $creditLeaveTypes] = $this->resolveManualCreditLeaveTypeSetsForEmployee($employee);
         if ($creditLeaveTypes->isEmpty()) {
             return response()->json([
-                'message' => 'No credit-based leave types are configured.',
+                'message' => 'No credit-based leave types are available for this employee.',
             ], 422);
         }
 
@@ -73,23 +108,37 @@ class HRLeaveBalanceImportController extends Controller
                 continue;
             }
 
-            if (array_key_exists($leaveTypeId, $submittedTypeIds)) {
+            $allCreditLeaveType = $allCreditLeaveTypesById->get($leaveTypeId);
+            if (!$allCreditLeaveType instanceof LeaveType) {
                 return response()->json([
-                    'message' => 'Duplicate leave type entries are not allowed.',
+                    'message' => 'Only credit-based leave types can have balances.',
                 ], 422);
+            }
+
+            if ($this->isManualCreditExcludedLeaveType($allCreditLeaveType)) {
+                if ($balanceValue > 0) {
+                    return response()->json([
+                        'message' => $this->manualCreditExcludedMessage($allCreditLeaveType),
+                    ], 422);
+                }
+
+                continue;
             }
 
             $leaveType = $creditLeaveTypesById->get($leaveTypeId);
             if (!$leaveType instanceof LeaveType) {
-                $blockedLeaveType = $allCreditLeaveTypesById->get($leaveTypeId);
-                if ($blockedLeaveType instanceof LeaveType && $this->isManualCreditExcludedLeaveType($blockedLeaveType)) {
+                if ($balanceValue > 0) {
                     return response()->json([
-                        'message' => $this->manualCreditExcludedMessage($blockedLeaveType),
+                        'message' => $this->manualCreditStatusRestrictedMessage($allCreditLeaveType, $employee),
                     ], 422);
                 }
 
+                continue;
+            }
+
+            if (array_key_exists($leaveTypeId, $submittedTypeIds)) {
                 return response()->json([
-                    'message' => 'Only credit-based leave types can have balances.',
+                    'message' => 'Duplicate leave type entries are not allowed.',
                 ], 422);
             }
 
@@ -142,11 +191,6 @@ class HRLeaveBalanceImportController extends Controller
             ], 422);
         }
 
-        $employee = HrisEmployee::findByControlNo($employeeControlNo);
-        if (!$employee) {
-            return response()->json(['message' => 'Employee not found.'], 422);
-        }
-
         $leaveTypesById = LeaveType::query()
             ->whereIn('id', array_keys($entries))
             ->get()
@@ -163,6 +207,14 @@ class HRLeaveBalanceImportController extends Controller
             if ($this->isManualCreditExcludedLeaveType($leaveType)) {
                 return response()->json([
                     'message' => $this->manualCreditExcludedMessage($leaveType),
+                ], 422);
+            }
+            if (
+                $this->employeeHasResolvedEmploymentStatus($employee)
+                && !$leaveType->allowsEmploymentStatus($employee->status ?? null)
+            ) {
+                return response()->json([
+                    'message' => $this->manualCreditStatusRestrictedMessage($leaveType, $employee),
                 ], 422);
             }
         }
@@ -303,6 +355,60 @@ class HRLeaveBalanceImportController extends Controller
         }
 
         return $entries;
+    }
+
+    private function resolveManualCreditLeaveTypeSetsForEmployee(object $employee): array
+    {
+        $allCreditLeaveTypes = LeaveType::query()
+            ->withoutLegacySpecialPrivilegeAliases()
+            ->where('is_credit_based', true)
+            ->orderBy('name')
+            ->get(['id', 'name', 'max_days', 'allowed_status']);
+
+        $allowedCreditLeaveTypes = $allCreditLeaveTypes
+            ->reject(fn (LeaveType $leaveType) => $this->isManualCreditExcludedLeaveType($leaveType))
+            ->filter(fn (LeaveType $leaveType): bool => !$this->employeeHasResolvedEmploymentStatus($employee)
+                || $leaveType->allowsEmploymentStatus($employee->status ?? null))
+            ->values();
+
+        return [$allCreditLeaveTypes, $allowedCreditLeaveTypes];
+    }
+
+    private function employeeHasResolvedEmploymentStatus(object $employee): bool
+    {
+        return LeaveType::normalizeEmploymentStatusKey($employee->status ?? null) !== null;
+    }
+
+    private function manualCreditStatusRestrictedMessage(LeaveType $leaveType, object $employee): string
+    {
+        $allowedStatusLabels = $leaveType->allowedStatusLabels();
+        if ($allowedStatusLabels !== []) {
+            return sprintf(
+                '%s is only available for %s.',
+                $leaveType->name,
+                implode(', ', $allowedStatusLabels)
+            );
+        }
+
+        $statusLabel = LeaveType::formatEmploymentStatusLabel($employee->status ?? null)
+            ?? trim((string) ($employee->status ?? ''));
+
+        return sprintf(
+            '%s is not available for %s employees.',
+            $leaveType->name,
+            $statusLabel !== '' ? $statusLabel : 'selected'
+        );
+    }
+
+    private function formatManualCreditLeaveTypePayload(LeaveType $leaveType): array
+    {
+        return [
+            'id' => (int) $leaveType->id,
+            'name' => trim((string) ($leaveType->name ?? '')),
+            'max_days' => $leaveType->max_days !== null ? (int) $leaveType->max_days : null,
+            'allowed_status' => $leaveType->normalizedAllowedStatuses(),
+            'allowed_status_labels' => $leaveType->allowedStatusLabels(),
+        ];
     }
 
     private function isManualCreditExcludedLeaveType(LeaveType $leaveType): bool

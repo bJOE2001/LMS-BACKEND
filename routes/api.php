@@ -145,6 +145,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::delete('/work-schedules/overrides/{id}', [HRWorkScheduleController::class, 'destroyOverride']);
 
         // Leave balance management
+        Route::get('/leave-balances/available-types', [HRLeaveBalanceImportController::class, 'availableTypes']);
         Route::post('/leave-balances', [HRLeaveBalanceImportController::class, 'store']);
 
         // User management
