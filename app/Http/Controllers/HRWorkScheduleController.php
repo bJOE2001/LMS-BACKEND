@@ -46,10 +46,14 @@ class HRWorkScheduleController extends Controller
             ], 422);
         }
 
+        $repricingSummary = app(LeaveApplicationController::class)
+            ->repriceFutureApprovedApplicationsForScheduleChange();
+
         return response()->json([
             'message' => 'Default work schedule updated successfully.',
             'default_schedule' => app(WorkScheduleService::class)->getResolvedDefaultSchedule(),
             'setting' => $setting,
+            'repricing' => $repricingSummary,
         ]);
     }
 
@@ -83,9 +87,13 @@ class HRWorkScheduleController extends Controller
             ], 422);
         }
 
+        $repricingSummary = app(LeaveApplicationController::class)
+            ->repriceFutureApprovedApplicationsForScheduleChange($employeeControlNo);
+
         return response()->json([
             'message' => 'Employee work schedule override created successfully.',
             'employee_override' => app(WorkScheduleService::class)->formatOverride($override),
+            'repricing' => $repricingSummary,
         ], 201);
     }
 
@@ -114,9 +122,13 @@ class HRWorkScheduleController extends Controller
             ], 422);
         }
 
+        $repricingSummary = app(LeaveApplicationController::class)
+            ->repriceFutureApprovedApplicationsForScheduleChange((string) ($override->employee_control_no ?? ''));
+
         return response()->json([
             'message' => 'Employee work schedule override updated successfully.',
             'employee_override' => app(WorkScheduleService::class)->formatOverride($override),
+            'repricing' => $repricingSummary,
         ]);
     }
 
@@ -132,10 +144,15 @@ class HRWorkScheduleController extends Controller
             return response()->json(['message' => 'Employee work schedule override not found.'], 404);
         }
 
+        $employeeControlNo = (string) ($override->employee_control_no ?? '');
         $override->delete();
+
+        $repricingSummary = app(LeaveApplicationController::class)
+            ->repriceFutureApprovedApplicationsForScheduleChange($employeeControlNo);
 
         return response()->json([
             'message' => 'Employee work schedule override removed successfully.',
+            'repricing' => $repricingSummary,
         ]);
     }
 
