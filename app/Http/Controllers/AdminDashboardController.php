@@ -2049,26 +2049,59 @@ class AdminDashboardController extends Controller
     private function getCertificationLeaveCredits(LeaveApplication $app, array $leaveBalanceDirectory = []): array
     {
         $currentLeaveBalances = $this->getCurrentLeaveBalancesForApp($app, $leaveBalanceDirectory);
-        $vacBalance = $this->findLeaveBalanceByName($currentLeaveBalances, 'Vacation Leave');
-        $sickBalance = $this->findLeaveBalanceByName($currentLeaveBalances, 'Sick Leave');
+        $vacBalance = round(max($this->findLeaveBalanceByName($currentLeaveBalances, 'Vacation Leave'), 0.0), 2);
+        $sickBalance = round(max($this->findLeaveBalanceByName($currentLeaveBalances, 'Sick Leave'), 0.0), 2);
+        $applicationStatus = strtoupper(trim((string) ($app->status ?? '')));
+        $isPendingStatus = in_array($applicationStatus, [
+            LeaveApplication::STATUS_PENDING_ADMIN,
+            LeaveApplication::STATUS_PENDING_HR,
+        ], true);
+        $deductionAlreadyApplied = $applicationStatus === LeaveApplication::STATUS_APPROVED
+            || ($isPendingStatus && $this->resolvePendingApprovedUpdateRequestRecord($app) !== null);
 
-        $days = (float) $app->total_days;
+        $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
+        $deductibleDays = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
+            ? 0.0
+            : round(max((float) ($app->deductible_days ?? $app->total_days ?? 0), 0.0), 2);
+
         $leaveTypeName = trim((string) ($app->leaveType?->name ?? ''));
-        $vacLess = strcasecmp($leaveTypeName, 'Vacation Leave') === 0 ? $days : 0.0;
-        $sickLess = strcasecmp($leaveTypeName, 'Sick Leave') === 0 ? $days : 0.0;
+        $linkedVacationDeduction = round(max((float) ($app->linked_vacation_leave_deducted_days ?? 0.0), 0.0), 2);
+
+        $vacLess = 0.0;
+        $sickLess = 0.0;
+        if (strcasecmp($leaveTypeName, 'Vacation Leave') === 0) {
+            $vacLess = $deductibleDays;
+        } elseif (strcasecmp($leaveTypeName, 'Sick Leave') === 0) {
+            $sickLess = $deductibleDays;
+        } elseif ($linkedVacationDeduction > 0.0) {
+            $vacLess = $linkedVacationDeduction;
+        }
+
+        $vacTotalEarned = $deductionAlreadyApplied
+            ? round($vacBalance + $vacLess, 2)
+            : $vacBalance;
+        $sickTotalEarned = $deductionAlreadyApplied
+            ? round($sickBalance + $sickLess, 2)
+            : $sickBalance;
+        $vacBalanceAfterApplication = $deductionAlreadyApplied
+            ? $vacBalance
+            : round(max($vacBalance - $vacLess, 0.0), 2);
+        $sickBalanceAfterApplication = $deductionAlreadyApplied
+            ? $sickBalance
+            : round(max($sickBalance - $sickLess, 0.0), 2);
 
         return [
             'vacation' => [
-                'total_earned' => $vacBalance,
+                'total_earned' => $vacTotalEarned,
                 'less_this_application' => $vacLess,
                 'balance' => $vacBalance,
-                'balance_after_application' => max($vacBalance - $vacLess, 0.0),
+                'balance_after_application' => $vacBalanceAfterApplication,
             ],
             'sick' => [
-                'total_earned' => $sickBalance,
+                'total_earned' => $sickTotalEarned,
                 'less_this_application' => $sickLess,
                 'balance' => $sickBalance,
-                'balance_after_application' => max($sickBalance - $sickLess, 0.0),
+                'balance_after_application' => $sickBalanceAfterApplication,
             ],
             'as_of_date' => $app->created_at?->format('F j, Y') ?? now()->format('F j, Y'),
         ];

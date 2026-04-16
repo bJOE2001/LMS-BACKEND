@@ -9819,6 +9819,7 @@ class LeaveApplicationController extends Controller
             'leaveBalances' => $leaveBalanceSnapshot,
             'leave_balances' => $leaveBalanceSnapshot,
             'employee_leave_balances' => $leaveBalanceSnapshot,
+            'certificationLeaveCredits' => $this->buildCertificationLeaveCredits($app, $leaveBalanceSnapshot),
             'admin_id' => $app->admin_id,
             'hr_id' => $app->hr_id,
             'admin_approved_at' => $app->admin_approved_at?->toIso8601String(),
@@ -9914,6 +9915,389 @@ class LeaveApplicationController extends Controller
         return response()->json(['message' => 'Attachment file not found.'], 404);
     }
 
+    /**
+     * Reprice future leave applications using the current work-schedule
+     * deductions and reconcile affected leave balances when needed.
+     *
+     * @return array{
+     *   checked:int,
+     *   repriced:int,
+     *   skipped:int,
+     *   failed:int,
+     *   updated_application_ids:array<int,int>,
+     *   errors:array<int,array{application_id:int,reason:string}>
+     * }
+     */
+    public function repriceFutureApprovedApplicationsForScheduleChange(?string $employeeControlNo = null): array
+    {
+        $stats = [
+            'checked' => 0,
+            'repriced' => 0,
+            'skipped' => 0,
+            'failed' => 0,
+            'updated_application_ids' => [],
+            'errors' => [],
+        ];
+
+        $query = LeaveApplication::query()
+            ->with('leaveType')
+            ->whereIn('status', [
+                LeaveApplication::STATUS_APPROVED,
+                LeaveApplication::STATUS_PENDING_ADMIN,
+                LeaveApplication::STATUS_PENDING_HR,
+            ])
+            ->where(function ($nestedQuery): void {
+                $nestedQuery->whereNull('is_monetization')
+                    ->orWhere('is_monetization', false);
+            });
+
+        $targetControlNo = trim((string) ($employeeControlNo ?? ''));
+        if ($targetControlNo !== '') {
+            $controlNoCandidates = $this->controlNoCandidates($targetControlNo);
+            if ($controlNoCandidates === []) {
+                return $stats;
+            }
+
+            $query->whereIn('employee_control_no', $controlNoCandidates);
+        }
+
+        $applications = $query
+            ->orderBy('id')
+            ->get();
+
+        if ($applications->isEmpty()) {
+            return $stats;
+        }
+
+        $today = now()->toDateString();
+        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
+        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+
+        foreach ($applications as $application) {
+            $stats['checked']++;
+
+            $lastLeaveDate = $this->resolveApplicationLastLeaveDate($application);
+            if ($lastLeaveDate === null || $lastLeaveDate < $today) {
+                $stats['skipped']++;
+                continue;
+            }
+
+            $leaveType = $application->leaveType
+                ?? LeaveType::query()->find((int) $application->leave_type_id);
+            if (!$leaveType instanceof LeaveType) {
+                $stats['failed']++;
+                $stats['errors'][] = [
+                    'application_id' => (int) $application->id,
+                    'reason' => 'Leave type could not be resolved.',
+                ];
+                continue;
+            }
+            $application->setRelation('leaveType', $leaveType);
+
+            $policyResolution = $this->applyRegularLeavePolicy(
+                $leaveType,
+                (float) ($application->total_days ?? 0),
+                $application->resolvedSelectedDates(),
+                is_array($application->selected_date_coverage) ? $application->selected_date_coverage : null,
+                is_array($application->selected_date_pay_status) ? $application->selected_date_pay_status : null,
+                $application->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY,
+                false,
+                (bool) ($application->attachment_submitted ?? false),
+                $this->trimNullableString($application->attachment_reference ?? null),
+                false,
+                $application->created_at ?? null,
+                $application->start_date?->toDateString(),
+                $application->end_date?->toDateString(),
+                (string) ($application->employee_control_no ?? '')
+            );
+
+            if ($policyResolution instanceof JsonResponse) {
+                $stats['failed']++;
+                $stats['errors'][] = [
+                    'application_id' => (int) $application->id,
+                    'reason' => 'Policy resolution failed during repricing.',
+                ];
+                continue;
+            }
+
+            $targetPayMode = $policyResolution['pay_mode'];
+            $targetSelectedDatePayStatus = $policyResolution['selected_date_pay_status'];
+            $targetDeductibleDays = round(max((float) ($policyResolution['deductible_days'] ?? 0.0), 0.0), 2);
+            $targetCtoDeductedHours = round(max((float) ($policyResolution['cto_deducted_hours'] ?? 0.0), 0.0), 2);
+
+            $sourcePayMode = $this->normalizePayMode($application->pay_mode ?? null, false);
+            $sourceDeductibleDays = $this->resolveApplicationDeductibleDays($application);
+            $sourceCtoDeductedHours = $this->resolveApplicationCtoDeductedHours($application);
+            $applicationStatus = strtoupper(trim((string) ($application->status ?? '')));
+            $isPendingStatus = in_array($applicationStatus, [
+                LeaveApplication::STATUS_PENDING_ADMIN,
+                LeaveApplication::STATUS_PENDING_HR,
+            ], true);
+            $shouldReconcileBalances = $applicationStatus === LeaveApplication::STATUS_APPROVED
+                || ($isPendingStatus && $this->hasPendingApprovedUpdateRequest($application));
+
+            $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId((int) $application->leave_type_id)
+                ?? (int) $application->leave_type_id;
+            $requestedTotalDays = round((float) ($application->total_days ?? $sourceDeductibleDays), 2);
+
+            $sourceDeductsBalance = $this->applicationDeductsEmployeeBalance(
+                false,
+                $leaveType,
+                $sourcePayMode
+            );
+            $targetDeductsBalance = $this->applicationDeductsEmployeeBalance(
+                false,
+                $leaveType,
+                $targetPayMode
+            );
+
+            $sourcePrimaryDeduction = $sourceDeductsBalance
+                ? $this->resolveStoredPrimaryLeaveDeduction($application, $leaveType, $sourceDeductibleDays)
+                : 0.0;
+            $sourceLinkedForcedDeduction = $sourceDeductsBalance
+                ? $this->resolveStoredLinkedForcedLeaveDeduction($application, $leaveType, $sourceDeductibleDays)
+                : 0.0;
+            $sourceLinkedVacationDeduction = $sourceDeductsBalance
+                ? $this->resolveStoredLinkedVacationLeaveDeduction($application, $leaveType, $sourceDeductibleDays)
+                : 0.0;
+
+            $targetPrimaryDeduction = $targetDeductsBalance
+                ? $this->resolvePrimaryLeaveTrackedDeductionDays(
+                    $leaveType,
+                    $canonicalLeaveTypeId,
+                    false,
+                    $requestedTotalDays,
+                    $targetDeductibleDays,
+                    $forcedLeaveTypeId,
+                    $vacationLeaveTypeId
+                )
+                : 0.0;
+
+            $targetLinkedForcedDeduction = ($targetDeductsBalance && $this->shouldLeaveTypeDeductForcedLeave(
+                $leaveType,
+                $canonicalLeaveTypeId,
+                false,
+                $forcedLeaveTypeId
+            ))
+                ? round(max($targetDeductibleDays, 0.0), 2)
+                : 0.0;
+
+            $targetLinkedVacationDeduction = $targetDeductsBalance
+                ? $this->resolveLeaveTypeVacationLeaveDeductionDays(
+                    $leaveType,
+                    $canonicalLeaveTypeId,
+                    false,
+                    $requestedTotalDays,
+                    $targetDeductibleDays,
+                    $forcedLeaveTypeId,
+                    $vacationLeaveTypeId
+                )
+                : 0.0;
+
+            $deltaPrimaryDeduction = round($targetPrimaryDeduction - $sourcePrimaryDeduction, 2);
+            $deltaLinkedForcedDeduction = round($targetLinkedForcedDeduction - $sourceLinkedForcedDeduction, 2);
+            $deltaLinkedVacationDeduction = round($targetLinkedVacationDeduction - $sourceLinkedVacationDeduction, 2);
+
+            if (abs($deltaPrimaryDeduction) < 0.01) {
+                $deltaPrimaryDeduction = 0.0;
+            }
+            if (abs($deltaLinkedForcedDeduction) < 0.01) {
+                $deltaLinkedForcedDeduction = 0.0;
+            }
+            if (abs($deltaLinkedVacationDeduction) < 0.01) {
+                $deltaLinkedVacationDeduction = 0.0;
+            }
+
+            if (!$shouldReconcileBalances) {
+                $deltaPrimaryDeduction = 0.0;
+                $deltaLinkedForcedDeduction = 0.0;
+                $deltaLinkedVacationDeduction = 0.0;
+            }
+
+            $targetStoredCtoDeductedHours = $this->hasLeaveApplicationCtoHoursColumn()
+                && $this->isCtoLeaveType($leaveType, $canonicalLeaveTypeId)
+                && $targetCtoDeductedHours > 0
+                    ? $targetCtoDeductedHours
+                    : null;
+
+            $hasApplicationFieldChanges = $sourcePayMode !== $targetPayMode
+                || round($sourceDeductibleDays, 2) !== $targetDeductibleDays
+                || round($sourceCtoDeductedHours, 2) !== round(max((float) ($targetStoredCtoDeductedHours ?? 0.0), 0.0), 2)
+                || (is_array($application->selected_date_pay_status) ? $application->selected_date_pay_status : null) !== $targetSelectedDatePayStatus
+                || round(max((float) ($application->linked_forced_leave_deducted_days ?? 0.0), 0.0), 2) !== $targetLinkedForcedDeduction
+                || round(max((float) ($application->linked_vacation_leave_deducted_days ?? 0.0), 0.0), 2) !== $targetLinkedVacationDeduction;
+
+            if (
+                !$hasApplicationFieldChanges
+                && $deltaPrimaryDeduction === 0.0
+                && $deltaLinkedForcedDeduction === 0.0
+                && $deltaLinkedVacationDeduction === 0.0
+            ) {
+                $stats['skipped']++;
+                continue;
+            }
+
+            $balanceConflictCode = 'HR_SCHEDULE_REPRICE_BALANCE_CONFLICT_' . (int) $application->id;
+
+            try {
+                DB::transaction(function () use (
+                    $application,
+                    $canonicalLeaveTypeId,
+                    $forcedLeaveTypeId,
+                    $vacationLeaveTypeId,
+                    $deltaPrimaryDeduction,
+                    $deltaLinkedForcedDeduction,
+                    $deltaLinkedVacationDeduction,
+                    $shouldReconcileBalances,
+                    $balanceConflictCode,
+                    $targetPayMode,
+                    $targetSelectedDatePayStatus,
+                    $targetDeductibleDays,
+                    $targetStoredCtoDeductedHours,
+                    $targetLinkedForcedDeduction,
+                    $targetLinkedVacationDeduction,
+                    $leaveType
+                ): void {
+                    if ($shouldReconcileBalances) {
+                        $this->applyScheduleRepricingBalanceDelta(
+                            $application,
+                            $canonicalLeaveTypeId,
+                            $deltaPrimaryDeduction,
+                            $balanceConflictCode
+                        );
+
+                        if ($forcedLeaveTypeId !== null) {
+                            $this->applyScheduleRepricingBalanceDelta(
+                                $application,
+                                $forcedLeaveTypeId,
+                                $deltaLinkedForcedDeduction,
+                                $balanceConflictCode
+                            );
+                        }
+
+                        if ($vacationLeaveTypeId !== null) {
+                            $this->applyScheduleRepricingBalanceDelta(
+                                $application,
+                                $vacationLeaveTypeId,
+                                $deltaLinkedVacationDeduction,
+                                $balanceConflictCode
+                            );
+                        }
+                    }
+
+                    $application->update([
+                        'pay_mode' => $targetPayMode,
+                        'selected_date_pay_status' => $targetSelectedDatePayStatus,
+                        'deductible_days' => $targetDeductibleDays,
+                        'cto_deducted_hours' => $targetStoredCtoDeductedHours,
+                        'linked_forced_leave_deducted_days' => $targetLinkedForcedDeduction,
+                        'linked_vacation_leave_deducted_days' => $targetLinkedVacationDeduction,
+                    ]);
+
+                    if ($application->employee_control_no && $this->isCtoLeaveType($leaveType, $canonicalLeaveTypeId)) {
+                        $this->syncEmployeeCtoBalance((string) $application->employee_control_no, true);
+                    }
+                });
+            } catch (\RuntimeException $exception) {
+                if ($exception->getMessage() !== $balanceConflictCode) {
+                    throw $exception;
+                }
+
+                $stats['failed']++;
+                $stats['errors'][] = [
+                    'application_id' => (int) $application->id,
+                    'reason' => 'Insufficient balance while repricing leave.',
+                ];
+                continue;
+            }
+
+            $stats['repriced']++;
+            $stats['updated_application_ids'][] = (int) $application->id;
+        }
+
+        return $stats;
+    }
+
+    private function applyScheduleRepricingBalanceDelta(
+        LeaveApplication $application,
+        int $leaveTypeId,
+        float $deltaDays,
+        string $balanceConflictCode
+    ): void {
+        $normalizedDeltaDays = round($deltaDays, 2);
+        if ($leaveTypeId <= 0 || abs($normalizedDeltaDays) < 0.01) {
+            return;
+        }
+
+        if ($application->employee_control_no) {
+            $balance = $this->findPreferredEmployeeLeaveBalanceRecord(
+                (string) $application->employee_control_no,
+                $leaveTypeId,
+                true
+            );
+
+            if (!$balance) {
+                if ($normalizedDeltaDays > 0) {
+                    throw new \RuntimeException($balanceConflictCode);
+                }
+
+                $canonicalControlNo = trim((string) (
+                    $this->findEmployeeByControlNo((string) $application->employee_control_no)?->control_no
+                    ?? $application->employee_control_no
+                ));
+                if ($canonicalControlNo === '') {
+                    throw new \RuntimeException($balanceConflictCode);
+                }
+
+                $balance = LeaveBalance::query()->create([
+                    'employee_control_no' => $canonicalControlNo,
+                    'leave_type_id' => $leaveTypeId,
+                    'balance' => 0,
+                    'year' => (int) now()->year,
+                ]);
+            }
+
+            if ($normalizedDeltaDays > 0) {
+                if ((float) $balance->balance + 1e-9 < $normalizedDeltaDays) {
+                    throw new \RuntimeException($balanceConflictCode);
+                }
+
+                $balance->decrement('balance', $normalizedDeltaDays);
+                return;
+            }
+
+            $balance->increment('balance', abs($normalizedDeltaDays));
+            return;
+        }
+
+        if ($application->applicant_admin_id) {
+            $balance = $this->findAdminEmployeeLeaveBalance(
+                (int) $application->applicant_admin_id,
+                $leaveTypeId,
+                true
+            );
+
+            if (!$balance) {
+                if ($normalizedDeltaDays > 0) {
+                    throw new \RuntimeException($balanceConflictCode);
+                }
+
+                return;
+            }
+
+            if ($normalizedDeltaDays > 0) {
+                if ((float) $balance->balance + 1e-9 < $normalizedDeltaDays) {
+                    throw new \RuntimeException($balanceConflictCode);
+                }
+
+                $balance->decrement('balance', $normalizedDeltaDays);
+                return;
+            }
+
+            $balance->increment('balance', abs($normalizedDeltaDays));
+        }
+    }
+
     private function getApplicationLeaveBalanceSnapshot(LeaveApplication $app): array
     {
         static $balanceSnapshotCache = [];
@@ -9985,6 +10369,78 @@ class LeaveApplicationController extends Controller
         }
 
         return null;
+    }
+
+    private function findLeaveTypeBalanceByNameInSnapshot(array $snapshot, string $leaveTypeName): float
+    {
+        foreach ($snapshot as $entry) {
+            if (strcasecmp((string) ($entry['leave_type_name'] ?? ''), $leaveTypeName) === 0) {
+                return round(max((float) ($entry['balance'] ?? 0.0), 0.0), 2);
+            }
+        }
+
+        return 0.0;
+    }
+
+    private function buildCertificationLeaveCredits(LeaveApplication $app, array $leaveBalanceSnapshot = []): array
+    {
+        $vacationCurrentBalance = $this->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Vacation Leave');
+        $sickCurrentBalance = $this->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Sick Leave');
+        $applicationStatus = strtoupper(trim((string) ($app->status ?? '')));
+        $isPendingStatus = in_array($applicationStatus, [
+            LeaveApplication::STATUS_PENDING_ADMIN,
+            LeaveApplication::STATUS_PENDING_HR,
+        ], true);
+        $deductionAlreadyApplied = $applicationStatus === LeaveApplication::STATUS_APPROVED
+            || ($isPendingStatus && $this->hasPendingApprovedUpdateRequest($app));
+
+        $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
+        $deductibleDays = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
+            ? 0.0
+            : round(max($this->resolveApplicationDeductibleDays($app), 0.0), 2);
+
+        $leaveTypeName = trim((string) ($app->leaveType?->name ?? ''));
+        $linkedVacationDeduction = round(max((float) ($app->linked_vacation_leave_deducted_days ?? 0.0), 0.0), 2);
+
+        $vacationLessThisApplication = 0.0;
+        $sickLessThisApplication = 0.0;
+
+        if (strcasecmp($leaveTypeName, 'Vacation Leave') === 0) {
+            $vacationLessThisApplication = $deductibleDays;
+        } elseif (strcasecmp($leaveTypeName, 'Sick Leave') === 0) {
+            $sickLessThisApplication = $deductibleDays;
+        } elseif ($linkedVacationDeduction > 0.0) {
+            $vacationLessThisApplication = $linkedVacationDeduction;
+        }
+
+        $vacationTotalEarned = $deductionAlreadyApplied
+            ? round($vacationCurrentBalance + $vacationLessThisApplication, 2)
+            : $vacationCurrentBalance;
+        $sickTotalEarned = $deductionAlreadyApplied
+            ? round($sickCurrentBalance + $sickLessThisApplication, 2)
+            : $sickCurrentBalance;
+        $vacationBalanceAfterApplication = $deductionAlreadyApplied
+            ? $vacationCurrentBalance
+            : round(max($vacationCurrentBalance - $vacationLessThisApplication, 0.0), 2);
+        $sickBalanceAfterApplication = $deductionAlreadyApplied
+            ? $sickCurrentBalance
+            : round(max($sickCurrentBalance - $sickLessThisApplication, 0.0), 2);
+
+        return [
+            'vacation' => [
+                'total_earned' => $vacationTotalEarned,
+                'less_this_application' => $vacationLessThisApplication,
+                'balance' => $vacationCurrentBalance,
+                'balance_after_application' => $vacationBalanceAfterApplication,
+            ],
+            'sick' => [
+                'total_earned' => $sickTotalEarned,
+                'less_this_application' => $sickLessThisApplication,
+                'balance' => $sickCurrentBalance,
+                'balance_after_application' => $sickBalanceAfterApplication,
+            ],
+            'as_of_date' => $app->created_at?->format('F j, Y') ?? now()->format('F j, Y'),
+        ];
     }
 
     private function mergeEmployeeControlNoInput(Request $request): void
