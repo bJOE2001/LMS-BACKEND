@@ -27,7 +27,7 @@ class LeaveBalanceAccrualHistory extends Model
         return [
             'leave_balance_id' => 'integer',
             'employee_control_no' => 'string',
-            'credits_added' => 'decimal:2',
+            'credits_added' => 'decimal:3',
             'accrual_date' => 'date',
         ];
     }

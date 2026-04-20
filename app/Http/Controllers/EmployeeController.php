@@ -32,6 +32,7 @@ class EmployeeController extends Controller
 {
     private const LEDGER_HOURS_PER_DAY = 8;
     private const LEDGER_MINUTES_PER_HOUR = 60;
+    private const LEDGER_DECIMAL_PRECISION = 3;
 
     /**
      * List departments for the filter dropdown.
@@ -282,7 +283,7 @@ class EmployeeController extends Controller
             );
         } else {
             $employees = $this->buildDepartmentAdminEmployeePaginator(
-                $departmentName,
+                $summaryDepartmentId,
                 $searchTerm,
                 $activeOnly,
                 $perPage,
@@ -290,7 +291,7 @@ class EmployeeController extends Controller
                 $departmentHeadLookup
             );
             $totalEmployees = $employees->total();
-            $statusCounts = $this->buildDepartmentAdminStatusCounts($departmentName, $searchTerm, $activeOnly);
+            $statusCounts = $this->buildDepartmentAdminStatusCounts($summaryDepartmentId, $searchTerm, $activeOnly);
 
             if (
                 $departmentHead
@@ -422,7 +423,7 @@ class EmployeeController extends Controller
     }
 
     /**
-     * Lightweight employee lookup for department-admin reassignment picker.
+     * Lightweight employee lookup for the department-admin "pull employee" dialog.
      */
     public function adminEmployeeOptions(Request $request): JsonResponse
     {
@@ -438,16 +439,11 @@ class EmployeeController extends Controller
 
         $searchTerm = trim((string) ($validated['search'] ?? ''));
         $limit = max(1, min(25, (int) ($validated['limit'] ?? 20)));
-        $adminDepartmentName = trim((string) ($admin->department?->name ?? ''));
+        $pulledEmployeeLookup = $this->loadPulledEmployeeControlNoLookup();
 
         $rows = HrisEmployee::allCached(true)
-            ->filter(function (object $employee) use ($searchTerm, $adminDepartmentName): bool {
-                $effectiveOffice = trim((string) ($employee->office ?? ''));
-
-                if (
-                    $adminDepartmentName !== ''
-                    && strcasecmp($effectiveOffice, $adminDepartmentName) === 0
-                ) {
+            ->filter(function (object $employee) use ($searchTerm, $pulledEmployeeLookup): bool {
+                if ($this->hasControlNoInLookup((string) ($employee->control_no ?? ''), $pulledEmployeeLookup)) {
                     return false;
                 }
 
@@ -503,33 +499,25 @@ class EmployeeController extends Controller
             return $admin;
         }
 
-        $employee = HrisEmployee::findByControlNo($controlNo);
-        if (!$employee) {
-            return response()->json([
-                'message' => 'Employee not found in HRIS records.',
-            ], 404);
-        }
-
-        $assignment = EmployeeDepartmentAssignment::query()
-            ->where('employee_control_no', trim((string) ($employee->control_no ?? '')))
-            ->first();
+        $assignment = $this->findPulledEmployeeAssignment($controlNo, (int) $admin->department_id);
 
         if (!$assignment) {
-            return response()->json([
-                'message' => 'Only reassigned employees can be removed from this department. Original HRIS employees cannot be deleted.',
-            ], 422);
-        }
+            $otherOfficeAssignment = $this->findPulledEmployeeAssignment($controlNo);
+            if ($otherOfficeAssignment) {
+                return response()->json([
+                    'message' => 'This employee is already pulled by another office.',
+                ], 403);
+            }
 
-        if ((int) $assignment->department_id !== (int) $admin->department_id) {
             return response()->json([
-                'message' => 'This employee is assigned to another LMS department.',
-            ], 403);
+                'message' => 'Employee is not in your pulled LMS employee list.',
+            ], 404);
         }
 
         $assignment->delete();
 
         return response()->json([
-            'message' => 'Employee removed from this department successfully.',
+            'message' => 'Employee removed from your pulled LMS employee list successfully.',
         ]);
     }
 
@@ -659,7 +647,7 @@ class EmployeeController extends Controller
         foreach ($otherTypeIds as $otherTypeId) {
             $otherRunningBalance += $this->resolveLedgerBalance($balancesByType, $otherTypeId);
         }
-        $otherRunningBalance = round($otherRunningBalance, 2);
+        $otherRunningBalance = $this->roundLedgerValue($otherRunningBalance);
         $runningBalances = [
             'vacation' => $this->resolveLedgerBalance($balancesByType, $trackedTypeIdsByKey['vacation'] ?? null),
             'sick' => $this->resolveLedgerBalance($balancesByType, $trackedTypeIdsByKey['sick'] ?? null),
@@ -701,7 +689,7 @@ class EmployeeController extends Controller
                         continue;
                     }
 
-                    $creditsAdded = round((float) $entry->credits_added, 2);
+                    $creditsAdded = $this->roundLedgerValue($entry->credits_added);
                     if ($creditsAdded <= 0) {
                         continue;
                     }
@@ -981,15 +969,14 @@ class EmployeeController extends Controller
             }
 
             $category = (string) ($transaction['category'] ?? '');
-            $amount = round((float) ($transaction['amount'] ?? 0), 2);
+            $amount = $this->roundLedgerValue($transaction['amount'] ?? 0);
             if ($amount <= 0) {
                 continue;
             }
 
-            $currentBalance = round((float) $runningBalances[$typeKey], 2);
-            $runningBalances[$typeKey] = round(
-                $currentBalance - (float) ($transaction['balance_delta'] ?? 0),
-                2
+            $currentBalance = $this->roundLedgerValue($runningBalances[$typeKey] ?? 0);
+            $runningBalances[$typeKey] = $this->roundLedgerValue(
+                $currentBalance - (float) ($transaction['balance_delta'] ?? 0)
             );
 
             $actionDate = (string) ($transaction['transaction_date'] ?? '');
@@ -1038,19 +1025,16 @@ class EmployeeController extends Controller
                     $ledgerRows[$rowIndex]['vacation_balance'] = $currentBalance;
                 }
                 if ($category === 'earned') {
-                    $ledgerRows[$rowIndex]['vacation_earned'] = round(
-                        (float) ($ledgerRows[$rowIndex]['vacation_earned'] ?? 0) + $amount,
-                        2
+                    $ledgerRows[$rowIndex]['vacation_earned'] = $this->roundLedgerValue(
+                        (float) ($ledgerRows[$rowIndex]['vacation_earned'] ?? 0) + $amount
                     );
                 } elseif ($category === 'deduction_with_pay') {
-                    $ledgerRows[$rowIndex]['vacation_abs_und_wp'] = round(
-                        (float) ($ledgerRows[$rowIndex]['vacation_abs_und_wp'] ?? 0) + $amount,
-                        2
+                    $ledgerRows[$rowIndex]['vacation_abs_und_wp'] = $this->roundLedgerValue(
+                        (float) ($ledgerRows[$rowIndex]['vacation_abs_und_wp'] ?? 0) + $amount
                     );
                 } elseif ($category === 'deduction_without_pay') {
-                    $ledgerRows[$rowIndex]['vacation_abs_und_wop'] = round(
-                        (float) ($ledgerRows[$rowIndex]['vacation_abs_und_wop'] ?? 0) + $amount,
-                        2
+                    $ledgerRows[$rowIndex]['vacation_abs_und_wop'] = $this->roundLedgerValue(
+                        (float) ($ledgerRows[$rowIndex]['vacation_abs_und_wop'] ?? 0) + $amount
                     );
                 }
             } elseif ($typeKey === 'sick') {
@@ -1058,19 +1042,16 @@ class EmployeeController extends Controller
                     $ledgerRows[$rowIndex]['sick_balance'] = $currentBalance;
                 }
                 if ($category === 'earned') {
-                    $ledgerRows[$rowIndex]['sick_earned'] = round(
-                        (float) ($ledgerRows[$rowIndex]['sick_earned'] ?? 0) + $amount,
-                        2
+                    $ledgerRows[$rowIndex]['sick_earned'] = $this->roundLedgerValue(
+                        (float) ($ledgerRows[$rowIndex]['sick_earned'] ?? 0) + $amount
                     );
                 } elseif ($category === 'deduction_with_pay') {
-                    $ledgerRows[$rowIndex]['sick_abs_und'] = round(
-                        (float) ($ledgerRows[$rowIndex]['sick_abs_und'] ?? 0) + $amount,
-                        2
+                    $ledgerRows[$rowIndex]['sick_abs_und'] = $this->roundLedgerValue(
+                        (float) ($ledgerRows[$rowIndex]['sick_abs_und'] ?? 0) + $amount
                     );
                 } elseif ($category === 'deduction_without_pay') {
-                    $ledgerRows[$rowIndex]['sick_abs_und_wop'] = round(
-                        (float) ($ledgerRows[$rowIndex]['sick_abs_und_wop'] ?? 0) + $amount,
-                        2
+                    $ledgerRows[$rowIndex]['sick_abs_und_wop'] = $this->roundLedgerValue(
+                        (float) ($ledgerRows[$rowIndex]['sick_abs_und_wop'] ?? 0) + $amount
                     );
                 }
             } elseif ($typeKey === 'other') {
@@ -1078,19 +1059,16 @@ class EmployeeController extends Controller
                     $ledgerRows[$rowIndex]['other_balance'] = $currentBalance;
                 }
                 if ($category === 'earned') {
-                    $ledgerRows[$rowIndex]['other_earned'] = round(
-                        (float) ($ledgerRows[$rowIndex]['other_earned'] ?? 0) + $amount,
-                        2
+                    $ledgerRows[$rowIndex]['other_earned'] = $this->roundLedgerValue(
+                        (float) ($ledgerRows[$rowIndex]['other_earned'] ?? 0) + $amount
                     );
                 } elseif ($category === 'deduction_with_pay') {
-                    $ledgerRows[$rowIndex]['other_abs_und'] = round(
-                        (float) ($ledgerRows[$rowIndex]['other_abs_und'] ?? 0) + $amount,
-                        2
+                    $ledgerRows[$rowIndex]['other_abs_und'] = $this->roundLedgerValue(
+                        (float) ($ledgerRows[$rowIndex]['other_abs_und'] ?? 0) + $amount
                     );
                 } elseif ($category === 'deduction_without_pay') {
-                    $ledgerRows[$rowIndex]['other_abs_und_wop'] = round(
-                        (float) ($ledgerRows[$rowIndex]['other_abs_und_wop'] ?? 0) + $amount,
-                        2
+                    $ledgerRows[$rowIndex]['other_abs_und_wop'] = $this->roundLedgerValue(
+                        (float) ($ledgerRows[$rowIndex]['other_abs_und_wop'] ?? 0) + $amount
                     );
                 }
             }
@@ -1236,15 +1214,28 @@ class EmployeeController extends Controller
     }
 
     private function buildDepartmentAdminEmployeePaginator(
-        ?string $departmentName,
+        ?int $departmentId,
         ?string $searchTerm,
         ?bool $activeOnly,
         int $perPage,
         int $page,
         array $departmentHeadLookup = []
     ): LengthAwarePaginator {
+        if ($departmentId === null || $departmentId <= 0) {
+            return new LengthAwarePaginator(
+                collect(),
+                0,
+                $perPage,
+                $page,
+                [
+                    'path' => request()->url(),
+                    'pageName' => 'page',
+                ]
+            );
+        }
+
         $departmentAdminControlNoLookup = $this->loadDepartmentAdminEmployeeControlNoLookup();
-        $rows = $this->fetchHrisEmployeeRows($departmentName, $searchTerm, false, $activeOnly)
+        $rows = $this->fetchDepartmentPulledEmployeeRows($departmentId, $searchTerm, $activeOnly)
             ->reject(fn(array $row): bool => $this->hasControlNoInLookup(
                 (string) ($row['control_no'] ?? ''),
                 $departmentAdminControlNoLookup
@@ -1271,13 +1262,17 @@ class EmployeeController extends Controller
     }
 
     private function buildDepartmentAdminStatusCounts(
-        ?string $departmentName,
+        ?int $departmentId,
         ?string $searchTerm,
         ?bool $activeOnly
     ): array
     {
+        if ($departmentId === null || $departmentId <= 0) {
+            return [];
+        }
+
         $departmentAdminControlNoLookup = $this->loadDepartmentAdminEmployeeControlNoLookup();
-        $rows = $this->fetchHrisEmployeeRows($departmentName, $searchTerm, false, $activeOnly)
+        $rows = $this->fetchDepartmentPulledEmployeeRows($departmentId, $searchTerm, $activeOnly)
             ->reject(fn(array $row): bool => $this->hasControlNoInLookup(
                 (string) ($row['control_no'] ?? ''),
                 $departmentAdminControlNoLookup
@@ -1506,6 +1501,167 @@ class EmployeeController extends Controller
         return $this->buildControlNoLookup($controlNos);
     }
 
+    private function loadPulledEmployeeControlNoLookup(): array
+    {
+        $controlNos = EmployeeDepartmentAssignment::query()
+            ->whereHas('department', fn ($query) => $query->where('is_inactive', false))
+            ->pluck('employee_control_no')
+            ->map(fn (mixed $value): string => trim((string) $value))
+            ->filter(fn (string $value): bool => $value !== '')
+            ->unique()
+            ->values()
+            ->all();
+
+        return $this->buildControlNoLookup($controlNos);
+    }
+
+    private function fetchDepartmentPulledEmployeeRows(
+        int $departmentId,
+        ?string $searchTerm,
+        ?bool $activeOnly
+    ): Collection {
+        $controlNos = EmployeeDepartmentAssignment::query()
+            ->where('department_id', $departmentId)
+            ->pluck('employee_control_no')
+            ->map(fn (mixed $value): string => trim((string) $value))
+            ->filter(fn (string $value): bool => $value !== '')
+            ->unique()
+            ->values()
+            ->all();
+
+        if ($controlNos === []) {
+            return collect();
+        }
+
+        return $this->fetchHrisEmployeeRowsByControlNos($controlNos, $searchTerm, false, $activeOnly);
+    }
+
+    private function fetchHrisEmployeeRowsByControlNos(
+        array $controlNos,
+        ?string $searchTerm,
+        bool $excludeContractual,
+        ?bool $activeOnly = null
+    ): Collection {
+        $lookupControlNos = collect($controlNos)
+            ->map(fn (mixed $value): string => trim((string) $value))
+            ->filter(fn (string $value): bool => $value !== '')
+            ->unique()
+            ->values()
+            ->all();
+
+        if ($lookupControlNos === []) {
+            return collect();
+        }
+
+        $normalizedSearchTerm = trim((string) ($searchTerm ?? ''));
+        $employeesByControlNo = HrisEmployee::directoryByControlNos($lookupControlNos, $activeOnly);
+        $rowsByControlNo = [];
+
+        foreach ($lookupControlNos as $rawControlNo) {
+            $employee = $this->resolveHrisDirectoryEmployee($employeesByControlNo, $rawControlNo);
+            if (!$employee) {
+                continue;
+            }
+
+            $employeeStatus = strtoupper(trim((string) ($employee->status ?? '')));
+            $isActive = filter_var($employee->is_active ?? false, FILTER_VALIDATE_BOOLEAN);
+
+            if ($excludeContractual && $employeeStatus === 'CONTRACTUAL') {
+                continue;
+            }
+
+            if ($activeOnly === false && in_array($employeeStatus, ['HONORARIUM', 'CONTRACTUAL'], true)) {
+                continue;
+            }
+
+            if (
+                $activeOnly === null
+                && !$isActive
+                && in_array($employeeStatus, ['HONORARIUM', 'CONTRACTUAL'], true)
+            ) {
+                continue;
+            }
+
+            if (!$this->matchesHrisEmployeeSearch($employee, $normalizedSearchTerm)) {
+                continue;
+            }
+
+            $serializedRow = $this->serializeEmployee($employee);
+            $serializedControlNo = trim((string) ($serializedRow['control_no'] ?? ''));
+            if ($serializedControlNo === '') {
+                continue;
+            }
+
+            $lookupKey = $this->normalizeLedgerControlNo($serializedControlNo) ?? $serializedControlNo;
+            if (isset($rowsByControlNo[$lookupKey])) {
+                continue;
+            }
+
+            $rowsByControlNo[$lookupKey] = $serializedRow;
+        }
+
+        return $this->sortEmployeeRows(collect(array_values($rowsByControlNo)))->values();
+    }
+
+    private function resolveHrisDirectoryEmployee(array $employeesByControlNo, string $controlNo): ?object
+    {
+        $rawControlNo = trim($controlNo);
+        if ($rawControlNo === '') {
+            return null;
+        }
+
+        $normalizedControlNo = $this->normalizeLedgerControlNo($rawControlNo);
+        $lookupKeys = array_values(array_unique(array_filter([
+            $rawControlNo,
+            $normalizedControlNo,
+        ], static fn (mixed $value): bool => $value !== null && trim((string) $value) !== '')));
+
+        foreach ($lookupKeys as $lookupKey) {
+            $employee = $employeesByControlNo[$lookupKey] ?? null;
+            if (is_object($employee)) {
+                return $employee;
+            }
+        }
+
+        return null;
+    }
+
+    private function findPulledEmployeeAssignment(string $controlNo, ?int $departmentId = null): ?EmployeeDepartmentAssignment
+    {
+        $rawControlNo = trim($controlNo);
+        if ($rawControlNo === '') {
+            return null;
+        }
+
+        $normalizedControlNo = $this->normalizeLedgerControlNo($rawControlNo);
+        if ($normalizedControlNo === null) {
+            return null;
+        }
+
+        $query = EmployeeDepartmentAssignment::query();
+        if ($departmentId !== null) {
+            $query->where('department_id', $departmentId);
+        }
+
+        return $query
+            ->get()
+            ->first(function (EmployeeDepartmentAssignment $assignment) use ($rawControlNo, $normalizedControlNo): bool {
+                $assignmentControlNo = trim((string) $assignment->employee_control_no);
+                if ($assignmentControlNo === '') {
+                    return false;
+                }
+
+                if ($assignmentControlNo === $rawControlNo) {
+                    return true;
+                }
+
+                $normalizedAssignmentControlNo = $this->normalizeLedgerControlNo($assignmentControlNo);
+
+                return $normalizedAssignmentControlNo !== null
+                    && $normalizedAssignmentControlNo === $normalizedControlNo;
+            });
+    }
+
     private function assignEmployeeToDepartment(DepartmentAdmin $admin, string $controlNo): JsonResponse
     {
         $employee = HrisEmployee::findByControlNo($controlNo, true);
@@ -1515,40 +1671,72 @@ class EmployeeController extends Controller
             ], 422);
         }
 
-        $targetDepartmentName = trim((string) ($admin->department?->name ?? ''));
-        $effectiveOffice = trim((string) ($employee->office ?? ''));
-        if ($targetDepartmentName !== '' && strcasecmp($targetDepartmentName, $effectiveOffice) === 0) {
-            return response()->json([
-                'message' => 'Selected employee already belongs to your department in LMS.',
-            ], 422);
-        }
-
         $storedControlNo = trim((string) ($employee->control_no ?? ''));
+        $assignmentIdentityFields = $this->buildAssignmentIdentityFields($employee);
         $existingAssignment = EmployeeDepartmentAssignment::query()
+            ->with('department:id,name,is_inactive')
             ->where('employee_control_no', $storedControlNo)
             ->first();
 
-        EmployeeDepartmentAssignment::query()->updateOrCreate(
-            [
-                'employee_control_no' => $storedControlNo,
-            ],
-            [
+        if ($existingAssignment && !($existingAssignment->department?->is_inactive ?? false)) {
+            if ((int) $existingAssignment->department_id === (int) $admin->department_id) {
+                $existingAssignment->fill($assignmentIdentityFields);
+                $existingAssignment->save();
+
+                return response()->json([
+                    'message' => 'Employee is already pulled into your office.',
+                    'employee' => $this->serializeEmployee($employee),
+                ]);
+            }
+
+            return response()->json([
+                'message' => 'Employee is already pulled by another office in LMS.',
+                'assigned_department_name' => trim((string) ($existingAssignment->department?->name ?? '')) ?: null,
+            ], 422);
+        }
+
+        $updatedEmployee = HrisEmployee::findByControlNo($storedControlNo, true) ?? $employee;
+        if ($existingAssignment) {
+            $existingAssignment->fill([
                 'department_id' => $admin->department_id,
                 'assigned_by_department_admin_id' => $admin->id,
                 'assigned_at' => now(),
-            ]
-        );
+                ...$assignmentIdentityFields,
+            ]);
+            $existingAssignment->save();
 
-        $updatedEmployee = HrisEmployee::findByControlNo($storedControlNo, true) ?? $employee;
-        $wasReassigned = $existingAssignment !== null
-            && (int) $existingAssignment->department_id !== (int) $admin->department_id;
+            return response()->json([
+                'message' => 'Employee pulled to your office successfully.',
+                'employee' => $this->serializeEmployee($updatedEmployee),
+            ]);
+        }
+
+        EmployeeDepartmentAssignment::query()->create([
+            'employee_control_no' => $storedControlNo,
+            'department_id' => $admin->department_id,
+            'assigned_by_department_admin_id' => $admin->id,
+            'assigned_at' => now(),
+            ...$assignmentIdentityFields,
+        ]);
 
         return response()->json([
-            'message' => $wasReassigned
-                ? 'Employee reassigned to your department successfully.'
-                : 'Employee added to your department successfully.',
+            'message' => 'Employee pulled to your office successfully.',
             'employee' => $this->serializeEmployee($updatedEmployee),
-        ], $existingAssignment ? 200 : 201);
+        ], 201);
+    }
+
+    private function buildAssignmentIdentityFields(object $employee): array
+    {
+        return [
+            'surname' => $this->trimNullable($employee->surname ?? null),
+            'firstname' => $this->trimNullable($employee->firstname ?? null),
+            'middlename' => $this->trimNullable($employee->middlename ?? null),
+            'department_acronym' => $this->trimNullable(
+                $employee->officeAcronym
+                    ?? $employee->hrisOfficeAcronym
+                    ?? null
+            ),
+        ];
     }
 
     private function buildControlNoLookup(array $controlNos): array
@@ -1913,7 +2101,12 @@ class EmployeeController extends Controller
             return 0.0;
         }
 
-        return round((float) ($balancesByType[$leaveTypeId]->balance ?? 0), 2);
+        return $this->roundLedgerValue($balancesByType[$leaveTypeId]->balance ?? 0);
+    }
+
+    private function roundLedgerValue(mixed $value): float
+    {
+        return round((float) $value, self::LEDGER_DECIMAL_PRECISION);
     }
 
     private function formatLedgerPeriodLabel(mixed $date): string

@@ -44,6 +44,7 @@ Route::post('/reset-password', [PasswordResetController::class, 'resetPassword']
 |--------------------------------------------------------------------------
 */
 Route::prefix('erms')->middleware('erms.auth')->group(function () {
+    Route::get('/employee-access', [LeaveApplicationController::class, 'ermsEmployeeAccess']);
     Route::get('/leave-balance/{id}', [LeaveApplicationController::class, 'ermsGetLeaveBalance']);
     Route::get('/leave-balances/{controlNo}', [LeaveApplicationController::class, 'ermsGetLeaveBalances']);
     Route::get('/leave-records', [LeaveApplicationController::class, 'ermsIndex']);

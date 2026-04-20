@@ -97,8 +97,6 @@ class HRUserManagementController extends Controller
     /**
      * List eligible employees:
      * - all ACTIVE employees (regardless of selected department)
-     *
-     * HONORARIUM and CONTRACTUAL employees are excluded.
      */
     public function eligibleEmployees(Request $request, ?int $departmentId = null): JsonResponse
     {
@@ -126,7 +124,6 @@ class HRUserManagementController extends Controller
         $limit = max(1, min(25, (int) ($validated['limit'] ?? 20)));
 
         $employees = HrisEmployee::allCached(true)
-            ->filter(fn(object $employee): bool => !$this->isExcludedDepartmentAdminEmployeeStatus($employee))
             ->filter(function (object $employee) use ($searchTerm): bool {
                 if ($searchTerm === '') {
                     return true;
@@ -363,20 +360,7 @@ class HRUserManagementController extends Controller
             ]);
         }
 
-        if ($this->isExcludedDepartmentAdminEmployeeStatus($employee)) {
-            throw ValidationException::withMessages([
-                'employee_control_no' => ['Honorarium and contractual employees cannot be assigned as department admin.'],
-            ]);
-        }
-
         return $employee;
-    }
-
-    private function isExcludedDepartmentAdminEmployeeStatus(object $employee): bool
-    {
-        $employeeStatus = strtoupper(trim((string) ($employee->status ?? '')));
-
-        return in_array($employeeStatus, ['HONORARIUM', 'CONTRACTUAL'], true);
     }
 
     private function assertUsernameAvailableForDepartmentAdmin(string $username, ?int $ignoreDepartmentAdminId = null): void
