@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\EmployeeDepartmentAssignment;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
@@ -220,6 +221,10 @@ class LeaveApplicationController extends Controller
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
         }
+        $pulledAccess = $this->assertErmsEmployeeIsPulled((string) $employee->control_no);
+        if ($pulledAccess instanceof JsonResponse) {
+            return $pulledAccess;
+        }
 
         $resolvedLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
         $leaveType = LeaveType::find($resolvedLeaveTypeId);
@@ -283,6 +288,10 @@ class LeaveApplicationController extends Controller
         $employee = $this->findEmployeeByControlNo($controlNo);
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+        $pulledAccess = $this->assertErmsEmployeeIsPulled((string) $employee->control_no);
+        if ($pulledAccess instanceof JsonResponse) {
+            return $pulledAccess;
         }
 
         $types = LeaveType::query()
@@ -357,6 +366,48 @@ class LeaveApplicationController extends Controller
     }
 
     /**
+     * GET /erms/employee-access
+     * Resolve whether an employee is allowed to access LMS leave modules.
+     */
+    public function ermsEmployeeAccess(Request $request): JsonResponse
+    {
+        $this->mergeEmployeeControlNoInput($request);
+
+        $validated = $request->validate([
+            'employee_control_no' => ['nullable', 'string', 'regex:/^\d+$/'],
+        ]);
+
+        $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
+        if ($controlNo === '') {
+            return response()->json([
+                'message' => 'The employee_control_no query parameter is required.',
+            ], 422);
+        }
+
+        $employee = $this->findEmployeeByControlNo($controlNo);
+        if (!$employee) {
+            return response()->json([
+                'message' => 'Employee record not found.',
+                ...$this->employeeControlNoResponse($controlNo),
+                'is_pulled_employee' => false,
+                'is_department_admin_employee' => false,
+                'can_access_leave_modules' => false,
+            ], 404);
+        }
+
+        $isPulledEmployee = $this->isPulledEmployeeControlNo((string) $employee->control_no);
+        $isDepartmentAdminEmployee = $this->isDepartmentAdminEmployeeControlNo((string) $employee->control_no);
+        $canAccessLeaveModules = $isPulledEmployee || $isDepartmentAdminEmployee;
+
+        return response()->json([
+            ...$this->employeeControlNoResponse((string) $employee->control_no),
+            'is_pulled_employee' => $isPulledEmployee,
+            'is_department_admin_employee' => $isDepartmentAdminEmployee,
+            'can_access_leave_modules' => $canAccessLeaveModules,
+        ]);
+    }
+
+    /**
      * GET /erms/apply-leave
      * Protected endpoint for ERMS/HRPDS personal leave records listing.
      */
@@ -378,6 +429,10 @@ class LeaveApplicationController extends Controller
         $employee = $this->findEmployeeByControlNo($controlNo);
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+        $pulledAccess = $this->assertErmsEmployeeIsPulled((string) $employee->control_no);
+        if ($pulledAccess instanceof JsonResponse) {
+            return $pulledAccess;
         }
 
         $applications = LeaveApplication::query()
@@ -430,6 +485,10 @@ class LeaveApplicationController extends Controller
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
         }
+        $pulledAccess = $this->assertErmsEmployeeIsPulled((string) $employee->control_no);
+        if ($pulledAccess instanceof JsonResponse) {
+            return $pulledAccess;
+        }
 
         $application = LeaveApplication::query()
             ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
@@ -470,6 +529,10 @@ class LeaveApplicationController extends Controller
 
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+        $pulledAccess = $this->assertErmsEmployeeIsPulled((string) $employee->control_no);
+        if ($pulledAccess instanceof JsonResponse) {
+            return $pulledAccess;
         }
 
         $actor = (object) ['id' => (int) ltrim((string) $employee->control_no, '0')];
@@ -729,6 +792,10 @@ class LeaveApplicationController extends Controller
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
         }
+        $pulledAccess = $this->assertErmsEmployeeIsPulled((string) $employee->control_no);
+        if ($pulledAccess instanceof JsonResponse) {
+            return $pulledAccess;
+        }
 
         $app = LeaveApplication::query()
             ->with('leaveType')
@@ -870,6 +937,10 @@ class LeaveApplicationController extends Controller
         $employee = $this->findEmployeeByControlNo($controlNo);
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+        $pulledAccess = $this->assertErmsEmployeeIsPulled((string) $employee->control_no);
+        if ($pulledAccess instanceof JsonResponse) {
+            return $pulledAccess;
         }
 
         $app = LeaveApplication::query()
@@ -1054,6 +1125,10 @@ class LeaveApplicationController extends Controller
         $employee = $this->findEmployeeByControlNo($controlNo);
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+        $pulledAccess = $this->assertErmsEmployeeIsPulled((string) $employee->control_no);
+        if ($pulledAccess instanceof JsonResponse) {
+            return $pulledAccess;
         }
 
         $app = LeaveApplication::query()
@@ -1723,6 +1798,21 @@ class LeaveApplicationController extends Controller
         ]);
     }
 
+    private function isCancelledForHrQueue(LeaveApplication $application): bool
+    {
+        if ($this->isCancelledRemark($application->remarks)) {
+            return true;
+        }
+
+        if ($application->relationLoaded('logs')) {
+            return $application->logs
+                ->filter(fn($log) => $log instanceof LeaveApplicationLog)
+                ->contains(fn(LeaveApplicationLog $log): bool => $this->isCancelledRemark($log->remarks));
+        }
+
+        return false;
+    }
+
     public function adminShow(Request $request, int $id): JsonResponse
     {
         $admin = $request->user();
@@ -1971,10 +2061,15 @@ class LeaveApplicationController extends Controller
             ->orderBy('created_at')
             ->orderBy('id')
             ->get();
-        $applications = $this->sortLeaveApplicationsForHrQueue($applications);
+        $applications = $this->sortLeaveApplicationsForHrQueue($applications)
+            ->reject(fn(LeaveApplication $application): bool => $this->isCancelledForHrQueue($application))
+            ->values();
+        $formattedApplications = $applications
+            ->map(fn(LeaveApplication $app): array => $this->formatApplication($app))
+            ->values();
 
         return response()->json([
-            'applications' => $applications->map(fn($app) => $this->formatApplication($app)),
+            'applications' => $formattedApplications,
         ]);
     }
 
@@ -3695,6 +3790,49 @@ class LeaveApplicationController extends Controller
         }
 
         return HrisEmployee::findByControlNo($controlNo);
+    }
+
+    private function assertErmsEmployeeIsPulled(string $controlNo): ?JsonResponse
+    {
+        if (
+            $this->isPulledEmployeeControlNo($controlNo)
+            || $this->isDepartmentAdminEmployeeControlNo($controlNo)
+        ) {
+            return null;
+        }
+
+        return response()->json([
+            ...$this->employeeControlNoResponse($controlNo),
+            'message' => 'This employee is not yet enabled for LMS leave modules. Please contact your department admin.',
+            'is_pulled_employee' => false,
+            'is_department_admin_employee' => false,
+            'can_access_leave_modules' => false,
+        ], 403);
+    }
+
+    private function isPulledEmployeeControlNo(string $controlNo): bool
+    {
+        $controlNoCandidates = $this->controlNoCandidates($controlNo);
+        if ($controlNoCandidates === []) {
+            return false;
+        }
+
+        return EmployeeDepartmentAssignment::query()
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->exists();
+    }
+
+    private function isDepartmentAdminEmployeeControlNo(string $controlNo): bool
+    {
+        $controlNoCandidates = $this->controlNoCandidates($controlNo);
+        if ($controlNoCandidates === []) {
+            return false;
+        }
+
+        return DepartmentAdmin::query()
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->whereHas('department', fn ($query) => $query->where('is_inactive', false))
+            ->exists();
     }
 
     private function findDepartmentEmployeeControlNos(?string $departmentName, ?bool $activeOnly = null): array

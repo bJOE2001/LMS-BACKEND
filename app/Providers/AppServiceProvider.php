@@ -54,8 +54,17 @@ class AppServiceProvider extends ServiceProvider
 
     private function authenticateSanctumAccessToken(mixed $accessToken, bool $isValid, int $idleTimeoutMinutes): bool
     {
-        if (!$isValid || !$accessToken instanceof PersonalAccessToken) {
+        if (!$accessToken instanceof PersonalAccessToken) {
             return $isValid;
+        }
+
+        if (!$isValid) {
+            if ($this->supportsManagedSanctumSession($accessToken)) {
+                $this->markSanctumAuthFailure('session_expired');
+                $this->revokeInvalidatedSanctumToken($accessToken);
+            }
+
+            return false;
         }
 
         if (!$this->supportsManagedSanctumSession($accessToken)) {
@@ -120,6 +129,16 @@ class AppServiceProvider extends ServiceProvider
 
     private function revokeInvalidatedSanctumToken(PersonalAccessToken $accessToken): void
     {
+        $tokenable = $accessToken->tokenable;
+        if (
+            ($tokenable instanceof HRAccount || $tokenable instanceof DepartmentAdmin)
+            && (int) ($tokenable->active_personal_access_token_id ?? 0) === (int) $accessToken->getKey()
+        ) {
+            $tokenable->forceFill([
+                'active_personal_access_token_id' => null,
+            ])->save();
+        }
+
         if ($accessToken->exists) {
             $accessToken->delete();
         }

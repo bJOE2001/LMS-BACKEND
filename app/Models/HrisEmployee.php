@@ -8,7 +8,6 @@ use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Schema;
 use Throwable;
 
 /**
@@ -38,7 +37,6 @@ class HrisEmployee
     private static array $singleLookupMemo = [];
     /** @var array<string, array{department_id:int|null, department_name:string}>|null */
     private static ?array $assignedDepartmentNamesMemo = null;
-    private static ?bool $snapshotTableExistsMemo = null;
     private static ?string $cacheVersionMemo = null;
 
     /**
@@ -207,7 +205,7 @@ class HrisEmployee
         return collect(self::directoryByOffice($normalizedOfficeName, $activeOnly))
             ->map(static fn (object $employee): string => trim((string) ($employee->control_no ?? '')))
             ->filter(static fn (string $controlNo): bool => $controlNo !== '')
-            ->unique()
+            ->uniqueStrict()
             ->values()
             ->all();
     }
@@ -513,6 +511,11 @@ class HrisEmployee
      */
     private static function fetchDirectoryRowsByControlNos(array $lookupValues, ?bool $activeOnly = null): array
     {
+        $lookupValues = self::controlNoLookupValues($lookupValues);
+        if ($lookupValues === []) {
+            return [];
+        }
+
         $personalRows = DB::connection(self::HR_CONNECTION)
             ->table(self::PERSONAL_TABLE.' as xp')
             ->select('xp.ControlNo as raw_control_no', 'xp.Surname as surname', 'xp.Firstname as firstname', 'xp.MIddlename as middlename', 'xp.BirthDate as birth_date')
@@ -830,11 +833,9 @@ class HrisEmployee
 
     private static function snapshotTableExists(): bool
     {
-        if (self::$snapshotTableExistsMemo !== null) {
-            return self::$snapshotTableExistsMemo;
-        }
-
-        return self::$snapshotTableExistsMemo = Schema::hasTable(self::SNAPSHOT_TABLE);
+        // Snapshot feature is intentionally disabled:
+        // LMS no longer reads or writes tblEmployees as an HRIS fallback/cache.
+        return false;
     }
 
     private static function snapshotQuery(?bool $activeOnly = null): Builder
@@ -897,7 +898,7 @@ class HrisEmployee
             ->pluck('control_no')
             ->map(static fn (mixed $controlNo): string => trim((string) $controlNo))
             ->filter(static fn (string $controlNo): bool => $controlNo !== '')
-            ->unique()
+            ->uniqueStrict()
             ->values()
             ->all();
     }
@@ -1372,7 +1373,7 @@ class HrisEmployee
                     $paddedControlNo,
                 ]));
             })
-            ->unique()
+            ->uniqueStrict()
             ->values()
             ->all();
     }
@@ -1440,7 +1441,7 @@ class HrisEmployee
         $literalValues = collect($lookupValues)
             ->map(static fn (mixed $value): string => trim((string) $value))
             ->filter(static fn (string $value): bool => $value !== '' && preg_match('/^\d+$/', $value) === 1)
-            ->unique()
+            ->uniqueStrict()
             ->values()
             ->all();
 

@@ -192,17 +192,16 @@ class AccrueLeaveCredits extends Command
     {
         if ($hrTimeout > 0) {
             $this->configureHrTimeout($hrTimeout);
-            $this->line("Trying live HRIS first with {$hrTimeout}s timeout (tblEmployees auto-sync disabled).");
+            $this->line("Trying live HRIS with {$hrTimeout}s timeout.");
         } else {
-            $this->line('Trying live HRIS first with no forced timeout (tblEmployees auto-sync disabled).');
+            $this->line('Trying live HRIS with no forced timeout.');
         }
 
         try {
-            // Use direct live query so leave accrual never auto-upserts tblEmployees.
             $records = HrisEmployee::query(true, false)->get();
         } catch (Throwable $exception) {
             report($exception);
-            $this->warn('Live HRIS lookup failed or timed out. Skipping live HRIS source for this run.');
+            $this->warn('Live HRIS lookup failed or timed out. Skipping accrual source for this run.');
             $records = collect();
         }
 
@@ -210,24 +209,9 @@ class AccrueLeaveCredits extends Command
             return $records;
         }
 
-        try {
-            $snapshotRecords = HrisEmployee::allSnapshot(true);
-        } catch (Throwable $exception) {
-            report($exception);
-            $this->warn('tblEmployees fallback lookup failed. Skipping snapshot source for this run.');
+        $this->warn('Live HRIS returned no active employee rows. Skipping accrual source for this run.');
 
-            return collect();
-        }
-
-        if ($snapshotRecords->isEmpty()) {
-            $this->warn('tblEmployees snapshot has no active rows. Skipping snapshot source for this run.');
-
-            return collect();
-        }
-
-        $this->warn("Live HRIS returned no active employee rows. Using tblEmployees snapshot ({$snapshotRecords->count()} active row(s)).");
-
-        return $snapshotRecords;
+        return collect();
     }
 
     private function configureHrTimeout(int $seconds): void

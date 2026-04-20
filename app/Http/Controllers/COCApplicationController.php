@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\COCApplication;
 use App\Models\COCApplicationRow;
 use App\Models\DepartmentAdmin;
+use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
 use App\Models\LeaveApplication;
@@ -96,6 +97,10 @@ class COCApplicationController extends Controller
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
         }
+        $pulledAccess = $this->assertErmsEmployeeIsPulled((string) $employee->control_no);
+        if ($pulledAccess instanceof JsonResponse) {
+            return $pulledAccess;
+        }
 
         if ($this->isCocRestrictedEmployeeStatus($employee->status)) {
             return response()->json([
@@ -137,6 +142,10 @@ class COCApplicationController extends Controller
         $employee = HrisEmployee::findByControlNo($this->resolveValidatedEmployeeControlNo($validated));
         if (!$employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+        $pulledAccess = $this->assertErmsEmployeeIsPulled((string) $employee->control_no);
+        if ($pulledAccess instanceof JsonResponse) {
+            return $pulledAccess;
         }
 
         if ($this->isCocRestrictedEmployeeStatus($employee->status)) {
@@ -1497,6 +1506,49 @@ class COCApplicationController extends Controller
     private function resolveValidatedEmployeeControlNo(array $validated): string
     {
         return trim((string) ($validated['employee_control_no'] ?? ''));
+    }
+
+    private function assertErmsEmployeeIsPulled(string $controlNo): ?JsonResponse
+    {
+        if (
+            $this->isPulledEmployeeControlNo($controlNo)
+            || $this->isDepartmentAdminEmployeeControlNo($controlNo)
+        ) {
+            return null;
+        }
+
+        return response()->json([
+            ...$this->employeeControlNoResponse($controlNo),
+            'message' => 'This employee is not yet enabled for LMS leave modules. Please contact your department admin.',
+            'is_pulled_employee' => false,
+            'is_department_admin_employee' => false,
+            'can_access_leave_modules' => false,
+        ], 403);
+    }
+
+    private function isPulledEmployeeControlNo(string $controlNo): bool
+    {
+        $controlNoCandidates = $this->controlNoCandidates($controlNo);
+        if ($controlNoCandidates === []) {
+            return false;
+        }
+
+        return EmployeeDepartmentAssignment::query()
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->exists();
+    }
+
+    private function isDepartmentAdminEmployeeControlNo(string $controlNo): bool
+    {
+        $controlNoCandidates = $this->controlNoCandidates($controlNo);
+        if ($controlNoCandidates === []) {
+            return false;
+        }
+
+        return DepartmentAdmin::query()
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->whereHas('department', fn ($query) => $query->where('is_inactive', false))
+            ->exists();
     }
 
     private function employeeControlNoResponse(?string $controlNo): array

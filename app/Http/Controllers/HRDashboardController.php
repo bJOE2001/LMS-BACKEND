@@ -7,6 +7,7 @@ use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
 use App\Models\LeaveApplication;
+use App\Models\LeaveApplicationLog;
 use App\Models\LeaveApplicationUpdateRequest;
 use App\Models\LeaveBalance;
 use Carbon\CarbonImmutable;
@@ -29,10 +30,13 @@ class HRDashboardController extends Controller
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
-        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin.department', 'updateRequests'])
+        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin.department', 'updateRequests', 'logs'])
             ->where('status', '!=', LeaveApplication::STATUS_PENDING_ADMIN)
             ->orderByDesc('created_at')
             ->get();
+        $applications = $applications
+            ->reject(fn(LeaveApplication $application): bool => $this->isCancelledLeaveApplication($application))
+            ->values();
 
         $cocApplications = COCApplication::query()
             ->select(['id', 'status', 'admin_reviewed_at'])
@@ -60,10 +64,7 @@ class HRDashboardController extends Controller
         );
         $employeeStatusByControlNo = $this->buildEmployeeStatusDirectory($employeeDirectoryByControlNo);
         $leaveBalanceDirectory = $this->buildLeaveBalanceDirectory($applications);
-        $activeEmployeeCount = HrisEmployee::countSnapshot(true);
-        if ($activeEmployeeCount <= 0) {
-            $activeEmployeeCount = HrisEmployee::countCached(true);
-        }
+        $activeEmployeeCount = HrisEmployee::countCached(true);
 
         // Count employees/admins currently on approved leave today
         $today = now()->toDateString();
@@ -232,6 +233,26 @@ class HRDashboardController extends Controller
         }
 
         return $app->admin_reviewed_at ? 'PENDING_HR' : 'PENDING_ADMIN';
+    }
+
+    private function isCancelledLeaveApplication(LeaveApplication $application): bool
+    {
+        if ((bool) preg_match('/^cancelled\b/i', trim((string) ($application->remarks ?? '')))) {
+            return true;
+        }
+
+        if ($application->relationLoaded('logs')) {
+            return $application->logs
+                ->filter(fn($log) => $log instanceof LeaveApplicationLog)
+                ->contains(
+                    fn(LeaveApplicationLog $log): bool => (bool) preg_match(
+                        '/^cancelled\b/i',
+                        trim((string) ($log->remarks ?? ''))
+                    )
+                );
+        }
+
+        return false;
     }
 
     private function normalizeDepartmentStatisticsGroupBy(string $groupBy): string

@@ -62,6 +62,9 @@ class AdminDashboardController extends Controller
             })
             ->orderByDesc('created_at')
             ->get();
+        $applications = $applications
+            ->reject(fn(LeaveApplication $application): bool => $this->isCancelledDashboardLeaveApplication($application))
+            ->values();
 
         $cocApplications = $this->excludePendingLateFilingReview(
                 COCApplication::query()
@@ -74,6 +77,9 @@ class AdminDashboardController extends Controller
             )
             ->orderByDesc('created_at')
             ->get();
+        $cocApplications = $cocApplications
+            ->reject(fn(COCApplication $application): bool => $this->isCancelledDashboardCocApplication($application))
+            ->values();
 
         $pendingApps = $applications->where('status', LeaveApplication::STATUS_PENDING_ADMIN);
         $pendingCocApps = $cocApplications->filter(
@@ -107,6 +113,11 @@ class AdminDashboardController extends Controller
             )
         );
         $totalApproved = $totalApprovedApps->count() + $totalApprovedCocApps->count();
+        $rejectedApps = $applications->where('status', LeaveApplication::STATUS_REJECTED);
+        $rejectedCocApps = $cocApplications->filter(
+            fn(COCApplication $app): bool => $this->deriveCocRawStatus($app) === COCApplication::STATUS_REJECTED
+        );
+        $rejected = $rejectedApps->count() + $rejectedCocApps->count();
 
         $employeesByControlNo = $this->loadDepartmentEmployeesByControlNo($deptName);
 
@@ -131,6 +142,7 @@ class AdminDashboardController extends Controller
             'pending_count' => $pending,
             'approved_today' => $approvedToday,
             'total_approved' => $totalApproved,
+            'rejected_count' => $rejected,
             'total_count' => $applications->count() + $cocApplications->count(),
             'kpi_breakdown' => $kpiBreakdown,
             'analytics' => $analytics,
@@ -2040,6 +2052,26 @@ class AdminDashboardController extends Controller
     private function isCancelledRemark(mixed $remarks): bool
     {
         return (bool) preg_match('/^cancelled\b/i', trim((string) ($remarks ?? '')));
+    }
+
+    private function isCancelledDashboardLeaveApplication(LeaveApplication $application): bool
+    {
+        if ($this->isCancelledRemark($application->remarks)) {
+            return true;
+        }
+
+        if ($application->relationLoaded('logs')) {
+            return $application->logs
+                ->filter(fn($log) => $log instanceof LeaveApplicationLog)
+                ->contains(fn(LeaveApplicationLog $log): bool => $this->isCancelledRemark($log->remarks));
+        }
+
+        return false;
+    }
+
+    private function isCancelledDashboardCocApplication(COCApplication $application): bool
+    {
+        return $this->isCancelledRemark($application->remarks);
     }
 
     /**

@@ -17,6 +17,8 @@ use Illuminate\Support\Facades\DB;
  */
 class HRLeaveBalanceImportController extends Controller
 {
+    private const MANUAL_CREDIT_PRECISION = 3;
+
     public function availableTypes(Request $request): JsonResponse
     {
         $user = $request->user();
@@ -66,10 +68,10 @@ class HRLeaveBalanceImportController extends Controller
         $validated = $request->validate([
             'employee_control_no' => ['required', 'string', 'max:50', 'regex:/^\d+$/'],
             'leave_type_id' => ['nullable', 'integer', 'exists:tblLeaveTypes,id'],
-            'balance' => ['nullable', 'numeric', 'min:0'],
+            'balance' => ['nullable', 'numeric', 'decimal:0,3', 'min:0'],
             'balances' => ['required', 'array', 'min:1'],
             'balances.*.leave_type_id' => ['required_with:balances', 'integer', 'exists:tblLeaveTypes,id'],
-            'balances.*.balance' => ['required_with:balances', 'numeric', 'min:0'],
+            'balances.*.balance' => ['required_with:balances', 'numeric', 'decimal:0,3', 'min:0'],
         ]);
 
         $employeeControlNo = trim((string) $validated['employee_control_no']);
@@ -103,7 +105,7 @@ class HRLeaveBalanceImportController extends Controller
             }
 
             $leaveTypeId = (int) ($entry['leave_type_id'] ?? 0);
-            $balanceValue = round((float) ($entry['balance'] ?? 0), 2);
+            $balanceValue = $this->normalizeManualCreditValue($entry['balance'] ?? 0);
             if ($leaveTypeId <= 0) {
                 continue;
             }
@@ -258,8 +260,8 @@ class HRLeaveBalanceImportController extends Controller
                     ->lockForUpdate()
                     ->first();
 
-                $previousBalance = round((float) ($existing?->balance ?? 0), 2);
-                $newBalance = round($previousBalance + $creditsToAdd, 2);
+                $previousBalance = $this->normalizeManualCreditValue($existing?->balance ?? 0);
+                $newBalance = $this->normalizeManualCreditValue($previousBalance + $creditsToAdd);
 
                 if ($existing) {
                     $existing->balance = $newBalance;
@@ -337,19 +339,21 @@ class HRLeaveBalanceImportController extends Controller
                 }
 
                 $leaveTypeId = (int) ($entry['leave_type_id'] ?? 0);
-                $creditsToAdd = round((float) ($entry['balance'] ?? 0), 2);
+                $creditsToAdd = $this->normalizeManualCreditValue($entry['balance'] ?? 0);
                 if ($leaveTypeId <= 0 || $creditsToAdd <= 0) {
                     continue;
                 }
 
-                $entries[$leaveTypeId] = round(((float) ($entries[$leaveTypeId] ?? 0)) + $creditsToAdd, 2);
+                $entries[$leaveTypeId] = $this->normalizeManualCreditValue(
+                    ((float) ($entries[$leaveTypeId] ?? 0)) + $creditsToAdd
+                );
             }
 
             return $entries;
         }
 
         $singleLeaveTypeId = (int) ($validated['leave_type_id'] ?? 0);
-        $singleCreditsToAdd = round((float) ($validated['balance'] ?? 0), 2);
+        $singleCreditsToAdd = $this->normalizeManualCreditValue($validated['balance'] ?? 0);
         if ($singleLeaveTypeId > 0 && $singleCreditsToAdd > 0) {
             $entries[$singleLeaveTypeId] = $singleCreditsToAdd;
         }
@@ -473,7 +477,7 @@ class HRLeaveBalanceImportController extends Controller
         string $employeeName = '',
         string $leaveTypeName = ''
     ): void {
-        $normalizedCreditsToAdd = round((float) $creditsToAdd, 2);
+        $normalizedCreditsToAdd = $this->normalizeManualCreditValue($creditsToAdd);
         if ($normalizedCreditsToAdd <= 0) {
             return;
         }
@@ -486,18 +490,17 @@ class HRLeaveBalanceImportController extends Controller
             ->lockForUpdate()
             ->first();
 
-            if ($existingEntry) {
-                $existingEntry->credits_added = round(
-                    (float) $existingEntry->credits_added + $normalizedCreditsToAdd,
-                    2
-                );
-                $existingEntry->source = $manualSource;
-                $existingEntry->employee_control_no = trim((string) ($leaveBalance->employee_control_no ?? '')) ?: null;
-                if ($employeeName !== '') {
-                    $existingEntry->employee_name = $employeeName;
-                }
-                if ($leaveTypeName !== '') {
-                    $existingEntry->leave_type_name = $leaveTypeName;
+        if ($existingEntry) {
+            $existingEntry->credits_added = $this->normalizeManualCreditValue(
+                (float) $existingEntry->credits_added + $normalizedCreditsToAdd
+            );
+            $existingEntry->source = $manualSource;
+            $existingEntry->employee_control_no = trim((string) ($leaveBalance->employee_control_no ?? '')) ?: null;
+            if ($employeeName !== '') {
+                $existingEntry->employee_name = $employeeName;
+            }
+            if ($leaveTypeName !== '') {
+                $existingEntry->leave_type_name = $leaveTypeName;
             }
             $existingEntry->save();
             return;
@@ -512,6 +515,11 @@ class HRLeaveBalanceImportController extends Controller
             'accrual_date' => $accrualDate,
             'source' => $manualSource,
         ]);
+    }
+
+    private function normalizeManualCreditValue(mixed $value): float
+    {
+        return round((float) $value, self::MANUAL_CREDIT_PRECISION);
     }
 
     private function formatEmployeeNameForStorage(object $employee): string

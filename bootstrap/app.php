@@ -33,10 +33,20 @@ return Application::configure(basePath: dirname(__DIR__))
             $message = match ($reason) {
                 'concurrent_login' => 'This account was logged in on another device.',
                 'idle_timeout' => 'Your session expired after 1 hour of inactivity.',
+                'session_expired' => 'Your session has expired. Please log in again.',
                 default => 'Unauthenticated.',
             };
 
-            $payload = ['message' => $message];
+            $shouldLogout = in_array($reason, [
+                'concurrent_login',
+                'idle_timeout',
+                'session_expired',
+            ], true);
+
+            $payload = [
+                'message' => $message,
+                'should_logout' => $shouldLogout,
+            ];
             if ($reason !== '') {
                 $payload['reason'] = $reason;
             }

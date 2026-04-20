@@ -14,6 +14,10 @@ class EmployeeDepartmentAssignment extends Model
         'department_id',
         'assigned_by_department_admin_id',
         'assigned_at',
+        'surname',
+        'firstname',
+        'middlename',
+        'department_acronym',
     ];
 
     protected function casts(): array
