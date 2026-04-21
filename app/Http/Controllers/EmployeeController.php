@@ -312,6 +312,10 @@ class EmployeeController extends Controller
             }
         }
 
+        if ($isHrAccount) {
+            $this->attachManualLeaveCreditsUsageFlags($employees);
+        }
+
         return response()->json([
             'employees' => $employees,
             'total_employees' => $totalEmployees,
@@ -522,13 +526,31 @@ class EmployeeController extends Controller
     }
 
     /**
-     * Return leave application history for one employee (HR only).
+     * Return leave application history for one employee (HR and department admin).
      */
     public function leaveHistory(Request $request, string $controlNo): JsonResponse
     {
         $account = $request->user();
-        if (!$account instanceof HRAccount) {
-            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        if ($account instanceof DepartmentAdmin) {
+            $account->loadMissing('department');
+            if (!$account->department_id || !$account->department?->name) {
+                return response()->json([
+                    'message' => 'Department admin account is not assigned to a department.',
+                ], 403);
+            }
+
+            $hasPulledEmployeeAssignment = $this->findPulledEmployeeAssignment($controlNo, (int) $account->department_id) !== null;
+            $isDepartmentHead = $this->matchesDepartmentHeadControlNo((int) $account->department_id, $controlNo);
+
+            if (!$hasPulledEmployeeAssignment && !$isDepartmentHead) {
+                return response()->json([
+                    'message' => 'Employee is not in your department assignment list.',
+                ], 403);
+            }
+        } elseif (!$account instanceof HRAccount) {
+            return response()->json([
+                'message' => 'Only HR and department admin accounts can access this endpoint.',
+            ], 403);
         }
 
         $employee = HrisEmployee::findByControlNo($controlNo);
@@ -573,6 +595,14 @@ class EmployeeController extends Controller
                 'surname' => $employee->surname,
                 'middlename' => $employee->middlename,
                 'office' => $employee->office,
+                'officeAcronym' => $this->trimOrBlank($employee->officeAcronym ?? null),
+                'office_acronym' => $this->trimOrBlank($employee->officeAcronym ?? $employee->office_acronym ?? null),
+                'hris_office' => $this->trimOrBlank($employee->hris_office ?? null),
+                'hrisOfficeAcronym' => $this->trimOrBlank($employee->hrisOfficeAcronym ?? null),
+                'hris_office_acronym' => $this->trimOrBlank($employee->hrisOfficeAcronym ?? $employee->hris_office_acronym ?? null),
+                'assigned_department_name' => $this->trimOrBlank($employee->assigned_department_name ?? null),
+                'assignedDepartmentAcronym' => $this->trimOrBlank($employee->assignedDepartmentAcronym ?? $employee->assigned_department_acronym ?? null),
+                'assigned_department_acronym' => $this->trimOrBlank($employee->assignedDepartmentAcronym ?? $employee->assigned_department_acronym ?? null),
                 'designation' => $employee->designation,
                 'status' => $employee->status,
             ],
@@ -1175,9 +1205,13 @@ class EmployeeController extends Controller
             'designation' => $this->trimOrBlank($employee->designation ?? null),
             'office' => trim((string) ($employee->office ?? '')),
             'officeAcronym' => $this->trimOrBlank($employee->officeAcronym ?? null),
+            'office_acronym' => $this->trimOrBlank($employee->officeAcronym ?? $employee->office_acronym ?? null),
             'hris_office' => $this->trimOrBlank($employee->hris_office ?? null),
             'hrisOfficeAcronym' => $this->trimOrBlank($employee->hrisOfficeAcronym ?? null),
+            'hris_office_acronym' => $this->trimOrBlank($employee->hrisOfficeAcronym ?? $employee->hris_office_acronym ?? null),
             'assigned_department_name' => $this->trimOrBlank($employee->assigned_department_name ?? null),
+            'assignedDepartmentAcronym' => $this->trimOrBlank($employee->assignedDepartmentAcronym ?? $employee->assigned_department_acronym ?? null),
+            'assigned_department_acronym' => $this->trimOrBlank($employee->assignedDepartmentAcronym ?? $employee->assigned_department_acronym ?? null),
             'assigned_department_id' => $employee->assigned_department_id !== null
                 ? (int) $employee->assigned_department_id
                 : null,
@@ -1662,6 +1696,42 @@ class EmployeeController extends Controller
             });
     }
 
+    private function matchesDepartmentHeadControlNo(int $departmentId, string $controlNo): bool
+    {
+        if ($departmentId <= 0) {
+            return false;
+        }
+
+        $targetControlNo = trim($controlNo);
+        if ($targetControlNo === '') {
+            return false;
+        }
+
+        $departmentHead = DepartmentHead::query()
+            ->where('department_id', $departmentId)
+            ->first();
+
+        if (!$departmentHead) {
+            return false;
+        }
+
+        $storedControlNo = trim((string) $departmentHead->control_no);
+        if ($storedControlNo === '') {
+            return false;
+        }
+
+        if ($storedControlNo === $targetControlNo) {
+            return true;
+        }
+
+        $normalizedTargetControlNo = $this->normalizeLedgerControlNo($targetControlNo);
+        $normalizedStoredControlNo = $this->normalizeLedgerControlNo($storedControlNo);
+
+        return $normalizedTargetControlNo !== null
+            && $normalizedStoredControlNo !== null
+            && $normalizedTargetControlNo === $normalizedStoredControlNo;
+    }
+
     private function assignEmployeeToDepartment(DepartmentAdmin $admin, string $controlNo): JsonResponse
     {
         $employee = HrisEmployee::findByControlNo($controlNo, true);
@@ -1756,6 +1826,65 @@ class EmployeeController extends Controller
         }
 
         return $lookup;
+    }
+
+    private function attachManualLeaveCreditsUsageFlags(LengthAwarePaginator $employees): void
+    {
+        $rows = $employees->getCollection();
+        if ($rows->isEmpty()) {
+            return;
+        }
+
+        $rowControlNos = $rows
+            ->map(fn (mixed $row): string => trim((string) (is_array($row) ? ($row['control_no'] ?? '') : '')))
+            ->filter(fn (string $controlNo): bool => $controlNo !== '')
+            ->values()
+            ->all();
+
+        $manualCreditUsageLookup = $this->loadManualLeaveCreditsUsageLookup($rowControlNos);
+        $employees->setCollection(
+            $rows->map(function (mixed $row) use ($manualCreditUsageLookup): mixed {
+                if (!is_array($row)) {
+                    return $row;
+                }
+
+                $controlNo = trim((string) ($row['control_no'] ?? ''));
+                $row['has_manual_leave_credits'] = $controlNo !== ''
+                    && $this->hasControlNoInLookup($controlNo, $manualCreditUsageLookup);
+
+                return $row;
+            })
+        );
+    }
+
+    private function loadManualLeaveCreditsUsageLookup(array $controlNos): array
+    {
+        $controlNoLookup = $this->buildControlNoLookup($controlNos);
+        if ($controlNoLookup === []) {
+            return [];
+        }
+
+        $candidateControlNos = array_keys($controlNoLookup);
+        $usedControlNos = LeaveBalanceAccrualHistory::query()
+            ->join('tblLeaveBalances as lb', 'lb.id', '=', 'tblLeaveBalanceCreditHistories.leave_balance_id')
+            ->whereIn('lb.employee_control_no', $candidateControlNos)
+            ->where(function ($query): void {
+                $query->whereRaw(
+                    "UPPER(LTRIM(RTRIM(COALESCE(tblLeaveBalanceCreditHistories.source, '')))) = ?",
+                    ['HR_ADD']
+                )->orWhereRaw(
+                    "UPPER(LTRIM(RTRIM(COALESCE(tblLeaveBalanceCreditHistories.source, '')))) LIKE ?",
+                    ['HR_ADD:%']
+                );
+            })
+            ->pluck('lb.employee_control_no')
+            ->map(fn (mixed $value): string => trim((string) $value))
+            ->filter(fn (string $value): bool => $value !== '')
+            ->unique()
+            ->values()
+            ->all();
+
+        return $this->buildControlNoLookup($usedControlNos);
     }
 
     private function hasControlNoInLookup(string $controlNo, array $lookup): bool
