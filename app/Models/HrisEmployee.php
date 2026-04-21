@@ -37,6 +37,8 @@ class HrisEmployee
     private static array $singleLookupMemo = [];
     /** @var array<string, array{department_id:int|null, department_name:string}>|null */
     private static ?array $assignedDepartmentNamesMemo = null;
+    /** @var array<string, string>|null */
+    private static ?array $officeAcronymsByOfficeNameMemo = null;
     private static ?string $cacheVersionMemo = null;
 
     /**
@@ -283,6 +285,7 @@ class HrisEmployee
         Cache::forget(self::cacheKey('count', false));
         self::$singleLookupMemo = [];
         self::$assignedDepartmentNamesMemo = null;
+        self::$officeAcronymsByOfficeNameMemo = null;
         self::$cacheVersionMemo = 'v'.str_replace('.', '', (string) microtime(true));
         Cache::forever(self::CACHE_VERSION_KEY, self::$cacheVersionMemo);
     }
@@ -766,6 +769,8 @@ class HrisEmployee
                 $row['hris_office'] = trim((string) ($row['office'] ?? ''));
                 $row['hrisOfficeAcronym'] = self::trimNullableString($row['officeAcronym'] ?? null);
                 $row['assigned_department_name'] = null;
+                $row['assignedDepartmentAcronym'] = null;
+                $row['assigned_department_acronym'] = null;
                 $row['assigned_department_id'] = null;
                 $row['is_department_reassigned'] = false;
 
@@ -780,19 +785,23 @@ class HrisEmployee
             $assignment = $normalizedControlNo !== null
                 ? ($departmentNamesByControlNo[$normalizedControlNo] ?? null)
                 : null;
+            $assignedDepartmentName = trim((string) ($assignment['department_name'] ?? ''));
+            $assignedDepartmentAcronym = self::resolveOfficeAcronymByName(
+                $assignedDepartmentName !== '' ? $assignedDepartmentName : null
+            );
 
             $row['hris_office'] = $originalOffice;
             $row['hrisOfficeAcronym'] = $originalOfficeAcronym;
-            $row['assigned_department_name'] = $assignment['department_name'] ?? null;
+            $row['assigned_department_name'] = $assignedDepartmentName !== '' ? $assignedDepartmentName : null;
+            $row['assignedDepartmentAcronym'] = $assignedDepartmentAcronym;
+            $row['assigned_department_acronym'] = $assignedDepartmentAcronym;
             $row['assigned_department_id'] = $assignment['department_id'] ?? null;
             $row['is_department_reassigned'] = $assignment !== null
-                && strcasecmp((string) ($assignment['department_name'] ?? ''), $originalOffice) !== 0;
+                && strcasecmp($assignedDepartmentName, $originalOffice) !== 0;
 
-            if ($assignment !== null && trim((string) ($assignment['department_name'] ?? '')) !== '') {
-                $row['office'] = trim((string) $assignment['department_name']);
-                if ($row['is_department_reassigned']) {
-                    $row['officeAcronym'] = null;
-                }
+            if ($assignment !== null && $assignedDepartmentName !== '') {
+                $row['office'] = $assignedDepartmentName;
+                $row['officeAcronym'] = $assignedDepartmentAcronym;
             }
 
             return $row;
@@ -829,6 +838,56 @@ class HrisEmployee
 
                 return $carry;
             }, []);
+    }
+
+    private static function resolveOfficeAcronymByName(?string $officeName): ?string
+    {
+        $lookupKey = self::normalizeOfficeLookupKey($officeName);
+        if ($lookupKey === '') {
+            return null;
+        }
+
+        $acronymsByOfficeName = self::loadOfficeAcronymsByOfficeName();
+
+        return $acronymsByOfficeName[$lookupKey] ?? null;
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private static function loadOfficeAcronymsByOfficeName(): array
+    {
+        if (self::$officeAcronymsByOfficeNameMemo !== null) {
+            return self::$officeAcronymsByOfficeNameMemo;
+        }
+
+        try {
+            $officeRows = DB::connection(self::HR_CONNECTION)
+                ->table(self::OFFICE_TABLE.' as yo')
+                ->selectRaw('NULLIF(LTRIM(RTRIM(CONVERT(VARCHAR(255), yo.Descriptions))), \'\') as office_name')
+                ->selectRaw('NULLIF(LTRIM(RTRIM(CONVERT(VARCHAR(255), yo.Abbr))), \'\') as office_acronym')
+                ->get();
+
+            $acronymsByOfficeName = [];
+            foreach ($officeRows as $officeRow) {
+                $lookupKey = self::normalizeOfficeLookupKey($officeRow->office_name ?? null);
+                $officeAcronym = self::trimNullableString($officeRow->office_acronym ?? null);
+
+                if ($lookupKey === '' || $officeAcronym === null) {
+                    continue;
+                }
+
+                $acronymsByOfficeName[$lookupKey] = $officeAcronym;
+            }
+
+            return self::$officeAcronymsByOfficeNameMemo = $acronymsByOfficeName;
+        } catch (Throwable $exception) {
+            self::reportFailure('loadOfficeAcronymsByOfficeName', $exception, [
+                'fallback' => 'empty_map',
+            ]);
+
+            return self::$officeAcronymsByOfficeNameMemo = [];
+        }
     }
 
     private static function snapshotTableExists(): bool
@@ -1601,6 +1660,16 @@ class HrisEmployee
     private static function trimStringOrBlank(mixed $value): string
     {
         return trim((string) ($value ?? ''));
+    }
+
+    private static function normalizeOfficeLookupKey(mixed $officeName): string
+    {
+        $normalized = preg_replace('/\s+/', ' ', trim((string) ($officeName ?? '')));
+        if (!is_string($normalized) || $normalized === '') {
+            return '';
+        }
+
+        return mb_strtoupper($normalized, 'UTF-8');
     }
 
     /**
