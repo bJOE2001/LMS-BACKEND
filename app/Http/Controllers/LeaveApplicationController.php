@@ -1727,7 +1727,8 @@ class LeaveApplicationController extends Controller
     // ═══════════════════════════════════════════════════════════════════
 
     /**
-     * List PENDING_ADMIN applications for the admin's department.
+     * List visible applications for the admin's department.
+     * Pending items are still prioritized by queue sorting.
      */
     public function adminIndex(Request $request): JsonResponse
     {
@@ -1737,7 +1738,11 @@ class LeaveApplicationController extends Controller
         }
 
         $deptName = $admin->department?->name;
-        $departmentEmployeeControlNos = $this->findDepartmentEmployeeControlNos($deptName, null);
+        $departmentEmployeeControlNos = $this->findDepartmentEmployeeControlNos(
+            $deptName,
+            null,
+            $admin->department_id !== null ? (int) $admin->department_id : null
+        );
         $departmentAdminIds = $admin->department_id !== null
             ? DepartmentAdmin::query()
                 ->where('department_id', $admin->department_id)
@@ -1747,8 +1752,14 @@ class LeaveApplicationController extends Controller
                 ->all()
             : [];
 
-        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin.department', 'updateRequests'])
-            ->where('status', LeaveApplication::STATUS_PENDING_ADMIN)
+        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin.department', 'updateRequests', 'logs'])
+            ->whereIn('status', [
+                LeaveApplication::STATUS_PENDING_ADMIN,
+                LeaveApplication::STATUS_PENDING_HR,
+                LeaveApplication::STATUS_APPROVED,
+                LeaveApplication::STATUS_REJECTED,
+                LeaveApplication::STATUS_RECALLED,
+            ])
             ->where(function ($query) use ($departmentEmployeeControlNos, $admin, $departmentAdminIds): void {
                 $hasVisibilityConstraint = false;
 
@@ -1758,28 +1769,39 @@ class LeaveApplicationController extends Controller
                 }
 
                 if ($admin->department_id !== null) {
+                    $selfDepartmentVisibility = function ($selfScopedQuery) use ($admin): void {
+                        $selfScopedQuery
+                            ->where(function ($employeeControlNoQuery): void {
+                                $employeeControlNoQuery
+                                    ->whereNull('employee_control_no')
+                                    ->orWhere('employee_control_no', '');
+                            })
+                            ->whereHas('applicantAdmin', fn ($nestedQuery) => $nestedQuery->where('department_id', $admin->department_id));
+                    };
+
                     if ($hasVisibilityConstraint) {
-                        $query->orWhereHas('applicantAdmin', fn($nestedQuery) => $nestedQuery->where('department_id', $admin->department_id));
+                        $query->orWhere($selfDepartmentVisibility);
                     } else {
-                        $query->whereHas('applicantAdmin', fn($nestedQuery) => $nestedQuery->where('department_id', $admin->department_id));
+                        $query->where($selfDepartmentVisibility);
                     }
                     $hasVisibilityConstraint = true;
                 }
 
                 if ($departmentAdminIds !== []) {
-                    if ($hasVisibilityConstraint) {
-                        $query->orWhereIn('admin_id', $departmentAdminIds);
-                    } else {
-                        $query->whereIn('admin_id', $departmentAdminIds);
-                    }
-                    $hasVisibilityConstraint = true;
-                }
+                    $selfAdminVisibility = function ($selfScopedQuery) use ($departmentAdminIds): void {
+                        $selfScopedQuery
+                            ->where(function ($employeeControlNoQuery): void {
+                                $employeeControlNoQuery
+                                    ->whereNull('employee_control_no')
+                                    ->orWhere('employee_control_no', '');
+                            })
+                            ->whereIn('admin_id', $departmentAdminIds);
+                    };
 
-                if ($admin->id !== null) {
                     if ($hasVisibilityConstraint) {
-                        $query->orWhere('admin_id', $admin->id);
+                        $query->orWhere($selfAdminVisibility);
                     } else {
-                        $query->where('admin_id', $admin->id);
+                        $query->where($selfAdminVisibility);
                     }
                     $hasVisibilityConstraint = true;
                 }
@@ -3498,7 +3520,12 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
-        if (!$this->sameOffice($employee->office ?? null, $admin->department?->name)) {
+        if (!$this->adminDepartmentCanAccessEmployee(
+            $admin->department_id !== null ? (int) $admin->department_id : null,
+            $admin->department?->name,
+            (string) $employee->control_no,
+            $employee
+        )) {
             return response()->json(['message' => 'You can only file leave for employees in your department.'], 403);
         }
 
@@ -3650,7 +3677,12 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
-        if (!$this->sameOffice($employee->office ?? null, $admin->department?->name)) {
+        if (!$this->adminDepartmentCanAccessEmployee(
+            $admin->department_id !== null ? (int) $admin->department_id : null,
+            $admin->department?->name,
+            (string) $employee->control_no,
+            $employee
+        )) {
             return response()->json(['message' => 'You can only file for employees in your department.'], 403);
         }
 
@@ -3789,6 +3821,52 @@ class LeaveApplicationController extends Controller
             return null;
         }
 
+        $lookupValues = collect([
+            $controlNo,
+            ltrim($controlNo, '0'),
+        ])
+            ->map(fn (mixed $value): string => trim((string) $value))
+            ->filter(fn (string $value): bool => $value !== '')
+            ->unique()
+            ->values()
+            ->all();
+
+        if ($lookupValues !== []) {
+            $snapshotRow = DB::table('tblEmployees')
+                ->select([
+                    'control_no',
+                    'surname',
+                    'firstname',
+                    'middlename',
+                    'office',
+                    'status',
+                    'designation',
+                    'rate_mon',
+                ])
+                ->whereIn('control_no', $lookupValues)
+                ->orderByRaw('CASE WHEN control_no = ? THEN 0 ELSE 1 END', [$controlNo])
+                ->first();
+
+            if ($snapshotRow) {
+                $snapshotEmployee = (object) [
+                    'control_no' => trim((string) ($snapshotRow->control_no ?? '')),
+                    'surname' => trim((string) ($snapshotRow->surname ?? '')),
+                    'firstname' => trim((string) ($snapshotRow->firstname ?? '')),
+                    'middlename' => trim((string) ($snapshotRow->middlename ?? '')),
+                    'office' => trim((string) ($snapshotRow->office ?? '')),
+                    'status' => trim((string) ($snapshotRow->status ?? '')),
+                    'designation' => trim((string) ($snapshotRow->designation ?? '')),
+                    'rate_mon' => $snapshotRow->rate_mon,
+                    'officeAcronym' => null,
+                    'hrisOfficeAcronym' => null,
+                ];
+
+                if ($snapshotEmployee->control_no !== '') {
+                    return $snapshotEmployee;
+                }
+            }
+        }
+
         return HrisEmployee::findByControlNo($controlNo);
     }
 
@@ -3835,9 +3913,155 @@ class LeaveApplicationController extends Controller
             ->exists();
     }
 
-    private function findDepartmentEmployeeControlNos(?string $departmentName, ?bool $activeOnly = null): array
+    /**
+     * @return array<string, int>
+     */
+    private function resolveLatestAssignmentDepartmentMap(): array
     {
-        return HrisEmployee::controlNosByOffice($departmentName, $activeOnly);
+        $latestDepartmentByControlNo = [];
+
+        $rows = EmployeeDepartmentAssignment::query()
+            ->select(['employee_control_no', 'department_id', 'assigned_at', 'id'])
+            ->orderByDesc('assigned_at')
+            ->orderByDesc('id')
+            ->get();
+
+        foreach ($rows as $row) {
+            $normalizedControlNo = $this->normalizeControlNo((string) ($row->employee_control_no ?? ''));
+            if ($normalizedControlNo === '' || array_key_exists($normalizedControlNo, $latestDepartmentByControlNo)) {
+                continue;
+            }
+
+            $departmentId = (int) ($row->department_id ?? 0);
+            if ($departmentId <= 0) {
+                continue;
+            }
+
+            $latestDepartmentByControlNo[$normalizedControlNo] = $departmentId;
+        }
+
+        return $latestDepartmentByControlNo;
+    }
+
+    private function resolveLatestAssignedDepartmentIdForControlNo(?string $controlNo): ?int
+    {
+        $rawControlNo = trim((string) ($controlNo ?? ''));
+        if ($rawControlNo === '') {
+            return null;
+        }
+
+        $controlNoCandidates = array_values(array_unique(array_filter([
+            $rawControlNo,
+            $this->normalizeControlNo($rawControlNo),
+        ])));
+
+        if ($controlNoCandidates === []) {
+            return null;
+        }
+
+        $departmentId = EmployeeDepartmentAssignment::query()
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->orderByDesc('assigned_at')
+            ->orderByDesc('id')
+            ->value('department_id');
+
+        $resolvedDepartmentId = (int) ($departmentId ?? 0);
+        return $resolvedDepartmentId > 0 ? $resolvedDepartmentId : null;
+    }
+
+    private function findDepartmentEmployeeControlNos(
+        ?string $departmentName,
+        ?bool $activeOnly = null,
+        ?int $departmentId = null
+    ): array
+    {
+        $normalizedDepartmentName = trim((string) ($departmentName ?? ''));
+        $resolvedDepartmentId = (int) ($departmentId ?? 0);
+        $snapshotControlNos = [];
+        $latestAssignmentDepartmentMap = $this->resolveLatestAssignmentDepartmentMap();
+
+        if ($normalizedDepartmentName !== '') {
+            $snapshotQuery = DB::table('tblEmployees')
+                ->select('control_no')
+                ->where('office', $normalizedDepartmentName);
+
+            if ($activeOnly === true) {
+                $snapshotQuery->where(function ($query): void {
+                    $query->where('is_active', 1)
+                        ->orWhereNull('is_active');
+                });
+            } elseif ($activeOnly === false) {
+                $snapshotQuery->where('is_active', 0);
+            }
+
+            $snapshotControlNos = $snapshotQuery
+                ->pluck('control_no')
+                ->map(fn (mixed $value): string => trim((string) $value))
+                ->filter(fn (string $controlNo): bool => $controlNo !== '')
+                ->values()
+                ->all();
+        }
+
+        $snapshotControlNos = collect($snapshotControlNos)
+            ->map(fn (mixed $value): string => trim((string) $value))
+            ->filter(fn (string $controlNo): bool => $controlNo !== '')
+            ->filter(function (string $controlNo) use ($resolvedDepartmentId, $latestAssignmentDepartmentMap): bool {
+                if ($resolvedDepartmentId <= 0) {
+                    return true;
+                }
+
+                $normalizedControlNo = $this->normalizeControlNo($controlNo);
+                if ($normalizedControlNo === '') {
+                    return false;
+                }
+
+                $latestAssignedDepartmentId = $latestAssignmentDepartmentMap[$normalizedControlNo] ?? null;
+                if ($latestAssignedDepartmentId === null) {
+                    return true;
+                }
+
+                return (int) $latestAssignedDepartmentId === $resolvedDepartmentId;
+            })
+            ->values()
+            ->all();
+
+        $assignedControlNos = $resolvedDepartmentId > 0
+            ? collect($latestAssignmentDepartmentMap)
+                ->filter(fn (int $assignedDepartmentId): bool => $assignedDepartmentId === $resolvedDepartmentId)
+                ->keys()
+                ->map(fn (mixed $value): string => trim((string) $value))
+                ->filter(fn (string $controlNo): bool => $controlNo !== '')
+                ->values()
+                ->all()
+            : [];
+
+        $resolvedControlNos = array_values(array_unique([
+            ...$snapshotControlNos,
+            ...$assignedControlNos,
+        ]));
+
+        if ($resolvedControlNos === []) {
+            if ($resolvedDepartmentId > 0) {
+                return [];
+            }
+
+            $resolvedControlNos = HrisEmployee::controlNosByOffice($departmentName, $activeOnly);
+        }
+
+        return collect($resolvedControlNos)
+            ->map(fn (mixed $value): string => trim((string) $value))
+            ->filter(fn (string $controlNo): bool => $controlNo !== '')
+            ->flatMap(function (string $controlNo): array {
+                $normalizedControlNo = $this->normalizeControlNo($controlNo);
+                return array_values(array_unique([
+                    $controlNo,
+                    $normalizedControlNo,
+                ]));
+            })
+            ->filter(fn (string $controlNo): bool => $controlNo !== '')
+            ->unique()
+            ->values()
+            ->all();
     }
 
     /**
@@ -3898,6 +4122,27 @@ class LeaveApplicationController extends Controller
         $rightOffice = $this->normalizeOffice($right);
 
         return $leftOffice !== '' && $leftOffice === $rightOffice;
+    }
+
+    private function adminDepartmentCanAccessEmployee(
+        ?int $departmentId,
+        ?string $departmentName,
+        string $employeeControlNo,
+        ?object $employee = null
+    ): bool {
+        $resolvedDepartmentId = (int) ($departmentId ?? 0);
+        if ($resolvedDepartmentId > 0) {
+            $latestAssignedDepartmentId = $this->resolveLatestAssignedDepartmentIdForControlNo($employeeControlNo);
+            if ($latestAssignedDepartmentId !== null) {
+                return (int) $latestAssignedDepartmentId === $resolvedDepartmentId;
+            }
+        }
+
+        if (!$employee) {
+            return false;
+        }
+
+        return $this->sameOffice($employee->office ?? null, $departmentName);
     }
 
     private function normalizeOffice(mixed $value): string
@@ -4738,9 +4983,19 @@ class LeaveApplicationController extends Controller
         $admin->loadMissing('department');
         $app->loadMissing('applicantAdmin.department');
 
-        $applicationEmployee = $this->resolveApplicationEmployee($app);
-        if (($applicationEmployee?->office ?? null) === $admin->department?->name) {
-            return true;
+        $employeeControlNo = trim((string) ($app->employee_control_no ?? ''));
+        if ($employeeControlNo !== '') {
+            $latestAssignedDepartmentId = $this->resolveLatestAssignedDepartmentIdForControlNo($employeeControlNo);
+            if ($latestAssignedDepartmentId !== null) {
+                return (int) $latestAssignedDepartmentId === (int) ($admin->department_id ?? 0);
+            }
+
+            $applicationEmployee = $this->resolveApplicationEmployee($app);
+            if (($applicationEmployee?->office ?? null) === $admin->department?->name) {
+                return true;
+            }
+
+            return false;
         }
 
         if ((int) ($app->admin_id ?? 0) > 0 && (int) $app->admin_id === (int) $admin->id) {
@@ -9881,6 +10136,36 @@ class LeaveApplicationController extends Controller
             ? $this->statusToFrontend(LeaveApplication::STATUS_APPROVED)
             : $this->statusToFrontend($app->status);
         $queueMeta = $this->resolveLeaveHrQueueMeta($app);
+        $logs = $app->relationLoaded('logs')
+            ? $app->logs
+                ->filter(fn($log) => $log instanceof LeaveApplicationLog)
+                ->sortBy(fn(LeaveApplicationLog $log) => $log->created_at?->timestamp ?? 0)
+                ->values()
+            : collect();
+        $hrReceivedLog = $logs->last(
+            fn(LeaveApplicationLog $log) =>
+                $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
+        $hrReleasedLog = $logs->last(
+            fn(LeaveApplicationLog $log) =>
+                $log->action === LeaveApplicationLog::ACTION_HR_RELEASED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
+        $statusHistory = $logs
+            ->map(function (LeaveApplicationLog $log): array {
+                $stage = $this->mapWorkflowLogStage($log);
+
+                return [
+                    'action' => $log->action,
+                    'stage' => $stage,
+                    'performed_by_type' => strtoupper((string) $log->performed_by_type),
+                    'remarks' => $log->remarks,
+                    'created_at' => $log->created_at?->toIso8601String(),
+                ];
+            })
+            ->values()
+            ->all();
 
         $effectiveRecallDateKeys = $this->resolveEffectiveStoredRecallDateKeys($app);
 
@@ -9962,6 +10247,17 @@ class LeaveApplicationController extends Controller
             'hr_id' => $app->hr_id,
             'admin_approved_at' => $app->admin_approved_at?->toIso8601String(),
             'hr_approved_at' => $app->hr_approved_at?->toIso8601String(),
+            'received_at' => $hrReceivedLog?->created_at?->toIso8601String(),
+            'receivedAt' => $hrReceivedLog?->created_at?->toIso8601String(),
+            'hr_received_at' => $hrReceivedLog?->created_at?->toIso8601String(),
+            'released_at' => $hrReleasedLog?->created_at?->toIso8601String(),
+            'releasedAt' => $hrReleasedLog?->created_at?->toIso8601String(),
+            'hr_released_at' => $hrReleasedLog?->created_at?->toIso8601String(),
+            'has_hr_received' => $hrReceivedLog !== null,
+            'hasHrReceived' => $hrReceivedLog !== null,
+            'has_hr_released' => $hrReleasedLog !== null,
+            'hasHrReleased' => $hrReleasedLog !== null,
+            'status_history' => $statusHistory,
             'recallEffectiveDate' => $app->recall_effective_date?->toDateString(),
             'recall_effective_date' => $app->recall_effective_date?->toDateString(),
             'recallSelectedDates' => $effectiveRecallDateKeys !== [] ? $effectiveRecallDateKeys : null,
