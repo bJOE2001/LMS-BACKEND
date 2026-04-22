@@ -12,6 +12,7 @@ use App\Services\RecycleBinService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
@@ -28,6 +29,8 @@ class HRUserManagementController extends Controller
         $validated = $request->validate([
             'search' => ['nullable', 'string', 'max:100'],
         ]);
+        $currentUser = $request->user();
+        $currentHrAccountId = $currentUser instanceof HRAccount ? (int) $currentUser->id : null;
 
         $searchTerm = trim((string) ($validated['search'] ?? ''));
 
@@ -39,6 +42,9 @@ class HRUserManagementController extends Controller
             ->values();
 
         $hrAccounts = HRAccount::query()
+            ->when($currentHrAccountId !== null, function ($query) use ($currentHrAccountId): void {
+                $query->where('id', '!=', $currentHrAccountId);
+            })
             ->orderBy('full_name')
             ->get()
             ->map(fn(HRAccount $account): array => $this->serializeHrAccountRow($account))
@@ -163,23 +169,37 @@ class HRUserManagementController extends Controller
     }
 
     /**
-     * Create a department admin account (employee-linked or guest) for a department.
+     * Create either an HR account or an office admin account.
      */
     public function store(Request $request): JsonResponse
     {
         $validated = $request->validate([
+            'is_hr_admin' => ['nullable', 'boolean'],
             'department_id' => [
-                'required',
+                'nullable',
                 'integer',
                 Rule::exists('tblDepartments', 'id')->where(fn ($query) => $query->where('is_inactive', false)),
             ],
             'is_guest' => ['nullable', 'boolean'],
             'employee_control_no' => ['nullable', 'string', 'max:50', 'regex:/^\d+$/'],
             'password' => ['nullable', 'string', 'min:8', 'max:255'],
-            'username' => ['required', 'string', 'max:255', Rule::unique('tblDepartmentAdmins', 'username')],
+            'username' => ['required', 'string', 'max:255'],
         ]);
 
-        $department = Department::query()->active()->find((int) $validated['department_id']);
+        $isHrAdmin = filter_var((string) ($validated['is_hr_admin'] ?? false), FILTER_VALIDATE_BOOLEAN);
+        $departmentId = isset($validated['department_id']) ? (int) $validated['department_id'] : null;
+
+        if ($isHrAdmin) {
+            return $this->storeHrAccount($validated);
+        }
+
+        if (!$departmentId) {
+            throw ValidationException::withMessages([
+                'department_id' => ['Office is required when creating an office admin account.'],
+            ]);
+        }
+
+        $department = Department::query()->active()->find($departmentId);
         if (!$department) {
             return response()->json([
                 'message' => 'Department not found.',
@@ -236,7 +256,7 @@ class HRUserManagementController extends Controller
             : $this->buildGuestAdminFullName((string) $validated['username']);
         $admin->username = trim((string) $validated['username']);
         $admin->password = $generatedPassword;
-        $admin->must_change_password = !$isGuest;
+        $admin->must_change_password = true;
         $admin->save();
         $admin->load([
             'department:id,name',
@@ -244,9 +264,59 @@ class HRUserManagementController extends Controller
 
         return response()->json([
             'message' => $isGuest
-                ? 'Guest department admin account created successfully.'
+                ? 'Guest department admin account created successfully. Password must be changed on first login.'
                 : 'Department admin assigned successfully. Default password is employee birthdate (MMDDYY).',
             'department_admin' => $this->serializeDepartmentAdmin($admin),
+        ], 201);
+    }
+
+    private function storeHrAccount(array $validated): JsonResponse
+    {
+        $isGuest = filter_var((string) ($validated['is_guest'] ?? false), FILTER_VALIDATE_BOOLEAN);
+        $employeeControlNo = trim((string) ($validated['employee_control_no'] ?? ''));
+        $rawPassword = (string) ($validated['password'] ?? '');
+
+        if (!$isGuest && $employeeControlNo === '') {
+            throw ValidationException::withMessages([
+                'employee_control_no' => ['Employee is required when guest mode is off.'],
+            ]);
+        }
+
+        if ($isGuest && trim($rawPassword) === '') {
+            throw ValidationException::withMessages([
+                'password' => ['Password is required when guest mode is on.'],
+            ]);
+        }
+
+        $employee = !$isGuest
+            ? $this->resolveEligibleEmployeeForAssignment($employeeControlNo)
+            : null;
+
+        $this->assertUsernameAvailableForDepartmentAdmin((string) $validated['username']);
+        $generatedPassword = $isGuest
+            ? trim($rawPassword)
+            : $this->buildGeneratedPasswordFromBirthDate($employee);
+
+        $position = trim((string) ($employee?->designation ?? ''));
+        if ($position === '') {
+            $position = 'HR';
+        }
+
+        $hrAccount = HRAccount::query()->create([
+            'full_name' => $employee
+                ? $this->buildEmployeeFullName($employee)
+                : $this->buildGuestHrFullName((string) $validated['username']),
+            'position' => $position,
+            'username' => trim((string) $validated['username']),
+            'password' => $generatedPassword,
+            'must_change_password' => true,
+        ]);
+
+        return response()->json([
+            'message' => $isGuest
+                ? 'Guest HR account created successfully. Password must be changed on first login.'
+                : 'HR account created successfully. Default password is employee birthdate (MMDDYY).',
+            'hr_account' => $this->serializeHrAccountRow($hrAccount),
         ], 201);
     }
 
@@ -351,6 +421,60 @@ class HRUserManagementController extends Controller
         ]);
     }
 
+    /**
+     * Remove an HR admin account.
+     */
+    public function destroyHrAccount(Request $request, int $id): JsonResponse
+    {
+        $hrAccount = HRAccount::query()->find($id);
+        if (!$hrAccount) {
+            return response()->json([
+                'message' => 'HR account not found.',
+            ], 404);
+        }
+
+        $currentUser = $request->user();
+        if ($currentUser instanceof HRAccount && (int) $currentUser->id === (int) $hrAccount->id) {
+            return response()->json([
+                'message' => 'You cannot remove the currently logged-in HR account.',
+            ], 422);
+        }
+
+        $remainingHrAccounts = HRAccount::query()
+            ->where('id', '!=', $hrAccount->id)
+            ->count();
+        if ($remainingHrAccounts < 1) {
+            return response()->json([
+                'message' => 'At least one HR account must remain.',
+            ], 422);
+        }
+
+        if ($this->hasHistoricalCocApplicationsForHrAccount($hrAccount)) {
+            return response()->json([
+                'message' => 'This HR account has historical COC records and cannot be removed.',
+            ], 422);
+        }
+
+        DB::transaction(function () use ($hrAccount, $request): void {
+            app(RecycleBinService::class)->storeDeletedModel(
+                $hrAccount,
+                $request->user(),
+                [
+                    'record_title' => $hrAccount->full_name,
+                    'delete_source' => 'hr.user-management',
+                    'delete_reason' => $request->input('reason'),
+                    'snapshot' => $hrAccount->toArray(),
+                ]
+            );
+
+            $hrAccount->delete();
+        });
+
+        return response()->json([
+            'message' => 'HR admin removed successfully.',
+        ]);
+    }
+
     private function resolveEligibleEmployeeForAssignment(string $employeeControlNo): object
     {
         $employee = HrisEmployee::findByControlNo($employeeControlNo, true);
@@ -419,6 +543,16 @@ class HRUserManagementController extends Controller
         return Str::limit($normalizedUsername, 255, '');
     }
 
+    private function buildGuestHrFullName(string $username): string
+    {
+        $normalizedUsername = trim($username);
+        if ($normalizedUsername === '') {
+            return 'HR Guest';
+        }
+
+        return Str::limit($normalizedUsername, 255, '');
+    }
+
     private function buildEmployeeDisplayName(object $employee): string
     {
         $surname = trim((string) $employee->surname);
@@ -482,7 +616,7 @@ class HRUserManagementController extends Controller
             'row_key' => 'HR-' . $account->id,
             'account_id' => $account->id,
             'role' => 'HR',
-            'role_label' => 'HR',
+            'role_label' => 'HR Admin',
             'full_name' => trim((string) ($account->full_name ?? '')),
             'username' => trim((string) ($account->username ?? '')),
             'department' => self::HR_DEFAULT_DEPARTMENT,
@@ -490,10 +624,47 @@ class HRUserManagementController extends Controller
                 ? trim((string) $account->position)
                 : null,
             'employee_control_no' => null,
+            'can_delete' => true,
             'must_change_password' => (bool) $account->must_change_password,
             'created_at' => $account->created_at?->toIso8601String(),
             'updated_at' => $account->updated_at?->toIso8601String(),
         ];
+    }
+
+    private function hasHistoricalCocApplicationsForHrAccount(HRAccount $account): bool
+    {
+        if (!Schema::hasTable('tblCOCApplications')) {
+            return false;
+        }
+
+        $candidateColumns = [];
+        foreach ([
+            'reviewed_by_hr_id',
+            'late_filing_reviewed_by_hr_id',
+            'hr_received_by_id',
+            'hr_released_by_id',
+        ] as $column) {
+            if (Schema::hasColumn('tblCOCApplications', $column)) {
+                $candidateColumns[] = $column;
+            }
+        }
+
+        if ($candidateColumns === []) {
+            return false;
+        }
+
+        return DB::table('tblCOCApplications')
+            ->where(function ($query) use ($candidateColumns, $account): void {
+                foreach ($candidateColumns as $index => $column) {
+                    if ($index === 0) {
+                        $query->where($column, $account->id);
+                        continue;
+                    }
+
+                    $query->orWhere($column, $account->id);
+                }
+            })
+            ->exists();
     }
 
     private function isDepartmentAdminAssignmentActive(?DepartmentAdmin $admin): bool
