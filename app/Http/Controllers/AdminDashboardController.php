@@ -47,18 +47,29 @@ class AdminDashboardController extends Controller
 
         $admin->loadMissing('department');
         $deptName = $admin->department?->name;
-        $departmentEmployeeControlNos = $this->departmentEmployeeControlNoCandidates($deptName);
+        $departmentEmployeeControlNos = $this->departmentEmployeeControlNoCandidates(
+            $deptName,
+            $admin->department_id !== null ? (int) $admin->department_id : null
+        );
 
         $applications = LeaveApplication::with(['leaveType', 'applicantAdmin', 'logs', 'updateRequests'])
             ->where(function ($query) use ($departmentEmployeeControlNos, $admin) {
-                // Include employee leaves for this department (matched by office)
+                // Include employee leaves currently assigned to this department.
                 $query->when(
                     $departmentEmployeeControlNos !== [],
                     fn($nestedQuery) => $nestedQuery->whereIn('employee_control_no', $departmentEmployeeControlNos),
                     fn($nestedQuery) => $nestedQuery->whereRaw('1 = 0')
                 )
-                    // OR admin self-apply leaves for this department
-                    ->orWhereHas('applicantAdmin', fn($q) => $q->where('department_id', $admin->department_id));
+                    // OR admin self-apply leaves for this department (no employee assignment target)
+                    ->orWhere(function ($selfScopedQuery) use ($admin): void {
+                        $selfScopedQuery
+                            ->where(function ($employeeControlNoQuery): void {
+                                $employeeControlNoQuery
+                                    ->whereNull('employee_control_no')
+                                    ->orWhere('employee_control_no', '');
+                            })
+                            ->whereHas('applicantAdmin', fn($q) => $q->where('department_id', $admin->department_id));
+                    });
             })
             ->orderByDesc('created_at')
             ->get();
@@ -119,7 +130,7 @@ class AdminDashboardController extends Controller
         );
         $rejected = $rejectedApps->count() + $rejectedCocApps->count();
 
-        $employeesByControlNo = $this->loadDepartmentEmployeesByControlNo($deptName);
+        $employeesByControlNo = $this->loadDepartmentEmployeesByControlNo($deptName, $departmentEmployeeControlNos);
 
         $employeeStatusByControlNo = collect($employeesByControlNo)
             ->map(fn(object $employee) => $employee->status ?? null)
@@ -441,8 +452,52 @@ class AdminDashboardController extends Controller
         }
 
         $admin->loadMissing('department');
-        $employee = HrisEmployee::findByControlNo($employeeControlNo);
-        if (!$employee || !$this->sameOffice($employee->office ?? null, $admin->department?->name)) {
+        $controlNoCandidates = array_values(array_unique(array_filter([
+            trim((string) $employeeControlNo),
+            $this->normalizeControlNo($employeeControlNo),
+        ])));
+
+        $employee = DB::table('tblEmployees')
+            ->select([
+                'control_no',
+                'surname',
+                'firstname',
+                'middlename',
+                'office',
+                'status',
+                'designation',
+                'rate_mon',
+            ])
+            ->when(
+                $controlNoCandidates !== [],
+                fn ($query) => $query->whereIn('control_no', $controlNoCandidates),
+                fn ($query) => $query->whereRaw('1 = 0')
+            )
+            ->first();
+
+        if ($employee) {
+            $employee = (object) [
+                'control_no' => trim((string) ($employee->control_no ?? '')),
+                'surname' => trim((string) ($employee->surname ?? '')),
+                'firstname' => trim((string) ($employee->firstname ?? '')),
+                'middlename' => trim((string) ($employee->middlename ?? '')),
+                'office' => trim((string) ($employee->office ?? '')),
+                'status' => trim((string) ($employee->status ?? '')),
+                'designation' => trim((string) ($employee->designation ?? '')),
+                'rate_mon' => $employee->rate_mon,
+                'officeAcronym' => null,
+                'hrisOfficeAcronym' => null,
+            ];
+        } else {
+            $employee = HrisEmployee::findByControlNo($employeeControlNo);
+        }
+
+        $latestAssignedDepartmentId = $this->resolveLatestAssignedDepartmentIdForControlNo($employeeControlNo);
+        $belongsToAdminDepartment = $latestAssignedDepartmentId !== null
+            ? (int) $latestAssignedDepartmentId === (int) ($admin->department_id ?? 0)
+            : $this->sameOffice($employee?->office ?? null, $admin->department?->name);
+
+        if (!$employee || !$belongsToAdminDepartment) {
             return response()->json(['message' => 'Employee not found in your department.'], 404);
         }
 
@@ -1363,11 +1418,127 @@ class AdminDashboardController extends Controller
     }
 
     /**
+     * @return array<string, int>
+     */
+    private function resolveLatestAssignmentDepartmentMap(): array
+    {
+        $latestDepartmentByControlNo = [];
+
+        $rows = DB::table('tblEmployeeDepartmentAssignments')
+            ->select(['employee_control_no', 'department_id', 'assigned_at', 'id'])
+            ->orderByDesc('assigned_at')
+            ->orderByDesc('id')
+            ->get();
+
+        foreach ($rows as $row) {
+            $normalizedControlNo = $this->normalizeControlNo((string) ($row->employee_control_no ?? ''));
+            if ($normalizedControlNo === '' || array_key_exists($normalizedControlNo, $latestDepartmentByControlNo)) {
+                continue;
+            }
+
+            $departmentId = (int) ($row->department_id ?? 0);
+            if ($departmentId <= 0) {
+                continue;
+            }
+
+            $latestDepartmentByControlNo[$normalizedControlNo] = $departmentId;
+        }
+
+        return $latestDepartmentByControlNo;
+    }
+
+    private function resolveLatestAssignedDepartmentIdForControlNo(?string $controlNo): ?int
+    {
+        $rawControlNo = trim((string) ($controlNo ?? ''));
+        if ($rawControlNo === '') {
+            return null;
+        }
+
+        $controlNoCandidates = array_values(array_unique(array_filter([
+            $rawControlNo,
+            $this->normalizeControlNo($rawControlNo),
+        ])));
+
+        if ($controlNoCandidates === []) {
+            return null;
+        }
+
+        $departmentId = DB::table('tblEmployeeDepartmentAssignments')
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->orderByDesc('assigned_at')
+            ->orderByDesc('id')
+            ->value('department_id');
+
+        $resolvedDepartmentId = (int) ($departmentId ?? 0);
+        return $resolvedDepartmentId > 0 ? $resolvedDepartmentId : null;
+    }
+
+    /**
      * @return array<int, string>
      */
-    private function departmentEmployeeControlNoCandidates(?string $departmentName): array
+    private function departmentEmployeeControlNoCandidates(?string $departmentName, ?int $departmentId = null): array
     {
-        $departmentControlNos = HrisEmployee::controlNosByOffice($departmentName);
+        $normalizedDepartmentName = trim((string) ($departmentName ?? ''));
+        $resolvedDepartmentId = (int) ($departmentId ?? 0);
+        $snapshotControlNos = [];
+        $latestAssignmentDepartmentMap = $this->resolveLatestAssignmentDepartmentMap();
+
+        if ($normalizedDepartmentName !== '') {
+            $snapshotControlNos = DB::table('tblEmployees')
+                ->where('office', $normalizedDepartmentName)
+                ->pluck('control_no')
+                ->map(fn (mixed $value): string => trim((string) $value))
+                ->filter(fn (string $controlNo): bool => $controlNo !== '')
+                ->values()
+                ->all();
+        }
+
+        $snapshotControlNos = collect($snapshotControlNos)
+            ->map(fn (mixed $value): string => trim((string) $value))
+            ->filter(fn (string $controlNo): bool => $controlNo !== '')
+            ->filter(function (string $controlNo) use ($resolvedDepartmentId, $latestAssignmentDepartmentMap): bool {
+                if ($resolvedDepartmentId <= 0) {
+                    return true;
+                }
+
+                $normalizedControlNo = $this->normalizeControlNo($controlNo);
+                if ($normalizedControlNo === '') {
+                    return false;
+                }
+
+                $latestAssignedDepartmentId = $latestAssignmentDepartmentMap[$normalizedControlNo] ?? null;
+                if ($latestAssignedDepartmentId === null) {
+                    return true;
+                }
+
+                return (int) $latestAssignedDepartmentId === $resolvedDepartmentId;
+            })
+            ->values()
+            ->all();
+
+        $assignedControlNos = $resolvedDepartmentId > 0
+            ? collect($latestAssignmentDepartmentMap)
+                ->filter(fn (int $assignedDepartmentId): bool => $assignedDepartmentId === $resolvedDepartmentId)
+                ->keys()
+                ->map(fn (mixed $value): string => trim((string) $value))
+                ->filter(fn (string $controlNo): bool => $controlNo !== '')
+                ->values()
+                ->all()
+            : [];
+
+        $departmentControlNos = array_values(array_unique([
+            ...$snapshotControlNos,
+            ...$assignedControlNos,
+        ]));
+
+        if ($departmentControlNos === []) {
+            if ($resolvedDepartmentId > 0) {
+                return [];
+            }
+
+            $departmentControlNos = HrisEmployee::controlNosByOffice($departmentName);
+        }
+
         if ($departmentControlNos === []) {
             return [];
         }
@@ -1383,10 +1554,68 @@ class AdminDashboardController extends Controller
     /**
      * @return array<string, object>
      */
-    private function loadDepartmentEmployeesByControlNo(?string $departmentName): array
+    private function loadDepartmentEmployeesByControlNo(
+        ?string $departmentName,
+        array $departmentEmployeeControlNos = []
+    ): array
     {
         $directory = [];
-        $employees = HrisEmployee::allByOffice($departmentName);
+        $normalizedDepartmentName = trim((string) ($departmentName ?? ''));
+        $employees = collect();
+
+        if ($departmentEmployeeControlNos !== []) {
+            $employees = DB::table('tblEmployees')
+                ->select([
+                    'control_no',
+                    'surname',
+                    'firstname',
+                    'middlename',
+                    'office',
+                    'status',
+                    'designation',
+                    'rate_mon',
+                ])
+                ->whereIn('control_no', array_values(array_unique(array_filter($departmentEmployeeControlNos))))
+                ->get()
+                ->map(static fn ($row): object => (object) [
+                    'control_no' => trim((string) ($row->control_no ?? '')),
+                    'surname' => trim((string) ($row->surname ?? '')),
+                    'firstname' => trim((string) ($row->firstname ?? '')),
+                    'middlename' => trim((string) ($row->middlename ?? '')),
+                    'office' => trim((string) ($row->office ?? '')),
+                    'status' => trim((string) ($row->status ?? '')),
+                    'designation' => trim((string) ($row->designation ?? '')),
+                    'rate_mon' => $row->rate_mon,
+                    'officeAcronym' => null,
+                    'hrisOfficeAcronym' => null,
+                ]);
+        } elseif ($normalizedDepartmentName !== '') {
+            $employees = DB::table('tblEmployees')
+                ->select([
+                    'control_no',
+                    'surname',
+                    'firstname',
+                    'middlename',
+                    'office',
+                    'status',
+                    'designation',
+                    'rate_mon',
+                ])
+                ->where('office', $normalizedDepartmentName)
+                ->get()
+                ->map(static fn ($row): object => (object) [
+                    'control_no' => trim((string) ($row->control_no ?? '')),
+                    'surname' => trim((string) ($row->surname ?? '')),
+                    'firstname' => trim((string) ($row->firstname ?? '')),
+                    'middlename' => trim((string) ($row->middlename ?? '')),
+                    'office' => trim((string) ($row->office ?? '')),
+                    'status' => trim((string) ($row->status ?? '')),
+                    'designation' => trim((string) ($row->designation ?? '')),
+                    'rate_mon' => $row->rate_mon,
+                    'officeAcronym' => null,
+                    'hrisOfficeAcronym' => null,
+                ]);
+        }
 
         foreach ($employees as $employee) {
             if (!is_object($employee)) {
@@ -1438,7 +1667,39 @@ class AdminDashboardController extends Controller
         if ($rawControlNo !== '') {
             $employee = $employeesByControlNo[$this->normalizeControlNo($rawControlNo)] ?? null;
             if (!$employee) {
-                $employee = HrisEmployee::findByControlNo($rawControlNo);
+                $employee = DB::table('tblEmployees')
+                    ->select([
+                        'control_no',
+                        'surname',
+                        'firstname',
+                        'middlename',
+                        'office',
+                        'status',
+                        'designation',
+                        'rate_mon',
+                    ])
+                    ->whereIn('control_no', array_values(array_unique(array_filter([
+                        trim($rawControlNo),
+                        ltrim(trim($rawControlNo), '0'),
+                    ]))))
+                    ->first();
+
+                if ($employee) {
+                    $employee = (object) [
+                        'control_no' => trim((string) ($employee->control_no ?? '')),
+                        'surname' => trim((string) ($employee->surname ?? '')),
+                        'firstname' => trim((string) ($employee->firstname ?? '')),
+                        'middlename' => trim((string) ($employee->middlename ?? '')),
+                        'office' => trim((string) ($employee->office ?? '')),
+                        'status' => trim((string) ($employee->status ?? '')),
+                        'designation' => trim((string) ($employee->designation ?? '')),
+                        'rate_mon' => $employee->rate_mon,
+                        'officeAcronym' => null,
+                        'hrisOfficeAcronym' => null,
+                    ];
+                } else {
+                    $employee = HrisEmployee::findByControlNo($rawControlNo);
+                }
             }
         }
 
