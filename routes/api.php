@@ -157,6 +157,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::post('/user-management/department-admins', [HRUserManagementController::class, 'store']);
         Route::put('/user-management/department-admins/{id}', [HRUserManagementController::class, 'update']);
         Route::delete('/user-management/department-admins/{id}', [HRUserManagementController::class, 'destroy']);
+        Route::delete('/user-management/hr-accounts/{id}', [HRUserManagementController::class, 'destroyHrAccount']);
 
         Route::prefix('departments')->group(function () {
             Route::get('/', [HRDepartmentLibraryController::class, 'index']);
