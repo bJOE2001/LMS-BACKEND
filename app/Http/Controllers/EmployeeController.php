@@ -720,19 +720,27 @@ class EmployeeController extends Controller
                     }
 
                     $creditsAdded = $this->roundLedgerValue($entry->credits_added);
-                    if ($creditsAdded <= 0) {
+                    if ($creditsAdded === 0.0) {
                         continue;
                     }
 
                     $source = strtoupper(trim((string) ($entry->source ?? '')));
                     $isManualAddSource = $source === 'HR_ADD' || str_starts_with($source, 'HR_ADD:');
+                    $isManualEditSource = $source === 'HR_EDIT' || str_starts_with($source, 'HR_EDIT:');
                     $actionTaken = match (true) {
                         $isManualAddSource => 'Leave credits added',
+                        $isManualEditSource => 'Leave credits adjusted',
                         default => 'Monthly accrual',
                     };
+                    $isNegativeAdjustment = $isManualEditSource && $creditsAdded < 0;
                     $otherTypeCode = $typeKey === 'other'
                         ? ($otherTypeCodeById[(int) $typeId] ?? null)
                         : null;
+                    $entryKind = $isNegativeAdjustment ? 'deduction' : 'earned';
+                    $displayAmount = abs($creditsAdded);
+                    $entryCategory = $isNegativeAdjustment
+                        ? 'deduction_with_pay'
+                        : 'earned';
 
                     $transactions[] = [
                         'row_id' => 'accrual-' . (int) $entry->id,
@@ -741,16 +749,16 @@ class EmployeeController extends Controller
                         'sort_date' => $accrualDate,
                         'sort_timestamp' => (string) ($entry->created_at?->toIso8601String() ?? $accrualDate),
                         'particulars' => $this->buildLedgerParticulars(
-                            'earned',
+                            $entryKind,
                             $typeKey,
-                            0.0,
+                            $displayAmount,
                             false,
                             false,
                             is_string($otherTypeCode) ? $otherTypeCode : null
                         ),
                         'action_taken' => $actionTaken,
-                        'category' => 'earned',
-                        'amount' => $creditsAdded,
+                        'category' => $entryCategory,
+                        'amount' => $displayAmount,
                         'balance_delta' => $creditsAdded,
                     ];
                 }
@@ -973,16 +981,18 @@ class EmployeeController extends Controller
         }
 
         usort($transactions, function (array $left, array $right): int {
-            $leftDate = (string) ($left['sort_date'] ?? '');
-            $rightDate = (string) ($right['sort_date'] ?? '');
-            if ($leftDate !== $rightDate) {
-                return $leftDate < $rightDate ? 1 : -1;
-            }
-
+            // Sort by actual transaction creation/approval timestamp first so
+            // backdated accrual rows still follow true operation sequence.
             $leftTimestamp = (string) ($left['sort_timestamp'] ?? '');
             $rightTimestamp = (string) ($right['sort_timestamp'] ?? '');
             if ($leftTimestamp !== $rightTimestamp) {
                 return $leftTimestamp < $rightTimestamp ? 1 : -1;
+            }
+
+            $leftDate = (string) ($left['sort_date'] ?? '');
+            $rightDate = (string) ($right['sort_date'] ?? '');
+            if ($leftDate !== $rightDate) {
+                return $leftDate < $rightDate ? 1 : -1;
             }
 
             $leftId = (string) ($left['row_id'] ?? '');

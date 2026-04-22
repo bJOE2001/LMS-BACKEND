@@ -43,14 +43,40 @@ class HRLeaveBalanceImportController extends Controller
             ], 422);
         }
 
+        $canonicalControlNo = trim((string) ($employee->control_no ?? $employeeControlNo));
+        $allowedTypeIds = $allowedCreditLeaveTypes
+            ->map(fn (LeaveType $leaveType): int => (int) $leaveType->id)
+            ->filter(fn (int $id): bool => $id > 0)
+            ->values()
+            ->all();
+        $currentBalancesByType = $this->resolveCurrentManualCreditBalances(
+            $canonicalControlNo,
+            $allowedTypeIds
+        );
+        $editableBalancesByType = $this->resolveManualEditableCreditBalances(
+            $canonicalControlNo,
+            $allowedTypeIds
+        );
+
         return response()->json([
-            'employee_control_no' => (string) ($employee->control_no ?? $employeeControlNo),
+            'employee_control_no' => $canonicalControlNo !== '' ? $canonicalControlNo : $employeeControlNo,
             'employee_name' => $this->formatEmployeeNameForStorage($employee),
             'employment_status' => LeaveType::formatEmploymentStatusLabel($employee->status ?? null)
                 ?? trim((string) ($employee->status ?? '')),
             'employment_status_key' => LeaveType::normalizeEmploymentStatusKey($employee->status ?? null),
+            'has_manual_leave_credits' => $canonicalControlNo !== ''
+                ? $this->hasManualCreditGrantUsage($canonicalControlNo)
+                : false,
             'leave_types' => $allowedCreditLeaveTypes
-                ->map(fn (LeaveType $leaveType): array => $this->formatManualCreditLeaveTypePayload($leaveType))
+                ->map(function (LeaveType $leaveType) use ($currentBalancesByType, $editableBalancesByType): array {
+                    $payload = $this->formatManualCreditLeaveTypePayload($leaveType);
+                    $payload['current_balance'] = $currentBalancesByType[(int) $leaveType->id]
+                        ?? 0.0;
+                    $payload['editable_balance'] = $editableBalancesByType[(int) $leaveType->id]
+                        ?? 0.0;
+
+                    return $payload;
+                })
                 ->values(),
         ]);
     }
@@ -328,6 +354,339 @@ class HRLeaveBalanceImportController extends Controller
         ]);
     }
 
+    /**
+     * HR-only: edit existing manually seeded leave credits by setting new target balances.
+     */
+    public function update(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        if (!$user instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can edit leave balances.'], 403);
+        }
+
+        $validated = $request->validate([
+            'employee_control_no' => ['required', 'string', 'max:50', 'regex:/^\d+$/'],
+            'balances' => ['required', 'array', 'min:1'],
+            'balances.*.leave_type_id' => ['required_with:balances', 'integer', 'exists:tblLeaveTypes,id'],
+            'balances.*.balance' => ['required_with:balances', 'numeric', 'decimal:0,3', 'min:0'],
+        ]);
+
+        $employeeControlNo = trim((string) $validated['employee_control_no']);
+        $submittedBalances = is_array($validated['balances'] ?? null) ? $validated['balances'] : [];
+        if ($submittedBalances === []) {
+            return response()->json([
+                'message' => 'All leave type balance fields are required.',
+            ], 422);
+        }
+
+        $employee = HrisEmployee::findByControlNo($employeeControlNo);
+        if (!$employee) {
+            return response()->json(['message' => 'Employee not found.'], 422);
+        }
+
+        [$allCreditLeaveTypes, $creditLeaveTypes] = $this->resolveManualCreditLeaveTypeSetsForEmployee($employee);
+        if ($creditLeaveTypes->isEmpty()) {
+            return response()->json([
+                'message' => 'No credit-based leave types are available for this employee.',
+            ], 422);
+        }
+
+        $allCreditLeaveTypesById = $allCreditLeaveTypes->keyBy('id');
+        $creditLeaveTypesById = $creditLeaveTypes->keyBy('id');
+        $submittedTypeIds = [];
+        foreach ($submittedBalances as $entry) {
+            if (!is_array($entry)) {
+                continue;
+            }
+
+            $leaveTypeId = (int) ($entry['leave_type_id'] ?? 0);
+            $balanceValue = $this->normalizeManualCreditValue($entry['balance'] ?? 0);
+            if ($leaveTypeId <= 0) {
+                continue;
+            }
+
+            $allCreditLeaveType = $allCreditLeaveTypesById->get($leaveTypeId);
+            if (!$allCreditLeaveType instanceof LeaveType) {
+                return response()->json([
+                    'message' => 'Only credit-based leave types can have balances.',
+                ], 422);
+            }
+
+            if ($this->isManualCreditExcludedLeaveType($allCreditLeaveType)) {
+                if ($balanceValue > 0) {
+                    return response()->json([
+                        'message' => $this->manualCreditExcludedMessage($allCreditLeaveType),
+                    ], 422);
+                }
+
+                continue;
+            }
+
+            $leaveType = $creditLeaveTypesById->get($leaveTypeId);
+            if (!$leaveType instanceof LeaveType) {
+                if ($balanceValue > 0) {
+                    return response()->json([
+                        'message' => $this->manualCreditStatusRestrictedMessage($allCreditLeaveType, $employee),
+                    ], 422);
+                }
+
+                continue;
+            }
+
+            if (array_key_exists($leaveTypeId, $submittedTypeIds)) {
+                return response()->json([
+                    'message' => 'Duplicate leave type entries are not allowed.',
+                ], 422);
+            }
+
+            $maxDays = $leaveType->max_days !== null ? (float) $leaveType->max_days : null;
+            if ($maxDays !== null && $balanceValue > $maxDays) {
+                return response()->json([
+                    'message' => "{$leaveType->name} cannot exceed {$maxDays} days.",
+                ], 422);
+            }
+
+            $submittedTypeIds[$leaveTypeId] = true;
+        }
+
+        $requiredTypeIds = $creditLeaveTypesById->keys()->map(fn($id) => (int) $id)->all();
+        $missingTypeIds = array_values(array_diff($requiredTypeIds, array_keys($submittedTypeIds)));
+        if ($missingTypeIds !== []) {
+            $missingNames = $creditLeaveTypesById
+                ->only($missingTypeIds)
+                ->pluck('name')
+                ->filter()
+                ->values()
+                ->all();
+            $missingLabel = implode(', ', array_slice($missingNames, 0, 4));
+            $extraCount = count($missingNames) - min(count($missingNames), 4);
+            if ($extraCount > 0) {
+                $missingLabel .= " and {$extraCount} more";
+            }
+
+            return response()->json([
+                'message' => $missingLabel !== ''
+                    ? "All leave type balances are required. Missing: {$missingLabel}."
+                    : 'All leave type balances are required.',
+            ], 422);
+        }
+
+        $entries = $this->resolveManualCreditTargetEntries($validated);
+        if ($entries === []) {
+            return response()->json([
+                'message' => 'All leave type balance fields are required.',
+            ], 422);
+        }
+
+        $leaveTypesById = LeaveType::query()
+            ->whereIn('id', array_keys($entries))
+            ->get()
+            ->keyBy('id');
+
+        foreach ($entries as $leaveTypeId => $_targetBalance) {
+            $leaveType = $leaveTypesById->get((int) $leaveTypeId);
+            if (!$leaveType instanceof LeaveType) {
+                return response()->json(['message' => 'Leave type not found.'], 422);
+            }
+            if (!(bool) $leaveType->is_credit_based) {
+                return response()->json(['message' => 'Only credit-based leave types can have balances.'], 422);
+            }
+            if ($this->isManualCreditExcludedLeaveType($leaveType)) {
+                return response()->json([
+                    'message' => $this->manualCreditExcludedMessage($leaveType),
+                ], 422);
+            }
+            if (
+                $this->employeeHasResolvedEmploymentStatus($employee)
+                && !$leaveType->allowsEmploymentStatus($employee->status ?? null)
+            ) {
+                return response()->json([
+                    'message' => $this->manualCreditStatusRestrictedMessage($leaveType, $employee),
+                ], 422);
+            }
+        }
+
+        $year = (int) now()->format('Y');
+        $manualAddSource = $this->resolveManualCreditSource($user);
+        $updateResult = DB::transaction(function () use (
+            $employee,
+            $entries,
+            $leaveTypesById,
+            $year,
+            $manualAddSource
+        ): array {
+            $recordedAt = now();
+            $canonicalControlNo = trim((string) ($employee->control_no ?? ''));
+            if ($canonicalControlNo === '') {
+                return [
+                    'success' => false,
+                    'message' => 'Employee record not found.',
+                ];
+            }
+
+            if (!$this->hasManualCreditGrantUsage($canonicalControlNo)) {
+                return [
+                    'success' => false,
+                    'message' => 'No manually added leave credits found for this employee. Use Add Leave Credits first.',
+                ];
+            }
+
+            $controlNoCandidates = $this->buildControlNoCandidates($canonicalControlNo);
+            $priorityByControlNo = array_flip($controlNoCandidates);
+            $savedBalances = [];
+            $updatedCount = 0;
+            foreach ($entries as $leaveTypeId => $targetBalance) {
+                $leaveType = $leaveTypesById->get((int) $leaveTypeId);
+                if (!$leaveType instanceof LeaveType) {
+                    continue;
+                }
+
+                $resolvedEmployeeName = $this->formatEmployeeNameForStorage($employee);
+                $resolvedLeaveTypeName = trim((string) ($leaveType->name ?? ''));
+                $normalizedTargetBalance = $this->normalizeManualCreditValue($targetBalance);
+
+                $existingCandidates = LeaveBalance::query()
+                    ->whereIn('employee_control_no', $controlNoCandidates)
+                    ->where('leave_type_id', $leaveType->id)
+                    ->lockForUpdate()
+                    ->orderByDesc('updated_at')
+                    ->orderByDesc('id')
+                    ->get();
+                $existing = null;
+                foreach ($existingCandidates as $candidate) {
+                    if (!$candidate instanceof LeaveBalance) {
+                        continue;
+                    }
+
+                    if (!$existing instanceof LeaveBalance) {
+                        $existing = $candidate;
+                        continue;
+                    }
+
+                    $currentControlNo = trim((string) $existing->employee_control_no);
+                    $incomingControlNo = trim((string) $candidate->employee_control_no);
+                    $currentPriority = $priorityByControlNo[$currentControlNo] ?? PHP_INT_MAX;
+                    $incomingPriority = $priorityByControlNo[$incomingControlNo] ?? PHP_INT_MAX;
+                    if ($incomingPriority < $currentPriority) {
+                        $existing = $candidate;
+                    }
+                }
+
+                $previousBalance = $this->normalizeManualCreditValue($existing?->balance ?? 0);
+                $currentEditableBalance = $existing
+                    ? $this->resolveManualEditableCreditsForBalance((int) $existing->id)
+                    : 0.0;
+                $delta = $this->normalizeManualCreditValue($normalizedTargetBalance - $currentEditableBalance);
+                $nextBalance = $this->normalizeManualCreditValue($previousBalance + $delta);
+                if ($nextBalance < 0) {
+                    return [
+                        'success' => false,
+                        'message' => sprintf(
+                            'Unable to set %s to %s. Current balance would become negative.',
+                            $leaveType->name,
+                            $this->normalizeManualCreditValue($normalizedTargetBalance)
+                        ),
+                    ];
+                }
+
+                if ($existing) {
+                    $existing->balance = $nextBalance;
+                    $existing->year = $year;
+                    if ($resolvedEmployeeName !== '' && trim((string) ($existing->employee_name ?? '')) === '') {
+                        $existing->employee_name = $resolvedEmployeeName;
+                    }
+                    if ($resolvedLeaveTypeName !== '') {
+                        $existing->leave_type_name = $resolvedLeaveTypeName;
+                    }
+                    $existing->save();
+                    $leaveBalance = $existing->fresh();
+                } else {
+                    $leaveBalance = LeaveBalance::query()->create([
+                        'employee_control_no' => $canonicalControlNo,
+                        'employee_name' => $resolvedEmployeeName !== '' ? $resolvedEmployeeName : null,
+                        'leave_type_id' => $leaveType->id,
+                        'leave_type_name' => $resolvedLeaveTypeName !== '' ? $resolvedLeaveTypeName : null,
+                        'balance' => $nextBalance,
+                        'year' => $year,
+                    ]);
+                }
+
+                $this->synchronizeManualEditableCredits(
+                    $leaveBalance,
+                    $normalizedTargetBalance,
+                    $recordedAt,
+                    $manualAddSource,
+                    $resolvedEmployeeName,
+                    $resolvedLeaveTypeName
+                );
+                if (abs($delta) > 0) {
+                    $updatedCount++;
+                }
+
+                $savedBalances[] = [
+                    'id' => (int) $leaveBalance->id,
+                    'employee_control_no' => (string) $leaveBalance->employee_control_no,
+                    'leave_type_id' => (int) $leaveBalance->leave_type_id,
+                    'leave_type_name' => $leaveType->name,
+                    'previous_balance' => $previousBalance,
+                    'previous_editable_balance' => $currentEditableBalance,
+                    'editable_balance' => $normalizedTargetBalance,
+                    'balance' => (float) $leaveBalance->balance,
+                    'delta' => $delta,
+                    'year' => (int) $leaveBalance->year,
+                    'updated_at' => $leaveBalance->updated_at?->toIso8601String(),
+                ];
+            }
+
+            return [
+                'success' => true,
+                'saved_balances' => $savedBalances,
+                'updated_count' => $updatedCount,
+            ];
+        });
+
+        if (!(bool) ($updateResult['success'] ?? false)) {
+            return response()->json([
+                'message' => (string) ($updateResult['message'] ?? 'Unable to edit leave credits.'),
+            ], 422);
+        }
+
+        $savedBalances = $updateResult['saved_balances'] ?? [];
+        $updatedCount = (int) ($updateResult['updated_count'] ?? 0);
+
+        return response()->json([
+            'message' => 'Leave credits updated successfully.',
+            'employee_control_no' => (string) $employee->control_no,
+            'employee_name' => trim("{$employee->firstname} {$employee->surname}"),
+            'updated_count' => $updatedCount,
+            'saved_count' => is_countable($savedBalances) ? count($savedBalances) : 0,
+            'leave_balances' => $savedBalances,
+        ]);
+    }
+
+    private function resolveManualCreditTargetEntries(array $validated): array
+    {
+        $entries = [];
+        if (!is_array($validated['balances'] ?? null)) {
+            return $entries;
+        }
+
+        foreach ($validated['balances'] as $entry) {
+            if (!is_array($entry)) {
+                continue;
+            }
+
+            $leaveTypeId = (int) ($entry['leave_type_id'] ?? 0);
+            if ($leaveTypeId <= 0) {
+                continue;
+            }
+
+            $entries[$leaveTypeId] = $this->normalizeManualCreditValue($entry['balance'] ?? 0);
+        }
+
+        return $entries;
+    }
+
     private function resolveManualCreditEntries(array $validated): array
     {
         $entries = [];
@@ -469,6 +828,249 @@ class HRLeaveBalanceImportController extends Controller
         ], static fn(string $value): bool => trim($value) !== '')));
     }
 
+    private function applyManualEditableSourceFilter($query): void
+    {
+        $query->where(function ($sourceQuery): void {
+            $sourceQuery->whereRaw(
+                "UPPER(LTRIM(RTRIM(COALESCE(tblLeaveBalanceCreditHistories.source, '')))) = ?",
+                ['HR_ADD']
+            )->orWhereRaw(
+                "UPPER(LTRIM(RTRIM(COALESCE(tblLeaveBalanceCreditHistories.source, '')))) LIKE ?",
+                ['HR_ADD:%']
+            )->orWhereRaw(
+                "UPPER(LTRIM(RTRIM(COALESCE(tblLeaveBalanceCreditHistories.source, '')))) = ?",
+                ['HR_EDIT']
+            )->orWhereRaw(
+                "UPPER(LTRIM(RTRIM(COALESCE(tblLeaveBalanceCreditHistories.source, '')))) LIKE ?",
+                ['HR_EDIT:%']
+            );
+        });
+    }
+
+    private function resolveManualEditableCreditsForBalance(int $leaveBalanceId): float
+    {
+        if ($leaveBalanceId <= 0) {
+            return 0.0;
+        }
+
+        $query = LeaveBalanceAccrualHistory::query()
+            ->where('leave_balance_id', $leaveBalanceId);
+        $this->applyManualEditableSourceFilter($query);
+
+        return $this->normalizeManualCreditValue($query->sum('credits_added'));
+    }
+
+    private function resolveManualEditableCreditBalances(string $employeeControlNo, array $leaveTypeIds): array
+    {
+        $candidates = $this->buildControlNoCandidates($employeeControlNo);
+        if ($candidates === [] || $leaveTypeIds === []) {
+            return [];
+        }
+
+        $priorityByControlNo = array_flip($candidates);
+        $preferredBalancesByType = [];
+        $balances = LeaveBalance::query()
+            ->whereIn('employee_control_no', $candidates)
+            ->whereIn('leave_type_id', $leaveTypeIds)
+            ->orderByDesc('updated_at')
+            ->orderByDesc('id')
+            ->get();
+
+        foreach ($balances as $balance) {
+            if (!$balance instanceof LeaveBalance) {
+                continue;
+            }
+
+            $typeId = (int) $balance->leave_type_id;
+            if ($typeId <= 0) {
+                continue;
+            }
+
+            if (!array_key_exists($typeId, $preferredBalancesByType)) {
+                $preferredBalancesByType[$typeId] = $balance;
+                continue;
+            }
+
+            $current = $preferredBalancesByType[$typeId];
+            $currentControlNo = trim((string) $current->employee_control_no);
+            $incomingControlNo = trim((string) $balance->employee_control_no);
+
+            $currentPriority = $priorityByControlNo[$currentControlNo] ?? PHP_INT_MAX;
+            $incomingPriority = $priorityByControlNo[$incomingControlNo] ?? PHP_INT_MAX;
+            if ($incomingPriority < $currentPriority) {
+                $preferredBalancesByType[$typeId] = $balance;
+            }
+        }
+
+        $editableBalances = [];
+        foreach ($leaveTypeIds as $typeId) {
+            $normalizedTypeId = (int) $typeId;
+            if ($normalizedTypeId <= 0) {
+                continue;
+            }
+
+            $editableBalances[$normalizedTypeId] = $this->normalizeManualCreditValue(
+                isset($preferredBalancesByType[$normalizedTypeId])
+                    ? $this->resolveManualEditableCreditsForBalance((int) $preferredBalancesByType[$normalizedTypeId]->id)
+                    : 0.0
+            );
+        }
+
+        return $editableBalances;
+    }
+
+    private function isManualAddSource(?string $source): bool
+    {
+        $normalized = strtoupper(trim((string) ($source ?? '')));
+        if ($normalized === '') {
+            return false;
+        }
+
+        return $normalized === 'HR_ADD' || str_starts_with($normalized, 'HR_ADD:');
+    }
+
+    private function isManualEditSource(?string $source): bool
+    {
+        $normalized = strtoupper(trim((string) ($source ?? '')));
+        if ($normalized === '') {
+            return false;
+        }
+
+        return $normalized === 'HR_EDIT' || str_starts_with($normalized, 'HR_EDIT:');
+    }
+
+    private function isManualEditableSource(?string $source): bool
+    {
+        return $this->isManualAddSource($source) || $this->isManualEditSource($source);
+    }
+
+    private function synchronizeManualEditableCredits(
+        LeaveBalance $leaveBalance,
+        float $targetEditableCredits,
+        \Illuminate\Support\Carbon $recordedAt,
+        string $preferredManualAddSource,
+        string $employeeName = '',
+        string $leaveTypeName = ''
+    ): void {
+        $normalizedTarget = $this->normalizeManualCreditValue($targetEditableCredits);
+        $editableEntries = LeaveBalanceAccrualHistory::query()
+            ->where('leave_balance_id', (int) $leaveBalance->id)
+            ->lockForUpdate()
+            ->orderBy('created_at')
+            ->orderBy('id')
+            ->get()
+            ->filter(fn (LeaveBalanceAccrualHistory $entry): bool => $this->isManualEditableSource($entry->source))
+            ->values();
+
+        $baselineEntry = $editableEntries->first(
+            fn (LeaveBalanceAccrualHistory $entry): bool => $this->isManualAddSource($entry->source)
+        );
+        if (!$baselineEntry instanceof LeaveBalanceAccrualHistory) {
+            $baselineEntry = $editableEntries->first();
+        }
+
+        if ($baselineEntry instanceof LeaveBalanceAccrualHistory) {
+            $resolvedSource = $this->isManualAddSource($baselineEntry->source)
+                ? trim((string) $baselineEntry->source)
+                : trim($preferredManualAddSource);
+            if ($resolvedSource === '') {
+                $resolvedSource = 'HR_ADD';
+            }
+
+            $baselineEntry->credits_added = $normalizedTarget;
+            $baselineEntry->source = $resolvedSource;
+            $baselineEntry->employee_control_no = trim((string) ($leaveBalance->employee_control_no ?? '')) ?: null;
+            if ($employeeName !== '') {
+                $baselineEntry->employee_name = $employeeName;
+            }
+            if ($leaveTypeName !== '') {
+                $baselineEntry->leave_type_name = $leaveTypeName;
+            }
+            if ($baselineEntry->accrual_date === null) {
+                $baselineEntry->accrual_date = $recordedAt->toDateString();
+            }
+            $baselineEntry->save();
+
+            $editableEntries
+                ->filter(fn (LeaveBalanceAccrualHistory $entry): bool => (int) $entry->id !== (int) $baselineEntry->id)
+                ->each(fn (LeaveBalanceAccrualHistory $entry): bool => (bool) $entry->delete());
+
+            return;
+        }
+
+        $resolvedSource = trim($preferredManualAddSource);
+        if ($resolvedSource === '') {
+            $resolvedSource = 'HR_ADD';
+        }
+
+        LeaveBalanceAccrualHistory::query()->create([
+            'leave_balance_id' => (int) $leaveBalance->id,
+            'employee_control_no' => trim((string) ($leaveBalance->employee_control_no ?? '')) ?: null,
+            'employee_name' => $employeeName !== '' ? $employeeName : null,
+            'leave_type_name' => $leaveTypeName !== '' ? $leaveTypeName : null,
+            'credits_added' => $normalizedTarget,
+            'accrual_date' => $recordedAt->toDateString(),
+            'source' => $resolvedSource,
+        ]);
+    }
+
+    private function resolveCurrentManualCreditBalances(string $employeeControlNo, array $leaveTypeIds): array
+    {
+        $candidates = $this->buildControlNoCandidates($employeeControlNo);
+        if ($candidates === [] || $leaveTypeIds === []) {
+            return [];
+        }
+
+        $priorityByControlNo = array_flip($candidates);
+        $preferredBalancesByType = [];
+        $balances = LeaveBalance::query()
+            ->whereIn('employee_control_no', $candidates)
+            ->whereIn('leave_type_id', $leaveTypeIds)
+            ->orderByDesc('updated_at')
+            ->orderByDesc('id')
+            ->get();
+
+        foreach ($balances as $balance) {
+            if (!$balance instanceof LeaveBalance) {
+                continue;
+            }
+
+            $typeId = (int) $balance->leave_type_id;
+            if ($typeId <= 0) {
+                continue;
+            }
+
+            if (!array_key_exists($typeId, $preferredBalancesByType)) {
+                $preferredBalancesByType[$typeId] = $balance;
+                continue;
+            }
+
+            $current = $preferredBalancesByType[$typeId];
+            $currentControlNo = trim((string) $current->employee_control_no);
+            $incomingControlNo = trim((string) $balance->employee_control_no);
+
+            $currentPriority = $priorityByControlNo[$currentControlNo] ?? PHP_INT_MAX;
+            $incomingPriority = $priorityByControlNo[$incomingControlNo] ?? PHP_INT_MAX;
+            if ($incomingPriority < $currentPriority) {
+                $preferredBalancesByType[$typeId] = $balance;
+            }
+        }
+
+        $currentBalances = [];
+        foreach ($leaveTypeIds as $typeId) {
+            $normalizedTypeId = (int) $typeId;
+            if ($normalizedTypeId <= 0) {
+                continue;
+            }
+
+            $currentBalances[$normalizedTypeId] = $this->normalizeManualCreditValue(
+                $preferredBalancesByType[$normalizedTypeId]->balance ?? 0
+            );
+        }
+
+        return $currentBalances;
+    }
+
     private function recordManualCreditLedgerEntry(
         LeaveBalance $leaveBalance,
         float $creditsToAdd,
@@ -478,7 +1080,7 @@ class HRLeaveBalanceImportController extends Controller
         string $leaveTypeName = ''
     ): void {
         $normalizedCreditsToAdd = $this->normalizeManualCreditValue($creditsToAdd);
-        if ($normalizedCreditsToAdd <= 0) {
+        if (abs($normalizedCreditsToAdd) <= 0) {
             return;
         }
 
@@ -491,9 +1093,15 @@ class HRLeaveBalanceImportController extends Controller
             ->first();
 
         if ($existingEntry) {
-            $existingEntry->credits_added = $this->normalizeManualCreditValue(
+            $nextCredits = $this->normalizeManualCreditValue(
                 (float) $existingEntry->credits_added + $normalizedCreditsToAdd
             );
+            if (abs($nextCredits) <= 0) {
+                $existingEntry->delete();
+                return;
+            }
+
+            $existingEntry->credits_added = $nextCredits;
             $existingEntry->source = $manualSource;
             $existingEntry->employee_control_no = trim((string) ($leaveBalance->employee_control_no ?? '')) ?: null;
             if ($employeeName !== '') {

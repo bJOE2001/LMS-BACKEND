@@ -102,7 +102,8 @@ class AccrueLeaveCredits extends Command
                         $balance->leave_type_name = $leaveTypeName;
                     }
 
-                    $balance->balance = round((float) $balance->balance + (float) $type->accrual_rate, 2);
+                    // Keep accrual math aligned with the 3-decimal leave balance precision.
+                    $balance->balance = round((float) $balance->balance + (float) $type->accrual_rate, 3);
                     $balance->last_accrual_date = $now->toDateString();
                     if (!$balance->year) {
                         $balance->year = (int) $now->year;
