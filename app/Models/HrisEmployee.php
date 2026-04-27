@@ -21,12 +21,9 @@ use Throwable;
 class HrisEmployee
 {
     private const HR_CONNECTION = 'hr';
-    private const SNAPSHOT_TABLE = 'tblEmployees';
     private const PERSONAL_TABLE = 'xPersonal';
     private const PARTITION_VIEW = 'vwpartitionforseparated';
     private const OFFICE_TABLE = 'yOffice';
-    private const SNAPSHOT_SYNC_CHUNK_SIZE = 250;
-    private const SNAPSHOT_WRITE_CHUNK_SIZE = 100;
     private const CACHE_TTL_MINUTES = 5;
     private const STALE_CACHE_TTL_MINUTES = 60;
     private const CACHE_LOCK_SECONDS = 15;
@@ -90,7 +87,7 @@ class HrisEmployee
     public static function allCached(?bool $activeOnly = null): Collection
     {
         $cacheKey = self::cacheKey('all', $activeOnly);
-        $fallbackRows = self::applyDepartmentAssignments(self::snapshotAllRows($activeOnly));
+        $fallbackRows = [];
 
         $rows = self::rememberResilient(
             $cacheKey,
@@ -100,8 +97,6 @@ class HrisEmployee
                     ->map(static fn (object $employee): array => (array) $employee)
                     ->values()
                     ->all();
-
-                self::syncSnapshotRows($rows);
 
                 return self::applyDepartmentAssignments($rows);
             },
@@ -118,29 +113,16 @@ class HrisEmployee
     public static function countCached(?bool $activeOnly = null): int
     {
         $cacheKey = self::cacheKey('count', $activeOnly);
-        $fallbackCount = self::snapshotCount($activeOnly);
 
         return (int) self::rememberResilient(
             $cacheKey,
             static fn (): int => (int) self::partitionQuery($activeOnly)->count(),
-            $fallbackCount,
+            0,
             'countCached',
             [
                 'active_only' => $activeOnly,
             ]
         );
-    }
-
-    public static function countSnapshot(?bool $activeOnly = null): int
-    {
-        return self::snapshotCount($activeOnly);
-    }
-
-    public static function allSnapshot(?bool $activeOnly = null): Collection
-    {
-        $rows = self::applyDepartmentAssignments(self::snapshotAllRows($activeOnly));
-
-        return collect($rows)->map(static fn (array $row): object => (object) $row);
     }
 
     /**
@@ -157,9 +139,7 @@ class HrisEmployee
         }
 
         $cacheKey = self::lookupCacheKey('directory_lookup', $lookupValues, $activeOnly);
-        $fallbackRows = self::applyDepartmentAssignments(
-            self::snapshotDirectoryRowsByControlNos($lookupValues, $activeOnly)
-        );
+        $fallbackRows = [];
 
         $rows = self::rememberResilient(
             $cacheKey,
@@ -290,176 +270,6 @@ class HrisEmployee
         Cache::forever(self::CACHE_VERSION_KEY, self::$cacheVersionMemo);
     }
 
-    public static function syncSnapshot(?string $officeName = null): int
-    {
-        if (!self::snapshotTableExists()) {
-            return 0;
-        }
-
-        $normalizedOfficeName = trim((string) ($officeName ?? ''));
-
-        if ($normalizedOfficeName === '') {
-            $syncedRows = self::syncSnapshotInChunks();
-        } else {
-            $rows = self::fetchLiveDirectoryRowsByOffice($normalizedOfficeName, null);
-            $syncedRows = self::syncSnapshotRows($rows);
-        }
-
-        self::flushCache();
-
-        return $syncedRows;
-    }
-
-    public static function repairSnapshotMissingEmploymentFields(?string $officeName = null): int
-    {
-        if (!self::snapshotTableExists()) {
-            return 0;
-        }
-
-        $repairControlNos = self::snapshotControlNosMissingEmploymentFields($officeName);
-        $repairedRows = 0;
-
-        foreach (array_chunk($repairControlNos, self::SNAPSHOT_SYNC_CHUNK_SIZE) as $controlNoChunk) {
-            $missingBefore = array_keys(self::rowsByNormalizedControlNo(
-                array_values(array_filter(
-                    self::snapshotDirectoryRowsByControlNos($controlNoChunk, null),
-                    static fn (array $row): bool => self::rowHasMissingEmploymentFields($row)
-                ))
-            ));
-
-            if ($missingBefore === []) {
-                continue;
-            }
-
-            try {
-                self::fetchDirectoryRowsByControlNos($controlNoChunk, null);
-            } catch (Throwable $exception) {
-                self::reportFailure('repairSnapshotMissingEmploymentFields.chunk', $exception, [
-                    'chunk_size' => count($controlNoChunk),
-                    'first_control_no' => $controlNoChunk[0] ?? null,
-                    'office' => trim((string) ($officeName ?? '')) ?: null,
-                ]);
-
-                continue;
-            }
-
-            $missingAfter = array_keys(self::rowsByNormalizedControlNo(
-                array_values(array_filter(
-                    self::snapshotDirectoryRowsByControlNos($controlNoChunk, null),
-                    static fn (array $row): bool => self::rowHasMissingEmploymentFields($row)
-                ))
-            ));
-
-            $repairedRows += count(array_diff($missingBefore, $missingAfter));
-        }
-
-        self::flushCache();
-
-        return $repairedRows;
-    }
-
-    public static function refreshLocalSnapshot(): int
-    {
-        if (!self::snapshotTableExists()) {
-            return 0;
-        }
-
-        $rows = self::snapshotAllRows(null);
-        if ($rows === []) {
-            self::flushCache();
-
-            return 0;
-        }
-
-        $now = now();
-        $records = collect(self::rowsByNormalizedControlNo($rows))
-            ->map(static function (array $row) use ($now): array {
-                $isActive = self::isCurrentlyActive($row['from_date'] ?? null, $row['to_date'] ?? null);
-
-                return [
-                    'control_no' => trim((string) ($row['control_no'] ?? '')),
-                    'surname' => self::trimStringOrBlank($row['surname'] ?? null),
-                    'firstname' => self::trimStringOrBlank($row['firstname'] ?? null),
-                    'middlename' => self::trimStringOrBlank($row['middlename'] ?? null),
-                    'office' => self::trimStringOrBlank($row['office'] ?? null),
-                    'status' => self::trimStringOrBlank($row['status'] ?? null),
-                    'designation' => self::trimStringOrBlank($row['designation'] ?? null),
-                    'rate_mon' => $row['rate_mon'] !== null ? (float) $row['rate_mon'] : null,
-                    'birth_date' => $row['birth_date'] ?? null,
-                    'from_date' => $row['from_date'] ?? null,
-                    'to_date' => $row['to_date'] ?? null,
-                    'is_active' => $isActive,
-                    'activity_status' => $isActive ? 'ACTIVE' : 'INACTIVE',
-                    'updated_at' => $now,
-                ];
-            })
-            ->values()
-            ->all();
-
-        foreach (array_chunk($records, self::SNAPSHOT_WRITE_CHUNK_SIZE) as $recordChunk) {
-            DB::table(self::SNAPSHOT_TABLE)->upsert(
-                $recordChunk,
-                ['control_no'],
-                [
-                    'surname',
-                    'firstname',
-                    'middlename',
-                    'office',
-                    'status',
-                    'designation',
-                    'rate_mon',
-                    'birth_date',
-                    'from_date',
-                    'to_date',
-                    'is_active',
-                    'activity_status',
-                    'updated_at',
-                ]
-            );
-        }
-
-        self::flushCache();
-
-        return count($records);
-    }
-
-    private static function syncSnapshotInChunks(): int
-    {
-        $syncedRows = 0;
-
-        DB::connection(self::HR_CONNECTION)
-            ->table(self::PERSONAL_TABLE.' as xp')
-            ->select('xp.ControlNo as raw_control_no')
-            ->chunkById(
-                self::SNAPSHOT_SYNC_CHUNK_SIZE,
-                static function (Collection $chunkRows) use (&$syncedRows): void {
-                $controlNos = $chunkRows
-                    ->map(static fn (object $row): string => trim((string) ($row->raw_control_no ?? '')))
-                    ->filter(static fn (string $controlNo): bool => $controlNo !== '')
-                    ->values()
-                    ->all();
-
-                if ($controlNos === []) {
-                    return;
-                }
-
-                try {
-                    $rows = self::fetchDirectoryRowsByControlNos($controlNos, null);
-                    $syncedRows += count(self::rowsByNormalizedControlNo($rows));
-                } catch (Throwable $exception) {
-                    self::reportFailure('syncSnapshot.chunk', $exception, [
-                        'chunk_size' => count($controlNos),
-                        'first_control_no' => $controlNos[0] ?? null,
-                    ]);
-                }
-                },
-                'xp.ControlNo',
-                'raw_control_no'
-            );
-
-        return $syncedRows;
-    }
-
     private static function applyOfficeFilter(Builder $query, ?string $officeName): void
     {
         $officeName = trim((string) ($officeName ?? ''));
@@ -550,8 +360,6 @@ class HrisEmployee
             ->selectRaw('NULLIF(LTRIM(RTRIM(CONVERT(VARCHAR(255), yo.Abbr))), \'\') as officeAcronym');
 
         self::applyLiteralControlNoFilter($partitionQuery, 'vp.ControlNo', $lookupValues);
-        $partitionLookupFailed = false;
-
         try {
             $partitionRows = $partitionQuery
                 ->get()
@@ -559,25 +367,18 @@ class HrisEmployee
                 ->values()
                 ->all();
         } catch (Throwable $exception) {
-            $partitionLookupFailed = true;
-
             self::reportFailure('fetchDirectoryRowsByControlNos.partition', $exception, [
                 'active_only' => $activeOnly,
                 'lookup_count' => count($lookupValues),
-                'fallback' => 'snapshot_or_personal_only',
+                'fallback' => 'personal_only',
             ]);
 
             $partitionRows = [];
         }
 
         $liveRows = self::mergeEmployeeRows($personalRows, $partitionRows, $activeOnly);
-        self::syncSnapshotRows($liveRows);
 
-        $snapshotRows = self::snapshotDirectoryRowsByControlNos($lookupValues, $activeOnly);
-
-        return $partitionLookupFailed
-            ? self::mergePreferredEmployeeRows($snapshotRows, $liveRows)
-            : self::mergePreferredEmployeeRows($liveRows, $snapshotRows);
+        return $liveRows;
     }
 
     /**
@@ -593,12 +394,7 @@ class HrisEmployee
         }
 
         $cacheKey = self::officeCacheKey('office_directory', $normalizedOfficeName, $activeOnly);
-        $fallbackRows = self::filterRowsByResolvedOffice(
-            self::applyDepartmentAssignments(
-                self::snapshotDirectoryRowsByOffice($normalizedOfficeName, $activeOnly)
-            ),
-            $normalizedOfficeName
-        );
+        $fallbackRows = [];
 
         $rows = self::rememberResilient(
             $cacheKey,
@@ -631,21 +427,15 @@ class HrisEmployee
 
         try {
             $rows = self::fetchLiveDirectoryRowsByOffice($officeName, $activeOnly);
-            self::syncSnapshotRows($rows);
         } catch (Throwable $exception) {
             $partitionLookupFailed = true;
 
             self::reportFailure('fetchDirectoryRowsByOffice.partition', $exception, [
                 'active_only' => $activeOnly,
                 'office' => $officeName,
-                'fallback' => 'snapshot_or_department_candidates',
+                'fallback' => 'department_candidates',
             ]);
         }
-
-        $snapshotRows = self::snapshotDirectoryRowsByOffice($officeName, $activeOnly);
-        $rows = $partitionLookupFailed
-            ? self::mergePreferredEmployeeRows($snapshotRows, $rows)
-            : self::mergePreferredEmployeeRows($rows, $snapshotRows);
 
         $fallbackControlNoCandidates = self::assignedControlNoCandidatesByDepartment($officeName);
 
@@ -871,7 +661,10 @@ class HrisEmployee
             $acronymsByOfficeName = [];
             foreach ($officeRows as $officeRow) {
                 $lookupKey = self::normalizeOfficeLookupKey($officeRow->office_name ?? null);
-                $officeAcronym = self::trimNullableString($officeRow->office_acronym ?? null);
+                $officeAcronym = self::normalizeOfficeAcronym(
+                    $officeRow->office_acronym ?? null,
+                    $officeRow->office_name ?? null
+                );
 
                 if ($lookupKey === '' || $officeAcronym === null) {
                     continue;
@@ -890,309 +683,43 @@ class HrisEmployee
         }
     }
 
-    private static function snapshotTableExists(): bool
+    private static function normalizeOfficeAcronym(mixed $officeAcronym, mixed $officeName = null): ?string
     {
-        // Snapshot feature is intentionally disabled:
-        // LMS no longer reads or writes tblEmployees as an HRIS fallback/cache.
-        return false;
+        $acronym = self::trimNullableString($officeAcronym);
+        if ($acronym === null) {
+            return null;
+        }
+
+        $officeNameText = self::trimNullableString($officeName);
+        if (
+            $officeNameText !== null
+            && self::normalizeOfficeLookupKey($acronym) === self::normalizeOfficeLookupKey($officeNameText)
+        ) {
+            return self::buildOfficeInitials($officeNameText) ?? $acronym;
+        }
+
+        return $acronym;
     }
 
-    private static function snapshotQuery(?bool $activeOnly = null): Builder
+    private static function buildOfficeInitials(string $officeName): ?string
     {
-        $query = DB::table(self::SNAPSHOT_TABLE);
-
-        if ($activeOnly === true) {
-            $query->where('is_active', true);
-            return $query;
+        $normalizedOfficeName = preg_replace('/\s+/', ' ', trim($officeName));
+        if ($normalizedOfficeName === null || $normalizedOfficeName === '') {
+            return null;
         }
 
-        if ($activeOnly === false) {
-            $query->where(function (Builder $nestedQuery): void {
-                $nestedQuery->where('is_active', false)
-                    ->orWhereNull('is_active');
-            });
+        $normalizedOfficeName = preg_replace('/^OFFICE\s+OF\s+(?:THE\s+)?/i', '', $normalizedOfficeName) ?? $normalizedOfficeName;
+        $words = preg_split('/[^A-Za-z0-9]+/', $normalizedOfficeName, -1, PREG_SPLIT_NO_EMPTY);
+        if ($words === false || $words === []) {
+            return null;
         }
 
-        return $query;
-    }
+        $initials = collect($words)
+            ->reject(static fn (string $word): bool => in_array(strtoupper($word), ['AND', 'OF', 'THE'], true))
+            ->map(static fn (string $word): string => strtoupper(substr($word, 0, 1)))
+            ->implode('');
 
-    /**
-     * @return array<int, string>
-     */
-    private static function snapshotControlNosMissingEmploymentFields(?string $officeName = null): array
-    {
-        if (!self::snapshotTableExists()) {
-            return [];
-        }
-
-        $normalizedOfficeName = trim((string) ($officeName ?? ''));
-        $query = self::snapshotQuery(null)->select('control_no');
-        self::applyMissingEmploymentFieldFilter($query);
-
-        if ($normalizedOfficeName !== '') {
-            $departmentCandidates = array_values(array_unique([
-                ...self::assignedControlNoCandidatesByDepartment($normalizedOfficeName),
-                ...self::observedControlNoCandidatesByDepartment($normalizedOfficeName),
-            ]));
-
-            $query->where(function (Builder $nestedQuery) use ($normalizedOfficeName, $departmentCandidates): void {
-                $nestedQuery->where('office', $normalizedOfficeName);
-
-                if ($departmentCandidates === []) {
-                    return;
-                }
-
-                $nestedQuery->orWhere(function (Builder $controlNoQuery) use ($departmentCandidates): void {
-                    self::applyLiteralControlNoFilter(
-                        $controlNoQuery,
-                        'control_no',
-                        self::controlNoLookupValues($departmentCandidates)
-                    );
-                });
-            });
-        }
-
-        return $query
-            ->orderBy('control_no')
-            ->pluck('control_no')
-            ->map(static fn (mixed $controlNo): string => trim((string) $controlNo))
-            ->filter(static fn (string $controlNo): bool => $controlNo !== '')
-            ->uniqueStrict()
-            ->values()
-            ->all();
-    }
-
-    /**
-     * @return array<int, array<string, mixed>>
-     */
-    private static function snapshotAllRows(?bool $activeOnly = null): array
-    {
-        if (!self::snapshotTableExists()) {
-            return [];
-        }
-
-        return self::fetchSnapshotRows(
-            self::snapshotQuery($activeOnly)
-                ->orderBy('surname')
-                ->orderBy('firstname')
-                ->orderBy('control_no')
-        );
-    }
-
-    private static function snapshotCount(?bool $activeOnly = null): int
-    {
-        if (!self::snapshotTableExists()) {
-            return 0;
-        }
-
-        return (int) self::snapshotQuery($activeOnly)->count();
-    }
-
-    /**
-     * @param array<int, string> $lookupValues
-     * @return array<int, array<string, mixed>>
-     */
-    private static function snapshotDirectoryRowsByControlNos(array $lookupValues, ?bool $activeOnly = null): array
-    {
-        if (!self::snapshotTableExists() || $lookupValues === []) {
-            return [];
-        }
-
-        $query = self::snapshotQuery($activeOnly);
-        self::applyLiteralControlNoFilter($query, 'control_no', $lookupValues);
-
-        return self::fetchSnapshotRows($query);
-    }
-
-    /**
-     * @return array<int, array<string, mixed>>
-     */
-    private static function snapshotDirectoryRowsByOffice(string $officeName, ?bool $activeOnly = null): array
-    {
-        if (!self::snapshotTableExists()) {
-            return [];
-        }
-
-        $normalizedOfficeName = trim($officeName);
-        if ($normalizedOfficeName === '') {
-            return [];
-        }
-
-        return self::fetchSnapshotRows(
-            self::snapshotQuery($activeOnly)
-                ->where('office', $normalizedOfficeName)
-                ->orderBy('surname')
-                ->orderBy('firstname')
-                ->orderBy('control_no')
-        );
-    }
-
-    /**
-     * @return array<int, array<string, mixed>>
-     */
-    private static function fetchSnapshotRows(Builder $query): array
-    {
-        return $query->get()
-            ->map(static fn (object $employee): array => self::mapSnapshotRow((array) $employee))
-            ->filter(static fn (array $row): bool => trim((string) ($row['control_no'] ?? '')) !== '')
-            ->values()
-            ->all();
-    }
-
-    /**
-     * @param array<string, mixed> $row
-     * @return array<string, mixed>
-     */
-    private static function mapSnapshotRow(array $row): array
-    {
-        $isActive = filter_var($row['is_active'] ?? null, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
-        if ($isActive === null) {
-            $isActive = self::isCurrentlyActive($row['from_date'] ?? null, $row['to_date'] ?? null);
-        }
-
-        $activityStatus = trim((string) ($row['activity_status'] ?? ''));
-        if ($activityStatus === '') {
-            $activityStatus = $isActive ? 'ACTIVE' : 'INACTIVE';
-        }
-
-        return [
-            'control_no' => trim((string) ($row['control_no'] ?? $row['raw_control_no'] ?? '')),
-            'surname' => self::trimStringOrBlank($row['surname'] ?? null),
-            'firstname' => self::trimStringOrBlank($row['firstname'] ?? null),
-            'middlename' => self::trimStringOrBlank($row['middlename'] ?? null),
-            'birth_date' => $row['birth_date'] ?? null,
-            'office' => self::trimStringOrBlank($row['office'] ?? null),
-            'officeAcronym' => null,
-            'status' => self::trimStringOrBlank($row['status'] ?? null),
-            'designation' => self::trimStringOrBlank($row['designation'] ?? null),
-            'rate_mon' => $row['rate_mon'] ?? null,
-            'from_date' => $row['from_date'] ?? null,
-            'to_date' => $row['to_date'] ?? null,
-            'is_active' => $isActive,
-            'activity_status' => self::trimStringOrBlank($activityStatus),
-            'last_synced_at' => $row['last_synced_at'] ?? null,
-        ];
-    }
-
-    /**
-     * @param array<int, array<string, mixed>> $rows
-     */
-    private static function syncSnapshotRows(array $rows): int
-    {
-        if (!self::snapshotTableExists() || $rows === []) {
-            return 0;
-        }
-
-        $incomingControlNos = collect($rows)
-            ->map(static fn (array $row): string => trim((string) ($row['control_no'] ?? $row['raw_control_no'] ?? '')))
-            ->filter(static fn (string $controlNo): bool => $controlNo !== '')
-            ->values()
-            ->all();
-
-        if ($incomingControlNos === []) {
-            return 0;
-        }
-
-        $mergedRows = self::mergePreferredEmployeeRows(
-            $rows,
-            self::snapshotDirectoryRowsByControlNos($incomingControlNos, null)
-        );
-        $records = self::buildSnapshotRecords($mergedRows);
-
-        if ($records === []) {
-            return 0;
-        }
-
-        foreach (array_chunk($records, self::SNAPSHOT_WRITE_CHUNK_SIZE) as $recordChunk) {
-            DB::table(self::SNAPSHOT_TABLE)->upsert(
-                $recordChunk,
-                ['control_no'],
-                [
-                    'surname',
-                    'firstname',
-                    'middlename',
-                    'office',
-                    'status',
-                    'designation',
-                    'rate_mon',
-                    'birth_date',
-                    'from_date',
-                    'to_date',
-                    'is_active',
-                    'activity_status',
-                    'last_synced_at',
-                    'updated_at',
-                ]
-            );
-        }
-
-        return count($records);
-    }
-
-    /**
-     * @param array<int, array<string, mixed>> $rows
-     */
-    private static function replaceSnapshotRows(array $rows): int
-    {
-        if (!self::snapshotTableExists()) {
-            return 0;
-        }
-
-        $records = self::buildSnapshotRecords($rows);
-
-        DB::transaction(function () use ($records): void {
-            DB::table(self::SNAPSHOT_TABLE)->delete();
-
-            foreach (array_chunk($records, self::SNAPSHOT_WRITE_CHUNK_SIZE) as $recordChunk) {
-                DB::table(self::SNAPSHOT_TABLE)->insert($recordChunk);
-            }
-        });
-
-        return count($records);
-    }
-
-    /**
-     * @param array<int, array<string, mixed>> $rows
-     * @return array<int, array<string, mixed>>
-     */
-    private static function buildSnapshotRecords(array $rows): array
-    {
-        $now = now();
-
-        return collect(self::rowsByNormalizedControlNo($rows))
-            ->map(static function (array $row) use ($now): array {
-                $controlNo = trim((string) ($row['control_no'] ?? ''));
-                $isActive = filter_var($row['is_active'] ?? null, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
-                if ($isActive === null) {
-                    $isActive = self::isCurrentlyActive($row['from_date'] ?? null, $row['to_date'] ?? null);
-                }
-
-                $activityStatus = trim((string) ($row['activity_status'] ?? ''));
-                if ($activityStatus === '') {
-                    $activityStatus = $isActive ? 'ACTIVE' : 'INACTIVE';
-                }
-
-                return [
-                    'control_no' => $controlNo,
-                    'surname' => self::trimStringOrBlank($row['surname'] ?? null),
-                    'firstname' => self::trimStringOrBlank($row['firstname'] ?? null),
-                    'middlename' => self::trimStringOrBlank($row['middlename'] ?? null),
-                    'office' => self::trimStringOrBlank($row['office'] ?? null),
-                    'status' => self::trimStringOrBlank($row['status'] ?? null),
-                    'designation' => self::trimStringOrBlank($row['designation'] ?? null),
-                    'rate_mon' => $row['rate_mon'] !== null ? (float) $row['rate_mon'] : null,
-                    'birth_date' => $row['birth_date'] ?? null,
-                    'from_date' => $row['from_date'] ?? null,
-                    'to_date' => $row['to_date'] ?? null,
-                    'is_active' => $isActive,
-                    'activity_status' => self::trimStringOrBlank($activityStatus),
-                    'last_synced_at' => $now,
-                    'created_at' => $now,
-                    'updated_at' => $now,
-                ];
-            })
-            ->values()
-            ->all();
+        return $initials !== '' ? $initials : null;
     }
 
     /**
@@ -1286,12 +813,6 @@ class HrisEmployee
         }
 
         return is_string($value) && trim($value) === '';
-    }
-
-    private static function rowHasMissingEmploymentFields(array $row): bool
-    {
-        return self::rowValueIsMissing($row['office'] ?? null)
-            || self::rowValueIsMissing($row['status'] ?? null);
     }
 
     /**
@@ -1515,16 +1036,6 @@ class HrisEmployee
         ));
 
         $query->whereRaw("{$qualifiedColumn} IN ({$quotedValues})");
-    }
-
-    private static function applyMissingEmploymentFieldFilter(Builder $query): void
-    {
-        $query->where(function (Builder $nestedQuery): void {
-            $nestedQuery->whereNull('office')
-                ->orWhere('office', '')
-                ->orWhereNull('status')
-                ->orWhere('status', '');
-        });
     }
 
     private static function reportFailure(string $operation, Throwable $exception, array $context = []): void
