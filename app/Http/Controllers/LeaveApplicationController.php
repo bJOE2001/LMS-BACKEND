@@ -3821,52 +3821,6 @@ class LeaveApplicationController extends Controller
             return null;
         }
 
-        $lookupValues = collect([
-            $controlNo,
-            ltrim($controlNo, '0'),
-        ])
-            ->map(fn (mixed $value): string => trim((string) $value))
-            ->filter(fn (string $value): bool => $value !== '')
-            ->unique()
-            ->values()
-            ->all();
-
-        if ($lookupValues !== []) {
-            $snapshotRow = DB::table('tblEmployees')
-                ->select([
-                    'control_no',
-                    'surname',
-                    'firstname',
-                    'middlename',
-                    'office',
-                    'status',
-                    'designation',
-                    'rate_mon',
-                ])
-                ->whereIn('control_no', $lookupValues)
-                ->orderByRaw('CASE WHEN control_no = ? THEN 0 ELSE 1 END', [$controlNo])
-                ->first();
-
-            if ($snapshotRow) {
-                $snapshotEmployee = (object) [
-                    'control_no' => trim((string) ($snapshotRow->control_no ?? '')),
-                    'surname' => trim((string) ($snapshotRow->surname ?? '')),
-                    'firstname' => trim((string) ($snapshotRow->firstname ?? '')),
-                    'middlename' => trim((string) ($snapshotRow->middlename ?? '')),
-                    'office' => trim((string) ($snapshotRow->office ?? '')),
-                    'status' => trim((string) ($snapshotRow->status ?? '')),
-                    'designation' => trim((string) ($snapshotRow->designation ?? '')),
-                    'rate_mon' => $snapshotRow->rate_mon,
-                    'officeAcronym' => null,
-                    'hrisOfficeAcronym' => null,
-                ];
-
-                if ($snapshotEmployee->control_no !== '') {
-                    return $snapshotEmployee;
-                }
-            }
-        }
-
         return HrisEmployee::findByControlNo($controlNo);
     }
 
@@ -3977,32 +3931,14 @@ class LeaveApplicationController extends Controller
     {
         $normalizedDepartmentName = trim((string) ($departmentName ?? ''));
         $resolvedDepartmentId = (int) ($departmentId ?? 0);
-        $snapshotControlNos = [];
+        $hrisControlNos = [];
         $latestAssignmentDepartmentMap = $this->resolveLatestAssignmentDepartmentMap();
 
         if ($normalizedDepartmentName !== '') {
-            $snapshotQuery = DB::table('tblEmployees')
-                ->select('control_no')
-                ->where('office', $normalizedDepartmentName);
-
-            if ($activeOnly === true) {
-                $snapshotQuery->where(function ($query): void {
-                    $query->where('is_active', 1)
-                        ->orWhereNull('is_active');
-                });
-            } elseif ($activeOnly === false) {
-                $snapshotQuery->where('is_active', 0);
-            }
-
-            $snapshotControlNos = $snapshotQuery
-                ->pluck('control_no')
-                ->map(fn (mixed $value): string => trim((string) $value))
-                ->filter(fn (string $controlNo): bool => $controlNo !== '')
-                ->values()
-                ->all();
+            $hrisControlNos = HrisEmployee::controlNosByOffice($normalizedDepartmentName, $activeOnly);
         }
 
-        $snapshotControlNos = collect($snapshotControlNos)
+        $hrisControlNos = collect($hrisControlNos)
             ->map(fn (mixed $value): string => trim((string) $value))
             ->filter(fn (string $controlNo): bool => $controlNo !== '')
             ->filter(function (string $controlNo) use ($resolvedDepartmentId, $latestAssignmentDepartmentMap): bool {
@@ -4036,7 +3972,7 @@ class LeaveApplicationController extends Controller
             : [];
 
         $resolvedControlNos = array_values(array_unique([
-            ...$snapshotControlNos,
+            ...$hrisControlNos,
             ...$assignedControlNos,
         ]));
 

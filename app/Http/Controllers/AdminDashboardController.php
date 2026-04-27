@@ -452,45 +452,7 @@ class AdminDashboardController extends Controller
         }
 
         $admin->loadMissing('department');
-        $controlNoCandidates = array_values(array_unique(array_filter([
-            trim((string) $employeeControlNo),
-            $this->normalizeControlNo($employeeControlNo),
-        ])));
-
-        $employee = DB::table('tblEmployees')
-            ->select([
-                'control_no',
-                'surname',
-                'firstname',
-                'middlename',
-                'office',
-                'status',
-                'designation',
-                'rate_mon',
-            ])
-            ->when(
-                $controlNoCandidates !== [],
-                fn ($query) => $query->whereIn('control_no', $controlNoCandidates),
-                fn ($query) => $query->whereRaw('1 = 0')
-            )
-            ->first();
-
-        if ($employee) {
-            $employee = (object) [
-                'control_no' => trim((string) ($employee->control_no ?? '')),
-                'surname' => trim((string) ($employee->surname ?? '')),
-                'firstname' => trim((string) ($employee->firstname ?? '')),
-                'middlename' => trim((string) ($employee->middlename ?? '')),
-                'office' => trim((string) ($employee->office ?? '')),
-                'status' => trim((string) ($employee->status ?? '')),
-                'designation' => trim((string) ($employee->designation ?? '')),
-                'rate_mon' => $employee->rate_mon,
-                'officeAcronym' => null,
-                'hrisOfficeAcronym' => null,
-            ];
-        } else {
-            $employee = HrisEmployee::findByControlNo($employeeControlNo);
-        }
+        $employee = HrisEmployee::findByControlNo($employeeControlNo);
 
         $latestAssignedDepartmentId = $this->resolveLatestAssignedDepartmentIdForControlNo($employeeControlNo);
         $belongsToAdminDepartment = $latestAssignedDepartmentId !== null
@@ -1480,20 +1442,14 @@ class AdminDashboardController extends Controller
     {
         $normalizedDepartmentName = trim((string) ($departmentName ?? ''));
         $resolvedDepartmentId = (int) ($departmentId ?? 0);
-        $snapshotControlNos = [];
+        $hrisControlNos = [];
         $latestAssignmentDepartmentMap = $this->resolveLatestAssignmentDepartmentMap();
 
         if ($normalizedDepartmentName !== '') {
-            $snapshotControlNos = DB::table('tblEmployees')
-                ->where('office', $normalizedDepartmentName)
-                ->pluck('control_no')
-                ->map(fn (mixed $value): string => trim((string) $value))
-                ->filter(fn (string $controlNo): bool => $controlNo !== '')
-                ->values()
-                ->all();
+            $hrisControlNos = HrisEmployee::controlNosByOffice($normalizedDepartmentName);
         }
 
-        $snapshotControlNos = collect($snapshotControlNos)
+        $hrisControlNos = collect($hrisControlNos)
             ->map(fn (mixed $value): string => trim((string) $value))
             ->filter(fn (string $controlNo): bool => $controlNo !== '')
             ->filter(function (string $controlNo) use ($resolvedDepartmentId, $latestAssignmentDepartmentMap): bool {
@@ -1527,7 +1483,7 @@ class AdminDashboardController extends Controller
             : [];
 
         $departmentControlNos = array_values(array_unique([
-            ...$snapshotControlNos,
+            ...$hrisControlNos,
             ...$assignedControlNos,
         ]));
 
@@ -1564,57 +1520,10 @@ class AdminDashboardController extends Controller
         $employees = collect();
 
         if ($departmentEmployeeControlNos !== []) {
-            $employees = DB::table('tblEmployees')
-                ->select([
-                    'control_no',
-                    'surname',
-                    'firstname',
-                    'middlename',
-                    'office',
-                    'status',
-                    'designation',
-                    'rate_mon',
-                ])
-                ->whereIn('control_no', array_values(array_unique(array_filter($departmentEmployeeControlNos))))
-                ->get()
-                ->map(static fn ($row): object => (object) [
-                    'control_no' => trim((string) ($row->control_no ?? '')),
-                    'surname' => trim((string) ($row->surname ?? '')),
-                    'firstname' => trim((string) ($row->firstname ?? '')),
-                    'middlename' => trim((string) ($row->middlename ?? '')),
-                    'office' => trim((string) ($row->office ?? '')),
-                    'status' => trim((string) ($row->status ?? '')),
-                    'designation' => trim((string) ($row->designation ?? '')),
-                    'rate_mon' => $row->rate_mon,
-                    'officeAcronym' => null,
-                    'hrisOfficeAcronym' => null,
-                ]);
+            $employees = collect(HrisEmployee::directoryByControlNos($departmentEmployeeControlNos))
+                ->values();
         } elseif ($normalizedDepartmentName !== '') {
-            $employees = DB::table('tblEmployees')
-                ->select([
-                    'control_no',
-                    'surname',
-                    'firstname',
-                    'middlename',
-                    'office',
-                    'status',
-                    'designation',
-                    'rate_mon',
-                ])
-                ->where('office', $normalizedDepartmentName)
-                ->get()
-                ->map(static fn ($row): object => (object) [
-                    'control_no' => trim((string) ($row->control_no ?? '')),
-                    'surname' => trim((string) ($row->surname ?? '')),
-                    'firstname' => trim((string) ($row->firstname ?? '')),
-                    'middlename' => trim((string) ($row->middlename ?? '')),
-                    'office' => trim((string) ($row->office ?? '')),
-                    'status' => trim((string) ($row->status ?? '')),
-                    'designation' => trim((string) ($row->designation ?? '')),
-                    'rate_mon' => $row->rate_mon,
-                    'officeAcronym' => null,
-                    'hrisOfficeAcronym' => null,
-                ]);
+            $employees = HrisEmployee::allByOffice($normalizedDepartmentName);
         }
 
         foreach ($employees as $employee) {
@@ -1667,39 +1576,7 @@ class AdminDashboardController extends Controller
         if ($rawControlNo !== '') {
             $employee = $employeesByControlNo[$this->normalizeControlNo($rawControlNo)] ?? null;
             if (!$employee) {
-                $employee = DB::table('tblEmployees')
-                    ->select([
-                        'control_no',
-                        'surname',
-                        'firstname',
-                        'middlename',
-                        'office',
-                        'status',
-                        'designation',
-                        'rate_mon',
-                    ])
-                    ->whereIn('control_no', array_values(array_unique(array_filter([
-                        trim($rawControlNo),
-                        ltrim(trim($rawControlNo), '0'),
-                    ]))))
-                    ->first();
-
-                if ($employee) {
-                    $employee = (object) [
-                        'control_no' => trim((string) ($employee->control_no ?? '')),
-                        'surname' => trim((string) ($employee->surname ?? '')),
-                        'firstname' => trim((string) ($employee->firstname ?? '')),
-                        'middlename' => trim((string) ($employee->middlename ?? '')),
-                        'office' => trim((string) ($employee->office ?? '')),
-                        'status' => trim((string) ($employee->status ?? '')),
-                        'designation' => trim((string) ($employee->designation ?? '')),
-                        'rate_mon' => $employee->rate_mon,
-                        'officeAcronym' => null,
-                        'hrisOfficeAcronym' => null,
-                    ];
-                } else {
-                    $employee = HrisEmployee::findByControlNo($rawControlNo);
-                }
+                $employee = HrisEmployee::findByControlNo($rawControlNo);
             }
         }
 
