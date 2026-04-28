@@ -376,6 +376,52 @@ class HRUserManagementController extends Controller
     }
 
     /**
+     * Reactivate an archived office admin account.
+     */
+    public function reactivate(Request $request, int $id): JsonResponse
+    {
+        $admin = DepartmentAdmin::query()->find($id);
+        if (!$admin) {
+            return response()->json([
+                'message' => 'Department admin not found.',
+            ], 404);
+        }
+
+        if ($this->isDepartmentAdminAssignmentActive($admin)) {
+            return response()->json([
+                'message' => 'This office admin account is already active.',
+            ], 422);
+        }
+
+        $validated = $request->validate([
+            'employee_control_no' => ['required', 'string', 'max:50', 'regex:/^\d+$/'],
+            'username' => ['required', 'string', 'max:255', Rule::unique('tblDepartmentAdmins', 'username')->ignore($admin->id)],
+        ]);
+
+        $employee = $this->resolveEligibleEmployeeForAssignment((string) $validated['employee_control_no']);
+        $this->assertUsernameAvailableForDepartmentAdmin(
+            (string) $validated['username'],
+            (int) $admin->id
+        );
+
+        $admin->employee_control_no = trim((string) $employee->control_no);
+        $admin->full_name = $this->buildEmployeeFullName($employee);
+        $admin->username = trim((string) $validated['username']);
+        $admin->password = $this->buildGeneratedPasswordFromBirthDate($employee);
+        $admin->must_change_password = true;
+        $admin->is_default_account = false;
+        $admin->save();
+        $admin->load([
+            'department:id,name',
+        ]);
+
+        return response()->json([
+            'message' => 'Office admin account reactivated successfully. Default password is employee birthdate (MMDDYY).',
+            'department_admin' => $this->serializeDepartmentAdmin($admin),
+        ]);
+    }
+
+    /**
      * Remove a department admin account.
      */
     public function destroy(Request $request, int $id): JsonResponse
@@ -387,11 +433,27 @@ class HRUserManagementController extends Controller
             ], 404);
         }
 
-        if ($this->hasHistoricalLeaveApplications($admin)) {
+        $departmentId = $admin->department_id !== null ? (int) $admin->department_id : null;
+        if ($departmentId !== null) {
+            $hasReplacementAdmin = DepartmentAdmin::query()
+                ->where('department_id', $departmentId)
+                ->where('id', '!=', $admin->id)
+                ->whereNotNull('employee_control_no')
+                ->whereRaw("LTRIM(RTRIM(employee_control_no)) <> ''")
+                ->exists();
+
+            if (!$hasReplacementAdmin) {
+                return response()->json([
+                    'message' => 'Assign a new department admin for this department before removing the current admin.',
+                ], 422);
+            }
+        }
+
+        if ($this->hasHistoricalLeaveApplications($admin) || $this->hasHistoricalCocApplicationsForDepartmentAdmin($admin)) {
             $this->vacateDepartmentAdminAssignment($admin);
 
             return response()->json([
-                'message' => 'Department admin removed successfully. Historical leave applications were preserved.',
+                'message' => 'Department admin removed successfully. Historical application records were preserved.',
             ]);
         }
 
@@ -582,6 +644,7 @@ class HRUserManagementController extends Controller
 
     private function serializeDepartmentAdminAccountRow(DepartmentAdmin $admin): array
     {
+        $isActive = $this->isDepartmentAdminAssignmentActive($admin);
         $employee = $this->resolveEmployeeForAdmin($admin);
         $position = trim((string) ($employee?->designation ?? ''));
         if ($position === '') {
@@ -595,6 +658,7 @@ class HRUserManagementController extends Controller
             'role_label' => 'Department Admin',
             'full_name' => trim((string) ($admin->full_name ?? '')),
             'username' => trim((string) ($admin->username ?? '')),
+            'department_id' => $admin->department_id !== null ? (int) $admin->department_id : null,
             'department' => trim((string) ($admin->department?->name ?? '')) !== ''
                 ? trim((string) $admin->department?->name)
                 : null,
@@ -602,6 +666,8 @@ class HRUserManagementController extends Controller
             'employee_control_no' => trim((string) ($admin->employee_control_no ?? '')) !== ''
                 ? trim((string) $admin->employee_control_no)
                 : null,
+            'is_active' => $isActive,
+            'can_reactivate' => !$isActive,
             'is_default_account' => (bool) $admin->is_default_account,
             'can_delete' => true,
             'must_change_password' => (bool) $admin->must_change_password,
@@ -683,14 +749,48 @@ class HRUserManagementController extends Controller
             ->exists();
     }
 
+    private function hasHistoricalCocApplicationsForDepartmentAdmin(DepartmentAdmin $admin): bool
+    {
+        if (!Schema::hasTable('tblCOCApplications')) {
+            return false;
+        }
+
+        $candidateColumns = [];
+        foreach ([
+            'reviewed_by_admin_id',
+        ] as $column) {
+            if (Schema::hasColumn('tblCOCApplications', $column)) {
+                $candidateColumns[] = $column;
+            }
+        }
+
+        if ($candidateColumns === []) {
+            return false;
+        }
+
+        return DB::table('tblCOCApplications')
+            ->where(function ($query) use ($candidateColumns, $admin): void {
+                foreach ($candidateColumns as $index => $column) {
+                    if ($index === 0) {
+                        $query->where($column, $admin->id);
+                        continue;
+                    }
+                    $query->orWhere($column, $admin->id);
+                }
+            })
+            ->exists();
+    }
+
     private function vacateDepartmentAdminAssignment(DepartmentAdmin $admin): void
     {
         $archivedUsername = $this->buildArchivedDepartmentAdminUsername($admin);
 
+        $admin->tokens()->delete();
         $admin->employee_control_no = null;
         $admin->username = $archivedUsername;
         $admin->password = Str::random(40);
         $admin->must_change_password = false;
+        $admin->active_personal_access_token_id = null;
         $admin->save();
     }
 

@@ -121,6 +121,9 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::get('/coc-applications/{id}', [COCApplicationController::class, 'adminShow']);
         Route::post('/coc-applications/{id}/approve', [COCApplicationController::class, 'adminApprove']);
         Route::post('/coc-applications/{id}/reject', [COCApplicationController::class, 'adminReject']);
+        Route::get('/employees-for-coc', [COCApplicationController::class, 'adminEmployees']);
+        Route::post('/coc-applications', [COCApplicationController::class, 'adminStore']);
+        Route::post('/coc-applications/self', [COCApplicationController::class, 'adminStoreSelf']);
 
         // Apply leave on behalf of employee
         Route::get('/employees-for-leave', [LeaveApplicationController::class, 'adminEmployees']);
@@ -157,6 +160,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::get('/user-management/departments/{departmentId}/eligible-employees', [HRUserManagementController::class, 'eligibleEmployees']);
         Route::post('/user-management/department-admins', [HRUserManagementController::class, 'store']);
         Route::put('/user-management/department-admins/{id}', [HRUserManagementController::class, 'update']);
+        Route::post('/user-management/department-admins/{id}/reactivate', [HRUserManagementController::class, 'reactivate']);
         Route::delete('/user-management/department-admins/{id}', [HRUserManagementController::class, 'destroy']);
         Route::delete('/user-management/hr-accounts/{id}', [HRUserManagementController::class, 'destroyHrAccount']);
 

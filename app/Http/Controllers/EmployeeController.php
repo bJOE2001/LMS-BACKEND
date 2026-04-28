@@ -1278,12 +1278,7 @@ class EmployeeController extends Controller
             );
         }
 
-        $departmentAdminControlNoLookup = $this->loadDepartmentAdminEmployeeControlNoLookup();
         $rows = $this->fetchDepartmentPulledEmployeeRows($departmentId, $searchTerm, $activeOnly)
-            ->reject(fn(array $row): bool => $this->hasControlNoInLookup(
-                (string) ($row['control_no'] ?? ''),
-                $departmentAdminControlNoLookup
-            ))
             ->values()
             ->map(function (array $row) use ($departmentHeadLookup): array {
                 $controlNo = trim((string) ($row['control_no'] ?? ''));
@@ -1315,12 +1310,7 @@ class EmployeeController extends Controller
             return [];
         }
 
-        $departmentAdminControlNoLookup = $this->loadDepartmentAdminEmployeeControlNoLookup();
         $rows = $this->fetchDepartmentPulledEmployeeRows($departmentId, $searchTerm, $activeOnly)
-            ->reject(fn(array $row): bool => $this->hasControlNoInLookup(
-                (string) ($row['control_no'] ?? ''),
-                $departmentAdminControlNoLookup
-            ))
             ->values();
 
         return $this->buildStatusCountsFromRows($rows);

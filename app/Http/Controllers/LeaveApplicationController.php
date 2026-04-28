@@ -5224,7 +5224,13 @@ class LeaveApplicationController extends Controller
             fn(LeaveApplicationLog $log) => $this->isCancelledRemark($log->remarks)
         );
 
-        $filedBy = $this->resolveWorkflowPerformerName($submittedLog, $actorDirectory, $employeeName) ?? $employeeName;
+        $filedBy = $this->resolveWorkflowPerformerName($submittedLog, $actorDirectory, $employeeName);
+        if (!$filedBy && $app->applicant_admin_id && $app->applicantAdmin) {
+            $filedBy = trim((string) ($app->applicantAdmin->full_name ?? '')) ?: null;
+        }
+        if (!$filedBy) {
+            $filedBy = $employeeName;
+        }
         $adminActionBy = ($app->admin_id && isset($actorDirectory['admin'][(int) $app->admin_id]))
             ? $actorDirectory['admin'][(int) $app->admin_id]
             : $this->resolveWorkflowPerformerName($adminApprovedLog ?? $adminRejectedLog, $actorDirectory, $employeeName);

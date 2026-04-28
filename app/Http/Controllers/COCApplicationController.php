@@ -261,6 +261,114 @@ class COCApplicationController extends Controller
         ]);
     }
 
+    public function adminEmployees(Request $request): JsonResponse
+    {
+        $admin = $request->user();
+        if (!$admin instanceof DepartmentAdmin) {
+            return response()->json(['message' => 'Only department admins can access this endpoint.'], 403);
+        }
+
+        $admin->loadMissing('department');
+        $departmentName = trim((string) ($admin->department?->name ?? ''));
+        if ($departmentName === '') {
+            return response()->json(['message' => 'Department admin account is not assigned to a department.'], 403);
+        }
+
+        $employees = HrisEmployee::allByOffice($departmentName)
+            ->map(function (object $employee): array {
+                $status = trim((string) ($employee->status ?? ''));
+                return [
+                    'control_no' => trim((string) ($employee->control_no ?? '')),
+                    'firstname' => trim((string) ($employee->firstname ?? '')),
+                    'middlename' => trim((string) ($employee->middlename ?? '')),
+                    'surname' => trim((string) ($employee->surname ?? '')),
+                    'full_name' => trim(implode(' ', array_filter([
+                        trim((string) ($employee->firstname ?? '')),
+                        trim((string) ($employee->middlename ?? '')),
+                        trim((string) ($employee->surname ?? '')),
+                    ]))),
+                    'office' => trim((string) ($employee->office ?? '')),
+                    'designation' => trim((string) ($employee->designation ?? '')),
+                    'status' => $status,
+                    'can_apply_coc' => !$this->isCocRestrictedEmployeeStatus($status),
+                ];
+            })
+            ->sort(function (array $left, array $right): int {
+                $leftSurname = strtoupper(trim((string) ($left['surname'] ?? '')));
+                $rightSurname = strtoupper(trim((string) ($right['surname'] ?? '')));
+                if ($leftSurname !== $rightSurname) {
+                    return $leftSurname <=> $rightSurname;
+                }
+
+                $leftFirstname = strtoupper(trim((string) ($left['firstname'] ?? '')));
+                $rightFirstname = strtoupper(trim((string) ($right['firstname'] ?? '')));
+                return $leftFirstname <=> $rightFirstname;
+            })
+            ->values();
+
+        return response()->json([
+            'employees' => $employees,
+        ]);
+    }
+
+    public function adminStore(Request $request): JsonResponse
+    {
+        $admin = $request->user();
+        if (!$admin instanceof DepartmentAdmin) {
+            return response()->json(['message' => 'Only department admins can file COC applications.'], 403);
+        }
+
+        $validated = $request->validate([
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
+            'rows' => ['required', 'array', 'min:1', 'max:100'],
+            'rows.*.date' => ['required', 'date'],
+            'rows.*.nature_of_overtime' => ['required', 'string', 'max:2000'],
+            'rows.*.time_from' => ['required', 'string', 'regex:/^\d{2}:\d{2}$/'],
+            'rows.*.time_to' => ['required', 'string', 'regex:/^\d{2}:\d{2}$/'],
+            'total_no_of_coc_applied_minutes' => ['nullable', 'integer', 'min:1', 'max:144000'],
+        ]);
+
+        $employee = HrisEmployee::findByControlNo($this->resolveValidatedEmployeeControlNo($validated));
+        if (!$employee) {
+            return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+
+        if (!$this->adminCanAccessEmployee($admin, (string) ($employee->control_no ?? ''), (string) ($employee->office ?? ''))) {
+            return response()->json(['message' => 'You can only file COC for employees in your department.'], 403);
+        }
+
+        return $this->createAdminSubmittedCocApplication($admin, $employee, $validated);
+    }
+
+    public function adminStoreSelf(Request $request): JsonResponse
+    {
+        $admin = $request->user();
+        if (!$admin instanceof DepartmentAdmin) {
+            return response()->json(['message' => 'Only department admins can file COC applications.'], 403);
+        }
+
+        $validated = $request->validate([
+            'rows' => ['required', 'array', 'min:1', 'max:100'],
+            'rows.*.date' => ['required', 'date'],
+            'rows.*.nature_of_overtime' => ['required', 'string', 'max:2000'],
+            'rows.*.time_from' => ['required', 'string', 'regex:/^\d{2}:\d{2}$/'],
+            'rows.*.time_to' => ['required', 'string', 'regex:/^\d{2}:\d{2}$/'],
+            'total_no_of_coc_applied_minutes' => ['nullable', 'integer', 'min:1', 'max:144000'],
+        ]);
+
+        $adminEmployeeControlNo = trim((string) ($admin->employee_control_no ?? ''));
+        if ($adminEmployeeControlNo === '') {
+            return response()->json(['message' => 'Department admin account is not linked to an employee record.'], 422);
+        }
+
+        $employee = HrisEmployee::findByControlNo($adminEmployeeControlNo);
+        if (!$employee) {
+            return response()->json(['message' => 'Employee record not found for this department admin account.'], 404);
+        }
+
+        return $this->createAdminSubmittedCocApplication($admin, $employee, $validated);
+    }
+
     public function adminShow(Request $request, int $id): JsonResponse
     {
         $admin = $request->user();
@@ -1576,6 +1684,108 @@ class COCApplicationController extends Controller
             || str_contains($normalized, 'HONORARIUM');
     }
 
+    private function createAdminSubmittedCocApplication(
+        DepartmentAdmin $admin,
+        object $employee,
+        array $validated
+    ): JsonResponse {
+        if ($this->isCocRestrictedEmployeeStatus($employee->status ?? null)) {
+            return response()->json([
+                'message' => 'COC application is not available for contractual or honorarium employees.',
+            ], 422);
+        }
+
+        $policySummary = $this->buildValidatedRows($validated['rows']);
+        if ($policySummary instanceof JsonResponse) {
+            return $policySummary;
+        }
+
+        $submittedTotalMinutes = isset($validated['total_no_of_coc_applied_minutes'])
+            ? (int) $validated['total_no_of_coc_applied_minutes']
+            : null;
+        if ($submittedTotalMinutes !== null && $submittedTotalMinutes !== (int) $policySummary['total_minutes']) {
+            return response()->json([
+                'message' => 'Total COC minutes do not match the provided overtime rows.',
+            ], 422);
+        }
+
+        $submittedAt = now();
+        $lateFilingDeadline = $this->resolveLateFilingDeadline(
+            (int) $policySummary['application_year'],
+            (int) $policySummary['application_month']
+        );
+        $isLateFiled = CarbonImmutable::instance($submittedAt)->greaterThan($lateFilingDeadline);
+
+        $application = DB::transaction(function () use ($employee, $policySummary, $submittedAt, $isLateFiled, $admin): COCApplication {
+            $app = COCApplication::create([
+                'employee_control_no' => (string) $employee->control_no,
+                'employee_name' => trim(implode(' ', array_filter([
+                    trim((string) ($employee->firstname ?? '')),
+                    trim((string) ($employee->middlename ?? '')),
+                    trim((string) ($employee->surname ?? '')),
+                ]))) ?: null,
+                'status' => COCApplication::STATUS_PENDING,
+                'is_late_filed' => $isLateFiled,
+                'late_filing_status' => $isLateFiled ? self::LATE_FILING_STATUS_PENDING : null,
+                'total_minutes' => (int) $policySummary['total_minutes'],
+                'application_year' => (int) $policySummary['application_year'],
+                'application_month' => (int) $policySummary['application_month'],
+                'credited_hours' => null,
+                'submitted_at' => $submittedAt,
+                'reviewed_by_admin_id' => $isLateFiled ? null : $admin->id,
+                'admin_reviewed_at' => $isLateFiled ? null : $submittedAt,
+            ]);
+
+            foreach ($policySummary['rows'] as $row) {
+                $app->rows()->create([
+                    ...$row,
+                    'employee_control_no' => (string) $app->employee_control_no,
+                    'employee_name' => $app->employee_name,
+                ]);
+            }
+
+            return $app;
+        });
+
+        $application->load(self::COC_RELATIONS);
+
+        if ($isLateFiled) {
+            $this->notifyHrOfPendingLateCocReview($application);
+        } else {
+            $this->notifyHrOfPendingCocReview($application);
+        }
+
+        $message = $isLateFiled
+            ? 'This COC application was filed beyond the allowed deadline and is pending CHRMO late-filing review.'
+            : 'COC application submitted and forwarded to HR review.';
+
+        return response()->json([
+            'message' => $message,
+            'application' => $this->formatApplication($application),
+        ], 201);
+    }
+
+    private function adminCanAccessEmployee(DepartmentAdmin $admin, string $employeeControlNo, string $employeeOffice): bool
+    {
+        $admin->loadMissing('department');
+        $departmentName = trim((string) ($admin->department?->name ?? ''));
+        if ($departmentName === '') {
+            return false;
+        }
+
+        $adminEmployeeControlNo = trim((string) ($admin->employee_control_no ?? ''));
+        $controlNoCandidates = $this->controlNoCandidates($employeeControlNo);
+        if ($adminEmployeeControlNo !== '') {
+            foreach ($this->controlNoCandidates($adminEmployeeControlNo) as $candidate) {
+                if (in_array($candidate, $controlNoCandidates, true)) {
+                    return true;
+                }
+            }
+        }
+
+        return strcasecmp(trim($employeeOffice), $departmentName) === 0;
+    }
+
     private function formatApplication(COCApplication $app, array $leaveBalanceDirectory = []): array
     {
         $rows = $app->relationLoaded('rows') ? $app->rows->values() : collect();
@@ -1623,6 +1833,13 @@ class COCApplicationController extends Controller
         $receivedActionAt = $app->hr_received_at?->toIso8601String();
         $releasedActionAt = $app->hr_released_at?->toIso8601String();
         $queueMeta = $this->resolveHrQueueMeta($app);
+        $filedBy = (string) ($employeeName ?? 'Unknown');
+        if ($this->isAdminFiledCocApplication($app)) {
+            $adminFiledBy = trim((string) ($app->reviewedByAdmin?->full_name ?? ''));
+            if ($adminFiledBy !== '') {
+                $filedBy = $adminFiledBy;
+            }
+        }
 
         return [
             'id' => $app->id,
@@ -1630,6 +1847,8 @@ class COCApplicationController extends Controller
             'employee_control_no' => (string) $app->employee_control_no,
             'employeeName' => $employeeName,
             'employee_name' => $employeeName,
+            'filedBy' => $filedBy,
+            'filed_by' => $filedBy,
             'office' => $resolvedEmployee?->office,
             'officeAcronym' => $resolvedEmployee?->officeAcronym,
             'office_acronym' => $resolvedEmployee?->officeAcronym,
@@ -1770,6 +1989,24 @@ class COCApplicationController extends Controller
             ];
             })->values(),
         ];
+    }
+
+    private function isAdminFiledCocApplication(COCApplication $application): bool
+    {
+        if (!$application->reviewed_by_admin_id || !$application->admin_reviewed_at || !$application->created_at) {
+            return false;
+        }
+
+        // Admin-filed COC is auto-forwarded with admin review at creation time.
+        // ERMS employee-filed COC is reviewed later by admin, so timestamps differ.
+        $submittedAt = $application->submitted_at ?? $application->created_at;
+        if (!$submittedAt) {
+            return false;
+        }
+
+        $submittedTimestamp = $submittedAt->getTimestamp();
+        $reviewedTimestamp = $application->admin_reviewed_at->getTimestamp();
+        return abs($reviewedTimestamp - $submittedTimestamp) <= 10;
     }
 
     private function isOvertimeRangeOvernight(string $timeFrom, string $timeTo): bool

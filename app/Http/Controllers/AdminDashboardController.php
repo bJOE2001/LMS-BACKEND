@@ -269,6 +269,7 @@ class AdminDashboardController extends Controller
         return response()->json([
             'leave_initialized' => $leaveInitialized,
             'salary' => $adminSalary,
+            'employment_status' => $adminEmploymentStatus ? strtoupper(trim((string) $adminEmploymentStatus)) : null,
             'accrued' => $accrued,
             'resettable' => $resettable,
             'event_based' => $eventBased,

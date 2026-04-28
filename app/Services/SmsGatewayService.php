@@ -230,25 +230,22 @@ class SmsGatewayService
         $testDestination = $this->testDestination();
 
         if ($this->isDevelopmentEnvironment()) {
-            if ($testDestination === null) {
-                Log::warning('SMS development routing is active, but SMS_TEST_DESTINATION is empty.');
-                return null;
-            }
+            if ($testDestination !== null) {
+                $normalizedTestDestination = $this->normalizePhilippineMobile($testDestination);
+                if ($normalizedTestDestination !== null) {
+                    Log::info('SMS development routing is active. Using SMS_TEST_DESTINATION override.', [
+                        'destination' => $normalizedTestDestination,
+                    ]);
 
-            $normalizedTestDestination = $this->normalizePhilippineMobile($testDestination);
-            if ($normalizedTestDestination !== null) {
-                Log::info('SMS development routing is active. Using SMS_TEST_DESTINATION only.', [
-                    'destination' => $normalizedTestDestination,
+                    return $normalizedTestDestination;
+                }
+
+                Log::warning('SMS_TEST_DESTINATION is invalid. Falling back to employee number.', [
+                    'configured_value' => $testDestination,
                 ]);
-
-                return $normalizedTestDestination;
+            } else {
+                Log::info('SMS development routing is active with no SMS_TEST_DESTINATION. Using employee number.');
             }
-
-            Log::warning('SMS_TEST_DESTINATION is invalid. Expected 09XXXXXXXXX.', [
-                'configured_value' => $testDestination,
-            ]);
-
-            return null;
         }
 
         if ($testDestination !== null) {

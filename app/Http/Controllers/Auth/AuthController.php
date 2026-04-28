@@ -107,6 +107,7 @@ class AuthController extends Controller
                 'username' => $account->username,
                 'role' => 'department_admin',
                 'employee_control_no' => trim((string) ($account->employee_control_no ?? '')) ?: null,
+                'status' => $this->resolveDepartmentAdminEmploymentStatus($account),
                 'department_id' => $account->department_id,
                 'department' => $account->department ? ['id' => $account->department->id, 'name' => $account->department->name] : null,
                 'position' => $this->resolveDepartmentAdminPosition($account),
@@ -139,6 +140,13 @@ class AuthController extends Controller
         $employee = $this->resolveDepartmentAdminEmployee($account);
         $designation = trim((string) ($employee?->designation ?? ''));
         return $designation !== '' ? $designation : 'Department Admin';
+    }
+
+    private function resolveDepartmentAdminEmploymentStatus(DepartmentAdmin $account): ?string
+    {
+        $employee = $this->resolveDepartmentAdminEmployee($account);
+        $status = trim((string) ($employee?->status ?? ''));
+        return $status !== '' ? $status : null;
     }
 
     private function resolveDepartmentAdminEmployee(DepartmentAdmin $account): ?object
