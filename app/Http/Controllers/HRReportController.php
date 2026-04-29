@@ -334,6 +334,21 @@ class HRReportController extends Controller
 
         $aggregates = [];
 
+        foreach (($employeeDirectory['by_raw'] ?? []) as $directoryEmployee) {
+            $controlNo = trim((string) ($directoryEmployee['control_no'] ?? ''));
+            $employeeKey = $this->normalizeControlNoKey($controlNo);
+            if ($employeeKey === '') {
+                continue;
+            }
+
+            if (!array_key_exists($employeeKey, $aggregates)) {
+                $aggregates[$employeeKey] = $this->emptyLeaveBalanceAggregate(
+                    $controlNo,
+                    (string) ($directoryEmployee['name'] ?? '')
+                );
+            }
+        }
+
         foreach ($balanceRows as $balanceRow) {
             $controlNo = trim((string) $balanceRow->employee_control_no);
             $employeeKey = $this->normalizeControlNoKey($controlNo);

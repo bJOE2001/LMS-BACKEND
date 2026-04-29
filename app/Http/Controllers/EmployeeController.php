@@ -785,6 +785,7 @@ class EmployeeController extends Controller
                     'leave_type_id',
                     'total_days',
                     'deductible_days',
+                    'linked_vacation_leave_deducted_days',
                     'pay_mode',
                     'is_monetization',
                     'status',
@@ -832,16 +833,22 @@ class EmployeeController extends Controller
                 $withPayAmount = $isMonetization
                     ? $deductibleDays
                     : ($payMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $deductibleDays);
-                if ($totalDays > 0 && $withPayAmount > $totalDays) {
-                    $withPayAmount = $totalDays;
-                }
                 $withPayAmount = round(max($withPayAmount, 0.0), 2);
+                $linkedVacationWithPayAmount = round(
+                    max((float) ($application->linked_vacation_leave_deducted_days ?? 0), 0.0),
+                    2
+                );
+                if ($typeKey === 'vacation') {
+                    $linkedVacationWithPayAmount = 0.0;
+                }
+                $linkedVacationWithPayAmount = round(min($linkedVacationWithPayAmount, $withPayAmount), 2);
+                $primaryWithPayAmount = round(max($withPayAmount - $linkedVacationWithPayAmount, 0.0), 2);
 
                 $withoutPayAmount = $isMonetization
                     ? 0.0
                     : round(max($totalDays - $withPayAmount, 0.0), 2);
 
-                if ($withPayAmount <= 0 && $withoutPayAmount <= 0) {
+                if ($primaryWithPayAmount <= 0 && $linkedVacationWithPayAmount <= 0 && $withoutPayAmount <= 0) {
                     continue;
                 }
 
@@ -874,7 +881,7 @@ class EmployeeController extends Controller
                 );
                 $mergeKey = 'app-' . $applicationId;
 
-                if ($withPayAmount > 0) {
+                if ($primaryWithPayAmount > 0) {
                     $transactions[] = [
                         'row_id' => $mergeKey . '-wp',
                         'merge_key' => $mergeKey,
@@ -892,8 +899,31 @@ class EmployeeController extends Controller
                         'inclusive_end_date' => $inclusiveEndDate,
                         'inclusive_dates' => $inclusiveDates,
                         'category' => 'deduction_with_pay',
-                        'amount' => $withPayAmount,
-                        'balance_delta' => -$withPayAmount,
+                        'amount' => $primaryWithPayAmount,
+                        'balance_delta' => -$primaryWithPayAmount,
+                    ];
+                }
+
+                if ($linkedVacationWithPayAmount > 0) {
+                    $transactions[] = [
+                        'row_id' => $mergeKey . '-vl-topup',
+                        'merge_key' => $mergeKey,
+                        'type_key' => 'vacation',
+                        'transaction_date' => $transactionDate,
+                        'sort_date' => $transactionDate,
+                        'sort_timestamp' => (string) (
+                            $application->hr_approved_at?->toIso8601String()
+                            ?? $application->created_at?->toIso8601String()
+                            ?? $transactionDate
+                        ),
+                        'particulars' => $particulars,
+                        'action_taken' => $actionTaken,
+                        'inclusive_start_date' => $inclusiveStartDate,
+                        'inclusive_end_date' => $inclusiveEndDate,
+                        'inclusive_dates' => $inclusiveDates,
+                        'category' => 'deduction_with_pay',
+                        'amount' => $linkedVacationWithPayAmount,
+                        'balance_delta' => -$linkedVacationWithPayAmount,
                     ];
                 }
 
