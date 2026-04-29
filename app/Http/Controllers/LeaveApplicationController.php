@@ -2725,9 +2725,13 @@ class LeaveApplicationController extends Controller
                     (string) $app->employee_control_no,
                     $deductTypeId
                 );
+                $currentBalance = $balance ? (float) $balance->balance : 0.0;
+                if ($usesVacationLeaveTopUpForScheduleExcess) {
+                    $requiredVacationLeaveDays = round(max($daysToDeduct - max($currentBalance, 0.0), 0.0), 2);
+                    $requiredPrimaryLeaveDays = round(max($daysToDeduct - $requiredVacationLeaveDays, 0.0), 2);
+                }
 
-                if (!$balance || (float) $balance->balance < $requiredPrimaryLeaveDays) {
-                    $currentBalance = $balance ? (float) $balance->balance : 0;
+                if (!$usesVacationLeaveTopUpForScheduleExcess && (!$balance || (float) $balance->balance < $requiredPrimaryLeaveDays)) {
                     if ($usesVacationLeaveTopUpForScheduleExcess) {
                         return $this->buildInsufficientPrimaryLeaveBalanceResponse(
                             $leaveType,
@@ -2785,9 +2789,13 @@ class LeaveApplicationController extends Controller
                     (int) $app->applicant_admin_id,
                     (int) $app->leave_type_id
                 );
+                $currentBalance = $balance ? (float) $balance->balance : 0.0;
+                if ($usesVacationLeaveTopUpForScheduleExcess) {
+                    $requiredVacationLeaveDays = round(max($daysToDeduct - max($currentBalance, 0.0), 0.0), 2);
+                    $requiredPrimaryLeaveDays = round(max($daysToDeduct - $requiredVacationLeaveDays, 0.0), 2);
+                }
 
-                if (!$balance || (float) $balance->balance < $requiredPrimaryLeaveDays) {
-                    $currentBalance = $balance ? (float) $balance->balance : 0;
+                if (!$usesVacationLeaveTopUpForScheduleExcess && (!$balance || (float) $balance->balance < $requiredPrimaryLeaveDays)) {
                     if ($usesVacationLeaveTopUpForScheduleExcess) {
                         return $this->buildInsufficientPrimaryLeaveBalanceResponse(
                             $leaveType,
@@ -2928,6 +2936,10 @@ class LeaveApplicationController extends Controller
                         (int) $app->leave_type_id
                     )?->balance ?? 0
                 );
+                if ($usesVacationLeaveTopUpForScheduleExcess) {
+                    $requiredVacationLeaveDays = round(max($daysToDeduct - max($currentBalance, 0.0), 0.0), 2);
+                    $requiredPrimaryLeaveDays = round(max($daysToDeduct - $requiredVacationLeaveDays, 0.0), 2);
+                }
 
                 if ($app->is_monetization) {
                     $monetizationBalanceRestriction = $this->validateMonetizationBalanceRules(
@@ -2963,15 +2975,6 @@ class LeaveApplicationController extends Controller
                     }
                 }
 
-                if ($usesVacationLeaveTopUpForScheduleExcess && $currentBalance + 1e-9 < $requiredPrimaryLeaveDays) {
-                    return $this->buildInsufficientPrimaryLeaveBalanceResponse(
-                        $leaveType,
-                        $currentBalance,
-                        $requiredPrimaryLeaveDays,
-                        true
-                    );
-                }
-
                 $label = $app->is_monetization ? 'monetization' : 'leave';
                 return response()->json([
                     'message' => "Insufficient leave balance for {$label}. Current: "
@@ -2988,6 +2991,10 @@ class LeaveApplicationController extends Controller
                     (int) $app->leave_type_id
                 )?->balance ?? 0
             );
+            if ($usesVacationLeaveTopUpForScheduleExcess) {
+                $requiredVacationLeaveDays = round(max($daysToDeduct - max($currentBalance, 0.0), 0.0), 2);
+                $requiredPrimaryLeaveDays = round(max($daysToDeduct - $requiredVacationLeaveDays, 0.0), 2);
+            }
 
             if ($app->is_monetization) {
                 $monetizationBalanceRestriction = $this->validateMonetizationBalanceRules(
@@ -3021,15 +3028,6 @@ class LeaveApplicationController extends Controller
                             . ', Required: ' . self::formatDays($requiredVacationLeaveDays) . '.',
                     ], 422);
                 }
-            }
-
-            if ($usesVacationLeaveTopUpForScheduleExcess && $currentBalance + 1e-9 < $requiredPrimaryLeaveDays) {
-                return $this->buildInsufficientPrimaryLeaveBalanceResponse(
-                    $leaveType,
-                    $currentBalance,
-                    $requiredPrimaryLeaveDays,
-                    true
-                );
             }
 
             return response()->json([
@@ -7001,13 +6999,34 @@ class LeaveApplicationController extends Controller
                 $vacationLeaveTypeId
             )
             : 0.0;
+        $usesVacationLeaveTopUpForScheduleExcess = $shouldDeductVacationLeave
+            && $vacationLeaveTypeId !== null
+            && $primaryLeaveType instanceof LeaveType
+            && $this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
+                $primaryLeaveType,
+                $primaryLeaveTypeId,
+                (bool) $app->is_monetization,
+                $vacationLeaveTypeId
+            );
 
         if ($isCtoDeduction) {
             $this->syncEmployeeCtoBalance($employeeControlNo, true);
         }
 
         $primaryBalance = $this->lockEmployeeLeaveBalance($employeeControlNo, $primaryLeaveTypeId);
-        if (!$primaryBalance || (float) $primaryBalance->balance < $primaryDaysToDeduct) {
+        if ($usesVacationLeaveTopUpForScheduleExcess) {
+            $primaryAvailable = $primaryBalance ? max((float) $primaryBalance->balance, 0.0) : 0.0;
+            $primaryDaysToDeduct = round(min($normalizedDaysToDeduct, $primaryAvailable), 2);
+            $linkedVacationLeaveRequiredDays = round(max($normalizedDaysToDeduct - $primaryDaysToDeduct, 0.0), 2);
+        }
+
+        if (
+            !$usesVacationLeaveTopUpForScheduleExcess
+            && (
+                !$primaryBalance
+                || (float) $primaryBalance->balance + 1e-9 < $primaryDaysToDeduct
+            )
+        ) {
             throw new \RuntimeException($balanceConflictError);
         }
 
@@ -7018,7 +7037,9 @@ class LeaveApplicationController extends Controller
             ];
         }
 
-        $primaryBalance->decrement('balance', $primaryDaysToDeduct);
+        if ($primaryBalance && $primaryDaysToDeduct > 0.0) {
+            $primaryBalance->decrement('balance', $primaryDaysToDeduct);
+        }
 
         $linkedForcedLeaveDeductedDays = 0.0;
         if ($shouldDeductForcedLeave && $forcedLeaveTypeId !== null) {
@@ -9734,14 +9755,9 @@ class LeaveApplicationController extends Controller
             ? ($availableBalanceHours + 1e-9 < $requiredBalanceHours)
             : ($availableBalance + 1e-9 < $requiredBalanceDays);
         if ($requiresVacationLeaveTopUp) {
-            if ($insufficientBalance) {
-                return $this->buildInsufficientPrimaryLeaveBalanceResponse(
-                    $leaveType,
-                    $availableBalance,
-                    $requiredBalanceDays,
-                    true
-                );
-            }
+            $requiredVacationLeaveDays = round(max($requiredBalanceDays - max($availableBalance, 0.0), 0.0), 2);
+            $requiredBalanceDays = round(max($requiredBalanceDays - $requiredVacationLeaveDays, 0.0), 2);
+            $insufficientBalance = false;
 
             if ($vacationLeaveTypeId !== null && $requiredVacationLeaveDays > 0.0) {
                 $vacationBalanceSnapshot = $this->resolveEmployeeLeaveBalanceSnapshot(

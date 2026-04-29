@@ -422,6 +422,69 @@ class HRUserManagementController extends Controller
     }
 
     /**
+     * Reset an active office admin account password to the default (MMDDYY).
+     */
+    public function resetDepartmentAdminPassword(Request $request, int $id): JsonResponse
+    {
+        $admin = DepartmentAdmin::query()->find($id);
+        if (!$admin) {
+            return response()->json([
+                'message' => 'Department admin not found.',
+            ], 404);
+        }
+
+        if (!$this->isDepartmentAdminAssignmentActive($admin)) {
+            return response()->json([
+                'message' => 'Only active office admin accounts can be reset.',
+            ], 422);
+        }
+
+        $employeeControlNo = trim((string) ($admin->employee_control_no ?? ''));
+        if ($employeeControlNo === '') {
+            return response()->json([
+                'message' => 'This office admin account has no linked employee. Unable to reset default password.',
+            ], 422);
+        }
+
+        $employee = HrisEmployee::findByControlNo($employeeControlNo);
+        if (!$employee) {
+            return response()->json([
+                'message' => 'Linked employee not found in HRIS. Unable to reset default password.',
+            ], 422);
+        }
+
+        $admin->password = $this->buildGeneratedPasswordFromBirthDate($employee);
+        $admin->must_change_password = true;
+        $admin->save();
+
+        return response()->json([
+            'message' => 'Office admin password reset successfully. Default password is employee birthdate (MMDDYY).',
+        ]);
+    }
+
+    /**
+     * Reset an HR account password to the default (MMDDYY).
+     */
+    public function resetHrAccountPassword(Request $request, int $id): JsonResponse
+    {
+        $hrAccount = HRAccount::query()->find($id);
+        if (!$hrAccount) {
+            return response()->json([
+                'message' => 'HR account not found.',
+            ], 404);
+        }
+
+        $employee = $this->resolveEmployeeForHrPasswordReset($hrAccount);
+        $hrAccount->password = $this->buildGeneratedPasswordFromBirthDate($employee);
+        $hrAccount->must_change_password = true;
+        $hrAccount->save();
+
+        return response()->json([
+            'message' => 'HR account password reset successfully. Default password is employee birthdate (MMDDYY).',
+        ]);
+    }
+
+    /**
      * Remove a department admin account.
      */
     public function destroy(Request $request, int $id): JsonResponse
@@ -668,6 +731,7 @@ class HRUserManagementController extends Controller
                 : null,
             'is_active' => $isActive,
             'can_reactivate' => !$isActive,
+            'can_reset_password' => $isActive && trim((string) ($admin->employee_control_no ?? '')) !== '',
             'is_default_account' => (bool) $admin->is_default_account,
             'can_delete' => true,
             'must_change_password' => (bool) $admin->must_change_password,
@@ -690,11 +754,47 @@ class HRUserManagementController extends Controller
                 ? trim((string) $account->position)
                 : null,
             'employee_control_no' => null,
+            'can_reset_password' => true,
             'can_delete' => true,
             'must_change_password' => (bool) $account->must_change_password,
             'created_at' => $account->created_at?->toIso8601String(),
             'updated_at' => $account->updated_at?->toIso8601String(),
         ];
+    }
+
+    private function resolveEmployeeForHrPasswordReset(HRAccount $account): object
+    {
+        $accountControlNo = trim((string) ($account->employee_control_no ?? ''));
+        if ($accountControlNo !== '') {
+            return $this->resolveEligibleEmployeeForAssignment($accountControlNo);
+        }
+
+        $targetFullName = mb_strtolower(trim((string) ($account->full_name ?? '')));
+        if ($targetFullName === '') {
+            throw ValidationException::withMessages([
+                'employee_control_no' => ['This HR account has no employee reference. Unable to reset default password.'],
+            ]);
+        }
+
+        $matches = HrisEmployee::allCached(true)
+            ->filter(function (object $employee) use ($targetFullName): bool {
+                return mb_strtolower($this->buildEmployeeFullName($employee)) === $targetFullName;
+            })
+            ->values();
+
+        if ($matches->count() < 1) {
+            throw ValidationException::withMessages([
+                'employee_control_no' => ['Linked employee not found in HRIS. Unable to reset default password for this HR account.'],
+            ]);
+        }
+
+        if ($matches->count() > 1) {
+            throw ValidationException::withMessages([
+                'employee_control_no' => ['Multiple HRIS employees match this HR account name. Unable to reset default password safely.'],
+            ]);
+        }
+
+        return (object) $matches->first();
     }
 
     private function hasHistoricalCocApplicationsForHrAccount(HRAccount $account): bool

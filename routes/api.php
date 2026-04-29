@@ -161,6 +161,8 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::post('/user-management/department-admins', [HRUserManagementController::class, 'store']);
         Route::put('/user-management/department-admins/{id}', [HRUserManagementController::class, 'update']);
         Route::post('/user-management/department-admins/{id}/reactivate', [HRUserManagementController::class, 'reactivate']);
+        Route::post('/user-management/department-admins/{id}/reset-password', [HRUserManagementController::class, 'resetDepartmentAdminPassword']);
+        Route::post('/user-management/hr-accounts/{id}/reset-password', [HRUserManagementController::class, 'resetHrAccountPassword']);
         Route::delete('/user-management/department-admins/{id}', [HRUserManagementController::class, 'destroy']);
         Route::delete('/user-management/hr-accounts/{id}', [HRUserManagementController::class, 'destroyHrAccount']);
 
