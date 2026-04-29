@@ -474,13 +474,26 @@ class HRUserManagementController extends Controller
             ], 404);
         }
 
-        $employee = $this->resolveEmployeeForHrPasswordReset($hrAccount);
-        $hrAccount->password = $this->buildGeneratedPasswordFromBirthDate($employee);
+        try {
+            $employee = $this->resolveEmployeeForHrPasswordReset($hrAccount);
+            $nextPassword = $this->buildGeneratedPasswordFromBirthDate($employee);
+            $successMessage = 'HR account password reset successfully. Default password is employee birthdate (MMDDYY).';
+        } catch (ValidationException $exception) {
+            $fallbackPassword = $this->resolveHrFallbackResetPassword();
+            if ($fallbackPassword === null) {
+                throw $exception;
+            }
+
+            $nextPassword = $fallbackPassword;
+            $successMessage = 'HR account password reset successfully. Default password is the configured HR fallback password.';
+        }
+
+        $hrAccount->password = $nextPassword;
         $hrAccount->must_change_password = true;
         $hrAccount->save();
 
         return response()->json([
-            'message' => 'HR account password reset successfully. Default password is employee birthdate (MMDDYY).',
+            'message' => $successMessage,
         ]);
     }
 
@@ -795,6 +808,21 @@ class HRUserManagementController extends Controller
         }
 
         return (object) $matches->first();
+    }
+
+    private function resolveHrFallbackResetPassword(): ?string
+    {
+        $seedPassword = trim((string) env('HR_SEEDER_PASSWORD', ''));
+        if ($seedPassword !== '') {
+            return $seedPassword;
+        }
+
+        $guestFallbackPassword = trim((string) env('HR_GUEST_DEFAULT_PASSWORD', ''));
+        if ($guestFallbackPassword !== '') {
+            return $guestFallbackPassword;
+        }
+
+        return null;
     }
 
     private function hasHistoricalCocApplicationsForHrAccount(HRAccount $account): bool
