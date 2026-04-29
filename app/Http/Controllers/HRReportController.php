@@ -18,7 +18,7 @@ use Illuminate\Support\Facades\Cache;
 class HRReportController extends Controller
 {
     private const HOURS_PER_WORKDAY = 8.0;
-    private const EMPLOYEE_DIRECTORY_CACHE_KEY = 'hr_reports.employee_directory.v1';
+    private const EMPLOYEE_DIRECTORY_CACHE_KEY = 'hr_reports.employee_directory.v2';
 
     /**
      * Get summary statistics for HR reports.
@@ -246,6 +246,10 @@ class HRReportController extends Controller
         $rows = [];
 
         foreach ($applications as $application) {
+            if (!$this->isEmployeeInDirectory($application->employee_control_no, $employeeDirectory)) {
+                continue;
+            }
+
             [, $withoutPayDays] = $this->resolveApplicationPayBreakdown($application);
             if ($withoutPayDays <= 0) {
                 continue;
@@ -285,6 +289,7 @@ class HRReportController extends Controller
 
     public function leaveBalancesReports(Request $request): JsonResponse
     {
+        ini_set('memory_limit', '512M');
         if ($response = $this->ensureHr($request)) {
             return $response;
         }
@@ -351,6 +356,10 @@ class HRReportController extends Controller
 
         foreach ($balanceRows as $balanceRow) {
             $controlNo = trim((string) $balanceRow->employee_control_no);
+            if (!$this->isEmployeeInDirectory($controlNo, $employeeDirectory)) {
+                continue;
+            }
+
             $employeeKey = $this->normalizeControlNoKey($controlNo);
             if ($employeeKey === '') {
                 continue;
@@ -381,6 +390,10 @@ class HRReportController extends Controller
         unset($aggregate);
 
         foreach ($applications as $application) {
+            if (!$this->isEmployeeInDirectory($application->employee_control_no, $employeeDirectory)) {
+                continue;
+            }
+
             $referenceDate = $this->resolveApplicationReferenceDate($application);
             if (!$referenceDate || (int) $referenceDate->year !== $currentYear) {
                 continue;
@@ -506,6 +519,10 @@ class HRReportController extends Controller
         $rows = [];
 
         foreach ($applications as $application) {
+            if (!$this->isEmployeeInDirectory($application->employee_control_no, $employeeDirectory)) {
+                continue;
+            }
+
             $employee = $this->resolveApplicationEmployeeProfile($application, $employeeDirectory);
             $receivedAt = $application->admin_approved_at ?? $application->hr_approved_at ?? $application->created_at;
             $referenceDate = $receivedAt ?? $application->created_at;
@@ -608,6 +625,10 @@ class HRReportController extends Controller
 
         $approvedCtoRowsByEmployee = [];
         foreach ($applications as $application) {
+            if (!$this->isEmployeeInDirectory($application->employee_control_no, $employeeDirectory)) {
+                continue;
+            }
+
             $employeeKey = $this->normalizeControlNoKey((string) $application->employee_control_no);
             if ($employeeKey === '') {
                 continue;
@@ -627,6 +648,10 @@ class HRReportController extends Controller
 
         $rows = [];
         foreach ($applications as $application) {
+            if (!$this->isEmployeeInDirectory($application->employee_control_no, $employeeDirectory)) {
+                continue;
+            }
+
             $employee = $this->resolveApplicationEmployeeProfile($application, $employeeDirectory);
             $employeeKey = $this->normalizeControlNoKey((string) $application->employee_control_no);
             if ($employeeKey === '') {
@@ -758,6 +783,10 @@ class HRReportController extends Controller
 
         foreach ($currentBalances as $balanceRow) {
             $controlNo = trim((string) $balanceRow->employee_control_no);
+            if (!$this->isEmployeeInDirectory($controlNo, $employeeDirectory)) {
+                continue;
+            }
+
             $employeeKey = $this->normalizeControlNoKey($controlNo);
             if ($employeeKey === '') {
                 continue;
@@ -783,6 +812,10 @@ class HRReportController extends Controller
         unset($aggregate);
         foreach ($approvedCocApplications as $cocApplication) {
             $controlNo = trim((string) $cocApplication->employee_control_no);
+            if (!$this->isEmployeeInDirectory($controlNo, $employeeDirectory)) {
+                continue;
+            }
+
             $employeeKey = $this->normalizeControlNoKey($controlNo);
             if ($employeeKey === '') {
                 continue;
@@ -822,6 +855,10 @@ class HRReportController extends Controller
 
         foreach ($approvedCtoApplications as $application) {
             $controlNo = trim((string) $application->employee_control_no);
+            if (!$this->isEmployeeInDirectory($controlNo, $employeeDirectory)) {
+                continue;
+            }
+
             $employeeKey = $this->normalizeControlNoKey($controlNo);
             if ($employeeKey === '') {
                 continue;
@@ -918,6 +955,10 @@ class HRReportController extends Controller
         $aggregates = [];
 
         foreach ($applications as $application) {
+            if (!$this->isEmployeeInDirectory($application->employee_control_no, $employeeDirectory)) {
+                continue;
+            }
+
             $referenceDate = $this->resolveApplicationReferenceDate($application) ?? $application->created_at;
             if (!$referenceDate) {
                 continue;
@@ -1125,7 +1166,7 @@ class HRReportController extends Controller
             $byRaw = [];
             $byKey = [];
 
-            foreach (HrisEmployee::allCached() as $employee) {
+            foreach (HrisEmployee::allCached(true) as $employee) {
                 $controlNo = trim((string) ($employee->control_no ?? ''));
                 if ($controlNo === '') {
                     continue;
@@ -1154,6 +1195,25 @@ class HRReportController extends Controller
                 'by_key' => $byKey,
             ];
         });
+    }
+
+    private function isEmployeeInDirectory(mixed $controlNo, array $directory): bool
+    {
+        $rawControlNo = trim((string) ($controlNo ?? ''));
+        if ($rawControlNo === '') {
+            return false;
+        }
+
+        if (array_key_exists($rawControlNo, $directory['by_raw'] ?? [])) {
+            return true;
+        }
+
+        $normalizedKey = $this->normalizeControlNoKey($rawControlNo);
+        if ($normalizedKey === '') {
+            return false;
+        }
+
+        return array_key_exists($normalizedKey, $directory['by_key'] ?? []);
     }
 
     private function resolveApplicationEmployeeProfile(LeaveApplication $application, array $directory): array

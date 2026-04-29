@@ -463,7 +463,7 @@ class HRUserManagementController extends Controller
     }
 
     /**
-     * Reset an HR account password to the default (MMDDYY).
+     * Reset an HR account password using a temporary password set by HR.
      */
     public function resetHrAccountPassword(Request $request, int $id): JsonResponse
     {
@@ -474,26 +474,16 @@ class HRUserManagementController extends Controller
             ], 404);
         }
 
-        try {
-            $employee = $this->resolveEmployeeForHrPasswordReset($hrAccount);
-            $nextPassword = $this->buildGeneratedPasswordFromBirthDate($employee);
-            $successMessage = 'HR account password reset successfully. Default password is employee birthdate (MMDDYY).';
-        } catch (ValidationException $exception) {
-            $fallbackPassword = $this->resolveHrFallbackResetPassword();
-            if ($fallbackPassword === null) {
-                throw $exception;
-            }
+        $validated = $request->validate([
+            'password' => ['required', 'string', 'min:8', 'max:255'],
+        ]);
 
-            $nextPassword = $fallbackPassword;
-            $successMessage = 'HR account password reset successfully. Default password is the configured HR fallback password.';
-        }
-
-        $hrAccount->password = $nextPassword;
+        $hrAccount->password = trim((string) ($validated['password'] ?? ''));
         $hrAccount->must_change_password = true;
         $hrAccount->save();
 
         return response()->json([
-            'message' => $successMessage,
+            'message' => 'HR account password reset successfully. The temporary password is now active and must be changed after login.',
         ]);
     }
 
@@ -773,56 +763,6 @@ class HRUserManagementController extends Controller
             'created_at' => $account->created_at?->toIso8601String(),
             'updated_at' => $account->updated_at?->toIso8601String(),
         ];
-    }
-
-    private function resolveEmployeeForHrPasswordReset(HRAccount $account): object
-    {
-        $accountControlNo = trim((string) ($account->employee_control_no ?? ''));
-        if ($accountControlNo !== '') {
-            return $this->resolveEligibleEmployeeForAssignment($accountControlNo);
-        }
-
-        $targetFullName = mb_strtolower(trim((string) ($account->full_name ?? '')));
-        if ($targetFullName === '') {
-            throw ValidationException::withMessages([
-                'employee_control_no' => ['This HR account has no employee reference. Unable to reset default password.'],
-            ]);
-        }
-
-        $matches = HrisEmployee::allCached(true)
-            ->filter(function (object $employee) use ($targetFullName): bool {
-                return mb_strtolower($this->buildEmployeeFullName($employee)) === $targetFullName;
-            })
-            ->values();
-
-        if ($matches->count() < 1) {
-            throw ValidationException::withMessages([
-                'employee_control_no' => ['Linked employee not found in HRIS. Unable to reset default password for this HR account.'],
-            ]);
-        }
-
-        if ($matches->count() > 1) {
-            throw ValidationException::withMessages([
-                'employee_control_no' => ['Multiple HRIS employees match this HR account name. Unable to reset default password safely.'],
-            ]);
-        }
-
-        return (object) $matches->first();
-    }
-
-    private function resolveHrFallbackResetPassword(): ?string
-    {
-        $seedPassword = trim((string) env('HR_SEEDER_PASSWORD', ''));
-        if ($seedPassword !== '') {
-            return $seedPassword;
-        }
-
-        $guestFallbackPassword = trim((string) env('HR_GUEST_DEFAULT_PASSWORD', ''));
-        if ($guestFallbackPassword !== '') {
-            return $guestFallbackPassword;
-        }
-
-        return null;
     }
 
     private function hasHistoricalCocApplicationsForHrAccount(HRAccount $account): bool
