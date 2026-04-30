@@ -80,6 +80,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
     // Shared LMS account routes
     Route::get('/departments', [EmployeeController::class, 'departments']);
     Route::get('/employees', [EmployeeController::class, 'index']);
+    Route::get('/city-administrator', [EmployeeController::class, 'cityAdministrator']);
     Route::get('/notifications/unread-count', [NotificationController::class, 'unreadCount']);
     Route::get('/notifications', [NotificationController::class, 'index']);
     Route::get('/notifications/{id}/application', [NotificationController::class, 'applicationDetails']);
@@ -89,6 +90,8 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
     Route::get('/settings/profile', [SettingsController::class, 'getProfile']);
     Route::put('/settings/profile', [SettingsController::class, 'updateProfile']);
     Route::put('/settings/password', [SettingsController::class, 'updatePassword']);
+    Route::get('/settings/signatories', [SettingsController::class, 'getSignatories']);
+    Route::put('/settings/signatories/chrmo-leave-in-charge', [SettingsController::class, 'updateChrmoLeaveInCharge']);
 
     Route::middleware('department_admin')->prefix('admin')->group(function () {
         // Employee management

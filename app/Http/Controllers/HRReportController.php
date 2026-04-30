@@ -18,7 +18,7 @@ use Illuminate\Support\Facades\Cache;
 class HRReportController extends Controller
 {
     private const HOURS_PER_WORKDAY = 8.0;
-    private const EMPLOYEE_DIRECTORY_CACHE_KEY = 'hr_reports.employee_directory.v2';
+    private const EMPLOYEE_DIRECTORY_CACHE_KEY = 'hr_reports.employee_directory.v6';
 
     /**
      * Get summary statistics for HR reports.
@@ -265,6 +265,9 @@ class HRReportController extends Controller
 
             $rows[] = [
                 'name' => $employee['name'],
+                'firstname' => $employee['firstname'],
+                'surname' => $employee['surname'],
+                'middlename' => $employee['middlename'],
                 'office' => $employee['office'],
                 'status' => $employee['status'],
                 'periodIncurred' => $this->formatDateSummaryFromDateKeys($wopDateKeys)
@@ -340,6 +343,10 @@ class HRReportController extends Controller
         $aggregates = [];
 
         foreach (($employeeDirectory['by_raw'] ?? []) as $directoryEmployee) {
+            if (!((bool) ($directoryEmployee['is_active'] ?? false))) {
+                continue;
+            }
+
             $controlNo = trim((string) ($directoryEmployee['control_no'] ?? ''));
             $employeeKey = $this->normalizeControlNoKey($controlNo);
             if ($employeeKey === '') {
@@ -449,6 +456,9 @@ class HRReportController extends Controller
 
             $rows[] = [
                 'name' => $employee['name'],
+                'firstname' => $employee['firstname'],
+                'surname' => $employee['surname'],
+                'middlename' => $employee['middlename'],
                 'designation' => $employee['designation'],
                 'status' => $employee['status'],
                 'office' => $employee['office'],
@@ -537,6 +547,9 @@ class HRReportController extends Controller
                 'dateReceivedHRMO' => $this->formatDateForDisplay($receivedAt),
                 'dateOfFiling' => $this->formatDateForDisplay($application->created_at),
                 'name' => $employee['name'],
+                'firstname' => $employee['firstname'],
+                'surname' => $employee['surname'],
+                'middlename' => $employee['middlename'],
                 'designation' => $employee['designation'],
                 'status' => $employee['status'],
                 'office' => $employee['office'],
@@ -695,6 +708,9 @@ class HRReportController extends Controller
             $rows[] = [
                 'dateFiled' => $this->formatDateForDisplay($application->created_at),
                 'name' => $employee['name'],
+                'firstname' => $employee['firstname'],
+                'surname' => $employee['surname'],
+                'middlename' => $employee['middlename'],
                 'designation' => $employee['designation'],
                 'office' => $employee['office'],
                 'status' => $this->formatCtoAvailmentEmploymentStatus($employee['status']),
@@ -905,6 +921,9 @@ class HRReportController extends Controller
 
             $rows[] = [
                 'name' => $employee['name'],
+                'firstname' => $employee['firstname'],
+                'surname' => $employee['surname'],
+                'middlename' => $employee['middlename'],
                 'designation' => $employee['designation'],
                 'status' => $employee['status'],
                 'office' => $employee['office'],
@@ -1043,6 +1062,9 @@ class HRReportController extends Controller
 
             $rows[] = [
                 'name' => $employee['name'],
+                'firstname' => $employee['firstname'],
+                'surname' => $employee['surname'],
+                'middlename' => $employee['middlename'],
                 'designation' => $employee['designation'],
                 'status' => $employee['status'],
                 'office' => $employee['office'],
@@ -1166,7 +1188,7 @@ class HRReportController extends Controller
             $byRaw = [];
             $byKey = [];
 
-            foreach (HrisEmployee::allCached(true) as $employee) {
+            foreach (HrisEmployee::allCached(null) as $employee) {
                 $controlNo = trim((string) ($employee->control_no ?? ''));
                 if ($controlNo === '') {
                     continue;
@@ -1175,8 +1197,12 @@ class HRReportController extends Controller
                 $entry = [
                     'control_no' => $controlNo,
                     'name' => $this->buildEmployeeNameFromSnapshot($employee) ?? $controlNo,
+                    'firstname' => $this->trimNullableString($employee->firstname ?? null) ?? '',
+                    'middlename' => $this->trimNullableString($employee->middlename ?? null) ?? '',
+                    'surname' => $this->trimNullableString($employee->surname ?? null) ?? '',
                     'office' => $this->trimNullableString($employee->office ?? null) ?? '',
                     'status' => $this->formatEmploymentStatus($employee->status ?? null),
+                    'is_active' => filter_var($employee->is_active ?? false, FILTER_VALIDATE_BOOLEAN),
                     'designation' => $this->trimNullableString($employee->designation ?? null) ?? '',
                 ];
 
@@ -1205,7 +1231,7 @@ class HRReportController extends Controller
         }
 
         if (array_key_exists($rawControlNo, $directory['by_raw'] ?? [])) {
-            return true;
+            return (bool) ($directory['by_raw'][$rawControlNo]['is_active'] ?? false);
         }
 
         $normalizedKey = $this->normalizeControlNoKey($rawControlNo);
@@ -1213,7 +1239,11 @@ class HRReportController extends Controller
             return false;
         }
 
-        return array_key_exists($normalizedKey, $directory['by_key'] ?? []);
+        if (!array_key_exists($normalizedKey, $directory['by_key'] ?? [])) {
+            return false;
+        }
+
+        return (bool) ($directory['by_key'][$normalizedKey]['is_active'] ?? false);
     }
 
     private function resolveApplicationEmployeeProfile(LeaveApplication $application, array $directory): array
@@ -1243,6 +1273,9 @@ class HRReportController extends Controller
             'name' => $this->trimNullableString($employee['name'] ?? null)
                 ?? $this->trimNullableString($fallbackName)
                 ?? 'Unknown',
+            'firstname' => $this->trimNullableString($employee['firstname'] ?? null) ?? '',
+            'middlename' => $this->trimNullableString($employee['middlename'] ?? null) ?? '',
+            'surname' => $this->trimNullableString($employee['surname'] ?? null) ?? '',
             'office' => $this->trimNullableString($employee['office'] ?? null)
                 ?? $this->trimNullableString($fallbackOffice)
                 ?? '',

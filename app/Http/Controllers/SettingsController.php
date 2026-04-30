@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
+use App\Models\SignatorySetting;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
@@ -13,6 +14,8 @@ use Illuminate\Validation\ValidationException;
 
 class SettingsController extends Controller
 {
+    private const CHRMO_LEAVE_IN_CHARGE_FALLBACK_POSITION = 'CHRMO Leave In-charge';
+
     /**
      * Get the current user's setting profile.
      */
@@ -130,6 +133,69 @@ class SettingsController extends Controller
     }
 
     /**
+     * Return signatory assignments used by leave-form printing.
+     */
+    public function getSignatories(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        if (!$user instanceof HRAccount && !$user instanceof DepartmentAdmin) {
+            return response()->json([
+                'message' => 'Only HR and department admin accounts can access this endpoint.',
+            ], 403);
+        }
+
+        return response()->json([
+            'signatories' => [
+                SignatorySetting::KEY_CHRMO_LEAVE_IN_CHARGE => $this->resolveChrmoLeaveInChargeSignatory(),
+            ],
+        ]);
+    }
+
+    /**
+     * Assign the CHRMO Leave In-charge signatory.
+     */
+    public function updateChrmoLeaveInCharge(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        if (!$user instanceof HRAccount) {
+            return response()->json([
+                'message' => 'Only HR accounts can update signatory assignments.',
+            ], 403);
+        }
+
+        $validated = $request->validate([
+            'employee_control_no' => ['required', 'string', 'max:64', 'regex:/^\d+$/'],
+        ]);
+
+        $employeeControlNo = trim((string) ($validated['employee_control_no'] ?? ''));
+        $employee = HrisEmployee::findByControlNo($employeeControlNo, true);
+        if (!$employee) {
+            return response()->json([
+                'message' => 'Selected employee was not found in active HRIS records.',
+            ], 422);
+        }
+
+        $resolvedControlNo = trim((string) ($employee->control_no ?? ''));
+        $resolvedFullName = $this->buildEmployeeFullName($employee);
+        $resolvedPosition = $this->trimNullableString($employee->designation) ?? self::CHRMO_LEAVE_IN_CHARGE_FALLBACK_POSITION;
+
+        $setting = SignatorySetting::query()->firstOrNew([
+            'signatory_key' => SignatorySetting::KEY_CHRMO_LEAVE_IN_CHARGE,
+        ]);
+
+        $setting->employee_control_no = $resolvedControlNo !== '' ? $resolvedControlNo : $employeeControlNo;
+        $setting->signatory_name = $resolvedFullName !== '' ? $resolvedFullName : null;
+        $setting->signatory_position = $resolvedPosition;
+        $setting->updated_by_hr_account_id = $user->id;
+        $setting->save();
+
+        return response()->json([
+            'message' => 'CHRMO Leave In-charge signatory updated successfully.',
+            'signatory' => $this->serializeSignatorySetting($setting),
+        ]);
+    }
+
+    /**
      * Helper to get the role name.
      */
     private function getRole($user): string
@@ -210,5 +276,63 @@ class SettingsController extends Controller
     {
         $trimmed = trim((string) ($value ?? ''));
         return $trimmed === '' ? null : $trimmed;
+    }
+
+    private function buildEmployeeFullName(object $employee): string
+    {
+        $parts = array_values(array_filter([
+            $this->trimNullableString($employee->firstname ?? null),
+            $this->trimNullableString($employee->middlename ?? null),
+            $this->trimNullableString($employee->surname ?? null),
+        ]));
+
+        if ($parts === []) {
+            return trim((string) ($employee->control_no ?? ''));
+        }
+
+        return trim(implode(' ', $parts));
+    }
+
+    private function resolveChrmoLeaveInChargeSignatory(): ?array
+    {
+        $setting = SignatorySetting::query()
+            ->where('signatory_key', SignatorySetting::KEY_CHRMO_LEAVE_IN_CHARGE)
+            ->first();
+
+        if (!$setting) {
+            return null;
+        }
+
+        return $this->serializeSignatorySetting($setting);
+    }
+
+    private function serializeSignatorySetting(SignatorySetting $setting): ?array
+    {
+        $controlNo = trim((string) ($setting->employee_control_no ?? ''));
+        $employee = $controlNo !== '' ? HrisEmployee::findByControlNo($controlNo) : null;
+
+        $fullName = $employee
+            ? $this->buildEmployeeFullName($employee)
+            : ($this->trimNullableString($setting->signatory_name) ?? '');
+        $position = $this->trimNullableString($employee?->designation)
+            ?? $this->trimNullableString($setting->signatory_position)
+            ?? self::CHRMO_LEAVE_IN_CHARGE_FALLBACK_POSITION;
+
+        if ($fullName === '') {
+            return null;
+        }
+
+        return [
+            'employee_control_no' => $controlNo !== '' ? $controlNo : null,
+            'control_no' => $controlNo !== '' ? $controlNo : null,
+            'full_name' => $fullName,
+            'name' => $fullName,
+            'designation' => $position,
+            'position' => $position,
+            'firstname' => $employee ? $this->trimNullableString($employee->firstname) : null,
+            'middlename' => $employee ? $this->trimNullableString($employee->middlename) : null,
+            'surname' => $employee ? $this->trimNullableString($employee->surname) : null,
+            'office' => $employee ? $this->trimNullableString($employee->office) : null,
+        ];
     }
 }

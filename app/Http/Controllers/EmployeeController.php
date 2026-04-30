@@ -69,6 +69,60 @@ class EmployeeController extends Controller
     }
 
     /**
+     * Return the City Administrator signatory record from HRIS.
+     * Accessible to HR and department admin accounts.
+     */
+    public function cityAdministrator(Request $request): JsonResponse
+    {
+        $account = $request->user();
+        if (!$account instanceof HRAccount && !$account instanceof DepartmentAdmin) {
+            return response()->json([
+                'message' => 'Only HR and department admin accounts can access this endpoint.',
+            ], 403);
+        }
+
+        $employee = HrisEmployee::query(true)
+            ->whereRaw("LOWER(LTRIM(RTRIM(vp.Designation))) LIKE ?", ['%city administrator%'])
+            ->orderByRaw('vp.ToDate DESC')
+            ->orderByRaw('vp.FromDate DESC')
+            ->orderByRaw('LTRIM(RTRIM(xp.Surname))')
+            ->orderByRaw('LTRIM(RTRIM(xp.Firstname))')
+            ->first();
+
+        if (!$employee) {
+            $employee = HrisEmployee::query(null)
+                ->whereRaw("LOWER(LTRIM(RTRIM(vp.Designation))) LIKE ?", ['%city administrator%'])
+                ->orderByRaw('CASE WHEN vp.FromDate IS NOT NULL AND vp.ToDate IS NOT NULL AND GETDATE() BETWEEN vp.FromDate AND vp.ToDate THEN 0 ELSE 1 END')
+                ->orderByRaw('vp.ToDate DESC')
+                ->orderByRaw('vp.FromDate DESC')
+                ->orderByRaw('LTRIM(RTRIM(xp.Surname))')
+                ->orderByRaw('LTRIM(RTRIM(xp.Firstname))')
+                ->first();
+        }
+
+        if (!$employee) {
+            return response()->json([
+                'city_administrator' => null,
+            ]);
+        }
+
+        $designation = $this->trimOrBlank($employee->designation ?? null);
+
+        return response()->json([
+            'city_administrator' => [
+                'control_no' => trim((string) ($employee->control_no ?? '')),
+                'firstname' => $this->trimOrBlank($employee->firstname ?? null),
+                'surname' => $this->trimOrBlank($employee->surname ?? null),
+                'middlename' => $this->trimOrBlank($employee->middlename ?? null),
+                'full_name' => $this->buildEmployeeFullName($employee),
+                'designation' => $designation !== '' ? $designation : 'City Administrator',
+                'position' => $designation !== '' ? $designation : 'City Administrator',
+                'office' => $this->trimOrBlank($employee->office ?? null),
+            ],
+        ]);
+    }
+
+    /**
      * Create or update the current department head for the authenticated department admin.
      * POST creates a new head and rejects a second head for the same department.
      * PUT updates the existing head record.
@@ -1515,18 +1569,109 @@ class EmployeeController extends Controller
             return true;
         }
 
-        $needle = mb_strtolower($searchTerm);
-        $haystack = implode(' ', array_filter([
-            trim((string) ($employee->firstname ?? '')),
-            trim((string) ($employee->surname ?? '')),
-            trim((string) ($employee->middlename ?? '')),
-            trim((string) ($employee->control_no ?? '')),
-            trim((string) ($employee->status ?? '')),
-            trim((string) ($employee->office ?? '')),
-            trim((string) ($employee->designation ?? '')),
-        ], static fn(string $value): bool => $value !== ''));
+        $firstname = trim((string) ($employee->firstname ?? ''));
+        $surname = trim((string) ($employee->surname ?? ''));
+        $middlename = trim((string) ($employee->middlename ?? ''));
+        $controlNo = trim((string) ($employee->control_no ?? ''));
+        $status = trim((string) ($employee->status ?? ''));
+        $office = trim((string) ($employee->office ?? ''));
+        $designation = trim((string) ($employee->designation ?? ''));
 
-        return mb_stripos($haystack, $needle) !== false;
+        $baseFields = array_values(array_filter([
+            $controlNo,
+            $status,
+            $office,
+            $designation,
+        ], static fn (string $value): bool => $value !== ''));
+
+        $nameVariants = array_values(array_filter([
+            trim(implode(' ', array_filter([$firstname, $middlename, $surname]))),
+            trim(implode(' ', array_filter([$surname, $firstname, $middlename]))),
+            trim($surname . ', ' . implode(' ', array_filter([$firstname, $middlename]))),
+            trim(implode(' ', array_filter([$firstname, $surname]))),
+            trim(implode(' ', array_filter([$surname, $firstname]))),
+        ], static fn (string $value): bool => $value !== ''));
+
+        $needle = mb_strtolower(trim($searchTerm));
+        $rawHaystack = implode(' ', array_merge($nameVariants, $baseFields));
+        if ($rawHaystack !== '' && mb_stripos($rawHaystack, $needle) !== false) {
+            return true;
+        }
+
+        $normalizedNeedle = $this->normalizeEmployeeSearchText($searchTerm);
+        if ($normalizedNeedle === '') {
+            return true;
+        }
+
+        foreach (array_merge($nameVariants, $baseFields) as $fieldValue) {
+            $normalizedFieldValue = $this->normalizeEmployeeSearchText($fieldValue);
+            if ($normalizedFieldValue !== '' && str_contains($normalizedFieldValue, $normalizedNeedle)) {
+                return true;
+            }
+        }
+
+        $searchTokens = $this->tokenizeEmployeeSearchText($normalizedNeedle);
+        if ($searchTokens === []) {
+            return false;
+        }
+
+        $normalizedNameBag = $this->normalizeEmployeeSearchText(
+            implode(' ', array_filter([$firstname, $middlename, $surname])),
+        );
+        if ($this->containsAllSearchTokens($normalizedNameBag, $searchTokens)) {
+            return true;
+        }
+
+        $normalizedAllFieldsBag = $this->normalizeEmployeeSearchText(
+            implode(' ', array_merge([$normalizedNameBag], $baseFields)),
+        );
+        return $this->containsAllSearchTokens($normalizedAllFieldsBag, $searchTokens);
+    }
+
+    private function normalizeEmployeeSearchText(string $value): string
+    {
+        $normalized = mb_strtolower(trim($value));
+        if ($normalized === '') {
+            return '';
+        }
+
+        $normalized = preg_replace('/[^\p{L}\p{N}\s]+/u', ' ', $normalized) ?? $normalized;
+        $normalized = preg_replace('/\s+/u', ' ', $normalized) ?? $normalized;
+
+        return trim($normalized);
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function tokenizeEmployeeSearchText(string $normalizedSearchText): array
+    {
+        if ($normalizedSearchText === '') {
+            return [];
+        }
+
+        return array_values(array_filter(
+            explode(' ', $normalizedSearchText),
+            static fn (string $token): bool => $token !== '',
+        ));
+    }
+
+    /**
+     * @param array<int, string> $tokens
+     */
+    private function containsAllSearchTokens(string $normalizedText, array $tokens): bool
+    {
+        if ($normalizedText === '' || $tokens === []) {
+            return false;
+        }
+
+        foreach ($tokens as $token) {
+            if (!str_contains($normalizedText, $token)) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private function sortEmployeeRows(Collection $rows): Collection

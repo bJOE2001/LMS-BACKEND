@@ -10767,7 +10767,7 @@ class LeaveApplicationController extends Controller
     {
         foreach ($snapshot as $entry) {
             if (strcasecmp((string) ($entry['leave_type_name'] ?? ''), $leaveTypeName) === 0) {
-                return round(max((float) ($entry['balance'] ?? 0.0), 0.0), 2);
+                return max((float) ($entry['balance'] ?? 0.0), 0.0);
             }
         }
 
@@ -10789,10 +10789,10 @@ class LeaveApplicationController extends Controller
         $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
         $deductibleDays = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
             ? 0.0
-            : round(max($this->resolveApplicationDeductibleDays($app), 0.0), 2);
+            : max($this->resolveApplicationDeductibleDays($app), 0.0);
 
         $leaveTypeName = trim((string) ($app->leaveType?->name ?? ''));
-        $linkedVacationDeduction = round(max((float) ($app->linked_vacation_leave_deducted_days ?? 0.0), 0.0), 2);
+        $linkedVacationDeduction = max((float) ($app->linked_vacation_leave_deducted_days ?? 0.0), 0.0);
 
         $vacationLessThisApplication = 0.0;
         $sickLessThisApplication = 0.0;
@@ -10806,17 +10806,17 @@ class LeaveApplicationController extends Controller
         }
 
         $vacationTotalEarned = $deductionAlreadyApplied
-            ? round($vacationCurrentBalance + $vacationLessThisApplication, 2)
+            ? ($vacationCurrentBalance + $vacationLessThisApplication)
             : $vacationCurrentBalance;
         $sickTotalEarned = $deductionAlreadyApplied
-            ? round($sickCurrentBalance + $sickLessThisApplication, 2)
+            ? ($sickCurrentBalance + $sickLessThisApplication)
             : $sickCurrentBalance;
         $vacationBalanceAfterApplication = $deductionAlreadyApplied
             ? $vacationCurrentBalance
-            : round(max($vacationCurrentBalance - $vacationLessThisApplication, 0.0), 2);
+            : max($vacationCurrentBalance - $vacationLessThisApplication, 0.0);
         $sickBalanceAfterApplication = $deductionAlreadyApplied
             ? $sickCurrentBalance
-            : round(max($sickCurrentBalance - $sickLessThisApplication, 0.0), 2);
+            : max($sickCurrentBalance - $sickLessThisApplication, 0.0);
 
         return [
             'vacation' => [
