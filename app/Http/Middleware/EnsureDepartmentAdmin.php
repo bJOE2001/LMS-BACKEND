@@ -23,8 +23,7 @@ class EnsureDepartmentAdmin
             ], 403);
         }
 
-        $isActiveDepartmentAdmin = trim((string) ($user->employee_control_no ?? '')) !== '';
-        if (! $isActiveDepartmentAdmin) {
+        if ($user->isDeactivatedAccount()) {
             $currentToken = $user->currentAccessToken();
             if ($currentToken instanceof PersonalAccessToken) {
                 $currentToken->delete();

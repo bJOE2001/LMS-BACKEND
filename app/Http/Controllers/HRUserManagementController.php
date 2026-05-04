@@ -807,7 +807,7 @@ class HRUserManagementController extends Controller
             return false;
         }
 
-        return trim((string) ($admin->employee_control_no ?? '')) !== '';
+        return !$admin->isDeactivatedAccount();
     }
 
     private function hasHistoricalLeaveApplications(DepartmentAdmin $admin): bool

@@ -5,6 +5,7 @@ namespace App\Models;
 use Illuminate\Contracts\Auth\Authenticatable as AuthenticatableContract;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Support\Str;
 use Laravel\Sanctum\HasApiTokens;
 
 /**
@@ -44,6 +45,29 @@ class DepartmentAdmin extends Model implements AuthenticatableContract
     public function department(): BelongsTo
     {
         return $this->belongsTo(Department::class);
+    }
+
+    public function hasEmployeeAssignment(): bool
+    {
+        return trim((string) ($this->employee_control_no ?? '')) !== '';
+    }
+
+    public function isDeactivatedAccount(): bool
+    {
+        if ($this->hasEmployeeAssignment()) {
+            return false;
+        }
+
+        if ((bool) ($this->is_default_account ?? false)) {
+            return true;
+        }
+
+        $username = Str::lower(trim((string) ($this->username ?? '')));
+        if ($username === '') {
+            return true;
+        }
+
+        return str_starts_with($username, 'archived_admin_');
     }
 
     public function getAuthIdentifierName(): string

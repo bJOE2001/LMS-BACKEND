@@ -589,7 +589,7 @@ class HRDashboardController extends Controller
             $normalizedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
         }
         $deductibleDays = $app->deductible_days !== null
-            ? round((float) $app->deductible_days, 2)
+            ? round((float) $app->deductible_days, 3)
             : ($normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $durationDays);
 
         return [

@@ -14,6 +14,7 @@ use App\Models\LeaveBalance;
 use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveType;
 use App\Services\RecycleBinService;
+use App\Services\WorkScheduleService;
 use Carbon\Carbon;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
@@ -877,7 +878,7 @@ class EmployeeController extends Controller
                 }
 
                 $totalDays = round((float) ($application->total_days ?? 0), 2);
-                $deductibleDays = round((float) ($application->deductible_days ?? $totalDays), 2);
+                $deductibleDays = round((float) ($application->deductible_days ?? $totalDays), 3);
                 $payMode = strtoupper(trim((string) ($application->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY)));
                 if (!in_array($payMode, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
                     $payMode = LeaveApplication::PAY_MODE_WITH_PAY;
@@ -887,20 +888,20 @@ class EmployeeController extends Controller
                 $withPayAmount = $isMonetization
                     ? $deductibleDays
                     : ($payMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $deductibleDays);
-                $withPayAmount = round(max($withPayAmount, 0.0), 2);
+                $withPayAmount = round(max($withPayAmount, 0.0), 3);
                 $linkedVacationWithPayAmount = round(
                     max((float) ($application->linked_vacation_leave_deducted_days ?? 0), 0.0),
-                    2
+                    3
                 );
                 if ($typeKey === 'vacation') {
                     $linkedVacationWithPayAmount = 0.0;
                 }
-                $linkedVacationWithPayAmount = round(min($linkedVacationWithPayAmount, $withPayAmount), 2);
-                $primaryWithPayAmount = round(max($withPayAmount - $linkedVacationWithPayAmount, 0.0), 2);
+                $linkedVacationWithPayAmount = round(min($linkedVacationWithPayAmount, $withPayAmount), self::LEDGER_DECIMAL_PRECISION);
+                $primaryWithPayAmount = round(max($withPayAmount - $linkedVacationWithPayAmount, 0.0), self::LEDGER_DECIMAL_PRECISION);
 
                 $withoutPayAmount = $isMonetization
                     ? 0.0
-                    : round(max($totalDays - $withPayAmount, 0.0), 2);
+                    : round(max($totalDays - $withPayAmount, 0.0), self::LEDGER_DECIMAL_PRECISION);
 
                 if ($primaryWithPayAmount <= 0 && $linkedVacationWithPayAmount <= 0 && $withoutPayAmount <= 0) {
                     continue;
@@ -2558,12 +2559,12 @@ class EmployeeController extends Controller
         }
 
         if ($application->deductible_days !== null) {
-            $stored = round((float) $application->deductible_days, 2);
+            $stored = round((float) $application->deductible_days, 3);
             if ($stored < 0.0) {
                 return 0.0;
             }
 
-            return $stored > $totalDays ? $totalDays : $stored;
+            return $stored;
         }
 
         if ((bool) $application->is_monetization) {
@@ -2607,7 +2608,8 @@ class EmployeeController extends Controller
         $coverageWeights = $this->resolveLedgerDateCoverageWeights(
             $selectedDates,
             $normalizedCoverage,
-            round((float) ($application->total_days ?? 0), 2)
+            round((float) ($application->total_days ?? 0), 2),
+            trim((string) ($application->employee_control_no ?? '')) ?: null
         );
 
         $selectedRecallDateSet = array_fill_keys(
@@ -2631,7 +2633,7 @@ class EmployeeController extends Controller
                 continue;
             }
 
-            $weight = round(max((float) ($coverageWeights[$dateKey] ?? 1.0), 0.0), 2);
+            $weight = round(max((float) ($coverageWeights[$dateKey] ?? 1.0), 0.0), self::LEDGER_DECIMAL_PRECISION);
             if ($weight <= 0.0) {
                 continue;
             }
@@ -2646,7 +2648,7 @@ class EmployeeController extends Controller
             $restorableDates[] = $dateKey;
         }
 
-        $restorableDays = round(max($restorableDays, 0.0), 2);
+        $restorableDays = round(max($restorableDays, 0.0), self::LEDGER_DECIMAL_PRECISION);
         if ($restorableDays > $deductibleDays) {
             $restorableDays = $deductibleDays;
         }
@@ -2910,7 +2912,8 @@ class EmployeeController extends Controller
     private function resolveLedgerDateCoverageWeights(
         array $selectedDates,
         ?array $selectedDateCoverage,
-        float $totalDays
+        float $totalDays,
+        ?string $employeeControlNo = null
     ): array {
         $resolvedDates = [];
         foreach ($selectedDates as $rawDate) {
@@ -2931,15 +2934,22 @@ class EmployeeController extends Controller
         $coverageMap = is_array($selectedDateCoverage) ? $selectedDateCoverage : [];
         $hasCoverageOverrides = $coverageMap !== [];
 
-        $defaultCoverageWeight = 1.0;
+        $defaultWholeDayWeight = app(WorkScheduleService::class)
+            ->resolveCoverageDeductionDays('whole', $employeeControlNo);
+        $defaultHalfDayWeight = app(WorkScheduleService::class)
+            ->resolveCoverageDeductionDays('half', $employeeControlNo);
+        $defaultCoverageWeight = $defaultWholeDayWeight;
         $dateCount = count($resolvedDates);
         if ($dateCount > 0) {
-            $halfMatch = abs(($dateCount * 0.5) - $totalDays) < 0.00001;
-            $wholeMatch = abs(((float) $dateCount) - $totalDays) < 0.00001;
+            $halfMatch = abs(($dateCount * $defaultHalfDayWeight) - $totalDays) < 0.00001;
+            $wholeMatch = abs(($dateCount * $defaultWholeDayWeight) - $totalDays) < 0.00001;
             if ($halfMatch) {
-                $defaultCoverageWeight = 0.5;
+                $defaultCoverageWeight = $defaultHalfDayWeight;
             } elseif (!$wholeMatch) {
-                $defaultCoverageWeight = max(min($totalDays / $dateCount, 1.0), 0.5);
+                $defaultCoverageWeight = max(
+                    min($totalDays / $dateCount, $defaultWholeDayWeight),
+                    $defaultHalfDayWeight
+                );
             }
         }
 
@@ -2948,17 +2958,17 @@ class EmployeeController extends Controller
             $hasCoverageValue = array_key_exists($dateKey, $coverageMap);
             $coverage = strtolower(trim((string) ($coverageMap[$dateKey] ?? '')));
             if ($coverage === 'half') {
-                $weights[$dateKey] = 0.5;
+                $weights[$dateKey] = $defaultHalfDayWeight;
                 continue;
             }
 
             if ($coverage === 'whole') {
-                $weights[$dateKey] = 1.0;
+                $weights[$dateKey] = $defaultWholeDayWeight;
                 continue;
             }
 
             if ($hasCoverageOverrides && !$hasCoverageValue) {
-                $weights[$dateKey] = 1.0;
+                $weights[$dateKey] = $defaultWholeDayWeight;
                 continue;
             }
 

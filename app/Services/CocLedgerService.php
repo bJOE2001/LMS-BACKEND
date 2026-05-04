@@ -407,7 +407,7 @@ class CocLedgerService
             return;
         }
 
-        $availableDays = round((float) ($snapshot['availableDays'] ?? 0), 2);
+        $availableDays = round((float) ($snapshot['availableDays'] ?? 0), 3);
         $canonicalControlNo = (string) ($snapshot['canonicalControlNo'] ?? '');
         if ($canonicalControlNo === '') {
             return;
@@ -433,7 +433,7 @@ class CocLedgerService
             return;
         }
 
-        if (round((float) $balance->balance, 2) !== $availableDays || !$balance->year) {
+        if (round((float) $balance->balance, 3) !== $availableDays || !$balance->year) {
             $balance->balance = $availableDays;
             if (!$balance->year) {
                 $balance->year = (int) now()->year;
@@ -529,7 +529,7 @@ class CocLedgerService
             return $creditedHours;
         }
 
-        $creditedDays = round((float) ($application->cto_credited_days ?? 0), 2);
+        $creditedDays = round((float) ($application->cto_credited_days ?? 0), 3);
         if ($creditedDays > 0) {
             return round($creditedDays * self::HOURS_PER_DAY, 2);
         }
@@ -609,7 +609,7 @@ class CocLedgerService
             return $storedHours;
         }
 
-        $days = round((float) ($application->deductible_days ?? $application->total_days ?? 0), 2);
+        $days = round((float) ($application->deductible_days ?? $application->total_days ?? 0), 3);
         return $days > 0 ? round($days * self::HOURS_PER_DAY, 2) : 0.0;
     }
 
@@ -640,7 +640,7 @@ class CocLedgerService
 
     private function hoursToDays(float $hours): float
     {
-        return $hours > 0 ? round($hours / self::HOURS_PER_DAY, 2) : 0.0;
+        return $hours > 0 ? round($hours / self::HOURS_PER_DAY, 3) : 0.0;
     }
 
     private function resolveCtoLeaveTypeId(): ?int

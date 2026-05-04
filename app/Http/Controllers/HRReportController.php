@@ -382,7 +382,7 @@ class HRReportController extends Controller
                 $aggregate['fallback_name'] = trim((string) ($balanceRow->employee_name ?? ''));
             }
 
-            $amount = round((float) ($balanceRow->balance ?? 0), 2);
+            $amount = round((float) ($balanceRow->balance ?? 0), 3);
             $bucket = $this->classifyLeaveBalanceType($creditTypeNamesById[(int) $balanceRow->leave_type_id] ?? null);
 
             match ($bucket) {
@@ -447,12 +447,12 @@ class HRReportController extends Controller
                 $employeeDirectory
             );
 
-            $balanceVl = round((float) $aggregate['balanceVl'], 2);
-            $balanceSl = round((float) $aggregate['balanceSl'], 2);
-            $balanceFl = round((float) $aggregate['balanceFl'], 2);
-            $balanceMcCo = round((float) $aggregate['balanceMcCo'], 2);
-            $balanceWlp = round((float) $aggregate['balanceWlp'], 2);
-            $balanceOthers = round((float) $aggregate['balanceOthers'], 2);
+            $balanceVl = round((float) $aggregate['balanceVl'], 3);
+            $balanceSl = round((float) $aggregate['balanceSl'], 3);
+            $balanceFl = round((float) $aggregate['balanceFl'], 3);
+            $balanceMcCo = round((float) $aggregate['balanceMcCo'], 3);
+            $balanceWlp = round((float) $aggregate['balanceWlp'], 3);
+            $balanceOthers = round((float) $aggregate['balanceOthers'], 3);
 
             $rows[] = [
                 'name' => $employee['name'],
@@ -467,11 +467,11 @@ class HRReportController extends Controller
                 'annualBalanceMcCo' => $balanceMcCo,
                 'annualBalanceWlp' => $balanceWlp,
                 'annualBalanceOthers' => $balanceOthers,
-                'daysVlFl' => round((float) $aggregate['daysVlFl'], 2),
-                'daysSl' => round((float) $aggregate['daysSl'], 2),
-                'daysMcCo' => round((float) $aggregate['daysMcCo'], 2),
-                'daysWlp' => round((float) $aggregate['daysWlp'], 2),
-                'daysOthers' => round((float) $aggregate['daysOthers'], 2),
+                'daysVlFl' => round((float) $aggregate['daysVlFl'], 3),
+                'daysSl' => round((float) $aggregate['daysSl'], 3),
+                'daysMcCo' => round((float) $aggregate['daysMcCo'], 3),
+                'daysWlp' => round((float) $aggregate['daysWlp'], 3),
+                'daysOthers' => round((float) $aggregate['daysOthers'], 3),
                 'balanceVl' => $balanceVl,
                 'balanceSl' => $balanceSl,
                 'balanceFl' => $balanceFl,
@@ -484,7 +484,7 @@ class HRReportController extends Controller
                     + (float) $aggregate['daysMcCo']
                     + (float) $aggregate['daysWlp']
                     + (float) $aggregate['daysOthers'],
-                    2
+                    3
                 ),
                 'remarks' => '',
                 'month' => (int) $now->month,
@@ -553,7 +553,7 @@ class HRReportController extends Controller
                 'designation' => $employee['designation'],
                 'status' => $employee['status'],
                 'office' => $employee['office'],
-                'totalDays' => round((float) ($application->deductible_days ?? $application->total_days ?? 0), 2),
+                'totalDays' => round((float) ($application->deductible_days ?? $application->total_days ?? 0), 3),
                 'remarks' => $remarks ?? '',
                 'month' => $monthYear['month'],
                 'year' => $monthYear['year'],
@@ -714,7 +714,7 @@ class HRReportController extends Controller
                 'designation' => $employee['designation'],
                 'office' => $employee['office'],
                 'status' => $this->formatCtoAvailmentEmploymentStatus($employee['status']),
-                'totalDaysApplied' => round($this->resolveReportableApplicationDays($application), 2),
+                'totalDaysApplied' => round($this->resolveReportableApplicationDays($application), 3),
                 'inclusiveDates' => $this->formatApplicationInclusiveDates($application),
                 'earnedCocHoursAsOf' => $this->formatDateForDisplay($latestEarnedCertificateDate),
                 'runningCocBalance' => $runningBalance,
@@ -1045,11 +1045,11 @@ class HRReportController extends Controller
                 $employeeDirectory
             );
 
-            $vlFl = round((float) $aggregate['vlFl'], 2);
-            $sl = round((float) $aggregate['sl'], 2);
-            $mcCo = round((float) $aggregate['mcCo'], 2);
-            $wlp = round((float) $aggregate['wlp'], 2);
-            $others = round((float) $aggregate['others'], 2);
+            $vlFl = round((float) $aggregate['vlFl'], 3);
+            $sl = round((float) $aggregate['sl'], 3);
+            $mcCo = round((float) $aggregate['mcCo'], 3);
+            $wlp = round((float) $aggregate['wlp'], 3);
+            $others = round((float) $aggregate['others'], 3);
             $months = array_values($aggregate['months']);
             sort($months);
             $years = array_values($aggregate['years']);
@@ -1073,7 +1073,7 @@ class HRReportController extends Controller
                 'mcCo' => $mcCo,
                 'wlp' => $wlp,
                 'others' => $others,
-                'totalNoLeave' => round($vlFl + $sl + $mcCo + $wlp + $others, 2),
+                'totalNoLeave' => round($vlFl + $sl + $mcCo + $wlp + $others, 3),
                 'remarks' => '',
                 'month' => (int) $latestReferenceDate->month,
                 'year' => (int) $latestReferenceDate->year,
@@ -1305,9 +1305,9 @@ class HRReportController extends Controller
 
     private function resolveApplicationPayBreakdown(LeaveApplication $application): array
     {
-        $totalDays = round((float) ($application->total_days ?? 0), 2);
+        $totalDays = round((float) ($application->total_days ?? 0), 3);
         $deductibleDays = $application->deductible_days !== null
-            ? round((float) $application->deductible_days, 2)
+            ? round((float) $application->deductible_days, 3)
             : $totalDays;
 
         if ((bool) $application->is_monetization) {
@@ -1324,8 +1324,8 @@ class HRReportController extends Controller
             $withPayDays = $totalDays;
         }
 
-        $withPayDays = round(max($withPayDays, 0.0), 2);
-        $withoutPayDays = round(max($totalDays - $withPayDays, 0.0), 2);
+        $withPayDays = round(max($withPayDays, 0.0), 3);
+        $withoutPayDays = round(max($totalDays - $withPayDays, 0.0), 3);
 
         return [$withPayDays, $withoutPayDays];
     }
@@ -1382,7 +1382,7 @@ class HRReportController extends Controller
     private function resolveReportableApplicationDays(LeaveApplication $application): float
     {
         if ((bool) $application->is_monetization) {
-            return round((float) ($application->deductible_days ?? $application->total_days ?? 0), 2);
+            return round((float) ($application->deductible_days ?? $application->total_days ?? 0), 3);
         }
 
         $selectedDates = $this->resolveApplicationDateKeys($application);
@@ -1391,15 +1391,15 @@ class HRReportController extends Controller
         );
 
         if ($selectedDates !== [] && $recalledDates !== []) {
-            return round((float) count(array_values(array_diff($selectedDates, $recalledDates))), 2);
+            return round((float) count(array_values(array_diff($selectedDates, $recalledDates))), 3);
         }
 
-        return round((float) ($application->total_days ?? 0), 2);
+        return round((float) ($application->total_days ?? 0), 3);
     }
 
     private function resolveOfficeLeaveAvailmentDays(LeaveApplication $application): float
     {
-        return round((float) ($application->total_days ?? 0), 2);
+        return round((float) ($application->total_days ?? 0), 3);
     }
 
     private function formatApplicationInclusiveDates(LeaveApplication $application): string
@@ -1695,7 +1695,7 @@ class HRReportController extends Controller
             return $creditedHours;
         }
 
-        $creditedDays = round((float) ($application->cto_credited_days ?? 0), 2);
+        $creditedDays = round((float) ($application->cto_credited_days ?? 0), 3);
         if ($creditedDays > 0) {
             return round($creditedDays * self::HOURS_PER_WORKDAY, 2);
         }

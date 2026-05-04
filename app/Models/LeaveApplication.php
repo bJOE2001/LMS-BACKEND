@@ -41,7 +41,7 @@ class LeaveApplication extends Model
                 $application->selected_date_pay_status = null;
                 $application->selected_date_coverage = null;
                 $application->selected_date_half_day_portion = null;
-                $application->deductible_days = round((float) ($application->total_days ?? 0), 2);
+                $application->deductible_days = round((float) ($application->total_days ?? 0), 3);
                 $application->cto_deducted_hours = null;
                 return;
             }
@@ -56,7 +56,7 @@ class LeaveApplication extends Model
             $totalDays = round((float) ($application->total_days ?? 0), 2);
             $fallbackDeductible = $application->pay_mode === self::PAY_MODE_WITHOUT_PAY ? 0.0 : $totalDays;
             $deductibleDays = $application->deductible_days !== null
-                ? round((float) $application->deductible_days, 2)
+                ? round((float) $application->deductible_days, 3)
                 : $fallbackDeductible;
 
             if ($deductibleDays < 0) {
@@ -105,6 +105,7 @@ class LeaveApplication extends Model
         'attachment_required',
         'attachment_submitted',
         'attachment_reference',
+        'certification_leave_credits_snapshot',
         'is_monetization',
         'equivalent_amount',
     ];
@@ -116,7 +117,7 @@ class LeaveApplication extends Model
             'start_date' => 'date',
             'end_date' => 'date',
             'total_days' => 'decimal:2',
-            'deductible_days' => 'decimal:2',
+            'deductible_days' => 'decimal:3',
             'cto_deducted_hours' => 'decimal:2',
             'admin_approved_at' => 'datetime',
             'hr_approved_at' => 'datetime',
@@ -127,12 +128,13 @@ class LeaveApplication extends Model
             'selected_date_coverage' => 'array',
             'selected_date_half_day_portion' => 'array',
             'pay_mode' => 'string',
-            'linked_forced_leave_deducted_days' => 'decimal:2',
-            'linked_vacation_leave_deducted_days' => 'decimal:2',
+            'linked_forced_leave_deducted_days' => 'decimal:3',
+            'linked_vacation_leave_deducted_days' => 'decimal:3',
             'requires_documents' => 'boolean',
             'attachment_required' => 'boolean',
             'attachment_submitted' => 'boolean',
             'attachment_reference' => 'string',
+            'certification_leave_credits_snapshot' => 'array',
             'is_monetization' => 'boolean',
             'equivalent_amount' => 'decimal:2',
         ];
