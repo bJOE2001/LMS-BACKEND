@@ -14,6 +14,7 @@ use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Schema;
 
 class HRReportController extends Controller
 {
@@ -601,6 +602,17 @@ class HRReportController extends Controller
             ]);
 
         $employeeDirectory = $this->getEmployeeDirectory();
+        $approvedCocColumns = [
+            'id',
+            'employee_control_no',
+            'total_minutes',
+            'credited_hours',
+            'cto_credited_days',
+            'cto_credited_at',
+            'reviewed_at',
+            'created_at',
+        ];
+
         $approvedCocApplications = COCApplication::query()
             ->where('status', COCApplication::STATUS_APPROVED)
             ->whereNotNull('cto_credited_days')
@@ -608,14 +620,7 @@ class HRReportController extends Controller
             ->orderBy('cto_credited_at')
             ->orderBy('reviewed_at')
             ->orderBy('created_at')
-            ->get([
-                'id',
-                'employee_control_no',
-                'total_minutes',
-                'cto_credited_at',
-                'reviewed_at',
-                'created_at',
-            ]);
+            ->get($approvedCocColumns);
 
         $creditEventsByEmployee = [];
         foreach ($approvedCocApplications as $cocApplication) {
@@ -632,7 +637,7 @@ class HRReportController extends Controller
             $creditEventsByEmployee[$employeeKey][] = [
                 'id' => (int) $cocApplication->id,
                 'credited_at' => $creditedAt->copy(),
-                'hours' => $this->minutesToHours((int) $cocApplication->total_minutes),
+                'hours' => $this->resolveApprovedCocEarnedHours($cocApplication),
             ];
         }
 
@@ -748,6 +753,16 @@ class HRReportController extends Controller
 
         $employeeDirectory = $this->getEmployeeDirectory();
         $now = Carbon::today();
+        $approvedCocColumns = [
+            'employee_control_no',
+            'employee_name',
+            'total_minutes',
+            'credited_hours',
+            'cto_credited_days',
+            'cto_credited_at',
+            'reviewed_at',
+            'created_at',
+        ];
 
         $currentBalances = LeaveBalance::query()
             ->where('leave_type_id', $ctoLeaveTypeId)
@@ -765,14 +780,7 @@ class HRReportController extends Controller
             ->orderBy('cto_credited_at')
             ->orderBy('reviewed_at')
             ->orderBy('created_at')
-            ->get([
-                'employee_control_no',
-                'employee_name',
-                'total_minutes',
-                'cto_credited_at',
-                'reviewed_at',
-                'created_at',
-            ]);
+            ->get($approvedCocColumns);
 
         $approvedCtoApplications = LeaveApplication::query()
             ->with('leaveType:id,name')
@@ -858,9 +866,10 @@ class HRReportController extends Controller
             $creditedAt = $cocApplication->cto_credited_at ?? $cocApplication->reviewed_at ?? $cocApplication->created_at;
             if ($creditedAt) {
                 $aggregate['earned_dates'][] = $creditedAt->copy();
-                $aggregate['expiry_dates'][] = $this->resolveCocExpiryDate(
-                    \Carbon\CarbonImmutable::parse((string) $creditedAt)->startOfDay()
-                );
+                $resolvedExpiry = $this->resolveCocApplicationExpiryDate($cocApplication);
+                if ($resolvedExpiry) {
+                    $aggregate['expiry_dates'][] = $resolvedExpiry;
+                }
 
                 if (!$aggregate['latest_earned_at'] || $creditedAt->gt($aggregate['latest_earned_at'])) {
                     $aggregate['latest_earned_at'] = $creditedAt->copy();
@@ -1706,6 +1715,22 @@ class HRReportController extends Controller
     private function resolveCocExpiryDate(\Carbon\CarbonImmutable $creditedOn): \Carbon\CarbonImmutable
     {
         return \Carbon\CarbonImmutable::create($creditedOn->year + 1, 12, 31)->endOfDay();
+    }
+
+    private function resolveCocApplicationExpiryDate(COCApplication $application): ?\Carbon\CarbonImmutable
+    {
+        $creditedAtRaw = $application->cto_credited_at ?? $application->reviewed_at ?? $application->created_at;
+        if (!$creditedAtRaw) {
+            return null;
+        }
+
+        try {
+            $creditedAt = \Carbon\CarbonImmutable::parse((string) $creditedAtRaw)->startOfDay();
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return $this->resolveCocExpiryDate($creditedAt);
     }
 
     private function resolveCtoLeaveTypeId(): ?int

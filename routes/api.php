@@ -203,6 +203,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::post('/coc-applications/{id}/late-filing/reject', [COCApplicationController::class, 'hrRejectLateFiling']);
         Route::post('/coc-applications/{id}/approve', [COCApplicationController::class, 'hrApprove']);
         Route::post('/coc-applications/{id}/reject', [COCApplicationController::class, 'hrReject']);
+        Route::post('/coc-balances/import', [COCApplicationController::class, 'hrImportBalances']);
 
         // Reports
         Route::prefix('reports')->group(function () {

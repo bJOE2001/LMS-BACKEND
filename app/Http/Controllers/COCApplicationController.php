@@ -69,6 +69,7 @@ class COCApplicationController extends Controller
         'releasedByHr',
         'ctoLeaveType',
     ];
+    private const HR_IMPORT_REMARK_PREFIX = 'COC balance import (HR)';
 
     private function cocLedgerService(): CocLedgerService
     {
@@ -112,6 +113,12 @@ class COCApplicationController extends Controller
         $applications = COCApplication::query()
             ->with(self::COC_RELATIONS)
             ->matchingControlNo($controlNo)
+            ->where(function ($query): void {
+                $prefix = strtolower(self::HR_IMPORT_REMARK_PREFIX) . '%';
+                $query
+                    ->whereNull('remarks')
+                    ->orWhereRaw('LOWER(remarks) NOT LIKE ?', [$prefix]);
+            })
             ->orderByDesc('created_at')
             ->get();
 
@@ -232,6 +239,7 @@ class COCApplicationController extends Controller
         $validated = $request->validate([
             'status' => ['nullable', 'string', 'max:50'],
             'employee_control_no' => ['nullable', 'string', 'regex:/^\d+$/'],
+            'include_imported' => ['nullable', 'boolean'],
         ]);
 
         $statusFilter = $this->normalizeStatusFilter($validated['status'] ?? null);
@@ -240,6 +248,7 @@ class COCApplicationController extends Controller
         }
 
         $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
+        $includeImported = filter_var($validated['include_imported'] ?? false, FILTER_VALIDATE_BOOLEAN);
 
         $applications = $this->excludePendingLateFilingReview(
                 $this->departmentScope($admin)
@@ -247,6 +256,14 @@ class COCApplicationController extends Controller
             ->with(self::COC_RELATIONS)
             ->when($controlNo !== '', function ($q) use ($controlNo): void {
                 $q->matchingControlNo($controlNo);
+            })
+            ->when(!$includeImported, function ($q): void {
+                $prefix = strtolower(self::HR_IMPORT_REMARK_PREFIX) . '%';
+                $q->where(function ($nestedQuery) use ($prefix): void {
+                    $nestedQuery
+                        ->whereNull('remarks')
+                        ->orWhereRaw('LOWER(remarks) NOT LIKE ?', [$prefix]);
+                });
             })
             ->orderByDesc('created_at')
             ->get();
@@ -494,6 +511,7 @@ class COCApplicationController extends Controller
         $validated = $request->validate([
             'status' => ['nullable', 'string', 'max:50'],
             'employee_control_no' => ['nullable', 'string', 'regex:/^\d+$/'],
+            'include_imported' => ['nullable', 'boolean'],
         ]);
 
         $statusFilter = $this->normalizeStatusFilter($validated['status'] ?? null);
@@ -502,6 +520,7 @@ class COCApplicationController extends Controller
         }
 
         $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
+        $includeImported = filter_var($validated['include_imported'] ?? false, FILTER_VALIDATE_BOOLEAN);
 
         $applications = COCApplication::query()
             ->with(self::COC_RELATIONS)
@@ -512,6 +531,14 @@ class COCApplicationController extends Controller
             })
             ->when($controlNo !== '', function ($q) use ($controlNo): void {
                 $q->matchingControlNo($controlNo);
+            })
+            ->when(!$includeImported, function ($q): void {
+                $prefix = strtolower(self::HR_IMPORT_REMARK_PREFIX) . '%';
+                $q->where(function ($nestedQuery) use ($prefix): void {
+                    $nestedQuery
+                        ->whereNull('remarks')
+                        ->orWhereRaw('LOWER(remarks) NOT LIKE ?', [$prefix]);
+                });
             })
             ->orderBy('created_at')
             ->orderBy('id')
@@ -930,7 +957,9 @@ class COCApplicationController extends Controller
                 'credited_hours' => (float) $result['hours'],
                 'certificate_number' => (string) ($result['certificate_number'] ?? ''),
                 'certificate_issued_at' => $result['certificate_issued_at'] ?? null,
-                'expires_on' => $this->resolveCocExpiryDate(CarbonImmutable::now())->toDateString(),
+                'expires_on' => $app
+                    ? $this->resolveApplicationCocExpiryDate($app)?->toDateString()
+                    : null,
                 'updated_balance' => (float) $result['balance'],
             ],
         ]);
@@ -976,6 +1005,205 @@ class COCApplicationController extends Controller
             'message' => 'COC application rejected.',
             'application' => $app ? $this->formatApplication($app) : null,
         ]);
+    }
+
+    public function hrImportBalances(Request $request): JsonResponse
+    {
+        $hr = $request->user();
+        if (!$hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can import COC balances.'], 403);
+        }
+
+        $validated = $request->validate([
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
+            'entries' => ['required', 'array', 'min:1', 'max:200'],
+            'entries.*.id' => ['nullable', 'integer', 'min:1'],
+            'entries.*.hours' => ['required', 'numeric', 'decimal:0,2', 'gt:0'],
+            'entries.*.credited_at' => ['required', 'date'],
+            'entries.*.expires_on' => ['nullable', 'date'],
+            'entries.*.remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $employee = HrisEmployee::findByControlNo($this->resolveValidatedEmployeeControlNo($validated));
+        if (!$employee) {
+            return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+
+        if ($this->isCocRestrictedEmployeeStatus($employee->status ?? null)) {
+            return response()->json([
+                'message' => 'COC application is not available for contractual or honorarium employees.',
+            ], 422);
+        }
+
+        $ctoLeaveType = $this->resolveCTOLeaveType();
+        if (!$ctoLeaveType) {
+            return response()->json([
+                'message' => 'CTO Leave type is missing. Seed or create CTO Leave first.',
+            ], 422);
+        }
+
+        $recordedAt = now();
+        $entries = is_array($validated['entries'] ?? null) ? $validated['entries'] : [];
+        foreach ($entries as $entry) {
+            try {
+                CarbonImmutable::parse((string) ($entry['credited_at'] ?? ''))->startOfDay();
+            } catch (\Throwable) {
+                return response()->json([
+                    'message' => 'Invalid COC import dates detected.',
+                ], 422);
+            }
+        }
+
+        $canonicalControlNo = trim((string) ($employee->control_no ?? ''));
+        if ($canonicalControlNo === '') {
+            return response()->json([
+                'message' => 'Employee control number could not be resolved.',
+            ], 422);
+        }
+
+        $resolvedEmployeeName = trim(implode(' ', array_filter([
+            trim((string) ($employee->firstname ?? '')),
+            trim((string) ($employee->middlename ?? '')),
+            trim((string) ($employee->surname ?? '')),
+        ]))) ?: null;
+
+        try {
+            $importResult = DB::transaction(function () use (
+                $entries,
+                $canonicalControlNo,
+                $resolvedEmployeeName,
+                $hr,
+                $recordedAt,
+                $ctoLeaveType
+            ): array {
+                $createdIds = [];
+                $updatedIds = [];
+                $employeeControlNoCandidates = $this->controlNoCandidates($canonicalControlNo);
+
+                foreach ($entries as $entry) {
+                    $creditedHours = round((float) ($entry['hours'] ?? 0), 2);
+                    if ($creditedHours <= 0) {
+                        continue;
+                    }
+
+                    $creditedDays = round($creditedHours / self::CTO_HOURS_PER_DAY, 2);
+                    if ($creditedDays <= 0) {
+                        continue;
+                    }
+
+                    $creditedAt = CarbonImmutable::parse((string) ($entry['credited_at'] ?? ''))->startOfDay();
+                    $applicationYear = (int) $creditedAt->year;
+                    $applicationMonth = (int) $creditedAt->month;
+                    $totalMinutes = max(1, (int) round($creditedHours * self::MINUTES_PER_HOUR));
+
+                    $remarks = self::HR_IMPORT_REMARK_PREFIX;
+                    $entryRemarks = trim((string) ($entry['remarks'] ?? ''));
+                    if ($entryRemarks !== '') {
+                        $remarks = mb_substr(self::HR_IMPORT_REMARK_PREFIX . ": {$entryRemarks}", 0, 2000);
+                    }
+
+                    $entryId = isset($entry['id']) ? (int) $entry['id'] : 0;
+                    if ($entryId > 0) {
+                        $application = COCApplication::query()->lockForUpdate()->find($entryId);
+                        if (!$application) {
+                            throw new RuntimeException('NOT_FOUND');
+                        }
+
+                        $entryControlNo = trim((string) ($application->employee_control_no ?? ''));
+                        if ($entryControlNo === '' || !in_array($entryControlNo, $employeeControlNoCandidates, true)) {
+                            throw new RuntimeException('ENTRY_NOT_EDITABLE');
+                        }
+
+                        if (!$this->isHrImportedCocBalanceEntry($application)) {
+                            throw new RuntimeException('ENTRY_NOT_EDITABLE');
+                        }
+
+                        $application->update([
+                            'employee_name' => $resolvedEmployeeName,
+                            'cto_leave_type_id' => (int) $ctoLeaveType->id,
+                            'cto_credited_days' => $creditedDays,
+                            'cto_credited_at' => $creditedAt->toDateTimeString(),
+                            'total_minutes' => $totalMinutes,
+                            'application_year' => $applicationYear,
+                            'application_month' => $applicationMonth,
+                            'credited_hours' => $creditedHours,
+                            'certificate_issued_at' => $creditedAt->toDateString(),
+                            'remarks' => $remarks,
+                        ]);
+
+                        $updatedIds[] = (int) $application->id;
+                        continue;
+                    }
+
+                    $application = COCApplication::query()->create([
+                        'employee_control_no' => $canonicalControlNo,
+                        'employee_name' => $resolvedEmployeeName,
+                        'status' => COCApplication::STATUS_APPROVED,
+                        'is_late_filed' => false,
+                        'late_filing_status' => null,
+                        'reviewed_by_admin_id' => null,
+                        'admin_reviewed_at' => $recordedAt,
+                        'reviewed_by_hr_id' => $hr->id,
+                        'hr_received_by_id' => $hr->id,
+                        'hr_received_at' => $recordedAt,
+                        'hr_released_by_id' => $hr->id,
+                        'hr_released_at' => $recordedAt,
+                        'reviewed_at' => $recordedAt,
+                        'cto_leave_type_id' => (int) $ctoLeaveType->id,
+                        'cto_credited_days' => $creditedDays,
+                        'cto_credited_at' => $creditedAt->toDateTimeString(),
+                        'total_minutes' => $totalMinutes,
+                        'application_year' => $applicationYear,
+                        'application_month' => $applicationMonth,
+                        'credited_hours' => $creditedHours,
+                        'certificate_number' => null,
+                        'certificate_issued_at' => $creditedAt->toDateString(),
+                        'remarks' => $remarks,
+                        'submitted_at' => $recordedAt,
+                    ]);
+
+                    $createdIds[] = (int) $application->id;
+                }
+
+                if ($createdIds === [] && $updatedIds === []) {
+                    throw new RuntimeException('INVALID_CREDIT');
+                }
+
+                $snapshot = $this->cocLedgerService()->syncEmployeeLedger(
+                    $canonicalControlNo,
+                    (int) $ctoLeaveType->id
+                );
+
+                return [
+                    'application_ids' => array_values(array_unique(array_merge($createdIds, $updatedIds))),
+                    'created_count' => count($createdIds),
+                    'updated_count' => count($updatedIds),
+                    'updated_balance' => (float) ($snapshot['availableDays'] ?? 0.0),
+                ];
+            });
+        } catch (RuntimeException $exception) {
+            return $this->handleRuntimeException($exception);
+        }
+
+        $applications = COCApplication::query()
+            ->with(self::COC_RELATIONS)
+            ->whereIn('id', $importResult['application_ids'])
+            ->orderByDesc('id')
+            ->get();
+
+        return response()->json([
+            'message' => 'COC entries saved successfully.',
+            ...$this->employeeControlNoResponse((string) $employee->control_no),
+            'employee_name' => $resolvedEmployeeName,
+            'imported_count' => (int) ($importResult['created_count'] ?? 0),
+            'created_count' => (int) ($importResult['created_count'] ?? 0),
+            'updated_count' => (int) ($importResult['updated_count'] ?? 0),
+            'saved_count' => count($importResult['application_ids']),
+            'updated_balance' => (float) ($importResult['updated_balance'] ?? 0.0),
+            'applications' => $applications
+                ->map(fn(COCApplication $application): array => $this->formatApplication($application))
+                ->values(),
+        ], 201);
     }
 
     private function calculateDurationMinutes(string $timeFrom, string $timeTo): ?int
@@ -1571,6 +1799,40 @@ class COCApplicationController extends Controller
         return CarbonImmutable::create($creditedOn->year + 1, 12, 31)->endOfDay();
     }
 
+    private function isHrImportedCocBalanceEntry(COCApplication $application): bool
+    {
+        $status = strtoupper(trim((string) ($application->status ?? '')));
+        if ($status !== COCApplication::STATUS_APPROVED) {
+            return false;
+        }
+
+        $remarks = trim((string) ($application->remarks ?? ''));
+        if ($remarks === '') {
+            return false;
+        }
+
+        return str_starts_with(
+            strtolower($remarks),
+            strtolower(self::HR_IMPORT_REMARK_PREFIX)
+        );
+    }
+
+    private function resolveApplicationCocExpiryDate(COCApplication $application): ?CarbonImmutable
+    {
+        $creditedAtRaw = $application->cto_credited_at ?? $application->reviewed_at ?? $application->created_at;
+        if (!$creditedAtRaw) {
+            return null;
+        }
+
+        try {
+            $creditedAt = CarbonImmutable::parse((string) $creditedAtRaw)->startOfDay();
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return $this->resolveCocExpiryDate($creditedAt);
+    }
+
     private function formatHours(float $hours): string
     {
         $display = $hours === (float) ((int) $hours) ? (string) ((int) $hours) : (string) $hours;
@@ -1595,6 +1857,7 @@ class COCApplicationController extends Controller
             'OVERNIGHT_LIMIT_EXCEEDED' => response()->json(['message' => 'No employee shall render overnight overtime for more than two consecutive nights.'], 422),
             'COC_RELEASE_BEFORE_RECEIVE' => response()->json(['message' => 'Cannot mark as released before confirming receipt of the COC application.'], 422),
             'LATE_FILING_NOT_PENDING' => response()->json(['message' => 'This COC late filing is no longer pending HR late-filing review.'], 422),
+            'ENTRY_NOT_EDITABLE' => response()->json(['message' => 'Only HR-imported approved COC entries may be edited here.'], 422),
             default => throw $exception,
         };
     }
@@ -1820,9 +2083,8 @@ class COCApplicationController extends Controller
         $durationHours = $this->minutesToHours((int) $app->total_minutes);
         $creditedHours = $this->resolveApplicationCreditedHours($app);
         $currentLeaveBalances = $this->getCurrentLeaveBalancesForApp($app, $leaveBalanceDirectory);
-        $creditedAt = $app->cto_credited_at ?? $app->reviewed_at ?? $app->created_at;
-        $expiresOn = $app->status === COCApplication::STATUS_APPROVED && $creditedAt
-            ? $this->resolveCocExpiryDate(CarbonImmutable::parse((string) $creditedAt)->startOfDay())->toDateString()
+        $expiresOn = $app->status === COCApplication::STATUS_APPROVED
+            ? $this->resolveApplicationCocExpiryDate($app)?->toDateString()
             : null;
         [$applicationYear, $applicationMonth] = $this->resolveApplicationPeriod($app);
         $lateFilingDeadline = ($applicationYear > 0 && $applicationMonth > 0)

@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\Schedule;
 
 // ─── Scheduled Tasks ─────────────────────────────────────────────────────────
 Schedule::command('leave:accrue')->monthlyOn(1, '00:01');
+Schedule::command('coc:sync-expiry')->dailyAt('00:10');
 Schedule::command('leave:reset')->yearlyOn(1, 1, '00:05');
 
 Artisan::command('inspire', function () {

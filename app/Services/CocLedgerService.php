@@ -100,6 +100,15 @@ class CocLedgerService
         $canonicalControlNo = $this->resolveCanonicalControlNo($employeeControlNo);
         $asOf = $asOfDate ?? CarbonImmutable::now();
 
+        $earnedEventColumns = [
+            'id',
+            'credited_hours',
+            'cto_credited_days',
+            'cto_credited_at',
+            'reviewed_at',
+            'created_at',
+        ];
+
         $earnedEvents = COCApplication::query()
             ->where('status', COCApplication::STATUS_APPROVED)
             ->whereIn('employee_control_no', $controlNoCandidates)
@@ -117,14 +126,7 @@ class CocLedgerService
             ->orderBy('cto_credited_at')
             ->orderBy('reviewed_at')
             ->orderBy('id')
-            ->get([
-                'id',
-                'credited_hours',
-                'cto_credited_days',
-                'cto_credited_at',
-                'reviewed_at',
-                'created_at',
-            ])
+            ->get($earnedEventColumns)
             ->map(function (COCApplication $application): ?array {
                 $hours = $this->resolveEarnedHours($application);
                 if ($hours <= 0) {
