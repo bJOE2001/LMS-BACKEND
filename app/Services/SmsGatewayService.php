@@ -171,17 +171,6 @@ class SmsGatewayService
         return max(1, (int) config('sms.timeout_seconds', 8));
     }
 
-    private function testDestination(): ?string
-    {
-        $value = trim((string) config('sms.test_destination', ''));
-        return $value !== '' ? $value : null;
-    }
-
-    private function isDevelopmentEnvironment(): bool
-    {
-        return app()->environment(['local', 'development', 'testing']);
-    }
-
     private function resolveApplicationControlNo(LeaveApplication $application): ?string
     {
         $controlNo = trim((string) ($application->employee_control_no ?? ''));
@@ -227,50 +216,12 @@ class SmsGatewayService
 
     private function resolveDestinationNumber(?string $rawPhoneNumber): ?string
     {
-        $testDestination = $this->testDestination();
-
-        if ($this->isDevelopmentEnvironment()) {
-            if ($testDestination !== null) {
-                $normalizedTestDestination = $this->normalizePhilippineMobile($testDestination);
-                if ($normalizedTestDestination !== null) {
-                    Log::info('SMS development routing is active. Using SMS_TEST_DESTINATION override.', [
-                        'destination' => $normalizedTestDestination,
-                    ]);
-
-                    return $normalizedTestDestination;
-                }
-
-                Log::warning('SMS_TEST_DESTINATION is invalid. Falling back to employee number.', [
-                    'configured_value' => $testDestination,
-                ]);
-            } else {
-                Log::info('SMS development routing is active with no SMS_TEST_DESTINATION. Using employee number.');
-            }
-        }
-
-        if ($testDestination !== null) {
-            $normalizedTestDestination = $this->normalizePhilippineMobile($testDestination);
-            if ($normalizedTestDestination !== null) {
-                Log::info('SMS test destination override is active.', [
-                    'destination' => $normalizedTestDestination,
-                ]);
-
-                return $normalizedTestDestination;
-            }
-
-            Log::warning('SMS test destination override is invalid. Expected 09XXXXXXXXX.', [
-                'configured_value' => $testDestination,
-            ]);
-
-            return null;
-        }
-
         $destination = $this->normalizePhilippineMobile($rawPhoneNumber);
         if ($destination !== null) {
             return $destination;
         }
 
-        Log::warning('Unable to resolve a valid mobile destination for leave approval SMS.', [
+        Log::warning('Unable to resolve a valid mobile destination for employee SMS.', [
             'raw_phone' => $rawPhoneNumber,
         ]);
 
@@ -322,16 +273,19 @@ class SmsGatewayService
 
         $leaveTypeName = trim((string) ($application->leaveType?->name ?? 'Leave'));
         $isMonetization = (bool) ($application->is_monetization ?? false);
-        $actionLabel = $isMonetization ? 'monetization request' : 'application';
-        $daysLabel = $this->formatDays((float) ($application->total_days ?? 0));
-        $dateLabel = $isMonetization
-            ? ''
-            : $this->buildApplicationDateLabel($application);
+        $totalDays = (float) ($application->total_days ?? 0);
+        $daysLabel = $this->formatApprovedDayTotal($totalDays);
 
-        $dayPhrase = "for {$daysLabel}";
-        $dateSegment = $dateLabel !== '' ? " {$dateLabel}" : '';
+        if ($isMonetization) {
+            return "Good day! This is the CHRMO. Your monetization request for a total of {$daysLabel} has been approved.";
+        }
 
-        return "Good day! This is CHRMO. Your {$leaveTypeName} {$actionLabel} {$dayPhrase}{$dateSegment} has been approved.";
+        $dateBlock = $this->buildApplicationInclusiveDateBlock($application);
+        if ($dateBlock !== '') {
+            return "Good day! This is the CHRMO. Your application for {$leaveTypeName} for a total of {$daysLabel} has been approved on the following dates:\n\n{$dateBlock}\n\nPlease take note of your approved leave schedule. Thank you.";
+        }
+
+        return "Good day! This is the CHRMO. Your application for {$leaveTypeName} for a total of {$daysLabel} has been approved.";
     }
 
     private function buildCocApprovedMessage(COCApplication $application, ?float $creditedDays = null): string
@@ -345,16 +299,19 @@ class SmsGatewayService
 
         $leaveTypeName = trim((string) ($application->leaveType?->name ?? 'Leave'));
         $isMonetization = (bool) ($application->is_monetization ?? false);
-        $actionLabel = $isMonetization ? 'monetization request' : 'application';
-        $daysLabel = $this->formatDays((float) ($application->total_days ?? 0));
-        $dateLabel = $isMonetization
-            ? ''
-            : $this->buildApplicationDateLabel($application);
+        $totalDays = (float) ($application->total_days ?? 0);
+        $daysLabel = $this->formatApprovedDayTotal($totalDays);
 
-        $dayPhrase = "for {$daysLabel}";
-        $dateSegment = $dateLabel !== '' ? " {$dateLabel}" : '';
+        if ($isMonetization) {
+            return "Good day! This is the CHRMO. Your monetization request for a total of {$daysLabel} has been rejected.";
+        }
 
-        return "Good day! This is CHRMO. Your {$leaveTypeName} {$actionLabel} {$dayPhrase}{$dateSegment} has been rejected.";
+        $dateBlock = $this->buildApplicationInclusiveDateBlock($application);
+        if ($dateBlock !== '') {
+            return "Good day! This is the CHRMO. Your application for {$leaveTypeName} for a total of {$daysLabel} has been rejected on the following dates:\n\n{$dateBlock}\n\nPlease take note of the rejection of your leave application. Thank you.";
+        }
+
+        return "Good day! This is the CHRMO. Your application for {$leaveTypeName} for a total of {$daysLabel} has been rejected.";
     }
 
     private function buildCocRejectedMessage(COCApplication $application): string
@@ -372,6 +329,96 @@ class SmsGatewayService
         return "{$display} day" . ($roundedDays === 1.0 ? '' : 's');
     }
 
+    private function formatApprovedDayTotal(float $days): string
+    {
+        $roundedDays = round($days, 2);
+        $isWholeNumber = abs($roundedDays - (float) round($roundedDays)) < 0.00001;
+        $dayUnit = abs($roundedDays - 1.0) < 0.00001 ? 'day' : 'days';
+
+        if ($isWholeNumber) {
+            $integerDays = (int) round($roundedDays);
+            return $this->numberToWords($integerDays) . " ({$integerDays}) {$dayUnit}";
+        }
+
+        $display = rtrim(rtrim(number_format($roundedDays, 2, '.', ''), '0'), '.');
+        return "{$display} {$dayUnit}";
+    }
+
+    private function numberToWords(int $number): string
+    {
+        $smallNumbers = [
+            0 => 'zero',
+            1 => 'one',
+            2 => 'two',
+            3 => 'three',
+            4 => 'four',
+            5 => 'five',
+            6 => 'six',
+            7 => 'seven',
+            8 => 'eight',
+            9 => 'nine',
+            10 => 'ten',
+            11 => 'eleven',
+            12 => 'twelve',
+            13 => 'thirteen',
+            14 => 'fourteen',
+            15 => 'fifteen',
+            16 => 'sixteen',
+            17 => 'seventeen',
+            18 => 'eighteen',
+            19 => 'nineteen',
+        ];
+
+        $tensNumbers = [
+            20 => 'twenty',
+            30 => 'thirty',
+            40 => 'forty',
+            50 => 'fifty',
+            60 => 'sixty',
+            70 => 'seventy',
+            80 => 'eighty',
+            90 => 'ninety',
+        ];
+
+        if ($number < 0) {
+            return 'minus ' . $this->numberToWords(abs($number));
+        }
+
+        if (array_key_exists($number, $smallNumbers)) {
+            return $smallNumbers[$number];
+        }
+
+        if ($number < 100) {
+            $tens = intdiv($number, 10) * 10;
+            $remainder = $number % 10;
+            return $remainder === 0
+                ? $tensNumbers[$tens]
+                : $tensNumbers[$tens] . '-' . $smallNumbers[$remainder];
+        }
+
+        if ($number < 1000) {
+            $hundreds = intdiv($number, 100);
+            $remainder = $number % 100;
+            $prefix = $smallNumbers[$hundreds] . ' hundred';
+
+            return $remainder === 0
+                ? $prefix
+                : $prefix . ' ' . $this->numberToWords($remainder);
+        }
+
+        if ($number < 1000000) {
+            $thousands = intdiv($number, 1000);
+            $remainder = $number % 1000;
+            $prefix = $this->numberToWords($thousands) . ' thousand';
+
+            return $remainder === 0
+                ? $prefix
+                : $prefix . ' ' . $this->numberToWords($remainder);
+        }
+
+        return (string) $number;
+    }
+
     private function truncateResponseBody(string $body, int $maxLength = 500): string
     {
         $trimmed = trim($body);
@@ -382,6 +429,103 @@ class SmsGatewayService
         return strlen($trimmed) > $maxLength
             ? substr($trimmed, 0, $maxLength) . '...'
             : $trimmed;
+    }
+
+    private function buildApplicationInclusiveDateBlock(LeaveApplication $application): string
+    {
+        $selectedDates = $this->resolveSelectedLeaveDates($application);
+        if ($selectedDates !== []) {
+            $formattedSelectedDates = $this->formatSelectedLeaveDatesForSms($selectedDates);
+            if ($formattedSelectedDates !== '') {
+                return $formattedSelectedDates;
+            }
+        }
+
+        return $this->buildApplicationDateLabel($application);
+    }
+
+    /**
+     * @param array<int, CarbonImmutable> $selectedDates
+     */
+    private function formatSelectedLeaveDatesForSms(array $selectedDates): string
+    {
+        $segments = $this->groupConsecutiveLeaveDates($selectedDates);
+        if ($segments === []) {
+            return '';
+        }
+
+        $lines = [];
+        foreach ($segments as [$start, $end]) {
+            if (!$start instanceof CarbonImmutable || !$end instanceof CarbonImmutable) {
+                continue;
+            }
+
+            $lines[] = '• ' . $this->formatSmsDateRangeLabel($start, $end);
+        }
+
+        return implode("\n", $lines);
+    }
+
+    private function formatSmsDateRangeLabel(CarbonImmutable $start, CarbonImmutable $end): string
+    {
+        if ($start->isSameDay($end)) {
+            return $start->format('F j, Y');
+        }
+
+        if ($start->year === $end->year) {
+            if ($start->month === $end->month) {
+                return $start->format('F j') . '–' . $end->format('j') . ', ' . $start->format('Y');
+            }
+
+            return $start->format('F j') . ' – ' . $end->format('F j') . ', ' . $start->format('Y');
+        }
+
+        return $start->format('F j, Y') . ' – ' . $end->format('F j, Y');
+    }
+
+    /**
+     * @param array<int, CarbonImmutable> $selectedDates
+     * @return array<int, array{0: CarbonImmutable, 1: CarbonImmutable}>
+     */
+    private function groupConsecutiveLeaveDates(array $selectedDates): array
+    {
+        $dates = collect($selectedDates)
+            ->filter(static fn (mixed $date): bool => $date instanceof CarbonImmutable)
+            ->map(static fn (CarbonImmutable $date): CarbonImmutable => $date->startOfDay())
+            ->unique(static fn (CarbonImmutable $date): string => $date->toDateString())
+            ->sortBy(static fn (CarbonImmutable $date): string => $date->toDateString())
+            ->values();
+
+        if ($dates->isEmpty()) {
+            return [];
+        }
+
+        $segments = [];
+        $segmentStart = $dates->first();
+        $segmentEnd = $segmentStart;
+
+        if (!$segmentStart instanceof CarbonImmutable) {
+            return [];
+        }
+
+        foreach ($dates->slice(1) as $date) {
+            if (!$date instanceof CarbonImmutable) {
+                continue;
+            }
+
+            if ($segmentEnd->addDay()->isSameDay($date)) {
+                $segmentEnd = $date;
+                continue;
+            }
+
+            $segments[] = [$segmentStart, $segmentEnd];
+            $segmentStart = $date;
+            $segmentEnd = $date;
+        }
+
+        $segments[] = [$segmentStart, $segmentEnd];
+
+        return $segments;
     }
 
     private function buildApplicationDateLabel(LeaveApplication $application): string
@@ -489,15 +633,10 @@ class SmsGatewayService
         }
 
         $destination = null;
-        $forceTestRouting = $this->isDevelopmentEnvironment() || $this->testDestination() !== null;
 
         try {
-            if ($forceTestRouting) {
-                $destination = $this->resolveDestinationNumber(null);
-            } else {
-                $rawPhoneNumber = $this->resolveEmployeePhoneNumberFromHris($controlNo);
-                $destination = $this->resolveDestinationNumber($rawPhoneNumber);
-            }
+            $rawPhoneNumber = $this->resolveEmployeePhoneNumberFromHris($controlNo);
+            $destination = $this->resolveDestinationNumber($rawPhoneNumber);
 
             if ($destination === null) {
                 return false;

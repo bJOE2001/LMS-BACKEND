@@ -13,5 +13,4 @@ return [
     'enabled' => (bool) env('SMS_ENABLED', false),
     'gateway_url' => env('SMS_GATEWAY_URL'),
     'timeout_seconds' => (int) env('SMS_TIMEOUT', 8),
-    'test_destination' => env('SMS_TEST_DESTINATION'),
 ];
