@@ -11,6 +11,16 @@
 /.phpunit.cache
 /.vscode
 /.zed
+
+# Laravel Boost
+/.agents
+/.ai
+/.codex
+/.mcp.json
+/AGENTS.md
+/CLAUDE.md
+/boost.json
+/junie
 /auth.json
 /node_modules
 /public/build
