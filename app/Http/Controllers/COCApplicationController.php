@@ -56,8 +56,9 @@ class COCApplicationController extends Controller
         'PENDING_HR_CLASSIFICATION' => 4,
         'PENDING_ADMIN' => 5,
         'PENDING_ADMIN_REVIEW' => 6,
-        'PENDING_RELEASE' => 7,
-        'PENDING' => 8,
+        'PENDING_CMO_CBMO_REVIEW' => 7,
+        'PENDING_RELEASE' => 8,
+        'PENDING' => 9,
     ];
     private const QUEUE_NON_PENDING_STAGE_PRIORITY = 999;
     private const COC_RELATIONS = [
@@ -66,6 +67,7 @@ class COCApplicationController extends Controller
         'reviewedByHr',
         'lateFilingReviewedByHr',
         'receivedByHr',
+        'cmoCbmoReviewedByHr',
         'releasedByHr',
         'ctoLeaveType',
     ];
@@ -794,6 +796,10 @@ class COCApplicationController extends Controller
                     throw new RuntimeException('COC_RELEASE_BEFORE_RECEIVE');
                 }
 
+                if ($app->cmo_cbmo_reviewed_at === null) {
+                    throw new RuntimeException('COC_RELEASE_BEFORE_CMO_CBMO_REVIEW');
+                }
+
                 $app->update([
                     'hr_released_by_id' => $hr->id,
                     'hr_released_at' => now(),
@@ -819,6 +825,61 @@ class COCApplicationController extends Controller
             'message' => $alreadyReleased
                 ? 'COC application release was already confirmed.'
                 : 'COC application release confirmed.',
+            'application' => $app ? $this->formatApplication($app) : null,
+        ]);
+    }
+
+    public function hrCmoCbmoReview(Request $request, int $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (!$hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can confirm CMO/CBMO review.'], 403);
+        }
+
+        try {
+            $alreadyReviewed = DB::transaction(function () use ($id, $hr): bool {
+                $app = COCApplication::query()->lockForUpdate()->find($id);
+                if (!$app) {
+                    throw new RuntimeException('NOT_FOUND');
+                }
+
+                if ($app->status !== COCApplication::STATUS_APPROVED) {
+                    throw new RuntimeException('COC_CMO_CBMO_REVIEW_INVALID_STATUS:' . (string) $app->status);
+                }
+
+                if ($app->hr_received_at === null) {
+                    throw new RuntimeException('COC_CMO_CBMO_REVIEW_BEFORE_RECEIVE');
+                }
+
+                if ($app->cmo_cbmo_reviewed_at !== null) {
+                    return true;
+                }
+
+                $app->update([
+                    'cmo_cbmo_reviewed_by_id' => $hr->id,
+                    'cmo_cbmo_reviewed_at' => now(),
+                ]);
+
+                return false;
+            });
+        } catch (RuntimeException $exception) {
+            if (str_starts_with($exception->getMessage(), 'COC_CMO_CBMO_REVIEW_INVALID_STATUS:')) {
+                $status = str_replace('COC_CMO_CBMO_REVIEW_INVALID_STATUS:', '', $exception->getMessage());
+
+                return response()->json([
+                    'message' => "Cannot complete CMO/CBMO review: application status is '{$status}'.",
+                ], 422);
+            }
+
+            return $this->handleRuntimeException($exception);
+        }
+
+        $app = COCApplication::query()->with(self::COC_RELATIONS)->find($id);
+
+        return response()->json([
+            'message' => $alreadyReviewed
+                ? 'COC application CMO/CBMO review was already completed.'
+                : 'COC application CMO/CBMO review completed.',
             'application' => $app ? $this->formatApplication($app) : null,
         ]);
     }
@@ -1146,6 +1207,8 @@ class COCApplicationController extends Controller
                         'reviewed_by_hr_id' => $hr->id,
                         'hr_received_by_id' => $hr->id,
                         'hr_received_at' => $recordedAt,
+                        'cmo_cbmo_reviewed_by_id' => $hr->id,
+                        'cmo_cbmo_reviewed_at' => $recordedAt,
                         'hr_released_by_id' => $hr->id,
                         'hr_released_at' => $recordedAt,
                         'reviewed_at' => $recordedAt,
@@ -1613,6 +1676,11 @@ class COCApplicationController extends Controller
         return $application->hr_received_at !== null || $application->hr_received_by_id !== null;
     }
 
+    private function isCocApplicationCmoCbmoReviewed(COCApplication $application): bool
+    {
+        return $application->cmo_cbmo_reviewed_at !== null || $application->cmo_cbmo_reviewed_by_id !== null;
+    }
+
     private function isCocApplicationReleasedByHr(COCApplication $application): bool
     {
         return $application->hr_released_at !== null || $application->hr_released_by_id !== null;
@@ -1675,14 +1743,17 @@ class COCApplicationController extends Controller
             $groupStatus = self::QUEUE_GROUP_PENDING;
             $stageKey = 'PENDING_ADMIN';
         } elseif ($rawStatus === COCApplication::STATUS_APPROVED) {
-            if (!$this->isCocApplicationReceivedByHr($application)) {
+            if ($this->isCocApplicationReleasedByHr($application)) {
+                $groupStatus = self::QUEUE_GROUP_APPROVED;
+            } elseif (!$this->isCocApplicationReceivedByHr($application)) {
                 $groupStatus = self::QUEUE_GROUP_PENDING;
                 $stageKey = 'PENDING_HR_RECEIVE';
+            } elseif (!$this->isCocApplicationCmoCbmoReviewed($application)) {
+                $groupStatus = self::QUEUE_GROUP_PENDING;
+                $stageKey = 'PENDING_CMO_CBMO_REVIEW';
             } elseif (!$this->isCocApplicationReleasedByHr($application)) {
                 $groupStatus = self::QUEUE_GROUP_PENDING;
                 $stageKey = 'PENDING_RELEASE';
-            } else {
-                $groupStatus = self::QUEUE_GROUP_APPROVED;
             }
         } elseif ($rawStatus === COCApplication::STATUS_REJECTED) {
             $groupStatus = self::QUEUE_GROUP_REJECTED;
@@ -1856,6 +1927,8 @@ class COCApplicationController extends Controller
             'BALANCE_CAP_EXCEEDED' => response()->json(['message' => 'Approving this application would exceed the 120-hour maximum COC balance.'], 422),
             'OVERNIGHT_LIMIT_EXCEEDED' => response()->json(['message' => 'No employee shall render overnight overtime for more than two consecutive nights.'], 422),
             'COC_RELEASE_BEFORE_RECEIVE' => response()->json(['message' => 'Cannot mark as released before confirming receipt of the COC application.'], 422),
+            'COC_RELEASE_BEFORE_CMO_CBMO_REVIEW' => response()->json(['message' => 'Cannot mark as released before completing CMO/CBMO review.'], 422),
+            'COC_CMO_CBMO_REVIEW_BEFORE_RECEIVE' => response()->json(['message' => 'Cannot complete CMO/CBMO review before confirming receipt of the COC application.'], 422),
             'LATE_FILING_NOT_PENDING' => response()->json(['message' => 'This COC late filing is no longer pending HR late-filing review.'], 422),
             'ENTRY_NOT_EDITABLE' => response()->json(['message' => 'Only HR-imported approved COC entries may be edited here.'], 422),
             default => throw $exception,
@@ -2091,8 +2164,10 @@ class COCApplicationController extends Controller
             ? $this->resolveLateFilingDeadline($applicationYear, $applicationMonth)->toDateString()
             : null;
         $receivedActionBy = trim((string) ($app->receivedByHr?->full_name ?? '')) ?: null;
+        $cmoCbmoReviewActionBy = trim((string) ($app->cmoCbmoReviewedByHr?->full_name ?? '')) ?: null;
         $releasedActionBy = trim((string) ($app->releasedByHr?->full_name ?? '')) ?: null;
         $receivedActionAt = $app->hr_received_at?->toIso8601String();
+        $cmoCbmoReviewActionAt = $app->cmo_cbmo_reviewed_at?->toIso8601String();
         $releasedActionAt = $app->hr_released_at?->toIso8601String();
         $queueMeta = $this->resolveHrQueueMeta($app);
         $filedBy = (string) ($employeeName ?? 'Unknown');
@@ -2170,17 +2245,23 @@ class COCApplicationController extends Controller
             'received_by' => $receivedActionBy,
             'receivedBy' => $receivedActionBy,
             'hr_received_by' => $receivedActionBy,
+            'cmo_cbmo_reviewed_by' => $cmoCbmoReviewActionBy,
+            'cmoCbmoReviewedBy' => $cmoCbmoReviewActionBy,
             'released_by' => $releasedActionBy,
             'releasedBy' => $releasedActionBy,
             'hr_released_by' => $releasedActionBy,
             'received_at' => $receivedActionAt,
             'receivedAt' => $receivedActionAt,
             'hr_received_at' => $receivedActionAt,
+            'cmo_cbmo_reviewed_at' => $cmoCbmoReviewActionAt,
+            'cmoCbmoReviewedAt' => $cmoCbmoReviewActionAt,
             'released_at' => $releasedActionAt,
             'releasedAt' => $releasedActionAt,
             'hr_released_at' => $releasedActionAt,
             'has_hr_received' => $receivedActionAt !== null,
             'hasHrReceived' => $receivedActionAt !== null,
+            'has_cmo_cbmo_reviewed' => $cmoCbmoReviewActionAt !== null,
+            'hasCmoCbmoReviewed' => $cmoCbmoReviewActionAt !== null,
             'has_hr_released' => $releasedActionAt !== null,
             'hasHrReleased' => $releasedActionAt !== null,
             'processedBy' => $rawStatus === 'PENDING_HR'

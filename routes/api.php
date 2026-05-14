@@ -198,6 +198,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::get('/leave-applications/{id}', [LeaveApplicationController::class, 'hrShow']);
         Route::get('/leave-applications/{id}/attachment', [LeaveApplicationController::class, 'hrViewAttachment']);
         Route::post('/leave-applications/{id}/receive', [LeaveApplicationController::class, 'hrReceive']);
+        Route::post('/leave-applications/{id}/cmo-cbmo-review', [LeaveApplicationController::class, 'hrCmoCbmoReview']);
         Route::post('/leave-applications/{id}/release', [LeaveApplicationController::class, 'hrRelease']);
         Route::post('/leave-applications/{id}/update-receive', [LeaveApplicationController::class, 'hrReceiveUpdate']);
         Route::post('/leave-applications/{id}/update-release', [LeaveApplicationController::class, 'hrReleaseUpdate']);
@@ -208,6 +209,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::get('/coc-applications/late-filings', [COCApplicationController::class, 'hrLateFilingIndex']);
         Route::get('/coc-applications/{id}', [COCApplicationController::class, 'hrShow']);
         Route::post('/coc-applications/{id}/receive', [COCApplicationController::class, 'hrReceive']);
+        Route::post('/coc-applications/{id}/cmo-cbmo-review', [COCApplicationController::class, 'hrCmoCbmoReview']);
         Route::post('/coc-applications/{id}/release', [COCApplicationController::class, 'hrRelease']);
         Route::post('/coc-applications/{id}/late-filing/approve', [COCApplicationController::class, 'hrApproveLateFiling']);
         Route::post('/coc-applications/{id}/late-filing/reject', [COCApplicationController::class, 'hrRejectLateFiling']);

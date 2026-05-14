@@ -34,6 +34,8 @@ class COCApplication extends Model
         'reviewed_by_hr_id',
         'hr_received_by_id',
         'hr_received_at',
+        'cmo_cbmo_reviewed_by_id',
+        'cmo_cbmo_reviewed_at',
         'hr_released_by_id',
         'hr_released_at',
         'reviewed_at',
@@ -61,6 +63,8 @@ class COCApplication extends Model
             'reviewed_by_hr_id' => 'integer',
             'hr_received_by_id' => 'integer',
             'hr_received_at' => 'datetime',
+            'cmo_cbmo_reviewed_by_id' => 'integer',
+            'cmo_cbmo_reviewed_at' => 'datetime',
             'hr_released_by_id' => 'integer',
             'hr_released_at' => 'datetime',
             'reviewed_at' => 'datetime',
@@ -143,6 +147,11 @@ class COCApplication extends Model
     public function releasedByHr(): BelongsTo
     {
         return $this->belongsTo(HRAccount::class, 'hr_released_by_id');
+    }
+
+    public function cmoCbmoReviewedByHr(): BelongsTo
+    {
+        return $this->belongsTo(HRAccount::class, 'cmo_cbmo_reviewed_by_id');
     }
 
     public function ctoLeaveType(): BelongsTo

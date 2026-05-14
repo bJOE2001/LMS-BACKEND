@@ -64,8 +64,9 @@ class LeaveApplicationController extends Controller
         'PENDING_HR_CLASSIFICATION' => 4,
         'PENDING_ADMIN' => 5,
         'PENDING_ADMIN_REVIEW' => 6,
-        'PENDING_RELEASE' => 7,
-        'PENDING' => 8,
+        'PENDING_CMO_CBMO_REVIEW' => 7,
+        'PENDING_RELEASE' => 8,
+        'PENDING' => 9,
     ];
     private const QUEUE_NON_PENDING_STAGE_PRIORITY = 999;
 
@@ -2130,6 +2131,15 @@ class LeaveApplicationController extends Controller
         ) instanceof LeaveApplicationLog;
     }
 
+    private function hasCmoCbmoReviewedForQueue(LeaveApplication $application): bool
+    {
+        return $this->resolveLatestHrActionLogForCycle(
+            $application,
+            LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED,
+            $this->resolveLatestApprovedUpdateCycleRequestedAt($application)
+        ) instanceof LeaveApplicationLog;
+    }
+
     private function resolveLeaveQueueCreatedTimestamp(LeaveApplication $application): int
     {
         $createdAt = $application->created_at;
@@ -2167,6 +2177,9 @@ class LeaveApplicationController extends Controller
         } elseif ($rawStatus === LeaveApplication::STATUS_APPROVED) {
             if ($this->hasHrReleasedForQueue($application)) {
                 $groupStatus = self::QUEUE_GROUP_APPROVED;
+            } elseif (!$this->hasCmoCbmoReviewedForQueue($application)) {
+                $groupStatus = self::QUEUE_GROUP_PENDING;
+                $stageKey = 'PENDING_CMO_CBMO_REVIEW';
             } else {
                 $groupStatus = self::QUEUE_GROUP_PENDING;
                 $stageKey = 'PENDING_RELEASE';
@@ -2424,6 +2437,18 @@ class LeaveApplicationController extends Controller
                 ], 422);
             }
 
+            $cmoCbmoReviewedLog = $app->logs->first(
+                fn(LeaveApplicationLog $log) =>
+                    $log->action === LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED
+                    && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+            );
+
+            if (!$cmoCbmoReviewedLog) {
+                return response()->json([
+                    'message' => 'Cannot mark as released before completing CMO/CBMO review.',
+                ], 422);
+            }
+
             LeaveApplicationLog::create([
                 'leave_application_id' => $app->id,
                 'action' => LeaveApplicationLog::ACTION_HR_RELEASED,
@@ -2441,6 +2466,73 @@ class LeaveApplicationController extends Controller
             'message' => $releasedLog
                 ? 'Hard-copy release was already confirmed for this application.'
                 : 'Hard-copy release confirmed.',
+            'application' => $this->formatErmsApplication($app, $actorDirectory),
+        ]);
+    }
+
+    /**
+     * HR records CMO/CBMO review after HR certification and before release.
+     */
+    public function hrCmoCbmoReview(Request $request, int $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (!$hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can confirm CMO/CBMO review.'], 403);
+        }
+
+        $request->validate([
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $app = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($id);
+        if (!$app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        if ($app->status !== LeaveApplication::STATUS_APPROVED) {
+            return response()->json([
+                'message' => "Cannot complete CMO/CBMO review: application status is '{$app->status}'.",
+            ], 422);
+        }
+
+        $receivedLog = $app->logs->first(
+            fn(LeaveApplicationLog $log) =>
+                $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
+
+        if (!$receivedLog) {
+            return response()->json([
+                'message' => 'Cannot complete CMO/CBMO review before confirming receipt of the hard-copy application.',
+            ], 422);
+        }
+
+        $reviewedLog = $app->logs->first(
+            fn(LeaveApplicationLog $log) =>
+                $log->action === LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
+
+        if (!$reviewedLog) {
+            LeaveApplicationLog::create([
+                'leave_application_id' => $app->id,
+                'action' => LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
+                'performed_by_id' => $hr->id,
+                'remarks' => $request->input('remarks') ?: 'CMO/CBMO review completed.',
+                'created_at' => now(),
+            ]);
+            $app->load('logs');
+        }
+
+        $actorDirectory = $this->buildWorkflowActorDirectory([$app]);
+
+        return response()->json([
+            'message' => $reviewedLog
+                ? 'CMO/CBMO review was already completed for this application.'
+                : 'CMO/CBMO review completed.',
             'application' => $this->formatErmsApplication($app, $actorDirectory),
         ]);
     }
@@ -5176,6 +5268,7 @@ class LeaveApplicationController extends Controller
             LeaveApplicationLog::ACTION_HR_REJECTED => 'hr rejected',
             LeaveApplicationLog::ACTION_HR_RECALLED => 'hr recalled',
             LeaveApplicationLog::ACTION_HR_RECEIVED => 'received application',
+            LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED => 'cmo/cbmo reviewed',
             LeaveApplicationLog::ACTION_HR_RELEASED => 'released application',
             default => strtolower(str_replace('_', ' ', (string) $log->action)),
         };
@@ -5210,6 +5303,11 @@ class LeaveApplicationController extends Controller
         $hrReceivedLog = $logs->last(
             fn(LeaveApplicationLog $log) =>
                 $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
+        $cmoCbmoReviewedLog = $logs->last(
+            fn(LeaveApplicationLog $log) =>
+                $log->action === LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED
                 && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
         );
         $hrReleasedLog = $logs->last(
@@ -5255,6 +5353,7 @@ class LeaveApplicationController extends Controller
             $recallActionBy = $actorDirectory['hr'][(int) $app->hr_id];
         }
         $receivedActionBy = $this->resolveWorkflowPerformerName($hrReceivedLog, $actorDirectory, $employeeName);
+        $cmoCbmoReviewActionBy = $this->resolveWorkflowPerformerName($cmoCbmoReviewedLog, $actorDirectory, $employeeName);
         $releasedActionBy = $this->resolveWorkflowPerformerName($hrReleasedLog, $actorDirectory, $employeeName);
 
         $isCancelled = $cancelledLog !== null || $this->isCancelledRemark($app->remarks);
@@ -5293,6 +5392,7 @@ class LeaveApplicationController extends Controller
         $recallActionAt = $hrRecalledLog?->created_at
             ?? ($app->status === LeaveApplication::STATUS_RECALLED ? $app->updated_at : null);
         $receivedActionAt = $hrReceivedLog?->created_at;
+        $cmoCbmoReviewActionAt = $cmoCbmoReviewedLog?->created_at;
         $releasedActionAt = $hrReleasedLog?->created_at;
         $cancelledAt = $cancelledLog?->created_at ?? ($isCancelled ? $app->updated_at : null);
 
@@ -5421,6 +5521,8 @@ class LeaveApplicationController extends Controller
             'received_by' => $receivedActionBy,
             'receivedBy' => $receivedActionBy,
             'hr_received_by' => $receivedActionBy,
+            'cmo_cbmo_reviewed_by' => $cmoCbmoReviewActionBy,
+            'cmoCbmoReviewedBy' => $cmoCbmoReviewActionBy,
             'released_by' => $releasedActionBy,
             'releasedBy' => $releasedActionBy,
             'hr_released_by' => $releasedActionBy,
@@ -5436,6 +5538,8 @@ class LeaveApplicationController extends Controller
             'received_at' => $receivedActionAt?->toIso8601String(),
             'receivedAt' => $receivedActionAt?->toIso8601String(),
             'hr_received_at' => $receivedActionAt?->toIso8601String(),
+            'cmo_cbmo_reviewed_at' => $cmoCbmoReviewActionAt?->toIso8601String(),
+            'cmoCbmoReviewedAt' => $cmoCbmoReviewActionAt?->toIso8601String(),
             'released_at' => $releasedActionAt?->toIso8601String(),
             'releasedAt' => $releasedActionAt?->toIso8601String(),
             'hr_released_at' => $releasedActionAt?->toIso8601String(),
@@ -5448,6 +5552,8 @@ class LeaveApplicationController extends Controller
             'cancelled_at' => $cancelledAt?->toIso8601String(),
             'has_hr_received' => $hrReceivedLog !== null,
             'hasHrReceived' => $hrReceivedLog !== null,
+            'has_cmo_cbmo_reviewed' => $cmoCbmoReviewedLog !== null,
+            'hasCmoCbmoReviewed' => $cmoCbmoReviewedLog !== null,
             'has_hr_released' => $hrReleasedLog !== null,
             'hasHrReleased' => $hrReleasedLog !== null,
             'status_history' => $statusHistory,
@@ -10120,6 +10226,11 @@ class LeaveApplicationController extends Controller
                 $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
                 && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
         );
+        $cmoCbmoReviewedLog = $logs->last(
+            fn(LeaveApplicationLog $log) =>
+                $log->action === LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
         $hrReleasedLog = $logs->last(
             fn(LeaveApplicationLog $log) =>
                 $log->action === LeaveApplicationLog::ACTION_HR_RELEASED
@@ -10223,11 +10334,15 @@ class LeaveApplicationController extends Controller
             'received_at' => $hrReceivedLog?->created_at?->toIso8601String(),
             'receivedAt' => $hrReceivedLog?->created_at?->toIso8601String(),
             'hr_received_at' => $hrReceivedLog?->created_at?->toIso8601String(),
+            'cmo_cbmo_reviewed_at' => $cmoCbmoReviewedLog?->created_at?->toIso8601String(),
+            'cmoCbmoReviewedAt' => $cmoCbmoReviewedLog?->created_at?->toIso8601String(),
             'released_at' => $hrReleasedLog?->created_at?->toIso8601String(),
             'releasedAt' => $hrReleasedLog?->created_at?->toIso8601String(),
             'hr_released_at' => $hrReleasedLog?->created_at?->toIso8601String(),
             'has_hr_received' => $hrReceivedLog !== null,
             'hasHrReceived' => $hrReceivedLog !== null,
+            'has_cmo_cbmo_reviewed' => $cmoCbmoReviewedLog !== null,
+            'hasCmoCbmoReviewed' => $cmoCbmoReviewedLog !== null,
             'has_hr_released' => $hrReleasedLog !== null,
             'hasHrReleased' => $hrReleasedLog !== null,
             'status_history' => $statusHistory,
