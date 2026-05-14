@@ -21,6 +21,7 @@ class DatabaseSeeder extends Seeder
             DepartmentSeeder::class,
             HRAccountSeeder::class,
             LeaveTypeSeeder::class,
+            IllnessSeeder::class,
         ]);
     }
 }

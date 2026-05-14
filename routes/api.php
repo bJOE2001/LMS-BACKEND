@@ -7,6 +7,7 @@ use App\Http\Controllers\Auth\PasswordResetController;
 use App\Http\Controllers\EmployeeController;
 use App\Http\Controllers\HRDashboardController;
 use App\Http\Controllers\HRDepartmentLibraryController;
+use App\Http\Controllers\HRIllnessLibraryController;
 use App\Http\Controllers\HRLeaveBalanceImportController;
 use App\Http\Controllers\HRLeaveTypeController;
 use App\Http\Controllers\HRReportController;
@@ -56,6 +57,7 @@ Route::prefix('erms')->middleware('erms.auth')->group(function () {
     Route::post('/apply-leave/{id}/request-update', [LeaveApplicationController::class, 'ermsRequestUpdate']);
     Route::post('/apply-leave/request-cancel', [LeaveApplicationController::class, 'ermsRequestCancel']);
     Route::post('/apply-leave/{id}/request-cancel', [LeaveApplicationController::class, 'ermsRequestCancel']);
+    Route::get('/illnesses/options', [HRIllnessLibraryController::class, 'options']);
     Route::get('/coc-records', [COCApplicationController::class, 'ermsIndex']);
     Route::get('/apply-coc', [COCApplicationController::class, 'ermsIndex']);
     Route::post('/apply-coc', [COCApplicationController::class, 'ermsStore']);
@@ -92,6 +94,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
     Route::put('/settings/password', [SettingsController::class, 'updatePassword']);
     Route::get('/settings/signatories', [SettingsController::class, 'getSignatories']);
     Route::put('/settings/signatories/chrmo-leave-in-charge', [SettingsController::class, 'updateChrmoLeaveInCharge']);
+    Route::get('/illnesses/options', [HRIllnessLibraryController::class, 'options']);
 
     Route::middleware('department_admin')->prefix('admin')->group(function () {
         // Employee management
@@ -174,6 +177,13 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::post('/', [HRDepartmentLibraryController::class, 'store']);
             Route::put('/{id}', [HRDepartmentLibraryController::class, 'update']);
             Route::delete('/{id}', [HRDepartmentLibraryController::class, 'destroy']);
+        });
+
+        Route::prefix('illnesses')->group(function () {
+            Route::get('/', [HRIllnessLibraryController::class, 'index']);
+            Route::post('/', [HRIllnessLibraryController::class, 'store']);
+            Route::put('/{id}', [HRIllnessLibraryController::class, 'update']);
+            Route::delete('/{id}', [HRIllnessLibraryController::class, 'destroy']);
         });
 
         Route::prefix('leave-types')->group(function () {
