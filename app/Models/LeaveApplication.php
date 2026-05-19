@@ -17,10 +17,16 @@ class LeaveApplication extends Model
     protected $table = 'tblLeaveApplications';
 
     public const PAY_MODE_WITH_PAY = 'WP';
+
     public const PAY_MODE_WITHOUT_PAY = 'WOP';
+
     public const MONETIZATION_REQUIRED_COMMUTATION = 'Requested';
+
     public const MONETIZATION_MINIMUM_VACATION_LEAVE_BALANCE_DAYS = 15.0;
+
     public const MONETIZATION_MINIMUM_REQUEST_DAYS = 10.0;
+
+    public const MONETIZATION_ATTACHMENT_THRESHOLD_DAYS = 10.0;
 
     protected static function booted(): void
     {
@@ -43,9 +49,11 @@ class LeaveApplication extends Model
                 $application->selected_date_half_day_portion = null;
                 $application->deductible_days = round((float) ($application->total_days ?? 0), 3);
                 $application->cto_deducted_hours = null;
+
                 return;
             }
 
+            $application->monetization_leave_credits = null;
             $application->selected_dates = self::resolveSelectedDates(
                 $application->start_date,
                 $application->end_date,
@@ -108,6 +116,7 @@ class LeaveApplication extends Model
         'certification_leave_credits_snapshot',
         'is_monetization',
         'equivalent_amount',
+        'monetization_leave_credits',
     ];
 
     protected function casts(): array
@@ -137,15 +146,20 @@ class LeaveApplication extends Model
             'certification_leave_credits_snapshot' => 'array',
             'is_monetization' => 'boolean',
             'equivalent_amount' => 'decimal:2',
+            'monetization_leave_credits' => 'array',
         ];
     }
 
     // ─── Status Constants ────────────────────────────────────────────
 
     public const STATUS_PENDING_ADMIN = 'PENDING_ADMIN';
+
     public const STATUS_PENDING_HR = 'PENDING_HR';
+
     public const STATUS_APPROVED = 'APPROVED';
+
     public const STATUS_REJECTED = 'REJECTED';
+
     public const STATUS_RECALLED = 'RECALLED';
 
     // ─── Relationships ───────────────────────────────────────────────
@@ -189,6 +203,7 @@ class LeaveApplication extends Model
         }
 
         $controlNo = trim((string) $rawControlNo);
+
         return $controlNo !== '' ? $controlNo : null;
     }
 
@@ -250,7 +265,7 @@ class LeaveApplication extends Model
             }
         }
 
-        if (!is_iterable($selectedDates)) {
+        if (! is_iterable($selectedDates)) {
             return [];
         }
 
@@ -305,7 +320,7 @@ class LeaveApplication extends Model
 
     private static function canInferConsecutiveDateRange(array $rangeDates, mixed $totalDays): bool
     {
-        if ($rangeDates === [] || !is_numeric($totalDays)) {
+        if ($rangeDates === [] || ! is_numeric($totalDays)) {
             return false;
         }
 
@@ -339,6 +354,7 @@ class LeaveApplication extends Model
             }
 
             $adminName = trim((string) ($admin?->full_name ?? ''));
+
             return $adminName !== '' ? $adminName : null;
         }
 
@@ -347,7 +363,7 @@ class LeaveApplication extends Model
 
     private static function formatSnapshotEmployeeName(?object $employee): ?string
     {
-        if (!$employee) {
+        if (! $employee) {
             return null;
         }
 

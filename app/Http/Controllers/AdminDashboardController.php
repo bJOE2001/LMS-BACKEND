@@ -896,9 +896,18 @@ class AdminDashboardController extends Controller
         $validated = $request->validate([
             'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
             'total_days' => ['required', 'numeric', 'min:'.LeaveApplication::MONETIZATION_MINIMUM_REQUEST_DAYS, 'max:999'],
+            'monetization_leave_credits' => ['nullable', 'array', 'min:1', 'max:2'],
+            'monetization_leave_credits.*.leave_type_id' => ['required_with:monetization_leave_credits', 'integer', 'exists:tblLeaveTypes,id'],
+            'monetization_leave_credits.*.days' => ['required_with:monetization_leave_credits', 'numeric', 'min:0', 'max:999'],
             'reason' => ['nullable', 'string', 'max:2000'],
             'details_of_leave' => ['nullable', 'string', 'max:2000'],
             'salary' => ['nullable', 'numeric', 'min:0'],
+            'attachment' => ['nullable', 'file', 'max:10240'],
+            'attachment_submitted' => ['nullable', 'boolean'],
+            'attachment_attached' => ['nullable', 'boolean'],
+            'has_attachment' => ['nullable', 'boolean'],
+            'with_attachment' => ['nullable', 'boolean'],
+            'attachment_reference' => ['nullable', 'string', 'max:500'],
         ]);
 
         $leaveType = LeaveType::find($validated['leave_type_id']);
@@ -911,19 +920,31 @@ class AdminDashboardController extends Controller
             ], 422);
         }
 
-        $balance = $this->findAdminEmployeeBalanceByLeaveType($admin, (int) $validated['leave_type_id']);
-
-        $currentBalance = $balance ? (float) $balance->balance : 0;
-
-        $requestedDays = (float) $validated['total_days'];
-        $monetizationPolicyRestriction = $this->validateMonetizationPolicyRules($leaveType, $requestedDays);
-        if ($monetizationPolicyRestriction instanceof JsonResponse) {
-            return $monetizationPolicyRestriction;
+        $monetizationComponents = $this->normalizeMonetizationLeaveCreditComponents($validated, $leaveType);
+        if ($monetizationComponents instanceof JsonResponse) {
+            return $monetizationComponents;
         }
 
-        $monetizationBalanceRestriction = $this->validateMonetizationBalanceRules($currentBalance, $requestedDays);
+        $requestedDays = $this->sumMonetizationComponentDays($monetizationComponents);
+        $monetizationBalanceRestriction = $this->validateAdminMonetizationComponentBalances(
+            $admin,
+            $monetizationComponents
+        );
         if ($monetizationBalanceRestriction instanceof JsonResponse) {
             return $monetizationBalanceRestriction;
+        }
+
+        $attachmentState = $this->resolveAttachmentStateFromRequest($request, $validated);
+        $attachmentRequired = $this->monetizationComponentsRequireAttachment($monetizationComponents);
+        if ($attachmentRequired && ! (bool) ($attachmentState['attachment_submitted'] ?? false)) {
+            $requiredDocumentMessage = 'Supporting attachment is required when Vacation Leave or Sick Leave monetization exceeds 10 days.';
+
+            return response()->json([
+                'message' => $requiredDocumentMessage,
+                'errors' => [
+                    'attachment' => [$requiredDocumentMessage],
+                ],
+            ], 422);
         }
 
         $equivalentAmount = null;
@@ -937,15 +958,30 @@ class AdminDashboardController extends Controller
         }
 
         $adminEmployeeControlNo = $this->resolveAdminEmployeeControlNo($admin);
+        $primaryLeaveTypeId = $this->resolvePrimaryMonetizationLeaveTypeId(
+            $monetizationComponents,
+            (int) $validated['leave_type_id']
+        );
+        $monetizationPayload = $this->serializeMonetizationLeaveCreditComponents($monetizationComponents);
 
-        $application = DB::transaction(function () use ($validated, $admin, $equivalentAmount, $adminEmployeeControlNo) {
+        $application = DB::transaction(function () use (
+            $validated,
+            $admin,
+            $equivalentAmount,
+            $adminEmployeeControlNo,
+            $primaryLeaveTypeId,
+            $requestedDays,
+            $monetizationPayload,
+            $attachmentRequired,
+            $attachmentState
+        ) {
             $app = LeaveApplication::create([
                 'applicant_admin_id' => $admin->id,
                 'employee_control_no' => $this->canonicalizeControlNo($adminEmployeeControlNo),
-                'leave_type_id' => $validated['leave_type_id'],
+                'leave_type_id' => $primaryLeaveTypeId,
                 'start_date' => null,
                 'end_date' => null,
-                'total_days' => $validated['total_days'],
+                'total_days' => $requestedDays,
                 'reason' => $validated['reason'] ?? null,
                 'details_of_leave' => $validated['details_of_leave'] ?? null,
                 'status' => LeaveApplication::STATUS_PENDING_HR,
@@ -955,6 +991,10 @@ class AdminDashboardController extends Controller
                 'commutation' => LeaveApplication::MONETIZATION_REQUIRED_COMMUTATION,
                 'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
                 'equivalent_amount' => $equivalentAmount,
+                'monetization_leave_credits' => $monetizationPayload,
+                'attachment_required' => $attachmentRequired,
+                'attachment_submitted' => (bool) ($attachmentState['attachment_submitted'] ?? false),
+                'attachment_reference' => $attachmentState['attachment_reference'] ?? null,
             ]);
 
             LeaveApplicationLog::create([
@@ -979,12 +1019,13 @@ class AdminDashboardController extends Controller
 
         $application->load('leaveType');
         $hrAccounts = HRAccount::all();
+        $monetizationLabel = $this->formatMonetizationComponentsLabel($monetizationComponents);
         foreach ($hrAccounts as $hrAccount) {
             Notification::send(
                 $hrAccount,
                 Notification::TYPE_LEAVE_REQUEST,
                 'Monetization Request',
-                "{$admin->full_name} submitted a personal monetization request for {$application->leaveType->name} (".self::formatDays($application->total_days).').',
+                "{$admin->full_name} submitted a personal monetization request for {$monetizationLabel} (".self::formatDays($application->total_days).').',
                 $application->id
             );
         }
@@ -1014,13 +1055,17 @@ class AdminDashboardController extends Controller
         $trendYear = (int) now()->year;
         $monthlyTrend = array_fill(0, 12, 0);
         $leaveTypeMonthlyTrend = [];
+        $countableStatuses = [
+            LeaveApplication::STATUS_PENDING_HR,
+            LeaveApplication::STATUS_APPROVED,
+        ];
 
         foreach ($applications as $application) {
             if (! $application instanceof LeaveApplication) {
                 continue;
             }
 
-            if ($application->status !== LeaveApplication::STATUS_APPROVED) {
+            if (! in_array($application->status, $countableStatuses, true)) {
                 continue;
             }
 
@@ -1113,7 +1158,248 @@ class AdminDashboardController extends Controller
         return strcasecmp($name, 'Vacation Leave') === 0;
     }
 
-    private function validateMonetizationPolicyRules(?LeaveType $leaveType, float $requestedDays): ?JsonResponse
+    /**
+     * @return array<int, array{leave_type_id:int, leave_type_name:string, days:float}>|JsonResponse
+     */
+    private function normalizeMonetizationLeaveCreditComponents(array $validated, ?LeaveType $fallbackLeaveType = null): array|JsonResponse
+    {
+        $rawComponents = $validated['monetization_leave_credits'] ?? null;
+        if (! is_array($rawComponents) || $rawComponents === []) {
+            $rawComponents = [[
+                'leave_type_id' => $validated['leave_type_id'] ?? $fallbackLeaveType?->id,
+                'days' => $validated['total_days'] ?? 0,
+            ]];
+        }
+
+        $componentsByType = [];
+        foreach ($rawComponents as $index => $rawComponent) {
+            if (! is_array($rawComponent)) {
+                return response()->json([
+                    'message' => 'Invalid monetization leave credit entry.',
+                    'errors' => [
+                        "monetization_leave_credits.{$index}" => ['Each monetization leave credit entry must be an object.'],
+                    ],
+                ], 422);
+            }
+
+            $leaveTypeId = (int) ($rawComponent['leave_type_id'] ?? $rawComponent['leaveTypeId'] ?? 0);
+            $days = round((float) ($rawComponent['days'] ?? $rawComponent['total_days'] ?? 0), 3);
+            if ($days <= 0.0) {
+                continue;
+            }
+
+            $leaveType = LeaveType::find($leaveTypeId);
+            $eligibilityRestriction = $this->validateMonetizationLeaveTypeEligibility(
+                $leaveType,
+                "monetization_leave_credits.{$index}.leave_type_id"
+            );
+            if ($eligibilityRestriction instanceof JsonResponse) {
+                return $eligibilityRestriction;
+            }
+
+            $canonicalLeaveTypeId = LeaveType::resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+            if (! array_key_exists($canonicalLeaveTypeId, $componentsByType)) {
+                $componentsByType[$canonicalLeaveTypeId] = [
+                    'leave_type_id' => $canonicalLeaveTypeId,
+                    'leave_type_name' => (string) $leaveType->name,
+                    'days' => 0.0,
+                ];
+            }
+
+            $componentsByType[$canonicalLeaveTypeId]['days'] = round(
+                (float) $componentsByType[$canonicalLeaveTypeId]['days'] + $days,
+                3
+            );
+        }
+
+        if ($componentsByType === []) {
+            return response()->json([
+                'message' => 'Select at least one leave type to monetize.',
+                'errors' => [
+                    'monetization_leave_credits' => ['Select at least one leave type to monetize.'],
+                ],
+            ], 422);
+        }
+
+        $components = collect($componentsByType)
+            ->sortBy(fn (array $component): int => $this->isVacationLeaveType(LeaveType::find((int) $component['leave_type_id'])) ? 0 : 1)
+            ->values()
+            ->all();
+
+        $requestedDays = $this->sumMonetizationComponentDays($components);
+        $declaredTotalDays = round((float) ($validated['total_days'] ?? 0), 3);
+        if (abs($requestedDays - $declaredTotalDays) > 0.001) {
+            return response()->json([
+                'message' => 'Total monetization days must match the selected Vacation Leave and Sick Leave days.',
+                'errors' => [
+                    'total_days' => ['Total monetization days must match the selected Vacation Leave and Sick Leave days.'],
+                ],
+            ], 422);
+        }
+
+        $minimumRestriction = $this->validateMonetizationRequestMinimum($requestedDays);
+        if ($minimumRestriction instanceof JsonResponse) {
+            return $minimumRestriction;
+        }
+
+        return $components;
+    }
+
+    /**
+     * @param  array<int, array{leave_type_id:int, leave_type_name:string, days:float}>  $components
+     * @return array<int, array{leave_type_id:int, leave_type_name:string, days:float}>
+     */
+    private function serializeMonetizationLeaveCreditComponents(array $components): array
+    {
+        return array_values(array_map(static fn (array $component): array => [
+            'leave_type_id' => (int) $component['leave_type_id'],
+            'leave_type_name' => (string) $component['leave_type_name'],
+            'days' => round((float) $component['days'], 3),
+        ], $components));
+    }
+
+    /**
+     * @return array<int, array{leave_type_id:int, leave_type_name:string, days:float}>
+     */
+    private function resolveStoredMonetizationLeaveCreditComponents(LeaveApplication $app): array
+    {
+        $rawComponents = $app->monetization_leave_credits ?? null;
+        if (is_string($rawComponents)) {
+            $decodedComponents = json_decode($rawComponents, true);
+            $rawComponents = json_last_error() === JSON_ERROR_NONE ? $decodedComponents : null;
+        }
+
+        $components = [];
+        if (is_array($rawComponents)) {
+            foreach ($rawComponents as $rawComponent) {
+                if (! is_array($rawComponent)) {
+                    continue;
+                }
+
+                $leaveTypeId = (int) ($rawComponent['leave_type_id'] ?? $rawComponent['leaveTypeId'] ?? 0);
+                $days = round((float) ($rawComponent['days'] ?? $rawComponent['total_days'] ?? 0), 3);
+                if ($leaveTypeId <= 0 || $days <= 0.0) {
+                    continue;
+                }
+
+                $canonicalLeaveTypeId = LeaveType::resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+                $leaveTypeName = $this->trimNullableString($rawComponent['leave_type_name'] ?? null)
+                    ?? LeaveType::query()->whereKey($canonicalLeaveTypeId)->value('name')
+                    ?? 'Leave';
+
+                $components[] = [
+                    'leave_type_id' => $canonicalLeaveTypeId,
+                    'leave_type_name' => (string) $leaveTypeName,
+                    'days' => $days,
+                ];
+            }
+        }
+
+        if ($components !== []) {
+            return $this->serializeMonetizationLeaveCreditComponents($components);
+        }
+
+        $leaveType = $app->leaveType instanceof LeaveType
+            ? $app->leaveType
+            : LeaveType::query()->find((int) $app->leave_type_id);
+        $leaveTypeId = (int) (LeaveType::resolveCanonicalLeaveTypeId((int) ($leaveType?->id ?? $app->leave_type_id)) ?? (int) $app->leave_type_id);
+
+        if ($leaveTypeId <= 0) {
+            return [];
+        }
+
+        return [[
+            'leave_type_id' => $leaveTypeId,
+            'leave_type_name' => (string) ($leaveType?->name ?? 'Leave'),
+            'days' => round((float) ($app->deductible_days ?? $app->total_days ?? 0), 3),
+        ]];
+    }
+
+    /**
+     * @param  array<int, array{leave_type_id:int, leave_type_name:string, days:float}>  $components
+     */
+    private function sumMonetizationComponentDays(array $components): float
+    {
+        return round(array_reduce(
+            $components,
+            static fn (float $carry, array $component): float => $carry + max((float) ($component['days'] ?? 0), 0.0),
+            0.0
+        ), 3);
+    }
+
+    /**
+     * @param  array<int, array{leave_type_id:int, leave_type_name:string, days:float}>  $components
+     */
+    private function resolvePrimaryMonetizationLeaveTypeId(array $components, int $requestedLeaveTypeId): int
+    {
+        $requestedLeaveTypeId = LeaveType::resolveCanonicalLeaveTypeId($requestedLeaveTypeId) ?? $requestedLeaveTypeId;
+        foreach ($components as $component) {
+            if ((int) $component['leave_type_id'] === $requestedLeaveTypeId) {
+                return $requestedLeaveTypeId;
+            }
+        }
+
+        return (int) ($components[0]['leave_type_id'] ?? $requestedLeaveTypeId);
+    }
+
+    /**
+     * @param  array<int, array{leave_type_id:int, leave_type_name:string, days:float}>  $components
+     */
+    private function formatMonetizationComponentsLabel(array $components, bool $includeDays = true): string
+    {
+        if ($components === []) {
+            return 'leave credits';
+        }
+
+        return collect($components)
+            ->map(function (array $component) use ($includeDays): string {
+                $label = (string) ($component['leave_type_name'] ?? 'Leave');
+                if (! $includeDays) {
+                    return $label;
+                }
+
+                return $label.' ('.self::formatDays((float) ($component['days'] ?? 0)).')';
+            })
+            ->implode(', ');
+    }
+
+    /**
+     * @param  array<int, array{leave_type_id:int, leave_type_name:string, days:float}>  $components
+     */
+    private function monetizationComponentsRequireAttachment(array $components): bool
+    {
+        foreach ($components as $component) {
+            if ((float) $component['days'] > LeaveApplication::MONETIZATION_ATTACHMENT_THRESHOLD_DAYS) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @param  array<int, array{leave_type_id:int, leave_type_name:string, days:float}>  $components
+     */
+    private function validateAdminMonetizationComponentBalances(DepartmentAdmin $admin, array $components): ?JsonResponse
+    {
+        foreach ($components as $component) {
+            $balance = $this->findAdminEmployeeBalanceByLeaveType($admin, (int) $component['leave_type_id']);
+            $currentBalance = $balance ? (float) $balance->balance : 0.0;
+
+            $restriction = $this->validateMonetizationBalanceRules(
+                $currentBalance,
+                (float) $component['days'],
+                'monetization_leave_credits'
+            );
+            if ($restriction instanceof JsonResponse) {
+                return $restriction;
+            }
+        }
+
+        return null;
+    }
+
+    private function validateMonetizationLeaveTypeEligibility(?LeaveType $leaveType, string $errorKey = 'leave_type_id'): ?JsonResponse
     {
         $isEligibleMonetizationType = $leaveType instanceof LeaveType
             && ($this->isVacationLeaveType($leaveType) || $this->isSickLeaveType($leaveType));
@@ -1121,25 +1407,43 @@ class AdminDashboardController extends Controller
         if (! $isEligibleMonetizationType) {
             return response()->json([
                 'message' => 'Monetization is only allowed for Vacation Leave or Sick Leave.',
-                'errors' => ['leave_type_id' => ['Monetization is only allowed for Vacation Leave or Sick Leave.']],
-            ], 422);
-        }
-
-        $normalizedRequestedDays = round(max($requestedDays, 0.0), 2);
-        if ($normalizedRequestedDays + 1e-9 < LeaveApplication::MONETIZATION_MINIMUM_REQUEST_DAYS) {
-            $minimumDays = self::formatDays(LeaveApplication::MONETIZATION_MINIMUM_REQUEST_DAYS);
-
-            return response()->json([
-                'message' => "A minimum of {$minimumDays} is required for monetization.",
-                'errors' => ['total_days' => ["A minimum of {$minimumDays} is required for monetization."]],
+                'errors' => [$errorKey => ['Monetization is only allowed for Vacation Leave or Sick Leave.']],
             ], 422);
         }
 
         return null;
     }
 
-    private function validateMonetizationBalanceRules(float $currentBalance, float $requestedDays): ?JsonResponse
+    private function validateMonetizationRequestMinimum(float $requestedDays, string $errorKey = 'total_days'): ?JsonResponse
     {
+        $normalizedRequestedDays = round(max($requestedDays, 0.0), 2);
+        if ($normalizedRequestedDays + 1e-9 < LeaveApplication::MONETIZATION_MINIMUM_REQUEST_DAYS) {
+            $minimumDays = self::formatDays(LeaveApplication::MONETIZATION_MINIMUM_REQUEST_DAYS);
+
+            return response()->json([
+                'message' => "A minimum of {$minimumDays} is required for monetization.",
+                'errors' => [$errorKey => ["A minimum of {$minimumDays} is required for monetization."]],
+            ], 422);
+        }
+
+        return null;
+    }
+
+    private function validateMonetizationPolicyRules(?LeaveType $leaveType, float $requestedDays): ?JsonResponse
+    {
+        $eligibilityRestriction = $this->validateMonetizationLeaveTypeEligibility($leaveType);
+        if ($eligibilityRestriction instanceof JsonResponse) {
+            return $eligibilityRestriction;
+        }
+
+        return $this->validateMonetizationRequestMinimum($requestedDays);
+    }
+
+    private function validateMonetizationBalanceRules(
+        float $currentBalance,
+        float $requestedDays,
+        string $errorKey = 'total_days'
+    ): ?JsonResponse {
         $normalizedCurrentBalance = round(max($currentBalance, 0.0), 2);
         $normalizedRequestedDays = round(max($requestedDays, 0.0), 2);
         $requiredMinimumBalance = LeaveApplication::MONETIZATION_MINIMUM_VACATION_LEAVE_BALANCE_DAYS;
@@ -1150,7 +1454,7 @@ class AdminDashboardController extends Controller
                     .self::formatDays($requiredMinimumBalance)
                     .' of leave credits are required to apply monetization.',
                 'errors' => [
-                    'total_days' => [
+                    $errorKey => [
                         'At least '
                         .self::formatDays($requiredMinimumBalance)
                         .' of leave credits are required. Current balance: '
@@ -1165,7 +1469,7 @@ class AdminDashboardController extends Controller
             return response()->json([
                 'message' => 'Requested monetization days exceed available leave credits.',
                 'errors' => [
-                    'total_days' => [
+                    $errorKey => [
                         'Requested monetization days ('
                         .self::formatDays($normalizedRequestedDays)
                         .') exceed available leave credits ('
@@ -1728,6 +2032,12 @@ class AdminDashboardController extends Controller
 
         $currentLeaveBalances = $this->getCurrentLeaveBalancesForApp($app, $leaveBalanceDirectory);
         $durationDays = (float) $app->total_days;
+        $monetizationComponents = (bool) $app->is_monetization
+            ? $this->resolveStoredMonetizationLeaveCreditComponents($app)
+            : [];
+        $displayLeaveTypeName = (bool) $app->is_monetization && $monetizationComponents !== []
+            ? $this->formatMonetizationComponentsLabel($monetizationComponents, false)
+            : ($app->leaveType?->name ?? 'Unknown');
         $selectedDates = $app->resolvedSelectedDates();
         $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
         $withoutPay = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
@@ -1811,7 +2121,8 @@ class AdminDashboardController extends Controller
             'surname' => $surname,
             'firstname' => $firstname,
             'middlename' => $middlename,
-            'leaveType' => $app->leaveType?->name ?? 'Unknown',
+            'leaveType' => $displayLeaveTypeName,
+            'leave_type_name' => $displayLeaveTypeName,
             'startDate' => $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : null,
             'endDate' => $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : null,
             'days' => $durationDays,
@@ -1866,6 +2177,11 @@ class AdminDashboardController extends Controller
             'attachment_submitted' => (bool) ($app->attachment_submitted ?? false),
             'attachment_reference' => $app->attachment_reference ? (string) $app->attachment_reference : null,
             'is_monetization' => (bool) $app->is_monetization,
+            'monetization_leave_credits' => $monetizationComponents,
+            'monetizationLeaveCredits' => $monetizationComponents,
+            'monetization_leave_credit_label' => $monetizationComponents !== []
+                ? $this->formatMonetizationComponentsLabel($monetizationComponents)
+                : null,
             'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
             'admin_id' => $app->admin_id,
             'hr_id' => $app->hr_id,
@@ -2283,7 +2599,16 @@ class AdminDashboardController extends Controller
 
         $vacLess = 0.0;
         $sickLess = 0.0;
-        if (strcasecmp($leaveTypeName, 'Vacation Leave') === 0) {
+        if ((bool) $app->is_monetization) {
+            foreach ($this->resolveStoredMonetizationLeaveCreditComponents($app) as $component) {
+                $leaveType = LeaveType::find((int) $component['leave_type_id']);
+                if ($this->isVacationLeaveType($leaveType)) {
+                    $vacLess += (float) $component['days'];
+                } elseif ($this->isSickLeaveType($leaveType)) {
+                    $sickLess += (float) $component['days'];
+                }
+            }
+        } elseif (strcasecmp($leaveTypeName, 'Vacation Leave') === 0) {
             $vacLess = $deductibleDays;
         } elseif (strcasecmp($leaveTypeName, 'Sick Leave') === 0) {
             $sickLess = $deductibleDays;
@@ -2369,6 +2694,7 @@ class AdminDashboardController extends Controller
                 'linked_vacation_leave_deducted_days',
                 'pay_mode',
                 'is_monetization',
+                'monetization_leave_credits',
                 'status',
                 'hr_approved_at',
             ]);
@@ -2431,7 +2757,16 @@ class AdminDashboardController extends Controller
 
         $vacation = 0.0;
         $sick = 0.0;
-        if (strcasecmp($leaveTypeName, 'Vacation Leave') === 0) {
+        if ((bool) $app->is_monetization) {
+            foreach ($this->resolveStoredMonetizationLeaveCreditComponents($app) as $component) {
+                $leaveType = LeaveType::find((int) $component['leave_type_id']);
+                if ($this->isVacationLeaveType($leaveType)) {
+                    $vacation += (float) $component['days'];
+                } elseif ($this->isSickLeaveType($leaveType)) {
+                    $sick += (float) $component['days'];
+                }
+            }
+        } elseif (strcasecmp($leaveTypeName, 'Vacation Leave') === 0) {
             $vacation = $deductibleDays;
         } elseif (strcasecmp($leaveTypeName, 'Sick Leave') === 0) {
             $sick = $deductibleDays;

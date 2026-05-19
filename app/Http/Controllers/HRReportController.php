@@ -270,6 +270,7 @@ class HRReportController extends Controller
                 'surname' => $employee['surname'],
                 'middlename' => $employee['middlename'],
                 'office' => $employee['office'],
+                'officeAcronym' => $employee['officeAcronym'],
                 'status' => $employee['status'],
                 'periodIncurred' => $this->formatDateSummaryFromDateKeys($wopDateKeys)
                     ?: $this->formatApplicationInclusiveDates($application),
@@ -463,6 +464,7 @@ class HRReportController extends Controller
                 'designation' => $employee['designation'],
                 'status' => $employee['status'],
                 'office' => $employee['office'],
+                'officeAcronym' => $employee['officeAcronym'],
                 'runningBalanceVl' => $balanceVl,
                 'runningBalanceSl' => $balanceSl,
                 'annualBalanceMcCo' => $balanceMcCo,
@@ -554,6 +556,7 @@ class HRReportController extends Controller
                 'designation' => $employee['designation'],
                 'status' => $employee['status'],
                 'office' => $employee['office'],
+                'officeAcronym' => $employee['officeAcronym'],
                 'totalDays' => round((float) ($application->deductible_days ?? $application->total_days ?? 0), 3),
                 'remarks' => $remarks ?? '',
                 'month' => $monthYear['month'],
@@ -718,6 +721,7 @@ class HRReportController extends Controller
                 'middlename' => $employee['middlename'],
                 'designation' => $employee['designation'],
                 'office' => $employee['office'],
+                'officeAcronym' => $employee['officeAcronym'],
                 'status' => $this->formatCtoAvailmentEmploymentStatus($employee['status']),
                 'totalDaysApplied' => round($this->resolveReportableApplicationDays($application), 3),
                 'inclusiveDates' => $this->formatApplicationInclusiveDates($application),
@@ -936,6 +940,7 @@ class HRReportController extends Controller
                 'designation' => $employee['designation'],
                 'status' => $employee['status'],
                 'office' => $employee['office'],
+                'officeAcronym' => $employee['officeAcronym'],
                 'totalBalanceHours' => $totalBalanceHours,
                 'monthYearEarned' => $this->formatMonthYearList($aggregate['earned_dates']),
                 'monthYearExpired' => $this->formatMonthYearList($aggregate['expiry_dates']),
@@ -1077,6 +1082,7 @@ class HRReportController extends Controller
                 'designation' => $employee['designation'],
                 'status' => $employee['status'],
                 'office' => $employee['office'],
+                'officeAcronym' => $employee['officeAcronym'],
                 'vlFl' => $vlFl,
                 'sl' => $sl,
                 'mcCo' => $mcCo,
@@ -1210,6 +1216,9 @@ class HRReportController extends Controller
                     'middlename' => $this->trimNullableString($employee->middlename ?? null) ?? '',
                     'surname' => $this->trimNullableString($employee->surname ?? null) ?? '',
                     'office' => $this->trimNullableString($employee->office ?? null) ?? '',
+                    'officeAcronym' => $this->trimNullableString($employee->officeAcronym ?? null)
+                        ?? $this->trimNullableString($employee->hrisOfficeAcronym ?? null)
+                        ?? '',
                     'status' => $this->formatEmploymentStatus($employee->status ?? null),
                     'is_active' => filter_var($employee->is_active ?? false, FILTER_VALIDATE_BOOLEAN),
                     'designation' => $this->trimNullableString($employee->designation ?? null) ?? '',
@@ -1288,6 +1297,7 @@ class HRReportController extends Controller
             'office' => $this->trimNullableString($employee['office'] ?? null)
                 ?? $this->trimNullableString($fallbackOffice)
                 ?? '',
+            'officeAcronym' => $this->trimNullableString($employee['officeAcronym'] ?? null) ?? '',
             'status' => $this->trimNullableString($employee['status'] ?? null) ?? '',
             'designation' => $this->trimNullableString($employee['designation'] ?? null) ?? '',
         ];
