@@ -18,9 +18,9 @@ use App\Services\WorkScheduleService;
 use Carbon\Carbon;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Collection;
-use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 
@@ -32,7 +32,9 @@ use Illuminate\Validation\Rule;
 class EmployeeController extends Controller
 {
     private const LEDGER_HOURS_PER_DAY = 8;
+
     private const LEDGER_MINUTES_PER_HOUR = 60;
+
     private const LEDGER_DECIMAL_PRECISION = 3;
 
     /**
@@ -76,23 +78,23 @@ class EmployeeController extends Controller
     public function cityAdministrator(Request $request): JsonResponse
     {
         $account = $request->user();
-        if (!$account instanceof HRAccount && !$account instanceof DepartmentAdmin) {
+        if (! $account instanceof HRAccount && ! $account instanceof DepartmentAdmin) {
             return response()->json([
                 'message' => 'Only HR and department admin accounts can access this endpoint.',
             ], 403);
         }
 
         $employee = HrisEmployee::query(true)
-            ->whereRaw("LOWER(LTRIM(RTRIM(vp.Designation))) LIKE ?", ['%city administrator%'])
+            ->whereRaw('LOWER(LTRIM(RTRIM(vp.Designation))) LIKE ?', ['%city administrator%'])
             ->orderByRaw('vp.ToDate DESC')
             ->orderByRaw('vp.FromDate DESC')
             ->orderByRaw('LTRIM(RTRIM(xp.Surname))')
             ->orderByRaw('LTRIM(RTRIM(xp.Firstname))')
             ->first();
 
-        if (!$employee) {
+        if (! $employee) {
             $employee = HrisEmployee::query(null)
-                ->whereRaw("LOWER(LTRIM(RTRIM(vp.Designation))) LIKE ?", ['%city administrator%'])
+                ->whereRaw('LOWER(LTRIM(RTRIM(vp.Designation))) LIKE ?', ['%city administrator%'])
                 ->orderByRaw('CASE WHEN vp.FromDate IS NOT NULL AND vp.ToDate IS NOT NULL AND GETDATE() BETWEEN vp.FromDate AND vp.ToDate THEN 0 ELSE 1 END')
                 ->orderByRaw('vp.ToDate DESC')
                 ->orderByRaw('vp.FromDate DESC')
@@ -101,7 +103,7 @@ class EmployeeController extends Controller
                 ->first();
         }
 
-        if (!$employee) {
+        if (! $employee) {
             return response()->json([
                 'city_administrator' => null,
             ]);
@@ -137,7 +139,7 @@ class EmployeeController extends Controller
 
         $validated = $this->validateDepartmentHeadPayload($request);
         $employee = HrisEmployee::findByControlNo((string) ($validated['control_no'] ?? ''), true);
-        if (!$employee) {
+        if (! $employee) {
             return response()->json([
                 'message' => 'Employee not found in HRIS active records.',
             ], 422);
@@ -179,7 +181,7 @@ class EmployeeController extends Controller
             ], 201);
         }
 
-        if (!$existingDepartmentHead) {
+        if (! $existingDepartmentHead) {
             return response()->json([
                 'message' => 'Department head not found.',
             ], 404);
@@ -208,7 +210,7 @@ class EmployeeController extends Controller
             ->where('department_id', $admin->department_id)
             ->first();
 
-        if (!$departmentHead) {
+        if (! $departmentHead) {
             return response()->json([
                 'message' => 'Department head not found.',
             ], 404);
@@ -269,7 +271,7 @@ class EmployeeController extends Controller
         $isHrAccount = $account instanceof HRAccount;
         $isDepartmentAdmin = $account instanceof DepartmentAdmin;
 
-        if (!$isHrAccount && !$isDepartmentAdmin) {
+        if (! $isHrAccount && ! $isDepartmentAdmin) {
             return response()->json([
                 'message' => 'Only HR and department admin accounts can access this resource.',
             ], 403);
@@ -291,7 +293,7 @@ class EmployeeController extends Controller
         if ($isDepartmentAdmin) {
             $account->loadMissing('department');
 
-            if (!$account->department_id || !$account->department?->name) {
+            if (! $account->department_id || ! $account->department?->name) {
                 return response()->json([
                     'message' => 'Department admin account is not assigned to a department.',
                 ], 403);
@@ -386,7 +388,7 @@ class EmployeeController extends Controller
     public function employeeOptions(Request $request): JsonResponse
     {
         $account = $request->user();
-        if (!$account instanceof HRAccount) {
+        if (! $account instanceof HRAccount) {
             return response()->json([
                 'message' => 'Only HR accounts can access this resource.',
             ], 403);
@@ -433,7 +435,7 @@ class EmployeeController extends Controller
 
         $existingEmployeeControlNoLookup = $this->buildControlNoLookup(
             $employeeRows
-                ->map(fn(array $employee): string => trim((string) ($employee['control_no'] ?? '')))
+                ->map(fn (array $employee): string => trim((string) ($employee['control_no'] ?? '')))
                 ->filter()
                 ->values()
                 ->all()
@@ -455,7 +457,7 @@ class EmployeeController extends Controller
                 $existingEmployeeControlNoLookup,
                 $activeOnly
             ): bool {
-                if (!$this->matchesDepartmentHeadEmployeeFilters($departmentHead, $searchTerm, true, $activeOnly)) {
+                if (! $this->matchesDepartmentHeadEmployeeFilters($departmentHead, $searchTerm, true, $activeOnly)) {
                     return false;
                 }
 
@@ -466,7 +468,7 @@ class EmployeeController extends Controller
 
                 return true;
             })
-            ->map(fn(DepartmentHead $departmentHead): array => $this->serializeDepartmentHeadAsEmployee($departmentHead));
+            ->map(fn (DepartmentHead $departmentHead): array => $this->serializeDepartmentHeadAsEmployee($departmentHead));
 
         $combinedRows = $this->sortEmployeeRows(
             $employeeRows
@@ -560,7 +562,7 @@ class EmployeeController extends Controller
 
         $assignment = $this->findPulledEmployeeAssignment($controlNo, (int) $admin->department_id);
 
-        if (!$assignment) {
+        if (! $assignment) {
             $otherOfficeAssignment = $this->findPulledEmployeeAssignment($controlNo);
             if ($otherOfficeAssignment) {
                 return response()->json([
@@ -588,7 +590,7 @@ class EmployeeController extends Controller
         $account = $request->user();
         if ($account instanceof DepartmentAdmin) {
             $account->loadMissing('department');
-            if (!$account->department_id || !$account->department?->name) {
+            if (! $account->department_id || ! $account->department?->name) {
                 return response()->json([
                     'message' => 'Department admin account is not assigned to a department.',
                 ], 403);
@@ -597,19 +599,19 @@ class EmployeeController extends Controller
             $hasPulledEmployeeAssignment = $this->findPulledEmployeeAssignment($controlNo, (int) $account->department_id) !== null;
             $isDepartmentHead = $this->matchesDepartmentHeadControlNo((int) $account->department_id, $controlNo);
 
-            if (!$hasPulledEmployeeAssignment && !$isDepartmentHead) {
+            if (! $hasPulledEmployeeAssignment && ! $isDepartmentHead) {
                 return response()->json([
                     'message' => 'Employee is not in your department assignment list.',
                 ], 403);
             }
-        } elseif (!$account instanceof HRAccount) {
+        } elseif (! $account instanceof HRAccount) {
             return response()->json([
                 'message' => 'Only HR and department admin accounts can access this endpoint.',
             ], 403);
         }
 
         $employee = HrisEmployee::findByControlNo($controlNo);
-        if (!$employee) {
+        if (! $employee) {
             return response()->json(['message' => 'Employee not found.'], 404);
         }
 
@@ -671,12 +673,12 @@ class EmployeeController extends Controller
     public function leaveCreditsLedger(Request $request, string $controlNo): JsonResponse
     {
         $account = $request->user();
-        if (!$account instanceof HRAccount) {
+        if (! $account instanceof HRAccount) {
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
         $employee = HrisEmployee::findByControlNo($controlNo);
-        if (!$employee) {
+        if (! $employee) {
             return response()->json(['message' => 'Employee not found.'], 404);
         }
 
@@ -742,12 +744,12 @@ class EmployeeController extends Controller
         $transactions = [];
         if ($trackedTypeIds !== []) {
             $balanceIds = array_values(array_map(
-                static fn(LeaveBalance $balance): int => (int) $balance->id,
+                static fn (LeaveBalance $balance): int => (int) $balance->id,
                 $balancesByType
             ));
             $balanceTypeLookup = [];
             foreach ($balancesByType as $balance) {
-                if (!$balance instanceof LeaveBalance) {
+                if (! $balance instanceof LeaveBalance) {
                     continue;
                 }
 
@@ -782,23 +784,26 @@ class EmployeeController extends Controller
                     $source = strtoupper(trim((string) ($entry->source ?? '')));
                     $isManualAddSource = $source === 'HR_ADD' || str_starts_with($source, 'HR_ADD:');
                     $isManualEditSource = $source === 'HR_EDIT' || str_starts_with($source, 'HR_EDIT:');
+                    $isManualBalanceSource = $isManualAddSource || $isManualEditSource;
                     $actionTaken = match (true) {
-                        $isManualAddSource => 'Leave credits added',
+                        $isManualAddSource => 'Initial leave balance',
                         $isManualEditSource => 'Leave credits adjusted',
                         default => 'Monthly accrual',
                     };
-                    $isNegativeAdjustment = $isManualEditSource && $creditsAdded < 0;
+                    $isNegativeAdjustment = ! $isManualBalanceSource && $creditsAdded < 0;
                     $otherTypeCode = $typeKey === 'other'
                         ? ($otherTypeCodeById[(int) $typeId] ?? null)
                         : null;
-                    $entryKind = $isNegativeAdjustment ? 'deduction' : 'earned';
+                    $entryKind = $isManualBalanceSource || ! $isNegativeAdjustment ? 'earned' : 'deduction';
                     $displayAmount = abs($creditsAdded);
-                    $entryCategory = $isNegativeAdjustment
+                    $entryCategory = $isManualBalanceSource
+                        ? 'balance_only'
+                        : ($isNegativeAdjustment
                         ? 'deduction_with_pay'
-                        : 'earned';
+                        : 'earned');
 
                     $transactions[] = [
-                        'row_id' => 'accrual-' . (int) $entry->id,
+                        'row_id' => 'accrual-'.(int) $entry->id,
                         'type_key' => $typeKey,
                         'transaction_date' => $accrualDate,
                         'sort_date' => $accrualDate,
@@ -843,6 +848,7 @@ class EmployeeController extends Controller
                     'linked_vacation_leave_deducted_days',
                     'pay_mode',
                     'is_monetization',
+                    'monetization_leave_credits',
                     'status',
                     'remarks',
                     'start_date',
@@ -880,7 +886,7 @@ class EmployeeController extends Controller
                 $totalDays = round((float) ($application->total_days ?? 0), 2);
                 $deductibleDays = round((float) ($application->deductible_days ?? $totalDays), 3);
                 $payMode = strtoupper(trim((string) ($application->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY)));
-                if (!in_array($payMode, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
+                if (! in_array($payMode, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
                     $payMode = LeaveApplication::PAY_MODE_WITH_PAY;
                 }
 
@@ -903,7 +909,25 @@ class EmployeeController extends Controller
                     ? 0.0
                     : round(max($totalDays - $withPayAmount, 0.0), self::LEDGER_DECIMAL_PRECISION);
 
-                if ($primaryWithPayAmount <= 0 && $linkedVacationWithPayAmount <= 0 && $withoutPayAmount <= 0) {
+                $monetizationComponents = $isMonetization
+                    ? $this->resolveLedgerMonetizationComponents(
+                        $application,
+                        $typeIdToKey,
+                        $typeKey,
+                        $deductibleDays
+                    )
+                    : [];
+
+                if ($isMonetization && $monetizationComponents === []) {
+                    continue;
+                }
+
+                if (
+                    ! $isMonetization
+                    && $primaryWithPayAmount <= 0
+                    && $linkedVacationWithPayAmount <= 0
+                    && $withoutPayAmount <= 0
+                ) {
                     continue;
                 }
 
@@ -934,11 +958,40 @@ class EmployeeController extends Controller
                     $inclusiveStartDate,
                     $inclusiveEndDate
                 );
-                $mergeKey = 'app-' . $applicationId;
+                $mergeKey = 'app-'.$applicationId;
 
-                if ($primaryWithPayAmount > 0) {
+                if ($isMonetization) {
+                    foreach ($monetizationComponents as $component) {
+                        $componentTypeKey = (string) $component['type_key'];
+                        $componentAmount = round(max((float) $component['days'], 0.0), self::LEDGER_DECIMAL_PRECISION);
+                        if ($componentAmount <= 0.0) {
+                            continue;
+                        }
+
+                        $transactions[] = [
+                            'row_id' => $mergeKey.'-monetization-'.$componentTypeKey,
+                            'merge_key' => $mergeKey,
+                            'type_key' => $componentTypeKey,
+                            'transaction_date' => $transactionDate,
+                            'sort_date' => $transactionDate,
+                            'sort_timestamp' => (string) (
+                                $application->hr_approved_at?->toIso8601String()
+                                ?? $application->created_at?->toIso8601String()
+                                ?? $transactionDate
+                            ),
+                            'particulars' => $particulars,
+                            'action_taken' => $actionTaken,
+                            'inclusive_start_date' => $inclusiveStartDate,
+                            'inclusive_end_date' => $inclusiveEndDate,
+                            'inclusive_dates' => $inclusiveDates,
+                            'category' => 'deduction_with_pay',
+                            'amount' => $componentAmount,
+                            'balance_delta' => -$componentAmount,
+                        ];
+                    }
+                } elseif ($primaryWithPayAmount > 0) {
                     $transactions[] = [
-                        'row_id' => $mergeKey . '-wp',
+                        'row_id' => $mergeKey.'-wp',
                         'merge_key' => $mergeKey,
                         'type_key' => $typeKey,
                         'transaction_date' => $transactionDate,
@@ -959,9 +1012,9 @@ class EmployeeController extends Controller
                     ];
                 }
 
-                if ($linkedVacationWithPayAmount > 0) {
+                if (! $isMonetization && $linkedVacationWithPayAmount > 0) {
                     $transactions[] = [
-                        'row_id' => $mergeKey . '-vl-topup',
+                        'row_id' => $mergeKey.'-vl-topup',
                         'merge_key' => $mergeKey,
                         'type_key' => 'vacation',
                         'transaction_date' => $transactionDate,
@@ -982,9 +1035,9 @@ class EmployeeController extends Controller
                     ];
                 }
 
-                if ($withoutPayAmount > 0) {
+                if (! $isMonetization && $withoutPayAmount > 0) {
                     $transactions[] = [
-                        'row_id' => $mergeKey . '-wop',
+                        'row_id' => $mergeKey.'-wop',
                         'merge_key' => $mergeKey,
                         'type_key' => $typeKey,
                         'transaction_date' => $transactionDate,
@@ -1019,7 +1072,7 @@ class EmployeeController extends Controller
                         : ($application->updated_at ? CarbonImmutable::instance($application->updated_at) : null);
                     $recallEffectiveAt = $application->recall_effective_date
                         ? CarbonImmutable::parse((string) $application->recall_effective_date)->startOfDay()
-                        : (!empty($storedRecallDateKeys) ? CarbonImmutable::parse($storedRecallDateKeys[0])->startOfDay() : $recallOccurredAt);
+                        : (! empty($storedRecallDateKeys) ? CarbonImmutable::parse($storedRecallDateKeys[0])->startOfDay() : $recallOccurredAt);
                     $recallDetails = $this->resolveLedgerRecallRestorableDetails($application, $storedRecallDateKeys, $recallEffectiveAt);
                     $restoredAmount = (float) ($recallDetails['days'] ?? 0.0);
                     $restoredDates = is_array($recallDetails['dates'] ?? null)
@@ -1035,8 +1088,8 @@ class EmployeeController extends Controller
                         $recallDate = $recallEffectiveAt?->toDateString() ?? $recallOccurredAt?->toDateString();
                         if ($recallDate !== null) {
                             $transactions[] = [
-                                'row_id' => $mergeKey . '-recall',
-                                'merge_key' => $mergeKey . '-recall',
+                                'row_id' => $mergeKey.'-recall',
+                                'merge_key' => $mergeKey.'-recall',
                                 'type_key' => $restoreTypeKey,
                                 'transaction_date' => $recallDate,
                                 'sort_date' => $recallDate,
@@ -1082,6 +1135,7 @@ class EmployeeController extends Controller
 
             $leftId = (string) ($left['row_id'] ?? '');
             $rightId = (string) ($right['row_id'] ?? '');
+
             return $rightId <=> $leftId;
         });
 
@@ -1089,7 +1143,7 @@ class EmployeeController extends Controller
         $rowIndexByMergeKey = [];
         foreach ($transactions as $transaction) {
             $typeKey = $transaction['type_key'] ?? null;
-            if (!is_string($typeKey) || !array_key_exists($typeKey, $runningBalances)) {
+            if (! is_string($typeKey) || ! array_key_exists($typeKey, $runningBalances)) {
                 continue;
             }
 
@@ -1110,19 +1164,19 @@ class EmployeeController extends Controller
             $inclusiveStartDate = trim((string) ($transaction['inclusive_start_date'] ?? ''));
             $inclusiveEndDate = trim((string) ($transaction['inclusive_end_date'] ?? ''));
             $inclusiveDates = $transaction['inclusive_dates'] ?? null;
-            if (!is_array($inclusiveDates)) {
+            if (! is_array($inclusiveDates)) {
                 $inclusiveDates = [];
             }
             $period = $this->formatLedgerPeriodLabel($actionDate);
 
             $mergeKey = null;
             if ($category === 'earned') {
-                $mergeKey = 'earned|' . mb_strtolower($actionDate . '|' . $particulars . '|' . $actionTaken);
+                $mergeKey = 'earned|'.mb_strtolower($actionDate.'|'.$particulars.'|'.$actionTaken);
             }
 
             $explicitMergeKey = trim((string) ($transaction['merge_key'] ?? ''));
             if ($explicitMergeKey !== '') {
-                $mergeKey = 'tx|' . mb_strtolower($explicitMergeKey);
+                $mergeKey = 'tx|'.mb_strtolower($explicitMergeKey);
             }
 
             if ($mergeKey !== null && array_key_exists($mergeKey, $rowIndexByMergeKey)) {
@@ -1146,7 +1200,7 @@ class EmployeeController extends Controller
             }
 
             if ($typeKey === 'vacation') {
-                if (!array_key_exists('vacation_balance', $ledgerRows[$rowIndex])) {
+                if (! array_key_exists('vacation_balance', $ledgerRows[$rowIndex])) {
                     $ledgerRows[$rowIndex]['vacation_balance'] = $currentBalance;
                 }
                 if ($category === 'earned') {
@@ -1163,7 +1217,7 @@ class EmployeeController extends Controller
                     );
                 }
             } elseif ($typeKey === 'sick') {
-                if (!array_key_exists('sick_balance', $ledgerRows[$rowIndex])) {
+                if (! array_key_exists('sick_balance', $ledgerRows[$rowIndex])) {
                     $ledgerRows[$rowIndex]['sick_balance'] = $currentBalance;
                 }
                 if ($category === 'earned') {
@@ -1180,7 +1234,7 @@ class EmployeeController extends Controller
                     );
                 }
             } elseif ($typeKey === 'other') {
-                if (!array_key_exists('other_balance', $ledgerRows[$rowIndex])) {
+                if (! array_key_exists('other_balance', $ledgerRows[$rowIndex])) {
                     $ledgerRows[$rowIndex]['other_balance'] = $currentBalance;
                 }
                 if ($category === 'earned') {
@@ -1199,12 +1253,18 @@ class EmployeeController extends Controller
             }
         }
 
+        $firstDayOfService = HrisEmployee::firstDayOfServiceByControlNo(
+            (string) ($employee->control_no ?? $controlNo)
+        ) ?? $this->normalizeLedgerDateString($employee->from_date ?? null);
+
         return response()->json([
             'employee' => [
                 'control_no' => $employee->control_no,
                 'firstname' => $employee->firstname,
                 'surname' => $employee->surname,
                 'middlename' => $employee->middlename,
+                'first_day_of_service' => $firstDayOfService,
+                'firstDayOfService' => $firstDayOfService,
                 'office' => $employee->office,
                 'designation' => $employee->designation,
                 'status' => $employee->status,
@@ -1235,14 +1295,14 @@ class EmployeeController extends Controller
     private function resolveDepartmentAdmin(Request $request): DepartmentAdmin|JsonResponse
     {
         $account = $request->user();
-        if (!$account instanceof DepartmentAdmin) {
+        if (! $account instanceof DepartmentAdmin) {
             return response()->json([
                 'message' => 'Only department admin accounts can manage employees.',
             ], 403);
         }
 
         $account->loadMissing('department');
-        if (!$account->department_id || !$account->department?->name) {
+        if (! $account->department_id || ! $account->department?->name) {
             return response()->json([
                 'message' => 'Department admin account is not assigned to a department.',
             ], 403);
@@ -1367,6 +1427,7 @@ class EmployeeController extends Controller
             ->values()
             ->map(function (array $row) use ($departmentHeadLookup): array {
                 $controlNo = trim((string) ($row['control_no'] ?? ''));
+
                 return array_merge($row, [
                     'has_account' => false,
                     'is_department_head_record' => $controlNo !== '' && $this->hasControlNoInLookup($controlNo, $departmentHeadLookup),
@@ -1389,8 +1450,7 @@ class EmployeeController extends Controller
         ?int $departmentId,
         ?string $searchTerm,
         ?bool $activeOnly
-    ): array
-    {
+    ): array {
         if ($departmentId === null || $departmentId <= 0) {
             return [];
         }
@@ -1414,6 +1474,7 @@ class EmployeeController extends Controller
         $employeeRows = $this->fetchHrisEmployeeRows($departmentName, $searchTerm, false, $activeOnly)
             ->map(function (array $employee) use ($departmentHeadLookup): array {
                 $controlNo = trim((string) ($employee['control_no'] ?? ''));
+
                 return array_merge($employee, [
                     'has_account' => false,
                     'is_department_head_record' => $controlNo !== '' && $this->hasControlNoInLookup($controlNo, $departmentHeadLookup),
@@ -1422,7 +1483,7 @@ class EmployeeController extends Controller
 
         $existingEmployeeControlNoLookup = $this->buildControlNoLookup(
             $employeeRows
-                ->map(fn(array $employee): string => trim((string) ($employee['control_no'] ?? '')))
+                ->map(fn (array $employee): string => trim((string) ($employee['control_no'] ?? '')))
                 ->filter()
                 ->values()
                 ->all()
@@ -1444,7 +1505,7 @@ class EmployeeController extends Controller
                 $existingEmployeeControlNoLookup,
                 $activeOnly
             ): bool {
-                if (!$this->matchesDepartmentHeadEmployeeFilters($departmentHead, $searchTerm, true, $activeOnly)) {
+                if (! $this->matchesDepartmentHeadEmployeeFilters($departmentHead, $searchTerm, true, $activeOnly)) {
                     return false;
                 }
 
@@ -1455,11 +1516,11 @@ class EmployeeController extends Controller
 
                 return true;
             })
-            ->map(fn(DepartmentHead $departmentHead): array => $this->serializeDepartmentHeadAsEmployee($departmentHead));
+            ->map(fn (DepartmentHead $departmentHead): array => $this->serializeDepartmentHeadAsEmployee($departmentHead));
 
         $combinedRows = $employeeRows
             ->concat($departmentHeadRows)
-            ->pipe(fn(Collection $rows): Collection => $this->sortEmployeeRows($rows))
+            ->pipe(fn (Collection $rows): Collection => $this->sortEmployeeRows($rows))
             ->values();
 
         $paginatedRows = new LengthAwarePaginator(
@@ -1521,7 +1582,7 @@ class EmployeeController extends Controller
 
             if (
                 $activeOnly === null
-                && !$isActive
+                && ! $isActive
                 && in_array($employeeStatus, ['HONORARIUM', 'CONTRACTUAL'], true)
             ) {
                 return false;
@@ -1534,11 +1595,11 @@ class EmployeeController extends Controller
             $limitedRows = [];
 
             foreach ($employees as $employee) {
-                if (!is_object($employee)) {
+                if (! is_object($employee)) {
                     continue;
                 }
 
-                if (!$matchesEmployeeFilters($employee)) {
+                if (! $matchesEmployeeFilters($employee)) {
                     continue;
                 }
 
@@ -1553,8 +1614,8 @@ class EmployeeController extends Controller
 
         $rows = $employees
             ->filter($matchesEmployeeFilters)
-            ->map(fn(object $employee): array => $this->serializeEmployee($employee))
-            ->pipe(fn(Collection $employeeRows): Collection => $this->sortEmployeeRows($employeeRows))
+            ->map(fn (object $employee): array => $this->serializeEmployee($employee))
+            ->pipe(fn (Collection $employeeRows): Collection => $this->sortEmployeeRows($employeeRows))
             ->values();
 
         if ($limit !== null && $limit > 0) {
@@ -1588,7 +1649,7 @@ class EmployeeController extends Controller
         $nameVariants = array_values(array_filter([
             trim(implode(' ', array_filter([$firstname, $middlename, $surname]))),
             trim(implode(' ', array_filter([$surname, $firstname, $middlename]))),
-            trim($surname . ', ' . implode(' ', array_filter([$firstname, $middlename]))),
+            trim($surname.', '.implode(' ', array_filter([$firstname, $middlename]))),
             trim(implode(' ', array_filter([$firstname, $surname]))),
             trim(implode(' ', array_filter([$surname, $firstname]))),
         ], static fn (string $value): bool => $value !== ''));
@@ -1626,6 +1687,7 @@ class EmployeeController extends Controller
         $normalizedAllFieldsBag = $this->normalizeEmployeeSearchText(
             implode(' ', array_merge([$normalizedNameBag], $baseFields)),
         );
+
         return $this->containsAllSearchTokens($normalizedAllFieldsBag, $searchTokens);
     }
 
@@ -1658,7 +1720,7 @@ class EmployeeController extends Controller
     }
 
     /**
-     * @param array<int, string> $tokens
+     * @param  array<int, string>  $tokens
      */
     private function containsAllSearchTokens(string $normalizedText, array $tokens): bool
     {
@@ -1667,7 +1729,7 @@ class EmployeeController extends Controller
         }
 
         foreach ($tokens as $token) {
-            if (!str_contains($normalizedText, $token)) {
+            if (! str_contains($normalizedText, $token)) {
                 return false;
             }
         }
@@ -1702,8 +1764,8 @@ class EmployeeController extends Controller
         $controlNos = DepartmentAdmin::query()
             ->whereNotNull('employee_control_no')
             ->pluck('employee_control_no')
-            ->map(fn(mixed $value): string => trim((string) $value))
-            ->filter(fn(string $value): bool => $value !== '')
+            ->map(fn (mixed $value): string => trim((string) $value))
+            ->filter(fn (string $value): bool => $value !== '')
             ->unique()
             ->values()
             ->all();
@@ -1769,7 +1831,7 @@ class EmployeeController extends Controller
 
         foreach ($lookupControlNos as $rawControlNo) {
             $employee = $this->resolveHrisDirectoryEmployee($employeesByControlNo, $rawControlNo);
-            if (!$employee) {
+            if (! $employee) {
                 continue;
             }
 
@@ -1786,13 +1848,13 @@ class EmployeeController extends Controller
 
             if (
                 $activeOnly === null
-                && !$isActive
+                && ! $isActive
                 && in_array($employeeStatus, ['HONORARIUM', 'CONTRACTUAL'], true)
             ) {
                 continue;
             }
 
-            if (!$this->matchesHrisEmployeeSearch($employee, $normalizedSearchTerm)) {
+            if (! $this->matchesHrisEmployeeSearch($employee, $normalizedSearchTerm)) {
                 continue;
             }
 
@@ -1887,7 +1949,7 @@ class EmployeeController extends Controller
             ->where('department_id', $departmentId)
             ->first();
 
-        if (!$departmentHead) {
+        if (! $departmentHead) {
             return false;
         }
 
@@ -1911,7 +1973,7 @@ class EmployeeController extends Controller
     private function assignEmployeeToDepartment(DepartmentAdmin $admin, string $controlNo): JsonResponse
     {
         $employee = HrisEmployee::findByControlNo($controlNo, true);
-        if (!$employee) {
+        if (! $employee) {
             return response()->json([
                 'message' => 'Employee not found in HRIS active records.',
             ], 422);
@@ -1924,7 +1986,7 @@ class EmployeeController extends Controller
             ->where('employee_control_no', $storedControlNo)
             ->first();
 
-        if ($existingAssignment && !($existingAssignment->department?->is_inactive ?? false)) {
+        if ($existingAssignment && ! ($existingAssignment->department?->is_inactive ?? false)) {
             if ((int) $existingAssignment->department_id === (int) $admin->department_id) {
                 $existingAssignment->fill($assignmentIdentityFields);
                 $existingAssignment->save();
@@ -2020,7 +2082,7 @@ class EmployeeController extends Controller
         $manualCreditUsageLookup = $this->loadManualLeaveCreditsUsageLookup($rowControlNos);
         $employees->setCollection(
             $rows->map(function (mixed $row) use ($manualCreditUsageLookup): mixed {
-                if (!is_array($row)) {
+                if (! is_array($row)) {
                     return $row;
                 }
 
@@ -2075,6 +2137,7 @@ class EmployeeController extends Controller
         }
 
         $normalizedControlNo = $this->normalizeLedgerControlNo($rawControlNo);
+
         return $normalizedControlNo !== null && isset($lookup[$normalizedControlNo]);
     }
 
@@ -2082,7 +2145,6 @@ class EmployeeController extends Controller
     {
         return strtoupper(trim((string) ($status ?? ''))) === 'CONTRACTUAL';
     }
-
 
     private function buildStatusCountsFromRows(Collection $rows): array
     {
@@ -2136,7 +2198,7 @@ class EmployeeController extends Controller
         bool $isHrAccount,
         ?bool $activeOnly = null
     ): bool {
-        if (!$this->matchesDepartmentHeadEmployeeFilters($departmentHead, $searchTerm, $isHrAccount, $activeOnly)) {
+        if (! $this->matchesDepartmentHeadEmployeeFilters($departmentHead, $searchTerm, $isHrAccount, $activeOnly)) {
             return false;
         }
 
@@ -2146,7 +2208,7 @@ class EmployeeController extends Controller
         }
 
         $employee = HrisEmployee::findByControlNo($controlNo);
-        if (!$employee) {
+        if (! $employee) {
             return true;
         }
 
@@ -2163,7 +2225,7 @@ class EmployeeController extends Controller
             $firstname = strtolower(trim((string) ($employee->firstname ?? '')));
             $surname = strtolower(trim((string) ($employee->surname ?? '')));
 
-            if (!str_contains($firstname, $term) && !str_contains($surname, $term)) {
+            if (! str_contains($firstname, $term) && ! str_contains($surname, $term)) {
                 return true;
             }
         }
@@ -2183,7 +2245,7 @@ class EmployeeController extends Controller
                 return false;
             }
 
-            if (!HrisEmployee::existsByControlNo($controlNo, $activeOnly)) {
+            if (! HrisEmployee::existsByControlNo($controlNo, $activeOnly)) {
                 return false;
             }
         }
@@ -2216,6 +2278,7 @@ class EmployeeController extends Controller
         }
 
         $text = trim((string) $value);
+
         return $text === '' ? null : $text;
     }
 
@@ -2230,7 +2293,7 @@ class EmployeeController extends Controller
             trim((string) ($employee->firstname ?? '')),
             trim((string) ($employee->middlename ?? '')),
             trim((string) ($employee->surname ?? '')),
-        ], static fn(string $part): bool => $part !== ''));
+        ], static fn (string $part): bool => $part !== ''));
 
         if ($parts === []) {
             return trim((string) ($employee->control_no ?? ''));
@@ -2261,7 +2324,7 @@ class EmployeeController extends Controller
 
         return array_values(array_unique(array_filter(
             $candidates,
-            static fn(string $value): bool => trim($value) !== ''
+            static fn (string $value): bool => trim($value) !== ''
         )));
     }
 
@@ -2272,11 +2335,12 @@ class EmployeeController extends Controller
             return null;
         }
 
-        if (!preg_match('/^\d+$/', $raw)) {
+        if (! preg_match('/^\d+$/', $raw)) {
             return null;
         }
 
         $normalized = ltrim($raw, '0');
+
         return $normalized === '' ? '0' : $normalized;
     }
 
@@ -2347,16 +2411,86 @@ class EmployeeController extends Controller
 
         $typeIds['mc06_related'] = array_values(array_unique(array_filter(
             array_map(
-                static fn(mixed $typeId): int => (int) $typeId,
+                static fn (mixed $typeId): int => (int) $typeId,
                 $typeIds['mc06_related']
             ),
-            static fn(int $typeId): bool => $typeId > 0
+            static fn (int $typeId): bool => $typeId > 0
         )));
         if ($typeIds['mc06'] === null && $typeIds['mc06_related'] !== []) {
             $typeIds['mc06'] = (int) $typeIds['mc06_related'][0];
         }
 
         return $typeIds;
+    }
+
+    /**
+     * @param  array<int, string>  $typeIdToKey
+     * @return array<int, array{leave_type_id:int, type_key:string, days:float}>
+     */
+    private function resolveLedgerMonetizationComponents(
+        LeaveApplication $application,
+        array $typeIdToKey,
+        ?string $fallbackTypeKey,
+        float $fallbackDays
+    ): array {
+        $rawComponents = $application->monetization_leave_credits ?? null;
+        if (is_string($rawComponents)) {
+            $decodedComponents = json_decode($rawComponents, true);
+            $rawComponents = json_last_error() === JSON_ERROR_NONE ? $decodedComponents : null;
+        }
+
+        if ($rawComponents instanceof Collection) {
+            $rawComponents = $rawComponents->all();
+        }
+
+        $componentsByKey = [];
+        if (is_array($rawComponents)) {
+            foreach ($rawComponents as $rawComponent) {
+                if (! is_array($rawComponent)) {
+                    continue;
+                }
+
+                $leaveTypeId = (int) ($rawComponent['leave_type_id'] ?? $rawComponent['leaveTypeId'] ?? 0);
+                $days = round(max((float) ($rawComponent['days'] ?? $rawComponent['total_days'] ?? 0), 0.0), self::LEDGER_DECIMAL_PRECISION);
+                if ($leaveTypeId <= 0 || $days <= 0.0) {
+                    continue;
+                }
+
+                $canonicalLeaveTypeId = LeaveType::resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+                $typeKey = $typeIdToKey[$canonicalLeaveTypeId] ?? $typeIdToKey[$leaveTypeId] ?? null;
+                if (! in_array($typeKey, ['vacation', 'sick'], true)) {
+                    continue;
+                }
+
+                if (! array_key_exists($typeKey, $componentsByKey)) {
+                    $componentsByKey[$typeKey] = [
+                        'leave_type_id' => $canonicalLeaveTypeId,
+                        'type_key' => $typeKey,
+                        'days' => 0.0,
+                    ];
+                }
+
+                $componentsByKey[$typeKey]['days'] = round(
+                    (float) $componentsByKey[$typeKey]['days'] + $days,
+                    self::LEDGER_DECIMAL_PRECISION
+                );
+            }
+        }
+
+        if ($componentsByKey !== []) {
+            return array_values($componentsByKey);
+        }
+
+        $fallbackAmount = round(max($fallbackDays, 0.0), self::LEDGER_DECIMAL_PRECISION);
+        if (! in_array($fallbackTypeKey, ['vacation', 'sick'], true) || $fallbackAmount <= 0.0) {
+            return [];
+        }
+
+        return [[
+            'leave_type_id' => (int) $application->leave_type_id,
+            'type_key' => $fallbackTypeKey,
+            'days' => $fallbackAmount,
+        ]];
     }
 
     private function loadPreferredLedgerBalancesByType(array $controlNoCandidates, array $trackedTypeIds): array
@@ -2381,8 +2515,9 @@ class EmployeeController extends Controller
                 continue;
             }
 
-            if (!array_key_exists($typeId, $preferredBalancesByType)) {
+            if (! array_key_exists($typeId, $preferredBalancesByType)) {
                 $preferredBalancesByType[$typeId] = $balance;
+
                 continue;
             }
 
@@ -2402,7 +2537,7 @@ class EmployeeController extends Controller
 
     private function resolveLedgerBalance(array $balancesByType, ?int $leaveTypeId): float
     {
-        if ($leaveTypeId === null || !isset($balancesByType[$leaveTypeId])) {
+        if ($leaveTypeId === null || ! isset($balancesByType[$leaveTypeId])) {
             return 0.0;
         }
 
@@ -2445,20 +2580,20 @@ class EmployeeController extends Controller
         };
 
         if ($entryKind === 'earned') {
-            return $prefix !== null ? $prefix . ' 0-0-0' : '0-0-0';
+            return $prefix !== null ? $prefix.' 0-0-0' : '0-0-0';
         }
 
         $formattedDuration = $this->formatLedgerDaysHoursMinutes($days);
         if ($isMonetization) {
-            return $formattedDuration . ' Monetization';
+            return $formattedDuration.' Monetization';
         }
 
         $baseParticulars = $prefix !== null
-            ? $prefix . ' ' . $formattedDuration
+            ? $prefix.' '.$formattedDuration
             : $formattedDuration;
 
         return $entryKind === 'recall'
-            ? $baseParticulars . ' Recalled'
+            ? $baseParticulars.' Recalled'
             : $baseParticulars;
     }
 
@@ -2591,7 +2726,7 @@ class EmployeeController extends Controller
         }
 
         $selectedDates = $application->resolvedSelectedDates();
-        if (!is_array($selectedDates) || $selectedDates === []) {
+        if (! is_array($selectedDates) || $selectedDates === []) {
             return ['days' => $deductibleDays, 'dates' => []];
         }
 
@@ -2629,7 +2764,7 @@ class EmployeeController extends Controller
 
         foreach ($selectedDates as $rawDate) {
             $dateKey = $this->normalizeLedgerDateKey($rawDate) ?? trim((string) $rawDate);
-            if ($dateKey === '' || !isset($selectedRecallDateSet[$dateKey])) {
+            if ($dateKey === '' || ! isset($selectedRecallDateSet[$dateKey])) {
                 continue;
             }
 
@@ -2675,7 +2810,7 @@ class EmployeeController extends Controller
         }
 
         $selectedDates = $application->resolvedSelectedDates();
-        if (!is_array($selectedDates) || $selectedDates === []) {
+        if (! is_array($selectedDates) || $selectedDates === []) {
             return [];
         }
 
@@ -2787,7 +2922,7 @@ class EmployeeController extends Controller
         ?array $selectedDates,
         string $payMode
     ): ?array {
-        if (!is_array($selectedDatePayStatus) || $selectedDatePayStatus === []) {
+        if (! is_array($selectedDatePayStatus) || $selectedDatePayStatus === []) {
             return null;
         }
 
@@ -2823,7 +2958,7 @@ class EmployeeController extends Controller
                 continue;
             }
 
-            if ($restrictToSelectedDates && !array_key_exists($dateKey, $dateSet)) {
+            if ($restrictToSelectedDates && ! array_key_exists($dateKey, $dateSet)) {
                 continue;
             }
 
@@ -2844,6 +2979,7 @@ class EmployeeController extends Controller
         }
 
         ksort($compacted);
+
         return $compacted;
     }
 
@@ -2851,7 +2987,7 @@ class EmployeeController extends Controller
         ?array $selectedDateCoverage,
         ?array $selectedDates
     ): ?array {
-        if (!is_array($selectedDateCoverage) || $selectedDateCoverage === []) {
+        if (! is_array($selectedDateCoverage) || $selectedDateCoverage === []) {
             return null;
         }
 
@@ -2886,17 +3022,18 @@ class EmployeeController extends Controller
                 continue;
             }
 
-            if ($restrictToSelectedDates && !array_key_exists($dateKey, $dateSet)) {
+            if ($restrictToSelectedDates && ! array_key_exists($dateKey, $dateSet)) {
                 continue;
             }
 
             $coverage = strtolower(trim((string) $rawCoverage));
             if ($coverage === 'half') {
                 $compacted[$dateKey] = 'half';
+
                 continue;
             }
 
-            if (!$restrictToSelectedDates && $coverage === 'whole') {
+            if (! $restrictToSelectedDates && $coverage === 'whole') {
                 $compacted[$dateKey] = 'whole';
             }
         }
@@ -2906,6 +3043,7 @@ class EmployeeController extends Controller
         }
 
         ksort($compacted);
+
         return $compacted;
     }
 
@@ -2945,7 +3083,7 @@ class EmployeeController extends Controller
             $wholeMatch = abs(($dateCount * $defaultWholeDayWeight) - $totalDays) < 0.00001;
             if ($halfMatch) {
                 $defaultCoverageWeight = $defaultHalfDayWeight;
-            } elseif (!$wholeMatch) {
+            } elseif (! $wholeMatch) {
                 $defaultCoverageWeight = max(
                     min($totalDays / $dateCount, $defaultWholeDayWeight),
                     $defaultHalfDayWeight
@@ -2959,16 +3097,19 @@ class EmployeeController extends Controller
             $coverage = strtolower(trim((string) ($coverageMap[$dateKey] ?? '')));
             if ($coverage === 'half') {
                 $weights[$dateKey] = $defaultHalfDayWeight;
+
                 continue;
             }
 
             if ($coverage === 'whole') {
                 $weights[$dateKey] = $defaultWholeDayWeight;
+
                 continue;
             }
 
-            if ($hasCoverageOverrides && !$hasCoverageValue) {
+            if ($hasCoverageOverrides && ! $hasCoverageValue) {
                 $weights[$dateKey] = $defaultWholeDayWeight;
+
                 continue;
             }
 

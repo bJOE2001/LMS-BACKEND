@@ -21,21 +21,34 @@ use Throwable;
 class HrisEmployee
 {
     private const HR_CONNECTION = 'hr';
+
     private const PERSONAL_TABLE = 'xPersonal';
+
     private const PARTITION_VIEW = 'vwpartitionforseparated';
+
     private const OFFICE_TABLE = 'yOffice';
+
     private const CACHE_TTL_MINUTES = 5;
+
     private const STALE_CACHE_TTL_MINUTES = 60;
+
     private const CACHE_LOCK_SECONDS = 15;
+
     private const CACHE_LOCK_WAIT_SECONDS = 6;
+
     private const CACHE_FAILURE_COOLDOWN_SECONDS = 30;
+
     private const CACHE_VERSION_KEY = 'hris_employees.cache_version';
+
     /** @var array<string, object|null> */
     private static array $singleLookupMemo = [];
+
     /** @var array<string, array{department_id:int|null, department_name:string}>|null */
     private static ?array $assignedDepartmentNamesMemo = null;
+
     /** @var array<string, string>|null */
     private static ?array $officeAcronymsByOfficeNameMemo = null;
+
     private static ?string $cacheVersionMemo = null;
 
     /**
@@ -61,7 +74,7 @@ class HrisEmployee
             ->selectRaw('vp.FromDate as from_date')
             ->selectRaw('vp.ToDate as to_date')
             ->selectRaw(
-                "CASE WHEN vp.FromDate IS NOT NULL AND vp.ToDate IS NOT NULL AND GETDATE() BETWEEN vp.FromDate AND vp.ToDate THEN CAST(1 AS bit) ELSE CAST(0 AS bit) END as is_active"
+                'CASE WHEN vp.FromDate IS NOT NULL AND vp.ToDate IS NOT NULL AND GETDATE() BETWEEN vp.FromDate AND vp.ToDate THEN CAST(1 AS bit) ELSE CAST(0 AS bit) END as is_active'
             )
             ->selectRaw(
                 "CASE WHEN vp.FromDate IS NOT NULL AND vp.ToDate IS NOT NULL AND GETDATE() BETWEEN vp.FromDate AND vp.ToDate THEN 'ACTIVE' ELSE 'INACTIVE' END as activity_status"
@@ -128,7 +141,7 @@ class HrisEmployee
     /**
      * Build an employee directory keyed by normalized control number.
      *
-     * @param array<int, mixed> $controlNos
+     * @param  array<int, mixed>  $controlNos
      * @return array<string, object>
      */
     public static function directoryByControlNos(array $controlNos, ?bool $activeOnly = null): array
@@ -225,6 +238,35 @@ class HrisEmployee
         return self::findByControlNo($controlNo, $activeOnly) !== null;
     }
 
+    public static function firstDayOfServiceByControlNo(string $controlNo): ?string
+    {
+        $lookupValues = self::controlNoLookupValues([$controlNo]);
+        if ($lookupValues === []) {
+            return null;
+        }
+
+        $cacheKey = self::lookupCacheKey('first_day_of_service', $lookupValues, null);
+
+        return self::rememberResilient(
+            $cacheKey,
+            static function () use ($lookupValues): ?string {
+                $query = DB::connection(self::HR_CONNECTION)
+                    ->table(self::PARTITION_VIEW.' as vp')
+                    ->whereNotNull('vp.FromDate')
+                    ->selectRaw('MIN(vp.FromDate) as first_day_of_service');
+
+                self::applyLiteralControlNoFilter($query, 'vp.ControlNo', $lookupValues);
+
+                return self::dateValueToDateString($query->value('first_day_of_service'));
+            },
+            null,
+            'firstDayOfServiceByControlNo',
+            [
+                'lookup_count' => count($lookupValues),
+            ]
+        );
+    }
+
     private static function orderedQuery(?bool $activeOnly = null, bool $includeOfficeAcronym = true): Builder
     {
         return self::query($activeOnly, $includeOfficeAcronym)
@@ -275,6 +317,7 @@ class HrisEmployee
         $officeName = trim((string) ($officeName ?? ''));
         if ($officeName === '') {
             $query->whereRaw('1 = 0');
+
             return;
         }
 
@@ -287,6 +330,7 @@ class HrisEmployee
             $query->whereRaw(
                 'vp.FromDate IS NOT NULL AND vp.ToDate IS NOT NULL AND GETDATE() BETWEEN vp.FromDate AND vp.ToDate'
             );
+
             return;
         }
 
@@ -306,12 +350,13 @@ class HrisEmployee
     }
 
     /**
-     * @param array<int, string> $lookupValues
+     * @param  array<int, string>  $lookupValues
      */
     private static function applyControlNoFilters(Builder $query, array $lookupValues): void
     {
         if ($lookupValues === []) {
             $query->whereRaw('1 = 0');
+
             return;
         }
 
@@ -319,7 +364,7 @@ class HrisEmployee
     }
 
     /**
-     * @param array<int, string> $lookupValues
+     * @param  array<int, string>  $lookupValues
      * @return array<int, array<string, mixed>>
      */
     private static function fetchDirectoryRowsByControlNos(array $lookupValues, ?bool $activeOnly = null): array
@@ -460,7 +505,7 @@ class HrisEmployee
             static function (string $controlNo) use ($existingNormalizedControlNos): bool {
                 $normalizedControlNo = self::normalizeControlNoInt($controlNo);
 
-                return $normalizedControlNo !== null && !array_key_exists($normalizedControlNo, $existingNormalizedControlNos);
+                return $normalizedControlNo !== null && ! array_key_exists($normalizedControlNo, $existingNormalizedControlNos);
             }
         ));
 
@@ -544,7 +589,7 @@ class HrisEmployee
     }
 
     /**
-     * @param array<int, array<string, mixed>> $rows
+     * @param  array<int, array<string, mixed>>  $rows
      * @return array<int, array<string, mixed>>
      */
     private static function applyDepartmentAssignments(array $rows): array
@@ -723,8 +768,8 @@ class HrisEmployee
     }
 
     /**
-     * @param array<int, array<string, mixed>> $primaryRows
-     * @param array<int, array<string, mixed>> $fallbackRows
+     * @param  array<int, array<string, mixed>>  $primaryRows
+     * @param  array<int, array<string, mixed>>  $fallbackRows
      * @return array<int, array<string, mixed>>
      */
     private static function mergePreferredEmployeeRows(array $primaryRows, array $fallbackRows): array
@@ -732,8 +777,9 @@ class HrisEmployee
         $resolvedRows = self::rowsByNormalizedControlNo($primaryRows);
 
         foreach (self::rowsByNormalizedControlNo($fallbackRows) as $normalizedControlNo => $fallbackRow) {
-            if (!array_key_exists($normalizedControlNo, $resolvedRows)) {
+            if (! array_key_exists($normalizedControlNo, $resolvedRows)) {
                 $resolvedRows[$normalizedControlNo] = $fallbackRow;
+
                 continue;
             }
 
@@ -747,8 +793,8 @@ class HrisEmployee
     }
 
     /**
-     * @param array<string, mixed> $primaryRow
-     * @param array<string, mixed> $fallbackRow
+     * @param  array<string, mixed>  $primaryRow
+     * @param  array<string, mixed>  $fallbackRow
      * @return array<string, mixed>
      */
     private static function mergeEmployeeRowFields(array $primaryRow, array $fallbackRow): array
@@ -773,25 +819,25 @@ class HrisEmployee
         ] as $field) {
             if (
                 self::rowValueIsMissing($resolvedRow[$field] ?? null)
-                && !self::rowValueIsMissing($fallbackRow[$field] ?? null)
+                && ! self::rowValueIsMissing($fallbackRow[$field] ?? null)
             ) {
                 $resolvedRow[$field] = $fallbackRow[$field];
             }
         }
 
-        $primaryHasActiveWindow = !self::rowValueIsMissing($resolvedRow['from_date'] ?? null)
-            || !self::rowValueIsMissing($resolvedRow['to_date'] ?? null);
+        $primaryHasActiveWindow = ! self::rowValueIsMissing($resolvedRow['from_date'] ?? null)
+            || ! self::rowValueIsMissing($resolvedRow['to_date'] ?? null);
 
         if (
-            !$primaryHasActiveWindow
+            ! $primaryHasActiveWindow
             && array_key_exists('is_active', $fallbackRow)
         ) {
             $resolvedRow['is_active'] = $fallbackRow['is_active'];
-        } elseif (!array_key_exists('is_active', $resolvedRow) && array_key_exists('is_active', $fallbackRow)) {
+        } elseif (! array_key_exists('is_active', $resolvedRow) && array_key_exists('is_active', $fallbackRow)) {
             $resolvedRow['is_active'] = $fallbackRow['is_active'];
         }
 
-        if (!array_key_exists('is_active', $resolvedRow)) {
+        if (! array_key_exists('is_active', $resolvedRow)) {
             $resolvedRow['is_active'] = self::isCurrentlyActive(
                 $resolvedRow['from_date'] ?? null,
                 $resolvedRow['to_date'] ?? null
@@ -816,8 +862,8 @@ class HrisEmployee
     }
 
     /**
-     * @param array<int, array<string, mixed>> $personalRows
-     * @param array<int, array<string, mixed>> $partitionRows
+     * @param  array<int, array<string, mixed>>  $personalRows
+     * @param  array<int, array<string, mixed>>  $partitionRows
      * @return array<int, array<string, mixed>>
      */
     private static function mergeEmployeeRows(array $personalRows, array $partitionRows, ?bool $activeOnly = null): array
@@ -864,7 +910,7 @@ class HrisEmployee
     }
 
     /**
-     * @param array<int, array<string, mixed>> $rows
+     * @param  array<int, array<string, mixed>>  $rows
      * @return array<int, array<string, mixed>>
      */
     private static function filterRowsByActivity(array $rows, ?bool $activeOnly): array
@@ -879,7 +925,7 @@ class HrisEmployee
         if ($activeOnly === false) {
             return array_values(array_filter(
                 $rows,
-                static fn (array $row): bool => !filter_var($row['is_active'] ?? false, FILTER_VALIDATE_BOOLEAN)
+                static fn (array $row): bool => ! filter_var($row['is_active'] ?? false, FILTER_VALIDATE_BOOLEAN)
             ));
         }
 
@@ -887,7 +933,7 @@ class HrisEmployee
     }
 
     /**
-     * @param array<int, array<string, mixed>> $rows
+     * @param  array<int, array<string, mixed>>  $rows
      * @return array<int, array<string, mixed>>
      */
     private static function filterRowsByResolvedOffice(array $rows, string $officeName): array
@@ -923,7 +969,7 @@ class HrisEmployee
     }
 
     /**
-     * @param array<int, mixed> $controlNos
+     * @param  array<int, mixed>  $controlNos
      * @return array<int, string>
      */
     private static function controlNoLookupValues(array $controlNos): array
@@ -959,7 +1005,7 @@ class HrisEmployee
     }
 
     /**
-     * @param array<int, array<string, mixed>> $rows
+     * @param  array<int, array<string, mixed>>  $rows
      * @return array<int, string>
      */
     private static function rawControlNoValues(array $rows): array
@@ -973,7 +1019,7 @@ class HrisEmployee
     }
 
     /**
-     * @param array<int, array<string, mixed>> $rows
+     * @param  array<int, array<string, mixed>>  $rows
      * @return array<string, array<string, mixed>>
      */
     private static function rowsByNormalizedControlNo(array $rows): array
@@ -986,7 +1032,7 @@ class HrisEmployee
                 continue;
             }
 
-            if (!array_key_exists('control_no', $row)) {
+            if (! array_key_exists('control_no', $row)) {
                 $row['control_no'] = trim((string) ($row['raw_control_no'] ?? ''));
             }
 
@@ -1013,8 +1059,25 @@ class HrisEmployee
         }
     }
 
+    private static function dateValueToDateString(mixed $value): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+
+        try {
+            $date = $value instanceof \DateTimeInterface
+                ? \DateTimeImmutable::createFromInterface($value)
+                : new \DateTimeImmutable((string) $value);
+
+            return $date->format('Y-m-d');
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     /**
-     * @param array<int, string> $lookupValues
+     * @param  array<int, string>  $lookupValues
      */
     private static function applyLiteralControlNoFilter(Builder $query, string $qualifiedColumn, array $lookupValues): void
     {
@@ -1027,6 +1090,7 @@ class HrisEmployee
 
         if ($literalValues === []) {
             $query->whereRaw('1 = 0');
+
             return;
         }
 
@@ -1044,7 +1108,7 @@ class HrisEmployee
         $logFingerprint = md5($operation.'|'.$message);
         $logKey = "hris_employee.failure.{$logFingerprint}";
 
-        if (!Cache::add($logKey, true, now()->addMinute())) {
+        if (! Cache::add($logKey, true, now()->addMinute())) {
             return;
         }
 
@@ -1130,7 +1194,7 @@ class HrisEmployee
     }
 
     /**
-     * @param array<int, array<string, mixed>> $rows
+     * @param  array<int, array<string, mixed>>  $rows
      * @return array<string, object>
      */
     private static function keyEmployeeDirectory(array $rows, ?bool $activeOnly): array
@@ -1176,7 +1240,7 @@ class HrisEmployee
     private static function normalizeOfficeLookupKey(mixed $officeName): string
     {
         $normalized = preg_replace('/\s+/', ' ', trim((string) ($officeName ?? '')));
-        if (!is_string($normalized) || $normalized === '') {
+        if (! is_string($normalized) || $normalized === '') {
             return '';
         }
 
@@ -1219,7 +1283,7 @@ class HrisEmployee
             ->where('name', $normalizedDepartmentName)
             ->value('id');
 
-        if (!$departmentId) {
+        if (! $departmentId) {
             return [];
         }
 
@@ -1275,7 +1339,7 @@ class HrisEmployee
     }
 
     /**
-     * @param array<int, array<string, mixed>> $rows
+     * @param  array<int, array<string, mixed>>  $rows
      * @return array<int, array<string, mixed>>
      */
     private static function hydrateOfficeFallbackRows(array $rows, string $officeName): array
@@ -1302,7 +1366,7 @@ class HrisEmployee
     }
 
     /**
-     * @param array<int, string> $lookupValues
+     * @param  array<int, string>  $lookupValues
      */
     private static function lookupCacheKey(string $suffix, array $lookupValues, ?bool $activeOnly): string
     {
@@ -1324,7 +1388,7 @@ class HrisEmployee
         }
 
         $cachedVersion = Cache::get(self::CACHE_VERSION_KEY);
-        if (!is_string($cachedVersion) || trim($cachedVersion) === '') {
+        if (! is_string($cachedVersion) || trim($cachedVersion) === '') {
             $cachedVersion = 'v4';
             Cache::forever(self::CACHE_VERSION_KEY, $cachedVersion);
         }
