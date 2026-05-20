@@ -7518,7 +7518,7 @@ class LeaveApplicationController extends Controller
         $effectiveBalance = round(max(
             $this->cocLedgerService()->getAvailableDays($employeeControlNo, $ctoLeaveTypeId, $asOfDate),
             0.0
-        ), 2);
+        ), 3);
 
         $query = LeaveBalance::query()
             ->whereIn('employee_control_no', $controlNoCandidates)
