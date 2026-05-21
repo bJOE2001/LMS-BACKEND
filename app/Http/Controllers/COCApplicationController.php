@@ -833,7 +833,7 @@ class COCApplicationController extends Controller
     {
         $hr = $request->user();
         if (!$hr instanceof HRAccount) {
-            return response()->json(['message' => 'Only HR accounts can confirm CMO/CBMO review.'], 403);
+            return response()->json(['message' => 'Only HR accounts can confirm CMO/CVMO review.'], 403);
         }
 
         try {
@@ -867,7 +867,7 @@ class COCApplicationController extends Controller
                 $status = str_replace('COC_CMO_CBMO_REVIEW_INVALID_STATUS:', '', $exception->getMessage());
 
                 return response()->json([
-                    'message' => "Cannot complete CMO/CBMO review: application status is '{$status}'.",
+                    'message' => "Cannot complete CMO/CVMO review: application status is '{$status}'.",
                 ], 422);
             }
 
@@ -878,8 +878,8 @@ class COCApplicationController extends Controller
 
         return response()->json([
             'message' => $alreadyReviewed
-                ? 'COC application CMO/CBMO review was already completed.'
-                : 'COC application CMO/CBMO review completed.',
+                ? 'COC application CMO/CVMO review was already completed.'
+                : 'COC application CMO/CVMO review completed.',
             'application' => $app ? $this->formatApplication($app) : null,
         ]);
     }
@@ -1927,8 +1927,8 @@ class COCApplicationController extends Controller
             'BALANCE_CAP_EXCEEDED' => response()->json(['message' => 'Approving this application would exceed the 120-hour maximum COC balance.'], 422),
             'OVERNIGHT_LIMIT_EXCEEDED' => response()->json(['message' => 'No employee shall render overnight overtime for more than two consecutive nights.'], 422),
             'COC_RELEASE_BEFORE_RECEIVE' => response()->json(['message' => 'Cannot mark as released before confirming receipt of the COC application.'], 422),
-            'COC_RELEASE_BEFORE_CMO_CBMO_REVIEW' => response()->json(['message' => 'Cannot mark as released before completing CMO/CBMO review.'], 422),
-            'COC_CMO_CBMO_REVIEW_BEFORE_RECEIVE' => response()->json(['message' => 'Cannot complete CMO/CBMO review before confirming receipt of the COC application.'], 422),
+            'COC_RELEASE_BEFORE_CMO_CBMO_REVIEW' => response()->json(['message' => 'Cannot mark as released before completing CMO/CVMO review.'], 422),
+            'COC_CMO_CBMO_REVIEW_BEFORE_RECEIVE' => response()->json(['message' => 'Cannot complete CMO/CVMO review before confirming receipt of the COC application.'], 422),
             'LATE_FILING_NOT_PENDING' => response()->json(['message' => 'This COC late filing is no longer pending HR late-filing review.'], 422),
             'ENTRY_NOT_EDITABLE' => response()->json(['message' => 'Only HR-imported approved COC entries may be edited here.'], 422),
             default => throw $exception,

@@ -2504,7 +2504,7 @@ class LeaveApplicationController extends Controller
 
             if (! $cmoCbmoReviewedLog) {
                 return response()->json([
-                    'message' => 'Cannot mark as released before completing CMO/CBMO review.',
+                    'message' => 'Cannot mark as released before completing CMO/CVMO review.',
                 ], 422);
             }
 
@@ -2530,13 +2530,13 @@ class LeaveApplicationController extends Controller
     }
 
     /**
-     * HR records CMO/CBMO review after HR certification and before release.
+     * HR records CMO/CVMO review after HR certification and before release.
      */
     public function hrCmoCbmoReview(Request $request, int $id): JsonResponse
     {
         $hr = $request->user();
         if (! $hr instanceof HRAccount) {
-            return response()->json(['message' => 'Only HR accounts can confirm CMO/CBMO review.'], 403);
+            return response()->json(['message' => 'Only HR accounts can confirm CMO/CVMO review.'], 403);
         }
 
         $request->validate([
@@ -2552,7 +2552,7 @@ class LeaveApplicationController extends Controller
 
         if ($app->status !== LeaveApplication::STATUS_APPROVED) {
             return response()->json([
-                'message' => "Cannot complete CMO/CBMO review: application status is '{$app->status}'.",
+                'message' => "Cannot complete CMO/CVMO review: application status is '{$app->status}'.",
             ], 422);
         }
 
@@ -2563,7 +2563,7 @@ class LeaveApplicationController extends Controller
 
         if (! $receivedLog) {
             return response()->json([
-                'message' => 'Cannot complete CMO/CBMO review before confirming receipt of the hard-copy application.',
+                'message' => 'Cannot complete CMO/CVMO review before confirming receipt of the hard-copy application.',
             ], 422);
         }
 
@@ -2578,7 +2578,7 @@ class LeaveApplicationController extends Controller
                 'action' => LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED,
                 'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
                 'performed_by_id' => $hr->id,
-                'remarks' => $request->input('remarks') ?: 'CMO/CBMO review completed.',
+                'remarks' => $request->input('remarks') ?: 'CMO/CVMO review completed.',
                 'created_at' => now(),
             ]);
             $app->load('logs');
@@ -2588,8 +2588,8 @@ class LeaveApplicationController extends Controller
 
         return response()->json([
             'message' => $reviewedLog
-                ? 'CMO/CBMO review was already completed for this application.'
-                : 'CMO/CBMO review completed.',
+                ? 'CMO/CVMO review was already completed for this application.'
+                : 'CMO/CVMO review completed.',
             'application' => $this->formatErmsApplication($app, $actorDirectory),
         ]);
     }
@@ -5367,7 +5367,7 @@ class LeaveApplicationController extends Controller
             LeaveApplicationLog::ACTION_HR_REJECTED => 'hr rejected',
             LeaveApplicationLog::ACTION_HR_RECALLED => 'hr recalled',
             LeaveApplicationLog::ACTION_HR_RECEIVED => 'received application',
-            LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED => 'cmo/cbmo reviewed',
+            LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED => 'cmo/cvmo reviewed',
             LeaveApplicationLog::ACTION_HR_RELEASED => 'released application',
             default => strtolower(str_replace('_', ' ', (string) $log->action)),
         };
