@@ -84,44 +84,95 @@ class EmployeeController extends Controller
             ], 403);
         }
 
-        $employee = HrisEmployee::query(true)
-            ->whereRaw('LOWER(LTRIM(RTRIM(vp.Designation))) LIKE ?', ['%city administrator%'])
-            ->orderByRaw('vp.ToDate DESC')
-            ->orderByRaw('vp.FromDate DESC')
-            ->orderByRaw('LTRIM(RTRIM(xp.Surname))')
-            ->orderByRaw('LTRIM(RTRIM(xp.Firstname))')
-            ->first();
+        return response()->json([
+            'city_administrator' => $this->serializeCityAdministratorEmployee(
+                $this->resolveCityAdministratorEmployee()
+            ),
+        ]);
+    }
 
-        if (! $employee) {
-            $employee = HrisEmployee::query(null)
-                ->whereRaw('LOWER(LTRIM(RTRIM(vp.Designation))) LIKE ?', ['%city administrator%'])
-                ->orderByRaw('CASE WHEN vp.FromDate IS NOT NULL AND vp.ToDate IS NOT NULL AND GETDATE() BETWEEN vp.FromDate AND vp.ToDate THEN 0 ELSE 1 END')
-                ->orderByRaw('vp.ToDate DESC')
-                ->orderByRaw('vp.FromDate DESC')
-                ->orderByRaw('LTRIM(RTRIM(xp.Surname))')
-                ->orderByRaw('LTRIM(RTRIM(xp.Firstname))')
-                ->first();
+    /**
+     * Return the City Administrator signatory for ERMS-integrated clients.
+     * Protected by the ERMS middleware route group.
+     */
+    public function ermsCityAdministrator(): JsonResponse
+    {
+        return response()->json([
+            'city_administrator' => $this->serializeCityAdministratorEmployee(
+                $this->resolveCityAdministratorEmployee()
+            ),
+        ]);
+    }
+
+    /**
+     * Resolve the department head for ERMS-integrated clients.
+     * Accepts department_id, department_name, or employee_control_no.
+     */
+    public function ermsDepartmentHead(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'department_id' => ['nullable', 'integer', 'min:1'],
+            'department_name' => ['nullable', 'string', 'max:255'],
+            'employee_control_no' => ['nullable', 'string', 'max:64', 'regex:/^\d+$/'],
+        ]);
+
+        $departmentId = isset($validated['department_id']) ? (int) $validated['department_id'] : null;
+        $departmentName = trim((string) ($validated['department_name'] ?? ''));
+        $employeeControlNo = trim((string) ($validated['employee_control_no'] ?? ''));
+
+        if ($departmentId !== null && $departmentName === '') {
+            $departmentName = trim((string) (Department::query()->find($departmentId)?->name ?? ''));
         }
 
-        if (! $employee) {
+        if ($departmentName === '' && $employeeControlNo !== '') {
+            $employee = HrisEmployee::findByControlNo($employeeControlNo, true)
+                ?? HrisEmployee::findByControlNo($employeeControlNo);
+            $departmentName = trim((string) ($employee?->office ?? ''));
+        }
+
+        if ($departmentId === null && $departmentName === '') {
             return response()->json([
-                'city_administrator' => null,
+                'department_head' => null,
             ]);
         }
 
-        $designation = $this->trimOrBlank($employee->designation ?? null);
+        $departmentHead = null;
+        if ($departmentId !== null) {
+            $departmentHead = DepartmentHead::query()
+                ->where('department_id', $departmentId)
+                ->orderByDesc('id')
+                ->first();
+        }
+
+        $normalizedDepartmentName = $this->normalizeDepartmentLookupLabel($departmentName);
+        if (! $departmentHead && $normalizedDepartmentName !== '') {
+            $departmentFromLibrary = Department::query()
+                ->active()
+                ->get()
+                ->first(function (Department $department) use ($normalizedDepartmentName): bool {
+                    return $this->normalizeDepartmentLookupLabel((string) $department->name) === $normalizedDepartmentName;
+                });
+
+            if ($departmentFromLibrary) {
+                $departmentHead = DepartmentHead::query()
+                    ->where('department_id', (int) $departmentFromLibrary->id)
+                    ->orderByDesc('id')
+                    ->first();
+            }
+        }
+
+        if (! $departmentHead && $normalizedDepartmentName !== '') {
+            $departmentHead = DepartmentHead::query()
+                ->orderByDesc('id')
+                ->get()
+                ->first(function (DepartmentHead $candidate) use ($normalizedDepartmentName): bool {
+                    return $this->normalizeDepartmentLookupLabel((string) ($candidate->office ?? ''))
+                        === $normalizedDepartmentName;
+                });
+        }
 
         return response()->json([
-            'city_administrator' => [
-                'control_no' => trim((string) ($employee->control_no ?? '')),
-                'firstname' => $this->trimOrBlank($employee->firstname ?? null),
-                'surname' => $this->trimOrBlank($employee->surname ?? null),
-                'middlename' => $this->trimOrBlank($employee->middlename ?? null),
-                'full_name' => $this->buildEmployeeFullName($employee),
-                'designation' => $designation !== '' ? $designation : 'City Administrator',
-                'position' => $designation !== '' ? $designation : 'City Administrator',
-                'office' => $this->trimOrBlank($employee->office ?? null),
-            ],
+            'department_head' => $departmentHead ? $this->serializeDepartmentHead($departmentHead) : null,
         ]);
     }
 
@@ -2262,6 +2313,50 @@ class EmployeeController extends Controller
             || str_contains(strtolower($surname), strtolower($term));
     }
 
+    private function resolveCityAdministratorEmployee(): ?object
+    {
+        $employee = HrisEmployee::query(true)
+            ->whereRaw('LOWER(LTRIM(RTRIM(vp.Designation))) LIKE ?', ['%city administrator%'])
+            ->orderByRaw('vp.ToDate DESC')
+            ->orderByRaw('vp.FromDate DESC')
+            ->orderByRaw('LTRIM(RTRIM(xp.Surname))')
+            ->orderByRaw('LTRIM(RTRIM(xp.Firstname))')
+            ->first();
+
+        if ($employee) {
+            return $employee;
+        }
+
+        return HrisEmployee::query(null)
+            ->whereRaw('LOWER(LTRIM(RTRIM(vp.Designation))) LIKE ?', ['%city administrator%'])
+            ->orderByRaw('CASE WHEN vp.FromDate IS NOT NULL AND vp.ToDate IS NOT NULL AND GETDATE() BETWEEN vp.FromDate AND vp.ToDate THEN 0 ELSE 1 END')
+            ->orderByRaw('vp.ToDate DESC')
+            ->orderByRaw('vp.FromDate DESC')
+            ->orderByRaw('LTRIM(RTRIM(xp.Surname))')
+            ->orderByRaw('LTRIM(RTRIM(xp.Firstname))')
+            ->first();
+    }
+
+    private function serializeCityAdministratorEmployee(?object $employee): ?array
+    {
+        if (! $employee) {
+            return null;
+        }
+
+        $designation = $this->trimOrBlank($employee->designation ?? null);
+
+        return [
+            'control_no' => trim((string) ($employee->control_no ?? '')),
+            'firstname' => $this->trimOrBlank($employee->firstname ?? null),
+            'surname' => $this->trimOrBlank($employee->surname ?? null),
+            'middlename' => $this->trimOrBlank($employee->middlename ?? null),
+            'full_name' => $this->buildEmployeeFullName($employee),
+            'designation' => $designation !== '' ? $designation : 'City Administrator',
+            'position' => $designation !== '' ? $designation : 'City Administrator',
+            'office' => $this->trimOrBlank($employee->office ?? null),
+        ];
+    }
+
     private function buildDepartmentHeadFullName(array $attributes): string
     {
         return trim(implode(' ', array_filter([
@@ -2269,6 +2364,22 @@ class EmployeeController extends Controller
             $attributes['middlename'] ?? null,
             $attributes['surname'] ?? null,
         ], static fn (mixed $value): bool => $value !== null && trim((string) $value) !== '')));
+    }
+
+    private function normalizeDepartmentLookupLabel(string $value): string
+    {
+        $normalized = strtoupper(trim($value));
+        if ($normalized === '') {
+            return '';
+        }
+
+        $normalized = preg_replace('/\s+/', ' ', $normalized) ?? $normalized;
+        $normalized = preg_replace('/[^A-Z0-9 ]+/', ' ', $normalized) ?? $normalized;
+        $normalized = preg_replace('/^OFFICE OF THE\s+/', '', $normalized) ?? $normalized;
+        $normalized = preg_replace('/^OFFICE OF\s+/', '', $normalized) ?? $normalized;
+        $normalized = preg_replace('/\s+/', ' ', $normalized) ?? $normalized;
+
+        return trim($normalized);
     }
 
     private function trimNullable(mixed $value): ?string

@@ -522,10 +522,27 @@ class LeaveApplicationController extends Controller
         }
 
         $actorDirectory = $this->buildWorkflowActorDirectory(collect([$application]));
+        $leaveBalanceSnapshot = $this->getApplicationLeaveBalanceSnapshot($application);
+        $currentLeaveBalance = $this->findLeaveTypeBalanceInSnapshot(
+            $leaveBalanceSnapshot,
+            (int) $application->leave_type_id
+        );
+        $applicationPayload = $this->formatErmsApplication($application, $actorDirectory);
+        $certificationLeaveCredits = $this->resolveCertificationLeaveCredits(
+            $application,
+            $leaveBalanceSnapshot
+        );
+
+        $applicationPayload['leaveBalance'] = $currentLeaveBalance;
+        $applicationPayload['leaveBalances'] = $leaveBalanceSnapshot;
+        $applicationPayload['leave_balances'] = $leaveBalanceSnapshot;
+        $applicationPayload['employee_leave_balances'] = $leaveBalanceSnapshot;
+        $applicationPayload['certificationLeaveCredits'] = $certificationLeaveCredits;
+        $applicationPayload['certification_leave_credits'] = $certificationLeaveCredits;
 
         return response()->json([
             ...$this->employeeControlNoResponse((string) $employee->control_no),
-            'application' => $this->formatErmsApplication($application, $actorDirectory),
+            'application' => $applicationPayload,
         ]);
     }
 

@@ -1,9 +1,9 @@
 <?php
 
 use App\Http\Controllers\AdminDashboardController;
-use App\Http\Controllers\COCApplicationController;
 use App\Http\Controllers\Auth\AuthController;
 use App\Http\Controllers\Auth\PasswordResetController;
+use App\Http\Controllers\COCApplicationController;
 use App\Http\Controllers\EmployeeController;
 use App\Http\Controllers\HRDashboardController;
 use App\Http\Controllers\HRDepartmentLibraryController;
@@ -11,8 +11,8 @@ use App\Http\Controllers\HRIllnessLibraryController;
 use App\Http\Controllers\HRLeaveBalanceImportController;
 use App\Http\Controllers\HRLeaveTypeController;
 use App\Http\Controllers\HRReportController;
-use App\Http\Controllers\HRWorkScheduleController;
 use App\Http\Controllers\HRUserManagementController;
+use App\Http\Controllers\HRWorkScheduleController;
 use App\Http\Controllers\LeaveApplicationController;
 use App\Http\Controllers\NotificationController;
 use App\Http\Controllers\SettingsController;
@@ -66,6 +66,9 @@ Route::prefix('erms')->middleware('erms.auth')->group(function () {
     Route::post('/leave-applications/{id}/request-cancel', [LeaveApplicationController::class, 'ermsRequestCancel']);
     Route::post('/leave-applications/{id}/edit-request', [LeaveApplicationController::class, 'ermsRequestUpdate']);
     Route::post('/leave-applications/{id}/request-edit', [LeaveApplicationController::class, 'ermsRequestEdit']);
+    Route::get('/admin/department-head', [EmployeeController::class, 'ermsDepartmentHead']);
+    Route::get('/city-administrator', [EmployeeController::class, 'ermsCityAdministrator']);
+    Route::get('/settings/signatories', [SettingsController::class, 'ermsSignatories']);
 });
 
 /*

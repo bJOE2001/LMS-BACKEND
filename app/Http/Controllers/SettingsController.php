@@ -92,7 +92,7 @@ class SettingsController extends Controller
 
         return response()->json([
             'message' => 'Profile updated successfully.',
-            'user' => $user
+            'user' => $user,
         ]);
     }
 
@@ -108,12 +108,12 @@ class SettingsController extends Controller
             'password' => ['required', 'confirmed', Password::defaults()],
         ]);
 
-        if (!Hash::check($validated['current_password'], $user->password)) {
+        if (! Hash::check($validated['current_password'], $user->password)) {
             return response()->json([
                 'message' => 'The provided password does not match your current password.',
                 'errors' => [
-                    'current_password' => ['The provided password does not match your current password.']
-                ]
+                    'current_password' => ['The provided password does not match your current password.'],
+                ],
             ], 422);
         }
 
@@ -128,7 +128,7 @@ class SettingsController extends Controller
         $user->update($data);
 
         return response()->json([
-            'message' => 'Password updated successfully.'
+            'message' => 'Password updated successfully.',
         ]);
     }
 
@@ -138,7 +138,7 @@ class SettingsController extends Controller
     public function getSignatories(Request $request): JsonResponse
     {
         $user = $request->user();
-        if (!$user instanceof HRAccount && !$user instanceof DepartmentAdmin) {
+        if (! $user instanceof HRAccount && ! $user instanceof DepartmentAdmin) {
             return response()->json([
                 'message' => 'Only HR and department admin accounts can access this endpoint.',
             ], 403);
@@ -152,12 +152,25 @@ class SettingsController extends Controller
     }
 
     /**
+     * Return signatory assignments used by ERMS leave-form printing.
+     * Protected by the ERMS middleware route group.
+     */
+    public function ermsSignatories(): JsonResponse
+    {
+        return response()->json([
+            'signatories' => [
+                SignatorySetting::KEY_CHRMO_LEAVE_IN_CHARGE => $this->resolveChrmoLeaveInChargeSignatory(),
+            ],
+        ]);
+    }
+
+    /**
      * Assign the CHRMO Leave In-charge signatory.
      */
     public function updateChrmoLeaveInCharge(Request $request): JsonResponse
     {
         $user = $request->user();
-        if (!$user instanceof HRAccount) {
+        if (! $user instanceof HRAccount) {
             return response()->json([
                 'message' => 'Only HR accounts can update signatory assignments.',
             ], 403);
@@ -169,7 +182,7 @@ class SettingsController extends Controller
 
         $employeeControlNo = trim((string) ($validated['employee_control_no'] ?? ''));
         $employee = HrisEmployee::findByControlNo($employeeControlNo, true);
-        if (!$employee) {
+        if (! $employee) {
             return response()->json([
                 'message' => 'Selected employee was not found in active HRIS records.',
             ], 422);
@@ -200,8 +213,13 @@ class SettingsController extends Controller
      */
     private function getRole($user): string
     {
-        if ($user instanceof HRAccount) return 'hr';
-        if ($user instanceof DepartmentAdmin) return 'admin';
+        if ($user instanceof HRAccount) {
+            return 'hr';
+        }
+        if ($user instanceof DepartmentAdmin) {
+            return 'admin';
+        }
+
         return 'unknown';
     }
 
@@ -275,6 +293,7 @@ class SettingsController extends Controller
     private function trimNullableString(mixed $value): ?string
     {
         $trimmed = trim((string) ($value ?? ''));
+
         return $trimmed === '' ? null : $trimmed;
     }
 
@@ -299,7 +318,7 @@ class SettingsController extends Controller
             ->where('signatory_key', SignatorySetting::KEY_CHRMO_LEAVE_IN_CHARGE)
             ->first();
 
-        if (!$setting) {
+        if (! $setting) {
             return null;
         }
 
