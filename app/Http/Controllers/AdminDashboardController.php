@@ -2320,6 +2320,14 @@ class AdminDashboardController extends Controller
             ], true)) {
                 return LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL;
             }
+
+            if (in_array($normalized, [
+                LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL,
+                'RECALL_REQUEST',
+                'LEAVE_RECALL_REQUEST',
+            ], true)) {
+                return LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL;
+            }
         }
 
         return null;

@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Models\COCApplication;
 use App\Models\DepartmentAdmin;
 use App\Models\LeaveApplication;
+use App\Models\SmsLog;
 use Carbon\CarbonImmutable;
 use Carbon\CarbonInterface;
 use Illuminate\Support\Facades\DB;
@@ -14,6 +15,7 @@ use Throwable;
 class SmsGatewayService
 {
     private const HR_CONNECTION = 'hr';
+
     private const HR_PERSONAL_ADDT_TABLE = 'xPersonalAddt';
 
     public function sendLeaveApprovedMessage(LeaveApplication $application): bool
@@ -30,6 +32,7 @@ class SmsGatewayService
         return $this->sendToEmployeeControlNo(
             $controlNo,
             $this->buildLeaveApprovedMessage($application),
+            SmsLog::TYPE_LEAVE_APPROVED,
             [
                 'leave_application_id' => (int) ($application->id ?? 0),
                 'employee_control_no' => $controlNo,
@@ -51,6 +54,7 @@ class SmsGatewayService
         return $this->sendToEmployeeControlNo(
             $controlNo,
             $this->buildCocApprovedMessage($application, $creditedDays),
+            SmsLog::TYPE_COC_APPROVED,
             [
                 'coc_application_id' => (int) ($application->id ?? 0),
                 'employee_control_no' => $controlNo,
@@ -72,6 +76,7 @@ class SmsGatewayService
         return $this->sendToEmployeeControlNo(
             $controlNo,
             $this->buildLeaveRejectedMessage($application),
+            SmsLog::TYPE_LEAVE_REJECTED,
             [
                 'leave_application_id' => (int) ($application->id ?? 0),
                 'employee_control_no' => $controlNo,
@@ -93,6 +98,7 @@ class SmsGatewayService
         return $this->sendToEmployeeControlNo(
             $controlNo,
             $this->buildCocRejectedMessage($application),
+            SmsLog::TYPE_COC_REJECTED,
             [
                 'coc_application_id' => (int) ($application->id ?? 0),
                 'employee_control_no' => $controlNo,
@@ -101,14 +107,14 @@ class SmsGatewayService
     }
 
     /**
-     * @param array<string, scalar|null> $params
+     * @param  array<string, scalar|null>  $params
      * @return array{success: bool, status: int, body: string, error: string|null}
      */
     private function sendViaCurl(string $gatewayUrl, array $params): array
     {
         $query = http_build_query($params, '', '&', PHP_QUERY_RFC3986);
         $separator = str_contains($gatewayUrl, '?') ? '&' : '?';
-        $requestUrl = $gatewayUrl . $separator . $query;
+        $requestUrl = $gatewayUrl.$separator.$query;
 
         $ch = curl_init($requestUrl);
         if ($ch === false) {
@@ -163,6 +169,7 @@ class SmsGatewayService
     private function gatewayUrl(): ?string
     {
         $gatewayUrl = trim((string) config('sms.gateway_url', ''));
+
         return $gatewayUrl !== '' ? $gatewayUrl : null;
     }
 
@@ -180,11 +187,12 @@ class SmsGatewayService
 
         $application->loadMissing('applicantAdmin');
         $applicantAdmin = $application->applicantAdmin;
-        if (!$applicantAdmin instanceof DepartmentAdmin) {
+        if (! $applicantAdmin instanceof DepartmentAdmin) {
             return null;
         }
 
         $adminControlNo = trim((string) ($applicantAdmin->employee_control_no ?? ''));
+
         return $adminControlNo !== '' ? $adminControlNo : null;
     }
 
@@ -239,9 +247,9 @@ class SmsGatewayService
         }
 
         if (str_starts_with($digits, '63') && strlen($digits) === 12) {
-            $digits = '0' . substr($digits, 2);
+            $digits = '0'.substr($digits, 2);
         } elseif (str_starts_with($digits, '9') && strlen($digits) === 10) {
-            $digits = '0' . $digits;
+            $digits = '0'.$digits;
         }
 
         return (strlen($digits) === 11 && str_starts_with($digits, '09'))
@@ -326,7 +334,7 @@ class SmsGatewayService
             ? (string) ((int) $roundedDays)
             : rtrim(rtrim(number_format($roundedDays, 2, '.', ''), '0'), '.');
 
-        return "{$display} day" . ($roundedDays === 1.0 ? '' : 's');
+        return "{$display} day".($roundedDays === 1.0 ? '' : 's');
     }
 
     private function formatApprovedDayTotal(float $days): string
@@ -337,10 +345,12 @@ class SmsGatewayService
 
         if ($isWholeNumber) {
             $integerDays = (int) round($roundedDays);
-            return $this->numberToWords($integerDays) . " ({$integerDays}) {$dayUnit}";
+
+            return $this->numberToWords($integerDays)." ({$integerDays}) {$dayUnit}";
         }
 
         $display = rtrim(rtrim(number_format($roundedDays, 2, '.', ''), '0'), '.');
+
         return "{$display} {$dayUnit}";
     }
 
@@ -381,7 +391,7 @@ class SmsGatewayService
         ];
 
         if ($number < 0) {
-            return 'minus ' . $this->numberToWords(abs($number));
+            return 'minus '.$this->numberToWords(abs($number));
         }
 
         if (array_key_exists($number, $smallNumbers)) {
@@ -391,29 +401,30 @@ class SmsGatewayService
         if ($number < 100) {
             $tens = intdiv($number, 10) * 10;
             $remainder = $number % 10;
+
             return $remainder === 0
                 ? $tensNumbers[$tens]
-                : $tensNumbers[$tens] . '-' . $smallNumbers[$remainder];
+                : $tensNumbers[$tens].'-'.$smallNumbers[$remainder];
         }
 
         if ($number < 1000) {
             $hundreds = intdiv($number, 100);
             $remainder = $number % 100;
-            $prefix = $smallNumbers[$hundreds] . ' hundred';
+            $prefix = $smallNumbers[$hundreds].' hundred';
 
             return $remainder === 0
                 ? $prefix
-                : $prefix . ' ' . $this->numberToWords($remainder);
+                : $prefix.' '.$this->numberToWords($remainder);
         }
 
         if ($number < 1000000) {
             $thousands = intdiv($number, 1000);
             $remainder = $number % 1000;
-            $prefix = $this->numberToWords($thousands) . ' thousand';
+            $prefix = $this->numberToWords($thousands).' thousand';
 
             return $remainder === 0
                 ? $prefix
-                : $prefix . ' ' . $this->numberToWords($remainder);
+                : $prefix.' '.$this->numberToWords($remainder);
         }
 
         return (string) $number;
@@ -427,7 +438,7 @@ class SmsGatewayService
         }
 
         return strlen($trimmed) > $maxLength
-            ? substr($trimmed, 0, $maxLength) . '...'
+            ? substr($trimmed, 0, $maxLength).'...'
             : $trimmed;
     }
 
@@ -445,7 +456,7 @@ class SmsGatewayService
     }
 
     /**
-     * @param array<int, CarbonImmutable> $selectedDates
+     * @param  array<int, CarbonImmutable>  $selectedDates
      */
     private function formatSelectedLeaveDatesForSms(array $selectedDates): string
     {
@@ -456,11 +467,11 @@ class SmsGatewayService
 
         $lines = [];
         foreach ($segments as [$start, $end]) {
-            if (!$start instanceof CarbonImmutable || !$end instanceof CarbonImmutable) {
+            if (! $start instanceof CarbonImmutable || ! $end instanceof CarbonImmutable) {
                 continue;
             }
 
-            $lines[] = '• ' . $this->formatSmsDateRangeLabel($start, $end);
+            $lines[] = '• '.$this->formatSmsDateRangeLabel($start, $end);
         }
 
         return implode("\n", $lines);
@@ -474,17 +485,17 @@ class SmsGatewayService
 
         if ($start->year === $end->year) {
             if ($start->month === $end->month) {
-                return $start->format('F j') . '–' . $end->format('j') . ', ' . $start->format('Y');
+                return $start->format('F j').'–'.$end->format('j').', '.$start->format('Y');
             }
 
-            return $start->format('F j') . ' – ' . $end->format('F j') . ', ' . $start->format('Y');
+            return $start->format('F j').' – '.$end->format('F j').', '.$start->format('Y');
         }
 
-        return $start->format('F j, Y') . ' – ' . $end->format('F j, Y');
+        return $start->format('F j, Y').' – '.$end->format('F j, Y');
     }
 
     /**
-     * @param array<int, CarbonImmutable> $selectedDates
+     * @param  array<int, CarbonImmutable>  $selectedDates
      * @return array<int, array{0: CarbonImmutable, 1: CarbonImmutable}>
      */
     private function groupConsecutiveLeaveDates(array $selectedDates): array
@@ -504,17 +515,18 @@ class SmsGatewayService
         $segmentStart = $dates->first();
         $segmentEnd = $segmentStart;
 
-        if (!$segmentStart instanceof CarbonImmutable) {
+        if (! $segmentStart instanceof CarbonImmutable) {
             return [];
         }
 
         foreach ($dates->slice(1) as $date) {
-            if (!$date instanceof CarbonImmutable) {
+            if (! $date instanceof CarbonImmutable) {
                 continue;
             }
 
             if ($segmentEnd->addDay()->isSameDay($date)) {
                 $segmentEnd = $date;
+
                 continue;
             }
 
@@ -544,7 +556,8 @@ class SmsGatewayService
                 if ($uniqueDates->count() === 1) {
                     /** @var CarbonImmutable $singleDate */
                     $singleDate = $uniqueDates->first();
-                    return 'on ' . $singleDate->format('F j, Y');
+
+                    return 'on '.$singleDate->format('F j, Y');
                 }
 
                 /** @var CarbonImmutable $firstDate */
@@ -561,33 +574,33 @@ class SmsGatewayService
                         ->map(static fn (CarbonImmutable $date): string => (string) $date->day)
                         ->join(',');
 
-                    return 'on ' . $firstDate->format('F') . ' ' . $dayList . ' ' . $firstDate->format('Y');
+                    return 'on '.$firstDate->format('F').' '.$dayList.' '.$firstDate->format('Y');
                 }
 
-                return 'from ' . $firstDate->format('F j, Y') . ' to ' . $lastDate->format('F j, Y');
+                return 'from '.$firstDate->format('F j, Y').' to '.$lastDate->format('F j, Y');
             }
         }
 
         $startDate = $application->start_date;
         $endDate = $application->end_date;
 
-        if (!$startDate instanceof CarbonInterface && !$endDate instanceof CarbonInterface) {
+        if (! $startDate instanceof CarbonInterface && ! $endDate instanceof CarbonInterface) {
             return '';
         }
 
         if ($startDate instanceof CarbonInterface && $endDate instanceof CarbonInterface) {
             if ($startDate->isSameDay($endDate)) {
-                return 'on ' . $startDate->format('M j, Y');
+                return 'on '.$startDate->format('M j, Y');
             }
 
-            return 'from ' . $startDate->format('M j, Y') . ' to ' . $endDate->format('M j, Y');
+            return 'from '.$startDate->format('M j, Y').' to '.$endDate->format('M j, Y');
         }
 
         if ($startDate instanceof CarbonInterface) {
-            return 'starting ' . $startDate->format('M j, Y');
+            return 'starting '.$startDate->format('M j, Y');
         }
 
-        return 'until ' . $endDate->format('M j, Y');
+        return 'until '.$endDate->format('M j, Y');
     }
 
     /**
@@ -596,7 +609,7 @@ class SmsGatewayService
     private function resolveSelectedLeaveDates(LeaveApplication $application): array
     {
         $resolvedDates = $application->resolvedSelectedDates();
-        if (!is_array($resolvedDates) || $resolvedDates === []) {
+        if (! is_array($resolvedDates) || $resolvedDates === []) {
             return [];
         }
 
@@ -618,17 +631,28 @@ class SmsGatewayService
     }
 
     /**
-     * @param array<string, mixed> $context
+     * @param  array<string, mixed>  $context
      */
-    private function sendToEmployeeControlNo(string $controlNo, string $message, array $context): bool
+    private function sendToEmployeeControlNo(string $controlNo, string $message, string $messageType, array $context): bool
     {
-        if (!$this->isEnabled()) {
+        $smsLog = $this->createSmsLog($controlNo, $message, $messageType, $context);
+
+        if (! $this->isEnabled()) {
+            $this->updateSmsLog($smsLog, SmsLog::STATUS_SKIPPED, [
+                'error_message' => 'SMS sending is disabled.',
+            ]);
+
             return false;
         }
 
         $gatewayUrl = $this->gatewayUrl();
         if ($gatewayUrl === null) {
             Log::warning('SMS gateway URL is not configured; skipping SMS send.', $context);
+
+            $this->updateSmsLog($smsLog, SmsLog::STATUS_SKIPPED, [
+                'error_message' => 'SMS gateway URL is not configured.',
+            ]);
+
             return false;
         }
 
@@ -639,6 +663,10 @@ class SmsGatewayService
             $destination = $this->resolveDestinationNumber($rawPhoneNumber);
 
             if ($destination === null) {
+                $this->updateSmsLog($smsLog, SmsLog::STATUS_FAILED, [
+                    'error_message' => 'Unable to resolve a valid employee mobile destination.',
+                ]);
+
                 return false;
             }
 
@@ -647,7 +675,7 @@ class SmsGatewayService
                 'content' => $message,
             ]);
 
-            if (!(bool) ($gatewayResult['success'] ?? false)) {
+            if (! (bool) ($gatewayResult['success'] ?? false)) {
                 Log::warning('SMS gateway returned a non-success status.', array_merge($context, [
                     'destination' => $destination,
                     'status' => (int) ($gatewayResult['status'] ?? 0),
@@ -655,13 +683,32 @@ class SmsGatewayService
                     'error' => $gatewayResult['error'] ?? null,
                 ]));
 
+                $this->updateSmsLog($smsLog, SmsLog::STATUS_FAILED, [
+                    'destination' => $destination,
+                    'gateway_http_status' => (int) ($gatewayResult['status'] ?? 0),
+                    'gateway_response' => $this->truncateResponseBody((string) ($gatewayResult['body'] ?? '')),
+                    'error_message' => (string) ($gatewayResult['error'] ?? 'SMS gateway returned a non-success status.'),
+                ]);
+
                 return false;
             }
+
+            $this->updateSmsLog($smsLog, SmsLog::STATUS_SENT, [
+                'destination' => $destination,
+                'gateway_http_status' => (int) ($gatewayResult['status'] ?? 0),
+                'gateway_response' => $this->truncateResponseBody((string) ($gatewayResult['body'] ?? '')),
+                'sent_at' => now(),
+            ]);
         } catch (Throwable $exception) {
             Log::warning('Failed to send SMS.', array_merge($context, [
                 'destination' => $destination,
                 'error' => $exception->getMessage(),
             ]));
+
+            $this->updateSmsLog($smsLog, SmsLog::STATUS_FAILED, [
+                'destination' => $destination,
+                'error_message' => $exception->getMessage(),
+            ]);
 
             return false;
         }
@@ -671,5 +718,39 @@ class SmsGatewayService
         ]));
 
         return true;
+    }
+
+    /**
+     * @param  array<string, mixed>  $context
+     */
+    private function createSmsLog(string $controlNo, string $message, string $messageType, array $context): SmsLog
+    {
+        return SmsLog::create([
+            'employee_control_no' => $controlNo,
+            'message_type' => $messageType,
+            'leave_application_id' => $this->contextId($context, 'leave_application_id'),
+            'coc_application_id' => $this->contextId($context, 'coc_application_id'),
+            'message' => $message,
+        ]);
+    }
+
+    /**
+     * @param  array<string, mixed>  $context
+     */
+    private function contextId(array $context, string $key): ?int
+    {
+        $id = (int) ($context[$key] ?? 0);
+
+        return $id > 0 ? $id : null;
+    }
+
+    /**
+     * @param  array<string, mixed>  $attributes
+     */
+    private function updateSmsLog(SmsLog $smsLog, string $status, array $attributes = []): void
+    {
+        $smsLog->forceFill(array_merge($attributes, [
+            'status' => $status,
+        ]))->save();
     }
 }

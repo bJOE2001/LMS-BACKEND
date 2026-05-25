@@ -2017,7 +2017,11 @@ class LeaveApplicationController extends Controller
             if ($this->trimNullableString($logRemarks) === null && $isPendingApprovedUpdateRequest) {
                 $logRemarks = $pendingApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
                     ? 'Approved leave cancellation request and forwarded to HR.'
-                    : 'Approved leave update request and forwarded to HR.';
+                    : (
+                        $pendingApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                            ? 'Approved leave recall request and forwarded to HR.'
+                            : 'Approved leave update request and forwarded to HR.'
+                    );
             }
 
             LeaveApplicationLog::create([
@@ -2042,12 +2046,20 @@ class LeaveApplicationController extends Controller
         $notificationTitle = $isPendingApprovedUpdateRequest
             ? ($pendingApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
                 ? "{$titleLabel} Cancellation Request Pending HR Review"
-                : "{$titleLabel} Edit Request Pending HR Review")
+                : (
+                    $pendingApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                        ? "{$titleLabel} Recall Request Pending HR Review"
+                        : "{$titleLabel} Edit Request Pending HR Review"
+                ))
             : "{$titleLabel} Application Pending HR Review";
         $notificationMessage = $isPendingApprovedUpdateRequest
             ? ($pendingApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
                 ? "{$employeeName} submitted a cancellation request for an approved {$app->leaveType->name} {$actionLabel}. The request has been approved by department admin and awaits your review."
-                : "{$employeeName} submitted an update request for an approved {$app->leaveType->name} {$actionLabel}. The request has been approved by department admin and awaits your review.")
+                : (
+                    $pendingApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                        ? "{$employeeName} submitted a recall request for an approved {$app->leaveType->name} {$actionLabel}. The request has been approved by department admin and awaits your review."
+                        : "{$employeeName} submitted an update request for an approved {$app->leaveType->name} {$actionLabel}. The request has been approved by department admin and awaits your review."
+                ))
             : "{$employeeName} submitted a {$app->leaveType->name} {$actionLabel} (".self::formatDays($app->total_days).') that has been approved by admin and awaits your review.';
 
         // Notify all HR accounts about the new pending application
@@ -2066,7 +2078,11 @@ class LeaveApplicationController extends Controller
             'message' => $isPendingApprovedUpdateRequest
                 ? ($pendingApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
                     ? 'Leave cancellation request approved by admin. Forwarded to HR for final approval.'
-                    : 'Leave update request approved by admin. Forwarded to HR for final approval.')
+                    : (
+                        $pendingApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                            ? 'Leave recall request approved by admin. Forwarded to HR for final approval.'
+                            : 'Leave update request approved by admin. Forwarded to HR for final approval.'
+                    ))
                 : 'Application approved by admin. Forwarded to HR.',
             'application' => $this->formatApplication($app->fresh('leaveType')),
         ]);
@@ -2132,6 +2148,178 @@ class LeaveApplicationController extends Controller
         return response()->json([
             'message' => 'Application rejected by admin.',
             'application' => $this->formatApplication($app->fresh('leaveType')),
+        ]);
+    }
+
+    public function adminRequestRecall(Request $request, int $id): JsonResponse
+    {
+        $admin = $request->user();
+        if (! $admin instanceof DepartmentAdmin) {
+            return response()->json(['message' => 'Only department admins can request recalls.'], 403);
+        }
+
+        $validated = $request->validate([
+            'recall_reason' => ['required', 'string', 'max:2000'],
+            'recall_selected_dates' => ['required', 'array', 'min:1'],
+            'recall_selected_dates.*' => ['required', 'date'],
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $admin->loadMissing('department');
+
+        $app = LeaveApplication::with(['leaveType', 'applicantAdmin'])->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        if (! $this->adminCanManageApplication($admin, $app)) {
+            return response()->json(['message' => 'You can only manage applications from your department.'], 403);
+        }
+
+        if ((bool) $app->is_monetization) {
+            return response()->json([
+                'message' => 'Monetization requests cannot be recalled.',
+            ], 422);
+        }
+
+        if ($app->status !== LeaveApplication::STATUS_APPROVED) {
+            return response()->json([
+                'message' => "Cannot request recall: application status is '{$app->status}', expected 'APPROVED'.",
+            ], 422);
+        }
+
+        if ($this->hasPendingApprovedUpdateRequest($app)) {
+            return response()->json([
+                'message' => 'There is already a pending approved leave request action for this application.',
+            ], 422);
+        }
+
+        $leaveType = $app->leaveType ?? LeaveType::find((int) $app->leave_type_id);
+        if (! $leaveType) {
+            return response()->json([
+                'message' => 'Selected leave type is no longer available.',
+            ], 422);
+        }
+        $app->setRelation('leaveType', $leaveType);
+
+        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
+        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+        $normalizedLeaveTypeName = strtolower(trim((string) $leaveType->name));
+        $isRecallableLeaveType = ($forcedLeaveTypeId !== null && (int) $app->leave_type_id === $forcedLeaveTypeId)
+            || ($vacationLeaveTypeId !== null && (int) $app->leave_type_id === $vacationLeaveTypeId)
+            || in_array($normalizedLeaveTypeName, ['mandatory / forced leave', 'vacation leave'], true);
+        if (! $isRecallableLeaveType) {
+            return response()->json([
+                'message' => 'Only Vacation Leave and Mandatory / Forced Leave applications can be recalled.',
+            ], 422);
+        }
+
+        $selectedRecallDateKeys = $this->resolveValidatedRecallSelectedDateKeys(
+            $app,
+            is_array($validated['recall_selected_dates'] ?? null)
+                ? $validated['recall_selected_dates']
+                : []
+        );
+        if ($selectedRecallDateKeys === null || $selectedRecallDateKeys === []) {
+            return response()->json([
+                'message' => 'Selected recall dates must match the application leave dates.',
+            ], 422);
+        }
+
+        $reason = trim((string) ($validated['recall_reason'] ?? $validated['remarks'] ?? ''));
+        $remarksLine = $reason !== ''
+            ? "Recall request submitted by department admin. Reason: {$reason}"
+            : 'Recall request submitted by department admin.';
+
+        $requestedUpdatePayload = $this->buildRequestedLeaveRecallPayload(
+            $app,
+            $reason,
+            $selectedRecallDateKeys
+        );
+
+        $requestedByControlNo = trim((string) (
+            $admin->employee_control_no
+            ?? $admin->control_no
+            ?? $admin->employee_id
+            ?? $app->employee_control_no
+            ?? ''
+        ));
+
+        DB::transaction(function () use (
+            $app,
+            $admin,
+            $remarksLine,
+            $requestedUpdatePayload,
+            $reason,
+            $requestedByControlNo
+        ): void {
+            $existingRemarks = trim((string) ($app->remarks ?? ''));
+            $updatedRemarks = $existingRemarks === ''
+                ? $remarksLine
+                : "{$existingRemarks}\n{$remarksLine}";
+
+            $app->update([
+                'status' => LeaveApplication::STATUS_PENDING_HR,
+                'admin_id' => $admin->id,
+                'remarks' => $updatedRemarks,
+            ]);
+
+            $pendingRequest = LeaveApplicationUpdateRequest::query()
+                ->where('leave_application_id', (int) $app->id)
+                ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
+                ->whereRaw('UPPER(LTRIM(RTRIM(previous_status))) = ?', [LeaveApplication::STATUS_APPROVED])
+                ->latest('id')
+                ->first();
+
+            $requestPayload = [
+                'employee_control_no' => $this->resolveLeaveApplicationUpdateEmployeeControlNo($app),
+                'employee_name' => $this->resolveLeaveApplicationUpdateEmployeeName($app),
+                'requested_payload' => $requestedUpdatePayload,
+                'requested_reason' => $reason !== '' ? $reason : null,
+                'previous_status' => LeaveApplication::STATUS_APPROVED,
+                'requested_by_control_no' => $requestedByControlNo !== '' ? $requestedByControlNo : (string) ($app->employee_control_no ?? ''),
+                'requested_at' => now(),
+            ];
+
+            if ($pendingRequest) {
+                $pendingRequest->update($requestPayload);
+            } else {
+                LeaveApplicationUpdateRequest::create(array_merge($requestPayload, [
+                    'leave_application_id' => (int) $app->id,
+                    'status' => LeaveApplicationUpdateRequest::STATUS_PENDING,
+                ]));
+            }
+
+            LeaveApplicationLog::create([
+                'leave_application_id' => $app->id,
+                'action' => LeaveApplicationLog::ACTION_SUBMITTED,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_ADMIN,
+                'performed_by_id' => $admin->id,
+                'remarks' => $remarksLine,
+                'created_at' => now(),
+            ]);
+        });
+
+        $employeeName = $this->resolveEmployeeDisplayName($app);
+        $message = "{$employeeName} requested a recall for an approved {$leaveType->name} leave application.";
+        if ($reason !== '') {
+            $message .= " Reason: {$reason}";
+        }
+
+        $hrAccounts = HRAccount::all();
+        foreach ($hrAccounts as $hrAccount) {
+            Notification::send(
+                $hrAccount,
+                Notification::TYPE_LEAVE_EDIT_REQUEST,
+                'Recall Request Pending HR Review',
+                $message,
+                $app->id
+            );
+        }
+
+        return response()->json([
+            'message' => 'Recall request submitted and forwarded to HR for approval.',
+            'application' => $this->formatApplication($app->fresh(['leaveType', 'applicantAdmin'])),
         ]);
     }
 
@@ -2529,6 +2717,99 @@ class LeaveApplicationController extends Controller
         ]);
     }
 
+    public function hrUndoReceive(Request $request, int $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can undo received applications.'], 403);
+        }
+
+        $app = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $cycleRequestedAt = $this->resolveCurrentHrDocumentCycleRequestedAt($app);
+        $releasedLog = $this->resolveLatestHrActionLogForCycle(
+            $app,
+            LeaveApplicationLog::ACTION_HR_RELEASED,
+            $cycleRequestedAt
+        );
+        if ($releasedLog instanceof LeaveApplicationLog) {
+            return response()->json([
+                'message' => 'Cannot undo receipt after release. Undo the release first.',
+            ], 422);
+        }
+
+        $reviewedLog = $this->resolveLatestHrActionLogForCycle(
+            $app,
+            LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED,
+            $cycleRequestedAt
+        );
+        if ($reviewedLog instanceof LeaveApplicationLog) {
+            return response()->json([
+                'message' => 'Cannot undo receipt after CMO/CVMO review has been completed.',
+            ], 422);
+        }
+
+        $receivedLog = $this->resolveLatestHrActionLogForCycle(
+            $app,
+            LeaveApplicationLog::ACTION_HR_RECEIVED,
+            $cycleRequestedAt
+        );
+
+        if ($receivedLog instanceof LeaveApplicationLog) {
+            $receivedLog->delete();
+            $app->load('logs');
+        }
+
+        $actorDirectory = $this->buildWorkflowActorDirectory([$app]);
+
+        return response()->json([
+            'message' => $receivedLog instanceof LeaveApplicationLog
+                ? 'Hard-copy receipt was undone.'
+                : 'Hard-copy receipt is not currently confirmed for this application.',
+            'application' => $this->formatErmsApplication($app, $actorDirectory),
+        ]);
+    }
+
+    public function hrUndoRelease(Request $request, int $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can undo released applications.'], 403);
+        }
+
+        $app = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $releasedLog = $this->resolveLatestHrActionLogForCycle(
+            $app,
+            LeaveApplicationLog::ACTION_HR_RELEASED,
+            $this->resolveCurrentHrDocumentCycleRequestedAt($app)
+        );
+
+        if ($releasedLog instanceof LeaveApplicationLog) {
+            $releasedLog->delete();
+            $app->load('logs');
+        }
+
+        $actorDirectory = $this->buildWorkflowActorDirectory([$app]);
+
+        return response()->json([
+            'message' => $releasedLog instanceof LeaveApplicationLog
+                ? 'Hard-copy release was undone.'
+                : 'Hard-copy release is not currently confirmed for this application.',
+            'application' => $this->formatErmsApplication($app, $actorDirectory),
+        ]);
+    }
+
     /**
      * HR records CMO/CVMO review after HR certification and before release.
      */
@@ -2645,7 +2926,11 @@ class LeaveApplicationController extends Controller
                 'remarks' => $request->input('remarks') ?: (
                     $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
                         ? 'Received leave cancellation request form.'
-                        : 'Received updated hard copy leave application form.'
+                        : (
+                            $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                                ? 'Received leave recall request form.'
+                                : 'Received updated hard copy leave application form.'
+                        )
                 ),
                 'created_at' => now(),
             ]);
@@ -2658,10 +2943,18 @@ class LeaveApplicationController extends Controller
             'message' => $receivedLog
                 ? ($pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
                     ? 'Cancellation request hard-copy receipt was already confirmed.'
-                    : 'Updated hard-copy receipt was already confirmed for this update request.')
+                    : (
+                        $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                            ? 'Recall request hard-copy receipt was already confirmed.'
+                            : 'Updated hard-copy receipt was already confirmed for this update request.'
+                    ))
                 : ($pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
                     ? 'Cancellation request hard-copy receipt confirmed.'
-                    : 'Updated hard-copy receipt confirmed.'),
+                    : (
+                        $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                            ? 'Recall request hard-copy receipt confirmed.'
+                            : 'Updated hard-copy receipt confirmed.'
+                    )),
             'application' => $this->formatErmsApplication($app, $actorDirectory),
         ]);
     }
@@ -2691,12 +2984,20 @@ class LeaveApplicationController extends Controller
         $latestApprovedActionType = $this->resolveLatestApprovedUpdateActionType($app);
         $allowedStatuses = $latestApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
             ? [LeaveApplication::STATUS_REJECTED, LeaveApplication::STATUS_APPROVED]
-            : [LeaveApplication::STATUS_APPROVED];
+            : (
+                $latestApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                    ? [LeaveApplication::STATUS_APPROVED, LeaveApplication::STATUS_RECALLED]
+                    : [LeaveApplication::STATUS_APPROVED]
+            );
         if (! in_array($app->status, $allowedStatuses, true)) {
             return response()->json([
                 'message' => $latestApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
                     ? "Cannot mark cancellation request copy as released: application status is '{$app->status}'."
-                    : "Cannot mark updated copy as released: application status is '{$app->status}'.",
+                    : (
+                        $latestApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                            ? "Cannot mark recall request copy as released: application status is '{$app->status}'."
+                            : "Cannot mark updated copy as released: application status is '{$app->status}'."
+                    ),
             ], 422);
         }
 
@@ -2724,7 +3025,11 @@ class LeaveApplicationController extends Controller
                 return response()->json([
                     'message' => $latestApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
                         ? 'Cannot mark cancellation request copy as released before confirming cancellation request hard-copy receipt.'
-                        : 'Cannot mark updated copy as released before confirming updated hard-copy receipt.',
+                        : (
+                            $latestApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                                ? 'Cannot mark recall request copy as released before confirming recall request hard-copy receipt.'
+                                : 'Cannot mark updated copy as released before confirming updated hard-copy receipt.'
+                        ),
                 ], 422);
             }
 
@@ -2736,7 +3041,11 @@ class LeaveApplicationController extends Controller
                 'remarks' => $request->input('remarks') ?: (
                     $latestApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
                         ? 'Released leave cancellation request form.'
-                        : 'Released updated hard copy leave application form.'
+                        : (
+                            $latestApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                                ? 'Released leave recall request form.'
+                                : 'Released updated hard copy leave application form.'
+                        )
                 ),
                 'created_at' => now(),
             ]);
@@ -2749,10 +3058,18 @@ class LeaveApplicationController extends Controller
             'message' => $releasedLog
                 ? ($latestApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
                     ? 'Cancellation request hard-copy release was already confirmed.'
-                    : 'Updated hard-copy release was already confirmed for this update request.')
+                    : (
+                        $latestApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                            ? 'Recall request hard-copy release was already confirmed.'
+                            : 'Updated hard-copy release was already confirmed for this update request.'
+                    ))
                 : ($latestApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
                     ? 'Cancellation request hard-copy release confirmed.'
-                    : 'Updated hard-copy release confirmed.'),
+                    : (
+                        $latestApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                            ? 'Recall request hard-copy release confirmed.'
+                            : 'Updated hard-copy release confirmed.'
+                    )),
             'application' => $this->formatErmsApplication($app, $actorDirectory),
         ]);
     }
@@ -3306,21 +3623,42 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Leave application not found.'], 404);
         }
 
+        if ($this->hasPendingApprovedUpdateRequest($app)) {
+            return response()->json([
+                'message' => 'Cannot recall while there is a pending approved update request for this application.',
+            ], 422);
+        }
+
+        $reason = trim((string) ($validated['recall_reason'] ?? $validated['remarks'] ?? ''));
+        $recallSelectedDates = is_array($validated['recall_selected_dates'] ?? null)
+            ? $validated['recall_selected_dates']
+            : [];
+
+        return $this->executeHrRecall($app, $hr, $reason, $recallSelectedDates);
+    }
+
+    private function executeHrRecall(
+        LeaveApplication $app,
+        HRAccount $hr,
+        string $reason,
+        array $requestedRecallDates,
+        ?LeaveApplicationUpdateRequest $pendingUpdateRequest = null,
+        mixed $pendingReviewRemarks = null
+    ): JsonResponse {
         if ((bool) $app->is_monetization) {
             return response()->json([
                 'message' => 'Monetization requests cannot be recalled.',
             ], 422);
         }
 
-        if ($app->status !== LeaveApplication::STATUS_APPROVED) {
+        $allowedStatuses = $pendingUpdateRequest instanceof LeaveApplicationUpdateRequest
+            ? [LeaveApplication::STATUS_PENDING_HR, LeaveApplication::STATUS_APPROVED]
+            : [LeaveApplication::STATUS_APPROVED];
+        if (! in_array($app->status, $allowedStatuses, true)) {
             return response()->json([
-                'message' => "Cannot recall: application status is '{$app->status}', expected 'APPROVED'.",
-            ], 422);
-        }
-
-        if ($this->hasPendingApprovedUpdateRequest($app)) {
-            return response()->json([
-                'message' => 'Cannot recall while there is a pending approved update request for this application.',
+                'message' => $pendingUpdateRequest instanceof LeaveApplicationUpdateRequest
+                    ? "Cannot approve recall request: application status is '{$app->status}'."
+                    : "Cannot recall: application status is '{$app->status}', expected 'APPROVED'.",
             ], 422);
         }
 
@@ -3347,9 +3685,7 @@ class LeaveApplicationController extends Controller
 
         $selectedRecallDateKeys = $this->resolveValidatedRecallSelectedDateKeys(
             $app,
-            is_array($validated['recall_selected_dates'] ?? null)
-                ? $validated['recall_selected_dates']
-                : []
+            $requestedRecallDates
         );
         if ($selectedRecallDateKeys === null || $selectedRecallDateKeys === []) {
             return response()->json([
@@ -3391,10 +3727,13 @@ class LeaveApplicationController extends Controller
         if ($forcedLeaveTypeId !== null && (int) $app->leave_type_id === $forcedLeaveTypeId) {
             $mainRestoreDays = min(
                 $daysToRestore,
-                $this->resolveStoredLinkedVacationLeaveDeduction($app, $leaveType, $this->resolveApplicationDeductibleDays($app))
+                $this->resolveStoredLinkedVacationLeaveDeduction(
+                    $app,
+                    $leaveType,
+                    $this->resolveApplicationDeductibleDays($app)
+                )
             );
         }
-        $reason = trim((string) ($validated['recall_reason'] ?? $validated['remarks'] ?? ''));
         $recallRemarks = $reason !== ''
             ? "Recalled by HR: {$reason}"
             : 'Recalled by HR';
@@ -3410,7 +3749,9 @@ class LeaveApplicationController extends Controller
                 $recallRemarks,
                 $effectiveRecallDate,
                 $mergedRecallDateKeys,
-                $isFullyRecalled
+                $isFullyRecalled,
+                $pendingUpdateRequest,
+                $pendingReviewRemarks
             ): void {
                 if ($mainRestoreDays > 0.0) {
                     $this->restoreApplicationBalance($app, $restoreLeaveTypeId, $mainRestoreDays);
@@ -3429,6 +3770,15 @@ class LeaveApplicationController extends Controller
                 }
 
                 $app->update($updatePayload);
+
+                if ($pendingUpdateRequest instanceof LeaveApplicationUpdateRequest) {
+                    $pendingUpdateRequest->update([
+                        'status' => LeaveApplicationUpdateRequest::STATUS_APPROVED,
+                        'reviewed_by_hr_id' => $hr->id,
+                        'reviewed_at' => now(),
+                        'review_remarks' => $this->trimNullableString($pendingReviewRemarks),
+                    ]);
+                }
 
                 LeaveApplicationLog::create([
                     'leave_application_id' => $app->id,
@@ -3454,16 +3804,24 @@ class LeaveApplicationController extends Controller
             Notification::send(
                 $app->applicantAdmin,
                 Notification::TYPE_LEAVE_CANCELLED,
-                'Leave Recalled by HR',
-                "Your {$app->leaveType->name} application was recalled by HR.".($reason !== '' ? " Reason: {$reason}" : ''),
+                $pendingUpdateRequest instanceof LeaveApplicationUpdateRequest
+                    ? 'Recall Request Approved by HR'
+                    : 'Leave Recalled by HR',
+                $pendingUpdateRequest instanceof LeaveApplicationUpdateRequest
+                    ? "Your {$app->leaveType->name} recall request was approved by HR.".($reason !== '' ? " Reason: {$reason}" : '')
+                    : "Your {$app->leaveType->name} application was recalled by HR.".($reason !== '' ? " Reason: {$reason}" : ''),
                 $app->id
             );
         }
 
         return response()->json([
-            'message' => $isFullyRecalled
-                ? 'Application recalled by HR.'
-                : 'Selected leave dates recalled by HR.',
+            'message' => $pendingUpdateRequest instanceof LeaveApplicationUpdateRequest
+                ? ($isFullyRecalled
+                    ? 'Recall request approved by HR. Application recalled.'
+                    : 'Recall request approved by HR. Selected leave dates were recalled.')
+                : ($isFullyRecalled
+                    ? 'Application recalled by HR.'
+                    : 'Selected leave dates recalled by HR.'),
             'application' => $this->formatApplication($app->fresh(['leaveType', 'applicantAdmin'])),
         ]);
     }
@@ -5701,6 +6059,39 @@ class LeaveApplicationController extends Controller
         ], LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL);
     }
 
+    private function buildRequestedLeaveRecallPayload(
+        LeaveApplication $app,
+        string $requestReason = '',
+        array $selectedRecallDateKeys = []
+    ): array {
+        $leaveTypeId = $this->resolveCanonicalLeaveTypeId((int) ($app->leave_type_id ?? 0))
+            ?? (int) ($app->leave_type_id ?? 0);
+        $normalizedRecallDateKeys = $this->normalizeRecallDateKeys($selectedRecallDateKeys);
+
+        return $this->withRequestedLeaveActionType([
+            'leave_type_id' => $leaveTypeId > 0 ? $leaveTypeId : null,
+            'leave_type_name' => $this->trimNullableString($app->leaveType?->name ?? null),
+            'start_date' => $app->start_date?->toDateString(),
+            'end_date' => $app->end_date?->toDateString(),
+            'selected_dates' => $app->resolvedSelectedDates(),
+            'selected_date_pay_status' => is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null,
+            'selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
+            'selected_date_half_day_portion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'total_days' => round((float) ($app->total_days ?? 0), 2),
+            'deductible_days' => $this->resolveApplicationDeductibleDays($app),
+            'reason' => $this->trimNullableString($requestReason) ?? $this->trimNullableString($app->reason ?? null),
+            'recall_reason' => $this->trimNullableString($requestReason),
+            'recall_selected_dates' => $normalizedRecallDateKeys,
+            'details_of_leave' => $this->trimNullableString($app->details_of_leave ?? null),
+            'commutation' => $this->trimNullableString($app->commutation ?? null) ?? 'Not Requested',
+            'pay_mode' => $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization),
+            'is_monetization' => (bool) $app->is_monetization,
+            'attachment_required' => (bool) ($app->attachment_required ?? false),
+            'attachment_submitted' => (bool) ($app->attachment_submitted ?? false),
+            'attachment_reference' => $this->trimNullableString($app->attachment_reference ?? null),
+        ], LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL);
+    }
+
     private function buildRequestedLeaveUpdatePayload(Request $request, array $validated, LeaveApplication $app): array|JsonResponse
     {
         $requestedIsMonetization = array_key_exists('is_monetization', $validated)
@@ -6041,6 +6432,17 @@ class LeaveApplicationController extends Controller
 
         if (
             in_array($normalized, [
+                LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL,
+                'RECALL',
+                'RECALL_REQUEST',
+                'LEAVE_RECALL_REQUEST',
+            ], true)
+        ) {
+            return LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL;
+        }
+
+        if (
+            in_array($normalized, [
                 LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL,
                 'CANCEL',
                 'REQUEST_CANCELLATION',
@@ -6077,6 +6479,16 @@ class LeaveApplicationController extends Controller
                 return LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL;
             }
         }
+        $recallFlagValues = [
+            $payload['recall_leave'] ?? null,
+            $payload['request_recall'] ?? null,
+            $payload['is_recall_request'] ?? null,
+        ];
+        foreach ($recallFlagValues as $value) {
+            if ($value === true || $value === 1 || $value === '1' || $value === 'true') {
+                return LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL;
+            }
+        }
 
         $actionType = $this->normalizeRequestedLeaveActionTypeToken(
             $payload['action_type']
@@ -6094,12 +6506,13 @@ class LeaveApplicationController extends Controller
         $normalizedActionType = $this->normalizeRequestedLeaveActionTypeToken($actionType);
         $requestKind = $normalizedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
             ? 'cancel'
-            : 'update';
+            : ($normalizedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL ? 'recall' : 'update');
 
         return array_merge($payload, [
             'action_type' => $normalizedActionType,
             'request_kind' => $requestKind,
             'cancel_leave' => $normalizedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL,
+            'recall_leave' => $normalizedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL,
         ]);
     }
 
@@ -6149,6 +6562,15 @@ class LeaveApplicationController extends Controller
         $pendingActionType = $this->resolveUpdateRequestActionTypeFromPayload($payload);
         if ($pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL) {
             return $this->hrApprovePendingCancellationRequest(
+                $request,
+                $app,
+                $hr,
+                $pendingUpdateRequest,
+                $pendingUpdateMeta
+            );
+        }
+        if ($pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL) {
+            return $this->hrApprovePendingRecallRequest(
                 $request,
                 $app,
                 $hr,
@@ -6494,6 +6916,37 @@ class LeaveApplicationController extends Controller
         ]);
     }
 
+    private function hrApprovePendingRecallRequest(
+        Request $request,
+        LeaveApplication $app,
+        HRAccount $hr,
+        mixed $pendingUpdateRequest = null,
+        array $pendingUpdateMeta = []
+    ): JsonResponse {
+        $payload = is_array($pendingUpdateMeta['payload'] ?? null)
+            ? $pendingUpdateMeta['payload']
+            : [];
+        $recallReason = trim((string) (
+            $pendingUpdateMeta['reason']
+            ?? $payload['recall_reason']
+            ?? $payload['reason']
+            ?? $request->input('remarks')
+            ?? ''
+        ));
+        $recallSelectedDates = is_array($payload['recall_selected_dates'] ?? null)
+            ? $payload['recall_selected_dates']
+            : (is_array($payload['selected_dates'] ?? null) ? $payload['selected_dates'] : []);
+
+        return $this->executeHrRecall(
+            $app,
+            $hr,
+            $recallReason,
+            $recallSelectedDates,
+            $pendingUpdateRequest instanceof LeaveApplicationUpdateRequest ? $pendingUpdateRequest : null,
+            $request->input('remarks')
+        );
+    }
+
     private function hrApprovePendingCancellationRequest(
         Request $request,
         LeaveApplication $app,
@@ -6639,7 +7092,11 @@ class LeaveApplicationController extends Controller
                 'remarks' => $request->input('remarks') ?: (
                     $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
                         ? 'Rejected leave cancellation request.'
-                        : 'Rejected leave update request.'
+                        : (
+                            $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                                ? 'Rejected leave recall request.'
+                                : 'Rejected leave update request.'
+                        )
                 ),
                 'created_at' => now(),
             ]);
@@ -6650,7 +7107,11 @@ class LeaveApplicationController extends Controller
         return response()->json([
             'message' => $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
                 ? 'Leave cancellation request rejected by HR. Original approved application remains unchanged.'
-                : 'Leave update request rejected by HR. Original approved application remains unchanged.',
+                : (
+                    $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                        ? 'Leave recall request rejected by HR. Original approved application remains unchanged.'
+                        : 'Leave update request rejected by HR. Original approved application remains unchanged.'
+                ),
             'application' => $this->formatApplication($app),
         ]);
     }
@@ -6699,7 +7160,11 @@ class LeaveApplicationController extends Controller
                 'remarks' => $request->input('remarks') ?: (
                     $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
                         ? 'Rejected leave cancellation request.'
-                        : 'Rejected leave update request.'
+                        : (
+                            $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                                ? 'Rejected leave recall request.'
+                                : 'Rejected leave update request.'
+                        )
                 ),
                 'created_at' => now(),
             ]);
@@ -6710,7 +7175,11 @@ class LeaveApplicationController extends Controller
         return response()->json([
             'message' => $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
                 ? 'Leave cancellation request rejected by admin. Original approved application remains unchanged.'
-                : 'Leave update request rejected by admin. Original approved application remains unchanged.',
+                : (
+                    $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                        ? 'Leave recall request rejected by admin. Original approved application remains unchanged.'
+                        : 'Leave update request rejected by admin. Original approved application remains unchanged.'
+                ),
             'application' => $this->formatApplication($app),
         ]);
     }
@@ -6772,6 +7241,15 @@ class LeaveApplicationController extends Controller
         }
 
         return $requestedAt;
+    }
+
+    private function resolveCurrentHrDocumentCycleRequestedAt(LeaveApplication $app): ?\DateTimeInterface
+    {
+        if ($this->isPendingApprovedUpdateRequest($app)) {
+            return $this->resolvePendingApprovedUpdateCycleRequestedAt($app);
+        }
+
+        return $this->resolveLatestApprovedUpdateCycleRequestedAt($app);
     }
 
     private function resolveLatestHrActionLogForCycle(
@@ -6918,6 +7396,57 @@ class LeaveApplicationController extends Controller
             return null;
         }
         $actionType = $this->resolveUpdateRequestActionTypeFromPayload($payload);
+
+        if ($actionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL) {
+            $leaveTypeId = $this->resolveCanonicalLeaveTypeId((int) ($payload['leave_type_id'] ?? 0))
+                ?? (int) ($payload['leave_type_id'] ?? 0);
+            $leaveTypeName = $this->trimNullableString($payload['leave_type_name'] ?? null);
+            $recallReason = $this->trimNullableString(
+                $payload['recall_reason']
+                ?? $payload['reason']
+                ?? $payload['reason_purpose']
+                ?? $payload['remarks']
+                ?? null
+            );
+            $selectedDates = is_array($payload['selected_dates'] ?? null)
+                ? LeaveApplication::resolveDateSet(null, null, $payload['selected_dates'], null)
+                : null;
+            $recallSelectedDates = $this->normalizeRecallDateKeys(
+                is_array($payload['recall_selected_dates'] ?? null)
+                    ? $payload['recall_selected_dates']
+                    : (is_array($selectedDates) ? $selectedDates : [])
+            );
+            $totalDays = round((float) (
+                $payload['total_days']
+                ?? ($recallSelectedDates !== [] ? count($recallSelectedDates) : 0)
+            ), 2);
+
+            return [
+                'action_type' => LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL,
+                'request_kind' => 'recall',
+                'cancel_leave' => false,
+                'recall_leave' => true,
+                'leave_type_id' => $leaveTypeId > 0 ? $leaveTypeId : null,
+                'leave_type_name' => $leaveTypeName,
+                'start_date' => $this->trimNullableString($payload['start_date'] ?? null),
+                'end_date' => $this->trimNullableString($payload['end_date'] ?? null),
+                'selected_dates' => $selectedDates,
+                'recall_selected_dates' => $recallSelectedDates,
+                'total_days' => $totalDays,
+                'deductible_days' => round((float) ($payload['deductible_days'] ?? $totalDays), 3),
+                'reason' => $recallReason,
+                'recall_reason' => $recallReason,
+                'details_of_leave' => $this->trimNullableString(
+                    $payload['details_of_leave'] ?? $payload['detailsOfLeave'] ?? null
+                ),
+                'commutation' => $this->trimNullableString($payload['commutation'] ?? null) ?? 'Not Requested',
+                'pay_mode' => $this->normalizePayMode(
+                    $payload['pay_mode'] ?? null,
+                    (bool) ($payload['is_monetization'] ?? false)
+                ),
+                'is_monetization' => (bool) ($payload['is_monetization'] ?? false),
+            ];
+        }
 
         if ($actionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL) {
             $isMonetization = (bool) ($payload['is_monetization'] ?? false);

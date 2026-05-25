@@ -13,10 +13,16 @@ class LeaveApplicationUpdateRequest extends Model
     protected $table = 'tblLeaveApplicationUpdateRequests';
 
     public const STATUS_PENDING = 'PENDING';
+
     public const STATUS_APPROVED = 'APPROVED';
+
     public const STATUS_REJECTED = 'REJECTED';
+
     public const ACTION_TYPE_UPDATE = 'REQUEST_UPDATE';
+
     public const ACTION_TYPE_CANCEL = 'REQUEST_CANCEL';
+
+    public const ACTION_TYPE_RECALL = 'REQUEST_RECALL';
 
     protected $fillable = [
         'leave_application_id',
