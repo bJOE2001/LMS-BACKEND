@@ -6,8 +6,8 @@ use App\Models\Department;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
-use App\Models\LeaveBalance;
 use App\Models\LeaveApplication;
+use App\Models\LeaveBalance;
 use App\Services\RecycleBinService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -38,7 +38,7 @@ class HRUserManagementController extends Controller
             ->with(['department:id,name'])
             ->orderBy('full_name')
             ->get()
-            ->map(fn(DepartmentAdmin $admin): array => $this->serializeDepartmentAdminAccountRow($admin))
+            ->map(fn (DepartmentAdmin $admin): array => $this->serializeDepartmentAdminAccountRow($admin))
             ->values();
 
         $hrAccounts = HRAccount::query()
@@ -47,7 +47,7 @@ class HRUserManagementController extends Controller
             })
             ->orderBy('full_name')
             ->get()
-            ->map(fn(HRAccount $account): array => $this->serializeHrAccountRow($account))
+            ->map(fn (HRAccount $account): array => $this->serializeHrAccountRow($account))
             ->values();
 
         $needle = mb_strtolower($searchTerm);
@@ -66,7 +66,7 @@ class HRUserManagementController extends Controller
                     trim((string) ($account['department'] ?? '')),
                     trim((string) ($account['position'] ?? '')),
                     trim((string) ($account['employee_control_no'] ?? '')),
-                ], fn(string $value): bool => $value !== '')));
+                ], fn (string $value): bool => $value !== '')));
 
                 return str_contains($haystack, $needle);
             })
@@ -120,7 +120,7 @@ class HRUserManagementController extends Controller
         $department = $resolvedDepartmentId !== null
             ? Department::query()->active()->find($resolvedDepartmentId)
             : null;
-        if ($resolvedDepartmentId !== null && !$department) {
+        if ($resolvedDepartmentId !== null && ! $department) {
             return response()->json([
                 'message' => 'Department not found.',
             ], 404);
@@ -154,7 +154,7 @@ class HRUserManagementController extends Controller
             })
             ->take($limit)
             ->values()
-            ->map(fn(object $employee): array => $this->serializeEligibleEmployee($employee))
+            ->map(fn (object $employee): array => $this->serializeEligibleEmployee($employee))
             ->values();
 
         return response()->json([
@@ -193,14 +193,14 @@ class HRUserManagementController extends Controller
             return $this->storeHrAccount($validated);
         }
 
-        if (!$departmentId) {
+        if (! $departmentId) {
             throw ValidationException::withMessages([
                 'department_id' => ['Office is required when creating an office admin account.'],
             ]);
         }
 
         $department = Department::query()->active()->find($departmentId);
-        if (!$department) {
+        if (! $department) {
             return response()->json([
                 'message' => 'Department not found.',
             ], 404);
@@ -210,7 +210,7 @@ class HRUserManagementController extends Controller
         $employeeControlNo = trim((string) ($validated['employee_control_no'] ?? ''));
         $rawPassword = (string) ($validated['password'] ?? '');
 
-        if (!$isGuest && $employeeControlNo === '') {
+        if (! $isGuest && $employeeControlNo === '') {
             throw ValidationException::withMessages([
                 'employee_control_no' => ['Employee is required when guest mode is off.'],
             ]);
@@ -222,7 +222,7 @@ class HRUserManagementController extends Controller
             ]);
         }
 
-        $employee = !$isGuest
+        $employee = ! $isGuest
             ? $this->resolveEligibleEmployeeForAssignment($employeeControlNo)
             : null;
 
@@ -244,8 +244,8 @@ class HRUserManagementController extends Controller
             ->orderBy('id')
             ->first();
 
-        if (!$admin) {
-            $admin = new DepartmentAdmin();
+        if (! $admin) {
+            $admin = new DepartmentAdmin;
         }
 
         $admin->department_id = $department->id;
@@ -276,7 +276,7 @@ class HRUserManagementController extends Controller
         $employeeControlNo = trim((string) ($validated['employee_control_no'] ?? ''));
         $rawPassword = (string) ($validated['password'] ?? '');
 
-        if (!$isGuest && $employeeControlNo === '') {
+        if (! $isGuest && $employeeControlNo === '') {
             throw ValidationException::withMessages([
                 'employee_control_no' => ['Employee is required when guest mode is off.'],
             ]);
@@ -288,7 +288,7 @@ class HRUserManagementController extends Controller
             ]);
         }
 
-        $employee = !$isGuest
+        $employee = ! $isGuest
             ? $this->resolveEligibleEmployeeForAssignment($employeeControlNo)
             : null;
 
@@ -326,7 +326,7 @@ class HRUserManagementController extends Controller
     public function update(Request $request, int $id): JsonResponse
     {
         $admin = DepartmentAdmin::query()->find($id);
-        if (!$admin) {
+        if (! $admin) {
             return response()->json([
                 'message' => 'Department admin not found.',
             ], 404);
@@ -343,7 +343,7 @@ class HRUserManagementController extends Controller
         ]);
 
         $department = Department::query()->active()->find((int) $validated['department_id']);
-        if (!$department) {
+        if (! $department) {
             return response()->json([
                 'message' => 'Department not found.',
             ], 404);
@@ -381,7 +381,7 @@ class HRUserManagementController extends Controller
     public function reactivate(Request $request, int $id): JsonResponse
     {
         $admin = DepartmentAdmin::query()->find($id);
-        if (!$admin) {
+        if (! $admin) {
             return response()->json([
                 'message' => 'Department admin not found.',
             ], 404);
@@ -427,13 +427,13 @@ class HRUserManagementController extends Controller
     public function resetDepartmentAdminPassword(Request $request, int $id): JsonResponse
     {
         $admin = DepartmentAdmin::query()->find($id);
-        if (!$admin) {
+        if (! $admin) {
             return response()->json([
                 'message' => 'Department admin not found.',
             ], 404);
         }
 
-        if (!$this->isDepartmentAdminAssignmentActive($admin)) {
+        if (! $this->isDepartmentAdminAssignmentActive($admin)) {
             return response()->json([
                 'message' => 'Only active office admin accounts can be reset.',
             ], 422);
@@ -447,7 +447,7 @@ class HRUserManagementController extends Controller
         }
 
         $employee = HrisEmployee::findByControlNo($employeeControlNo);
-        if (!$employee) {
+        if (! $employee) {
             return response()->json([
                 'message' => 'Linked employee not found in HRIS. Unable to reset default password.',
             ], 422);
@@ -468,7 +468,7 @@ class HRUserManagementController extends Controller
     public function resetHrAccountPassword(Request $request, int $id): JsonResponse
     {
         $hrAccount = HRAccount::query()->find($id);
-        if (!$hrAccount) {
+        if (! $hrAccount) {
             return response()->json([
                 'message' => 'HR account not found.',
             ], 404);
@@ -493,7 +493,7 @@ class HRUserManagementController extends Controller
     public function destroy(Request $request, int $id): JsonResponse
     {
         $admin = DepartmentAdmin::query()->find($id);
-        if (!$admin) {
+        if (! $admin) {
             return response()->json([
                 'message' => 'Department admin not found.',
             ], 404);
@@ -508,7 +508,7 @@ class HRUserManagementController extends Controller
                 ->whereRaw("LTRIM(RTRIM(employee_control_no)) <> ''")
                 ->exists();
 
-            if (!$hasReplacementAdmin) {
+            if (! $hasReplacementAdmin) {
                 return response()->json([
                     'message' => 'Assign a new department admin for this department before removing the current admin.',
                 ], 422);
@@ -555,7 +555,7 @@ class HRUserManagementController extends Controller
     public function destroyHrAccount(Request $request, int $id): JsonResponse
     {
         $hrAccount = HRAccount::query()->find($id);
-        if (!$hrAccount) {
+        if (! $hrAccount) {
             return response()->json([
                 'message' => 'HR account not found.',
             ], 404);
@@ -606,7 +606,7 @@ class HRUserManagementController extends Controller
     private function resolveEligibleEmployeeForAssignment(string $employeeControlNo): object
     {
         $employee = HrisEmployee::findByControlNo($employeeControlNo, true);
-        if (!$employee) {
+        if (! $employee) {
             throw ValidationException::withMessages([
                 'employee_control_no' => ['Active employee not found.'],
             ]);
@@ -652,7 +652,7 @@ class HRUserManagementController extends Controller
             trim((string) $employee->firstname),
             trim((string) $employee->middlename),
             trim((string) $employee->surname),
-        ], fn(string $part): bool => $part !== ''));
+        ], fn (string $part): bool => $part !== ''));
 
         if ($parts === []) {
             return trim((string) $employee->control_no);
@@ -712,28 +712,27 @@ class HRUserManagementController extends Controller
     {
         $isActive = $this->isDepartmentAdminAssignmentActive($admin);
         $employee = $this->resolveEmployeeForAdmin($admin);
+        $departmentName = trim((string) ($admin->department?->name ?? ''));
         $position = trim((string) ($employee?->designation ?? ''));
         if ($position === '') {
             $position = 'Department Admin';
         }
 
         return [
-            'row_key' => 'DEPARTMENT_ADMIN-' . $admin->id,
+            'row_key' => 'DEPARTMENT_ADMIN-'.$admin->id,
             'account_id' => $admin->id,
             'role' => 'DEPARTMENT_ADMIN',
             'role_label' => 'Department Admin',
             'full_name' => trim((string) ($admin->full_name ?? '')),
             'username' => trim((string) ($admin->username ?? '')),
             'department_id' => $admin->department_id !== null ? (int) $admin->department_id : null,
-            'department' => trim((string) ($admin->department?->name ?? '')) !== ''
-                ? trim((string) $admin->department?->name)
-                : null,
+            'department' => $this->resolveUserManagementOfficeFromHris($employee, $departmentName),
             'position' => $position,
             'employee_control_no' => trim((string) ($admin->employee_control_no ?? '')) !== ''
                 ? trim((string) $admin->employee_control_no)
                 : null,
             'is_active' => $isActive,
-            'can_reactivate' => !$isActive,
+            'can_reactivate' => ! $isActive,
             'can_reset_password' => $isActive && trim((string) ($admin->employee_control_no ?? '')) !== '',
             'is_default_account' => (bool) $admin->is_default_account,
             'can_delete' => true,
@@ -743,10 +742,27 @@ class HRUserManagementController extends Controller
         ];
     }
 
+    private function resolveUserManagementOfficeFromHris(?object $employee, string $fallbackDepartmentName): ?string
+    {
+        $hrisOfficeAcronym = trim((string) ($employee?->hrisOfficeAcronym ?? ''));
+        if ($hrisOfficeAcronym !== '') {
+            return $hrisOfficeAcronym;
+        }
+
+        $hrisOfficeName = trim((string) ($employee?->hris_office ?? ''));
+        if ($hrisOfficeName !== '') {
+            return $hrisOfficeName;
+        }
+
+        $fallback = trim($fallbackDepartmentName);
+
+        return $fallback !== '' ? $fallback : null;
+    }
+
     private function serializeHrAccountRow(HRAccount $account): array
     {
         return [
-            'row_key' => 'HR-' . $account->id,
+            'row_key' => 'HR-'.$account->id,
             'account_id' => $account->id,
             'role' => 'HR',
             'role_label' => 'HR Admin',
@@ -767,7 +783,7 @@ class HRUserManagementController extends Controller
 
     private function hasHistoricalCocApplicationsForHrAccount(HRAccount $account): bool
     {
-        if (!Schema::hasTable('tblCOCApplications')) {
+        if (! Schema::hasTable('tblCOCApplications')) {
             return false;
         }
 
@@ -792,6 +808,7 @@ class HRUserManagementController extends Controller
                 foreach ($candidateColumns as $index => $column) {
                     if ($index === 0) {
                         $query->where($column, $account->id);
+
                         continue;
                     }
 
@@ -803,11 +820,11 @@ class HRUserManagementController extends Controller
 
     private function isDepartmentAdminAssignmentActive(?DepartmentAdmin $admin): bool
     {
-        if (!$admin) {
+        if (! $admin) {
             return false;
         }
 
-        return !$admin->isDeactivatedAccount();
+        return ! $admin->isDeactivatedAccount();
     }
 
     private function hasHistoricalLeaveApplications(DepartmentAdmin $admin): bool
@@ -819,7 +836,7 @@ class HRUserManagementController extends Controller
 
     private function hasHistoricalCocApplicationsForDepartmentAdmin(DepartmentAdmin $admin): bool
     {
-        if (!Schema::hasTable('tblCOCApplications')) {
+        if (! Schema::hasTable('tblCOCApplications')) {
             return false;
         }
 
@@ -841,6 +858,7 @@ class HRUserManagementController extends Controller
                 foreach ($candidateColumns as $index => $column) {
                     if ($index === 0) {
                         $query->where($column, $admin->id);
+
                         continue;
                     }
                     $query->orWhere($column, $admin->id);
@@ -864,7 +882,7 @@ class HRUserManagementController extends Controller
 
     private function buildArchivedDepartmentAdminUsername(DepartmentAdmin $admin): string
     {
-        $base = 'archived_admin_' . $admin->id;
+        $base = 'archived_admin_'.$admin->id;
         $candidate = $base;
 
         while (
@@ -873,7 +891,7 @@ class HRUserManagementController extends Controller
                 ->where('id', '!=', $admin->id)
                 ->exists()
         ) {
-            $candidate = $base . '_' . Str::lower(Str::random(6));
+            $candidate = $base.'_'.Str::lower(Str::random(6));
         }
 
         return $candidate;
@@ -940,7 +958,7 @@ class HRUserManagementController extends Controller
     private function buildGeneratedPasswordFromBirthDate(object $employee): string
     {
         $birthDate = $this->resolveEmployeeBirthDate($employee);
-        if (!$birthDate) {
+        if (! $birthDate) {
             throw ValidationException::withMessages([
                 'employee_control_no' => ['Selected employee has no birth date in HRIS. Cannot generate default password.'],
             ]);
@@ -988,7 +1006,7 @@ class HRUserManagementController extends Controller
 
         $candidateEmployeeControlNos = array_values(array_unique(array_filter(
             $candidateEmployeeControlNos,
-            static fn(string $value): bool => $value !== ''
+            static fn (string $value): bool => $value !== ''
         )));
 
         return LeaveBalance::query()
