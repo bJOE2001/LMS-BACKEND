@@ -687,6 +687,11 @@ class HrisEmployee
         return $acronymsByOfficeName[$lookupKey] ?? null;
     }
 
+    public static function officeAcronymByName(?string $officeName): ?string
+    {
+        return self::resolveOfficeAcronymByName($officeName);
+    }
+
     /**
      * @return array<string, string>
      */

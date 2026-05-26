@@ -151,13 +151,14 @@ class SmsGatewayService
         }
 
         $body = $headerSize > 0 ? (string) substr((string) $rawResponse, $headerSize) : (string) $rawResponse;
-        $isSuccess = $status >= 200 && $status < 300;
+        $gatewayBodyError = $this->extractGatewayBodyError($body);
+        $isSuccess = $status >= 200 && $status < 300 && $gatewayBodyError === null;
 
         return [
             'success' => $isSuccess,
             'status' => $status,
             'body' => $body,
-            'error' => null,
+            'error' => $gatewayBodyError,
         ];
     }
 
@@ -440,6 +441,20 @@ class SmsGatewayService
         return strlen($trimmed) > $maxLength
             ? substr($trimmed, 0, $maxLength).'...'
             : $trimmed;
+    }
+
+    private function extractGatewayBodyError(string $body): ?string
+    {
+        $trimmedBody = trim($body);
+        if ($trimmedBody === '') {
+            return null;
+        }
+
+        if (preg_match('/\bresponse\s*:\s*error\b/i', $trimmedBody) === 1) {
+            return $this->truncateResponseBody($trimmedBody);
+        }
+
+        return null;
     }
 
     private function buildApplicationInclusiveDateBlock(LeaveApplication $application): string

@@ -7,6 +7,7 @@ use App\Http\Requests\Auth\LoginRequest;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
+use App\Services\HrAccessControlService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -14,7 +15,6 @@ use Laravel\Sanctum\NewAccessToken;
 
 class AuthController extends Controller
 {
-    private const DASHBOARD_HR = '/hr/dashboard';
     private const DASHBOARD_DEPARTMENT_ADMIN = '/admin/dashboard';
 
     /**
@@ -80,12 +80,14 @@ class AuthController extends Controller
     }
 
     /**
-     * @param HRAccount|DepartmentAdmin $account
      * @return array{0: array, 1: string}
      */
     private function formatAccount(HRAccount|DepartmentAdmin $account): array
     {
         if ($account instanceof HRAccount) {
+            $accessControl = app(HrAccessControlService::class);
+            $moduleAccess = $accessControl->allowedModuleKeysForAccount($account);
+
             return [
                 [
                     'id' => $account->id,
@@ -93,13 +95,16 @@ class AuthController extends Controller
                     'username' => $account->username,
                     'role' => 'hr',
                     'position' => trim((string) ($account->position ?? '')) !== '' ? $account->position : 'HR',
+                    'hr_module_access' => $moduleAccess,
+                    'is_access_control_owner' => $accessControl->isAccessControlOwner($account),
                     'must_change_password' => (bool) $account->must_change_password,
                 ],
-                self::DASHBOARD_HR,
+                $accessControl->resolveDashboardRouteForAccount($account),
             ];
         }
 
         $account->loadMissing(['department']);
+
         return [
             [
                 'id' => $account->id,
@@ -139,6 +144,7 @@ class AuthController extends Controller
     {
         $employee = $this->resolveDepartmentAdminEmployee($account);
         $designation = trim((string) ($employee?->designation ?? ''));
+
         return $designation !== '' ? $designation : 'Department Admin';
     }
 
@@ -146,6 +152,7 @@ class AuthController extends Controller
     {
         $employee = $this->resolveDepartmentAdminEmployee($account);
         $status = trim((string) ($employee?->status ?? ''));
+
         return $status !== '' ? $status : null;
     }
 

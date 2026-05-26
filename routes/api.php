@@ -5,6 +5,7 @@ use App\Http\Controllers\Auth\AuthController;
 use App\Http\Controllers\Auth\PasswordResetController;
 use App\Http\Controllers\COCApplicationController;
 use App\Http\Controllers\EmployeeController;
+use App\Http\Controllers\HRAccessControlController;
 use App\Http\Controllers\HRDashboardController;
 use App\Http\Controllers\HRDepartmentLibraryController;
 use App\Http\Controllers\HRIllnessLibraryController;
@@ -68,6 +69,8 @@ Route::prefix('erms')->middleware('erms.auth')->group(function () {
     Route::post('/leave-applications/{id}/request-edit', [LeaveApplicationController::class, 'ermsRequestEdit']);
     Route::get('/admin/department-head', [EmployeeController::class, 'ermsDepartmentHead']);
     Route::get('/city-administrator', [EmployeeController::class, 'ermsCityAdministrator']);
+    Route::get('/city-mayor', [EmployeeController::class, 'ermsCityMayor']);
+    Route::get('/city-vice-mayor', [EmployeeController::class, 'ermsCityViceMayor']);
     Route::get('/settings/signatories', [SettingsController::class, 'ermsSignatories']);
 });
 
@@ -86,6 +89,8 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
     Route::get('/departments', [EmployeeController::class, 'departments']);
     Route::get('/employees', [EmployeeController::class, 'index']);
     Route::get('/city-administrator', [EmployeeController::class, 'cityAdministrator']);
+    Route::get('/city-mayor', [EmployeeController::class, 'cityMayor']);
+    Route::get('/city-vice-mayor', [EmployeeController::class, 'cityViceMayor']);
     Route::get('/notifications/unread-count', [NotificationController::class, 'unreadCount']);
     Route::get('/notifications', [NotificationController::class, 'index']);
     Route::get('/notifications/{id}/application', [NotificationController::class, 'applicationDetails']);
@@ -140,92 +145,111 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
     });
 
     Route::middleware('hr')->prefix('hr')->group(function () {
-        // Employee management
-        Route::get('/employee-options', [EmployeeController::class, 'employeeOptions']);
-        Route::get('/employees/{controlNo}/leave-history', [EmployeeController::class, 'leaveHistory']);
-        Route::get('/employees/{controlNo}/leave-balance-ledger', [EmployeeController::class, 'leaveCreditsLedger']);
-        Route::get('/employees/{controlNo}/leave-credits-ledger', [EmployeeController::class, 'leaveCreditsLedger']);
+        Route::middleware('hr.module:employee_management')->group(function () {
+            // Employee management
+            Route::get('/employee-options', [EmployeeController::class, 'employeeOptions']);
+            Route::get('/employees/{controlNo}/leave-history', [EmployeeController::class, 'leaveHistory']);
+            Route::get('/employees/{controlNo}/leave-balance-ledger', [EmployeeController::class, 'leaveCreditsLedger']);
+            Route::get('/employees/{controlNo}/leave-credits-ledger', [EmployeeController::class, 'leaveCreditsLedger']);
 
-        // Dashboard
-        Route::get('/dashboard', [HRDashboardController::class, 'index']);
-        Route::get('/calendar', [HRDashboardController::class, 'calendarLeaves']);
-        Route::get('/department-statistics', [HRDashboardController::class, 'departmentStatistics']);
+            // Leave balance management
+            Route::get('/leave-balances/available-types', [HRLeaveBalanceImportController::class, 'availableTypes']);
+            Route::post('/leave-balances', [HRLeaveBalanceImportController::class, 'store']);
+            Route::put('/leave-balances', [HRLeaveBalanceImportController::class, 'update']);
+        });
 
-        // Work schedule and leave deduction settings
-        Route::get('/work-schedules', [HRWorkScheduleController::class, 'index']);
-        Route::put('/work-schedules/default', [HRWorkScheduleController::class, 'updateDefault']);
-        Route::post('/work-schedules/overrides', [HRWorkScheduleController::class, 'storeOverride']);
-        Route::put('/work-schedules/overrides/{id}', [HRWorkScheduleController::class, 'updateOverride']);
-        Route::delete('/work-schedules/overrides/{id}', [HRWorkScheduleController::class, 'destroyOverride']);
+        Route::middleware('hr.module:dashboard')->group(function () {
+            // Dashboard
+            Route::get('/dashboard', [HRDashboardController::class, 'index']);
+            Route::get('/calendar', [HRDashboardController::class, 'calendarLeaves']);
+            Route::get('/department-statistics', [HRDashboardController::class, 'departmentStatistics']);
+        });
 
-        // Leave balance management
-        Route::get('/leave-balances/available-types', [HRLeaveBalanceImportController::class, 'availableTypes']);
-        Route::post('/leave-balances', [HRLeaveBalanceImportController::class, 'store']);
-        Route::put('/leave-balances', [HRLeaveBalanceImportController::class, 'update']);
+        Route::middleware('hr.module:work_schedules')->group(function () {
+            // Work schedule and leave deduction settings
+            Route::get('/work-schedules', [HRWorkScheduleController::class, 'index']);
+            Route::put('/work-schedules/default', [HRWorkScheduleController::class, 'updateDefault']);
+            Route::post('/work-schedules/overrides', [HRWorkScheduleController::class, 'storeOverride']);
+            Route::put('/work-schedules/overrides/{id}', [HRWorkScheduleController::class, 'updateOverride']);
+            Route::delete('/work-schedules/overrides/{id}', [HRWorkScheduleController::class, 'destroyOverride']);
+        });
 
-        // User management
-        Route::get('/user-management/department-admins', [HRUserManagementController::class, 'index']);
-        Route::get('/user-management/eligible-employees', [HRUserManagementController::class, 'eligibleEmployees']);
-        Route::get('/user-management/departments/{departmentId}/eligible-employees', [HRUserManagementController::class, 'eligibleEmployees']);
-        Route::post('/user-management/department-admins', [HRUserManagementController::class, 'store']);
-        Route::put('/user-management/department-admins/{id}', [HRUserManagementController::class, 'update']);
-        Route::post('/user-management/department-admins/{id}/reactivate', [HRUserManagementController::class, 'reactivate']);
-        Route::post('/user-management/department-admins/{id}/reset-password', [HRUserManagementController::class, 'resetDepartmentAdminPassword']);
-        Route::post('/user-management/hr-accounts/{id}/reset-password', [HRUserManagementController::class, 'resetHrAccountPassword']);
-        Route::delete('/user-management/department-admins/{id}', [HRUserManagementController::class, 'destroy']);
-        Route::delete('/user-management/hr-accounts/{id}', [HRUserManagementController::class, 'destroyHrAccount']);
+        Route::middleware('hr.module:user_management')->group(function () {
+            // User management
+            Route::get('/user-management/department-admins', [HRUserManagementController::class, 'index']);
+            Route::get('/user-management/eligible-employees', [HRUserManagementController::class, 'eligibleEmployees']);
+            Route::get('/user-management/departments/{departmentId}/eligible-employees', [HRUserManagementController::class, 'eligibleEmployees']);
+            Route::post('/user-management/department-admins', [HRUserManagementController::class, 'store']);
+            Route::put('/user-management/department-admins/{id}', [HRUserManagementController::class, 'update']);
+            Route::post('/user-management/department-admins/{id}/reactivate', [HRUserManagementController::class, 'reactivate']);
+            Route::post('/user-management/department-admins/{id}/reset-password', [HRUserManagementController::class, 'resetDepartmentAdminPassword']);
+            Route::post('/user-management/hr-accounts/{id}/reset-password', [HRUserManagementController::class, 'resetHrAccountPassword']);
+            Route::delete('/user-management/department-admins/{id}', [HRUserManagementController::class, 'destroy']);
+            Route::delete('/user-management/hr-accounts/{id}', [HRUserManagementController::class, 'destroyHrAccount']);
+        });
 
-        Route::prefix('departments')->group(function () {
+        Route::middleware('hr.module:access_control')->prefix('access-control')->group(function () {
+            Route::get('/modules', [HRAccessControlController::class, 'modules']);
+            Route::get('/hr-admins', [HRAccessControlController::class, 'hrAdmins']);
+            Route::put('/hr-admins/{id}/modules', [HRAccessControlController::class, 'updateHrAdminModules']);
+        });
+
+        Route::middleware('hr.module:office_library')->prefix('departments')->group(function () {
             Route::get('/', [HRDepartmentLibraryController::class, 'index']);
             Route::post('/', [HRDepartmentLibraryController::class, 'store']);
             Route::put('/{id}', [HRDepartmentLibraryController::class, 'update']);
             Route::delete('/{id}', [HRDepartmentLibraryController::class, 'destroy']);
         });
 
-        Route::prefix('illnesses')->group(function () {
+        Route::middleware('hr.module:illness_library')->prefix('illnesses')->group(function () {
             Route::get('/', [HRIllnessLibraryController::class, 'index']);
             Route::post('/', [HRIllnessLibraryController::class, 'store']);
             Route::put('/{id}', [HRIllnessLibraryController::class, 'update']);
             Route::delete('/{id}', [HRIllnessLibraryController::class, 'destroy']);
         });
 
-        Route::prefix('leave-types')->group(function () {
+        Route::middleware('hr.module:leave_types')->prefix('leave-types')->group(function () {
             Route::get('/', [HRLeaveTypeController::class, 'index']);
             Route::post('/', [HRLeaveTypeController::class, 'store']);
             Route::put('/{id}', [HRLeaveTypeController::class, 'update']);
             Route::delete('/{id}', [HRLeaveTypeController::class, 'destroy']);
         });
 
-        // Leave application review
-        Route::get('/leave-applications', [LeaveApplicationController::class, 'hrIndex']);
-        Route::get('/leave-applications/{id}', [LeaveApplicationController::class, 'hrShow']);
-        Route::get('/leave-applications/{id}/attachment', [LeaveApplicationController::class, 'hrViewAttachment']);
-        Route::post('/leave-applications/{id}/receive', [LeaveApplicationController::class, 'hrReceive']);
-        Route::post('/leave-applications/{id}/undo-receive', [LeaveApplicationController::class, 'hrUndoReceive']);
-        Route::post('/leave-applications/{id}/cmo-cbmo-review', [LeaveApplicationController::class, 'hrCmoCbmoReview']);
-        Route::post('/leave-applications/{id}/release', [LeaveApplicationController::class, 'hrRelease']);
-        Route::post('/leave-applications/{id}/undo-release', [LeaveApplicationController::class, 'hrUndoRelease']);
-        Route::post('/leave-applications/{id}/update-receive', [LeaveApplicationController::class, 'hrReceiveUpdate']);
-        Route::post('/leave-applications/{id}/update-release', [LeaveApplicationController::class, 'hrReleaseUpdate']);
-        Route::post('/leave-applications/{id}/approve', [LeaveApplicationController::class, 'hrApprove']);
-        Route::post('/leave-applications/{id}/reject', [LeaveApplicationController::class, 'hrReject']);
-        Route::post('/leave-applications/{id}/recall', [LeaveApplicationController::class, 'hrRecall']);
-        Route::get('/coc-applications', [COCApplicationController::class, 'hrIndex']);
-        Route::get('/coc-applications/late-filings', [COCApplicationController::class, 'hrLateFilingIndex']);
-        Route::get('/coc-applications/{id}', [COCApplicationController::class, 'hrShow']);
-        Route::post('/coc-applications/{id}/receive', [COCApplicationController::class, 'hrReceive']);
-        Route::post('/coc-applications/{id}/undo-receive', [COCApplicationController::class, 'hrUndoReceive']);
-        Route::post('/coc-applications/{id}/cmo-cbmo-review', [COCApplicationController::class, 'hrCmoCbmoReview']);
-        Route::post('/coc-applications/{id}/release', [COCApplicationController::class, 'hrRelease']);
-        Route::post('/coc-applications/{id}/undo-release', [COCApplicationController::class, 'hrUndoRelease']);
-        Route::post('/coc-applications/{id}/late-filing/approve', [COCApplicationController::class, 'hrApproveLateFiling']);
-        Route::post('/coc-applications/{id}/late-filing/reject', [COCApplicationController::class, 'hrRejectLateFiling']);
-        Route::post('/coc-applications/{id}/approve', [COCApplicationController::class, 'hrApprove']);
-        Route::post('/coc-applications/{id}/reject', [COCApplicationController::class, 'hrReject']);
-        Route::post('/coc-balances/import', [COCApplicationController::class, 'hrImportBalances']);
+        Route::middleware('hr.module:applications')->group(function () {
+            // Leave application review
+            Route::get('/leave-applications', [LeaveApplicationController::class, 'hrIndex']);
+            Route::get('/leave-applications/{id}', [LeaveApplicationController::class, 'hrShow']);
+            Route::get('/leave-applications/{id}/attachment', [LeaveApplicationController::class, 'hrViewAttachment']);
+            Route::post('/leave-applications/{id}/receive', [LeaveApplicationController::class, 'hrReceive']);
+            Route::post('/leave-applications/{id}/undo-receive', [LeaveApplicationController::class, 'hrUndoReceive']);
+            Route::post('/leave-applications/{id}/cmo-cbmo-review', [LeaveApplicationController::class, 'hrCmoCbmoReview']);
+            Route::post('/leave-applications/{id}/release', [LeaveApplicationController::class, 'hrRelease']);
+            Route::post('/leave-applications/{id}/undo-release', [LeaveApplicationController::class, 'hrUndoRelease']);
+            Route::post('/leave-applications/{id}/update-receive', [LeaveApplicationController::class, 'hrReceiveUpdate']);
+            Route::post('/leave-applications/{id}/update-release', [LeaveApplicationController::class, 'hrReleaseUpdate']);
+            Route::post('/leave-applications/{id}/approve', [LeaveApplicationController::class, 'hrApprove']);
+            Route::post('/leave-applications/{id}/reject', [LeaveApplicationController::class, 'hrReject']);
+            Route::post('/leave-applications/{id}/recall', [LeaveApplicationController::class, 'hrRecall']);
+        });
 
-        // Reports
-        Route::prefix('reports')->group(function () {
+        Route::middleware('hr.module:coc_applications')->group(function () {
+            Route::get('/coc-applications', [COCApplicationController::class, 'hrIndex']);
+            Route::get('/coc-applications/late-filings', [COCApplicationController::class, 'hrLateFilingIndex']);
+            Route::get('/coc-applications/{id}', [COCApplicationController::class, 'hrShow']);
+            Route::post('/coc-applications/{id}/receive', [COCApplicationController::class, 'hrReceive']);
+            Route::post('/coc-applications/{id}/undo-receive', [COCApplicationController::class, 'hrUndoReceive']);
+            Route::post('/coc-applications/{id}/cmo-cbmo-review', [COCApplicationController::class, 'hrCmoCbmoReview']);
+            Route::post('/coc-applications/{id}/release', [COCApplicationController::class, 'hrRelease']);
+            Route::post('/coc-applications/{id}/undo-release', [COCApplicationController::class, 'hrUndoRelease']);
+            Route::post('/coc-applications/{id}/late-filing/approve', [COCApplicationController::class, 'hrApproveLateFiling']);
+            Route::post('/coc-applications/{id}/late-filing/reject', [COCApplicationController::class, 'hrRejectLateFiling']);
+            Route::post('/coc-applications/{id}/approve', [COCApplicationController::class, 'hrApprove']);
+            Route::post('/coc-applications/{id}/reject', [COCApplicationController::class, 'hrReject']);
+            Route::post('/coc-balances/import', [COCApplicationController::class, 'hrImportBalances']);
+        });
+
+        Route::middleware('hr.module:reports_monitoring')->prefix('reports')->group(function () {
+            // Reports
             Route::get('/lwop', [HRReportController::class, 'lwopReports']);
             Route::get('/leave-balances', [HRReportController::class, 'leaveBalancesReports']);
             Route::get('/monetization', [HRReportController::class, 'monetizationReports']);

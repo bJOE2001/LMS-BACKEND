@@ -4,6 +4,7 @@ namespace App\Models;
 
 use Illuminate\Contracts\Auth\Authenticatable as AuthenticatableContract;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 use Laravel\Sanctum\HasApiTokens;
 
 /**
@@ -62,12 +63,15 @@ class HRAccount extends Model implements AuthenticatableContract
         return null;
     }
 
-    public function setRememberToken($value): void
-    {
-    }
+    public function setRememberToken($value): void {}
 
     public function getRememberTokenName(): ?string
     {
         return null;
+    }
+
+    public function modulePermissions(): HasMany
+    {
+        return $this->hasMany(HRModulePermission::class, 'hr_account_id');
     }
 }

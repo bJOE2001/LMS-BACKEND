@@ -92,6 +92,46 @@ class EmployeeController extends Controller
     }
 
     /**
+     * Return the City Mayor signatory record from HRIS.
+     * Accessible to HR and department admin accounts.
+     */
+    public function cityMayor(Request $request): JsonResponse
+    {
+        $account = $request->user();
+        if (! $account instanceof HRAccount && ! $account instanceof DepartmentAdmin) {
+            return response()->json([
+                'message' => 'Only HR and department admin accounts can access this endpoint.',
+            ], 403);
+        }
+
+        return response()->json([
+            'city_mayor' => $this->serializeCityMayorEmployee(
+                $this->resolveCityMayorEmployee()
+            ),
+        ]);
+    }
+
+    /**
+     * Return the City Vice Mayor signatory record from HRIS.
+     * Accessible to HR and department admin accounts.
+     */
+    public function cityViceMayor(Request $request): JsonResponse
+    {
+        $account = $request->user();
+        if (! $account instanceof HRAccount && ! $account instanceof DepartmentAdmin) {
+            return response()->json([
+                'message' => 'Only HR and department admin accounts can access this endpoint.',
+            ], 403);
+        }
+
+        return response()->json([
+            'city_vice_mayor' => $this->serializeCityViceMayorEmployee(
+                $this->resolveCityViceMayorEmployee()
+            ),
+        ]);
+    }
+
+    /**
      * Return the City Administrator signatory for ERMS-integrated clients.
      * Protected by the ERMS middleware route group.
      */
@@ -100,6 +140,32 @@ class EmployeeController extends Controller
         return response()->json([
             'city_administrator' => $this->serializeCityAdministratorEmployee(
                 $this->resolveCityAdministratorEmployee()
+            ),
+        ]);
+    }
+
+    /**
+     * Return the City Mayor signatory for ERMS-integrated clients.
+     * Protected by the ERMS middleware route group.
+     */
+    public function ermsCityMayor(): JsonResponse
+    {
+        return response()->json([
+            'city_mayor' => $this->serializeCityMayorEmployee(
+                $this->resolveCityMayorEmployee()
+            ),
+        ]);
+    }
+
+    /**
+     * Return the City Vice Mayor signatory for ERMS-integrated clients.
+     * Protected by the ERMS middleware route group.
+     */
+    public function ermsCityViceMayor(): JsonResponse
+    {
+        return response()->json([
+            'city_vice_mayor' => $this->serializeCityViceMayorEmployee(
+                $this->resolveCityViceMayorEmployee()
             ),
         ]);
     }
@@ -852,21 +918,31 @@ class EmployeeController extends Controller
                         : ($isNegativeAdjustment
                         ? 'deduction_with_pay'
                         : 'earned');
-
-                    $transactions[] = [
-                        'row_id' => 'accrual-'.(int) $entry->id,
-                        'type_key' => $typeKey,
-                        'transaction_date' => $accrualDate,
-                        'sort_date' => $accrualDate,
-                        'sort_timestamp' => (string) ($entry->created_at?->toIso8601String() ?? $accrualDate),
-                        'particulars' => $this->buildLedgerParticulars(
+                    $shouldMergeMonthlyVlSlAccrual = ! $isManualBalanceSource
+                        && $entryCategory === 'earned'
+                        && in_array($typeKey, ['vacation', 'sick'], true);
+                    $accrualMergeKey = $shouldMergeMonthlyVlSlAccrual
+                        ? 'monthly-accrual-vl-sl-'.$accrualDate
+                        : null;
+                    $accrualParticulars = $shouldMergeMonthlyVlSlAccrual
+                        ? 'VL/SL 0-0-0'
+                        : $this->buildLedgerParticulars(
                             $entryKind,
                             $typeKey,
                             $displayAmount,
                             false,
                             false,
                             is_string($otherTypeCode) ? $otherTypeCode : null
-                        ),
+                        );
+
+                    $transactions[] = [
+                        'row_id' => 'accrual-'.(int) $entry->id,
+                        'merge_key' => $accrualMergeKey,
+                        'type_key' => $typeKey,
+                        'transaction_date' => $accrualDate,
+                        'sort_date' => $accrualDate,
+                        'sort_timestamp' => (string) ($entry->created_at?->toIso8601String() ?? $accrualDate),
+                        'particulars' => $accrualParticulars,
                         'action_taken' => $actionTaken,
                         'category' => $entryCategory,
                         'amount' => $displayAmount,
@@ -2337,6 +2413,60 @@ class EmployeeController extends Controller
             ->first();
     }
 
+    private function resolveCityMayorEmployee(): ?object
+    {
+        $employee = HrisEmployee::query(true)
+            ->whereRaw('LOWER(LTRIM(RTRIM(vp.Designation))) LIKE ?', ['%city mayor%'])
+            ->whereRaw('LOWER(LTRIM(RTRIM(vp.Designation))) NOT LIKE ?', ['%vice%'])
+            ->whereRaw('LOWER(LTRIM(RTRIM(vp.Status))) = ?', ['elective'])
+            ->orderByRaw('vp.ToDate DESC')
+            ->orderByRaw('vp.FromDate DESC')
+            ->orderByRaw('LTRIM(RTRIM(xp.Surname))')
+            ->orderByRaw('LTRIM(RTRIM(xp.Firstname))')
+            ->first();
+
+        if ($employee) {
+            return $employee;
+        }
+
+        return HrisEmployee::query(null)
+            ->whereRaw('LOWER(LTRIM(RTRIM(vp.Designation))) LIKE ?', ['%city mayor%'])
+            ->whereRaw('LOWER(LTRIM(RTRIM(vp.Designation))) NOT LIKE ?', ['%vice%'])
+            ->whereRaw('LOWER(LTRIM(RTRIM(vp.Status))) = ?', ['elective'])
+            ->orderByRaw('CASE WHEN vp.FromDate IS NOT NULL AND vp.ToDate IS NOT NULL AND GETDATE() BETWEEN vp.FromDate AND vp.ToDate THEN 0 ELSE 1 END')
+            ->orderByRaw('vp.ToDate DESC')
+            ->orderByRaw('vp.FromDate DESC')
+            ->orderByRaw('LTRIM(RTRIM(xp.Surname))')
+            ->orderByRaw('LTRIM(RTRIM(xp.Firstname))')
+            ->first();
+    }
+
+    private function resolveCityViceMayorEmployee(): ?object
+    {
+        $employee = HrisEmployee::query(true)
+            ->whereRaw('LOWER(LTRIM(RTRIM(vp.Designation))) LIKE ?', ['%city vice mayor%'])
+            ->whereRaw('LOWER(LTRIM(RTRIM(vp.Status))) = ?', ['elective'])
+            ->orderByRaw('vp.ToDate DESC')
+            ->orderByRaw('vp.FromDate DESC')
+            ->orderByRaw('LTRIM(RTRIM(xp.Surname))')
+            ->orderByRaw('LTRIM(RTRIM(xp.Firstname))')
+            ->first();
+
+        if ($employee) {
+            return $employee;
+        }
+
+        return HrisEmployee::query(null)
+            ->whereRaw('LOWER(LTRIM(RTRIM(vp.Designation))) LIKE ?', ['%city vice mayor%'])
+            ->whereRaw('LOWER(LTRIM(RTRIM(vp.Status))) = ?', ['elective'])
+            ->orderByRaw('CASE WHEN vp.FromDate IS NOT NULL AND vp.ToDate IS NOT NULL AND GETDATE() BETWEEN vp.FromDate AND vp.ToDate THEN 0 ELSE 1 END')
+            ->orderByRaw('vp.ToDate DESC')
+            ->orderByRaw('vp.FromDate DESC')
+            ->orderByRaw('LTRIM(RTRIM(xp.Surname))')
+            ->orderByRaw('LTRIM(RTRIM(xp.Firstname))')
+            ->first();
+    }
+
     private function serializeCityAdministratorEmployee(?object $employee): ?array
     {
         if (! $employee) {
@@ -2353,6 +2483,46 @@ class EmployeeController extends Controller
             'full_name' => $this->buildEmployeeFullName($employee),
             'designation' => $designation !== '' ? $designation : 'City Administrator',
             'position' => $designation !== '' ? $designation : 'City Administrator',
+            'office' => $this->trimOrBlank($employee->office ?? null),
+        ];
+    }
+
+    private function serializeCityMayorEmployee(?object $employee): ?array
+    {
+        if (! $employee) {
+            return null;
+        }
+
+        $designation = $this->trimOrBlank($employee->designation ?? null);
+
+        return [
+            'control_no' => trim((string) ($employee->control_no ?? '')),
+            'firstname' => $this->trimOrBlank($employee->firstname ?? null),
+            'surname' => $this->trimOrBlank($employee->surname ?? null),
+            'middlename' => $this->trimOrBlank($employee->middlename ?? null),
+            'full_name' => $this->buildEmployeeFullName($employee),
+            'designation' => $designation !== '' ? $designation : 'City Mayor',
+            'position' => $designation !== '' ? $designation : 'City Mayor',
+            'office' => $this->trimOrBlank($employee->office ?? null),
+        ];
+    }
+
+    private function serializeCityViceMayorEmployee(?object $employee): ?array
+    {
+        if (! $employee) {
+            return null;
+        }
+
+        $designation = $this->trimOrBlank($employee->designation ?? null);
+
+        return [
+            'control_no' => trim((string) ($employee->control_no ?? '')),
+            'firstname' => $this->trimOrBlank($employee->firstname ?? null),
+            'surname' => $this->trimOrBlank($employee->surname ?? null),
+            'middlename' => $this->trimOrBlank($employee->middlename ?? null),
+            'full_name' => $this->buildEmployeeFullName($employee),
+            'designation' => $designation !== '' ? $designation : 'City Vice Mayor',
+            'position' => $designation !== '' ? $designation : 'City Vice Mayor',
             'office' => $this->trimOrBlank($employee->office ?? null),
         ];
     }

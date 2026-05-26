@@ -713,6 +713,7 @@ class HRUserManagementController extends Controller
         $isActive = $this->isDepartmentAdminAssignmentActive($admin);
         $employee = $this->resolveEmployeeForAdmin($admin);
         $departmentName = trim((string) ($admin->department?->name ?? ''));
+        $departmentOfficeAbbr = $this->resolveUserManagementOfficeAcronymFromHris($employee, $departmentName);
         $position = trim((string) ($employee?->designation ?? ''));
         if ($position === '') {
             $position = 'Department Admin';
@@ -726,6 +727,7 @@ class HRUserManagementController extends Controller
             'full_name' => trim((string) ($admin->full_name ?? '')),
             'username' => trim((string) ($admin->username ?? '')),
             'department_id' => $admin->department_id !== null ? (int) $admin->department_id : null,
+            'department_office_abbr' => $departmentOfficeAbbr,
             'department' => $this->resolveUserManagementOfficeFromHris($employee, $departmentName),
             'position' => $position,
             'employee_control_no' => trim((string) ($admin->employee_control_no ?? '')) !== ''
@@ -744,9 +746,14 @@ class HRUserManagementController extends Controller
 
     private function resolveUserManagementOfficeFromHris(?object $employee, string $fallbackDepartmentName): ?string
     {
-        $hrisOfficeAcronym = trim((string) ($employee?->hrisOfficeAcronym ?? ''));
-        if ($hrisOfficeAcronym !== '') {
-            return $hrisOfficeAcronym;
+        $officeAcronym = $this->resolveUserManagementOfficeAcronymFromHris($employee, $fallbackDepartmentName);
+        if ($officeAcronym !== null) {
+            return $officeAcronym;
+        }
+
+        $officeName = trim((string) ($employee?->office ?? ''));
+        if ($officeName !== '') {
+            return $officeName;
         }
 
         $hrisOfficeName = trim((string) ($employee?->hris_office ?? ''));
@@ -759,8 +766,44 @@ class HRUserManagementController extends Controller
         return $fallback !== '' ? $fallback : null;
     }
 
+    private function resolveUserManagementOfficeAcronymFromHris(
+        ?object $employee,
+        string $fallbackDepartmentName = ''
+    ): ?string {
+        $acronymCandidates = [
+            trim((string) ($employee?->officeAcronym ?? '')),
+            trim((string) ($employee?->hrisOfficeAcronym ?? '')),
+        ];
+
+        foreach ($acronymCandidates as $acronymCandidate) {
+            if ($acronymCandidate !== '') {
+                return $acronymCandidate;
+            }
+        }
+
+        $officeNameCandidates = [
+            trim((string) ($employee?->office ?? '')),
+            trim((string) ($employee?->hris_office ?? '')),
+            trim($fallbackDepartmentName),
+        ];
+        foreach ($officeNameCandidates as $officeNameCandidate) {
+            if ($officeNameCandidate === '') {
+                continue;
+            }
+
+            $resolvedAcronym = HrisEmployee::officeAcronymByName($officeNameCandidate);
+            if ($resolvedAcronym !== null && trim($resolvedAcronym) !== '') {
+                return trim($resolvedAcronym);
+            }
+        }
+
+        return null;
+    }
+
     private function serializeHrAccountRow(HRAccount $account): array
     {
+        $hrDepartmentOfficeAbbr = HrisEmployee::officeAcronymByName(self::HR_DEFAULT_DEPARTMENT);
+
         return [
             'row_key' => 'HR-'.$account->id,
             'account_id' => $account->id,
@@ -768,6 +811,7 @@ class HRUserManagementController extends Controller
             'role_label' => 'HR Admin',
             'full_name' => trim((string) ($account->full_name ?? '')),
             'username' => trim((string) ($account->username ?? '')),
+            'department_office_abbr' => $hrDepartmentOfficeAbbr,
             'department' => self::HR_DEFAULT_DEPARTMENT,
             'position' => trim((string) ($account->position ?? '')) !== ''
                 ? trim((string) $account->position)
