@@ -191,7 +191,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::middleware('hr.module:access_control')->prefix('access-control')->group(function () {
             Route::get('/modules', [HRAccessControlController::class, 'modules']);
             Route::get('/hr-admins', [HRAccessControlController::class, 'hrAdmins']);
-            Route::put('/hr-admins/{id}/modules', [HRAccessControlController::class, 'updateHrAdminModules']);
+            Route::post('/hr-admins/{id}/modules', [HRAccessControlController::class, 'updateHrAdminModules']);
         });
 
         Route::middleware('hr.module:office_library')->prefix('departments')->group(function () {
