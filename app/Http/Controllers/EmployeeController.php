@@ -801,6 +801,13 @@ class EmployeeController extends Controller
 
         $controlNoCandidates = $this->buildLedgerControlNoCandidates($controlNo, $employee);
         $trackedTypeIdsByKey = $this->resolveLedgerTrackedLeaveTypeIds();
+        $otherUsageOnlyTypeIds = array_values(array_unique(array_filter(
+            array_map(
+                static fn (mixed $typeId): int => (int) $typeId,
+                $trackedTypeIdsByKey['other_usage_only'] ?? []
+            ),
+            static fn (int $typeId): bool => $typeId > 0
+        )));
         $typeIdToKey = [];
         foreach (['vacation', 'sick'] as $typeKey) {
             $typeId = $trackedTypeIdsByKey[$typeKey] ?? null;
@@ -811,6 +818,22 @@ class EmployeeController extends Controller
 
         $otherTypeIds = [];
         $otherTypeCodeById = [];
+        $trackedOtherTypeIds = $trackedTypeIdsByKey['other'] ?? [];
+        if (is_array($trackedOtherTypeIds)) {
+            foreach ($trackedOtherTypeIds as $typeId) {
+                $normalizedTypeId = (int) $typeId;
+                if ($normalizedTypeId <= 0) {
+                    continue;
+                }
+
+                $otherTypeIds[] = $normalizedTypeId;
+                $trackedCode = $trackedTypeIdsByKey['other_code_by_id'][$normalizedTypeId] ?? null;
+                if (is_string($trackedCode) && trim($trackedCode) !== '') {
+                    $otherTypeCodeById[$normalizedTypeId] = strtoupper(trim($trackedCode));
+                }
+            }
+        }
+
         $mc06RelatedTypeIds = $trackedTypeIdsByKey['mc06_related'] ?? [];
         if (is_array($mc06RelatedTypeIds)) {
             foreach ($mc06RelatedTypeIds as $typeId) {
@@ -934,11 +957,16 @@ class EmployeeController extends Controller
                             false,
                             is_string($otherTypeCode) ? $otherTypeCode : null
                         );
+                    $leaveTypeCode = $this->resolveLedgerTypeCode(
+                        $typeKey,
+                        is_string($otherTypeCode) ? $otherTypeCode : null,
+                    );
 
                     $transactions[] = [
                         'row_id' => 'accrual-'.(int) $entry->id,
                         'merge_key' => $accrualMergeKey,
                         'type_key' => $typeKey,
+                        'leave_type_code' => $leaveTypeCode,
                         'transaction_date' => $accrualDate,
                         'sort_date' => $accrualDate,
                         'sort_timestamp' => (string) ($entry->created_at?->toIso8601String() ?? $accrualDate),
@@ -1003,6 +1031,8 @@ class EmployeeController extends Controller
                 if ($typeKey === null) {
                     continue;
                 }
+                $isUsageOnlyOtherType = $typeKey === 'other'
+                    && in_array($typeId, $otherUsageOnlyTypeIds, true);
 
                 $transactionDate = $application->hr_approved_at?->toDateString()
                     ?? $application->created_at?->toDateString();
@@ -1064,6 +1094,11 @@ class EmployeeController extends Controller
                 $otherTypeCode = $typeKey === 'other'
                     ? ($otherTypeCodeById[$typeId] ?? null)
                     : null;
+                $leaveTypeCode = $this->resolveLedgerTypeCode(
+                    $typeKey,
+                    is_string($otherTypeCode) ? $otherTypeCode : null,
+                    $isForcedLeave,
+                );
                 $particulars = $this->buildLedgerParticulars(
                     'deduction',
                     $typeKey,
@@ -1099,6 +1134,7 @@ class EmployeeController extends Controller
                             'row_id' => $mergeKey.'-monetization-'.$componentTypeKey,
                             'merge_key' => $mergeKey,
                             'type_key' => $componentTypeKey,
+                            'leave_type_code' => $this->resolveLedgerTypeCode($componentTypeKey),
                             'transaction_date' => $transactionDate,
                             'sort_date' => $transactionDate,
                             'sort_timestamp' => (string) (
@@ -1121,6 +1157,7 @@ class EmployeeController extends Controller
                         'row_id' => $mergeKey.'-wp',
                         'merge_key' => $mergeKey,
                         'type_key' => $typeKey,
+                        'leave_type_code' => $leaveTypeCode,
                         'transaction_date' => $transactionDate,
                         'sort_date' => $transactionDate,
                         'sort_timestamp' => (string) (
@@ -1135,7 +1172,7 @@ class EmployeeController extends Controller
                         'inclusive_dates' => $inclusiveDates,
                         'category' => 'deduction_with_pay',
                         'amount' => $primaryWithPayAmount,
-                        'balance_delta' => -$primaryWithPayAmount,
+                        'balance_delta' => $isUsageOnlyOtherType ? 0.0 : -$primaryWithPayAmount,
                     ];
                 }
 
@@ -1144,6 +1181,7 @@ class EmployeeController extends Controller
                         'row_id' => $mergeKey.'-vl-topup',
                         'merge_key' => $mergeKey,
                         'type_key' => 'vacation',
+                        'leave_type_code' => $this->resolveLedgerTypeCode('vacation'),
                         'transaction_date' => $transactionDate,
                         'sort_date' => $transactionDate,
                         'sort_timestamp' => (string) (
@@ -1167,6 +1205,7 @@ class EmployeeController extends Controller
                         'row_id' => $mergeKey.'-wop',
                         'merge_key' => $mergeKey,
                         'type_key' => $typeKey,
+                        'leave_type_code' => $leaveTypeCode,
                         'transaction_date' => $transactionDate,
                         'sort_date' => $transactionDate,
                         'sort_timestamp' => (string) (
@@ -1218,6 +1257,11 @@ class EmployeeController extends Controller
                                 'row_id' => $mergeKey.'-recall',
                                 'merge_key' => $mergeKey.'-recall',
                                 'type_key' => $restoreTypeKey,
+                                'leave_type_code' => $this->resolveLedgerTypeCode(
+                                    $restoreTypeKey,
+                                    is_string($otherTypeCode) ? $otherTypeCode : null,
+                                    $isForcedLeave,
+                                ),
                                 'transaction_date' => $recallDate,
                                 'sort_date' => $recallDate,
                                 'sort_timestamp' => (string) (
@@ -1237,7 +1281,7 @@ class EmployeeController extends Controller
                                 'inclusive_dates' => $restoredDates,
                                 'category' => 'earned',
                                 'amount' => $restoredAmount,
-                                'balance_delta' => $restoredAmount,
+                                'balance_delta' => $isUsageOnlyOtherType ? 0.0 : $restoredAmount,
                             ];
                         }
                     }
@@ -1295,6 +1339,7 @@ class EmployeeController extends Controller
                 $inclusiveDates = [];
             }
             $period = $this->formatLedgerPeriodLabel($actionDate);
+            $leaveTypeCode = strtoupper(trim((string) ($transaction['leave_type_code'] ?? '')));
 
             $mergeKey = null;
             if ($category === 'earned') {
@@ -1314,6 +1359,7 @@ class EmployeeController extends Controller
                     'id' => $transaction['row_id'] ?? null,
                     'period' => $period,
                     'particulars' => $particulars,
+                    'leave_type_code' => $leaveTypeCode !== '' ? $leaveTypeCode : null,
                     'action_date' => $actionDate,
                     'action_taken' => $actionTaken,
                     'inclusive_start_date' => $inclusiveStartDate !== '' ? $inclusiveStartDate : null,
@@ -1324,6 +1370,13 @@ class EmployeeController extends Controller
                 if ($mergeKey !== null) {
                     $rowIndexByMergeKey[$mergeKey] = $rowIndex;
                 }
+            }
+
+            if (
+                $leaveTypeCode !== ''
+                && trim((string) ($ledgerRows[$rowIndex]['leave_type_code'] ?? '')) === ''
+            ) {
+                $ledgerRows[$rowIndex]['leave_type_code'] = $leaveTypeCode;
             }
 
             if ($typeKey === 'vacation') {
@@ -2634,10 +2687,18 @@ class EmployeeController extends Controller
             'mc06' => null,
             'wellness' => null,
             'mc06_related' => [],
+            'other' => [],
+            'other_usage_only' => [],
+            'other_code_by_id' => [],
+        ];
+        $forcedLeaveNames = [
+            'mandatory / forced leave',
+            'mandatory forced leave',
+            'forced leave',
         ];
 
         $leaveTypes = LeaveType::query()
-            ->select(['id', 'name'])
+            ->select(['id', 'name', 'category', 'is_credit_based'])
             ->get();
 
         foreach ($leaveTypes as $leaveType) {
@@ -2663,7 +2724,7 @@ class EmployeeController extends Controller
 
             if (
                 $typeIds['forced'] === null
-                && in_array($normalizedName, ['mandatory / forced leave', 'mandatory forced leave', 'forced leave'], true)
+                && in_array($normalizedName, $forcedLeaveNames, true)
             ) {
                 $typeIds['forced'] = $typeId;
             }
@@ -2680,6 +2741,26 @@ class EmployeeController extends Controller
                     $typeIds['mc06'] = $typeId;
                 }
                 $typeIds['mc06_related'][] = $typeId;
+            }
+
+            $isCreditBased = (bool) ($leaveType->is_credit_based ?? false);
+            $normalizedCategory = strtoupper(trim((string) ($leaveType->category ?? '')));
+            $isCoreType = in_array($normalizedName, ['vacation leave', 'vacation', 'sick leave', 'sick'], true);
+            $isOtherEligibleType = ! $isCoreType && ! in_array($normalizedName, $forcedLeaveNames, true);
+            if ($isOtherEligibleType && $isCreditBased) {
+                $typeIds['other'][] = $typeId;
+                $typeIds['other_code_by_id'][$typeId] = $this->resolveLedgerOtherTypeCode(
+                    $leaveType->name ?? null,
+                    $typeId,
+                );
+            }
+            if ($isOtherEligibleType && ! $isCreditBased && $normalizedCategory === 'EVENT') {
+                $typeIds['other'][] = $typeId;
+                $typeIds['other_usage_only'][] = $typeId;
+                $typeIds['other_code_by_id'][$typeId] = $this->resolveLedgerOtherTypeCode(
+                    $leaveType->name ?? null,
+                    $typeId,
+                );
             }
         }
 
@@ -2701,7 +2782,143 @@ class EmployeeController extends Controller
             $typeIds['mc06'] = (int) $typeIds['mc06_related'][0];
         }
 
+        foreach ($typeIds['mc06_related'] as $typeId) {
+            $typeIds['other'][] = $typeId;
+            $typeIds['other_code_by_id'][$typeId] = 'MC06';
+        }
+        if (is_int($typeIds['mc06']) && $typeIds['mc06'] > 0) {
+            $typeIds['other'][] = $typeIds['mc06'];
+            $typeIds['other_code_by_id'][$typeIds['mc06']] = 'MC06';
+        }
+        if (is_int($typeIds['wellness']) && $typeIds['wellness'] > 0) {
+            $typeIds['other'][] = $typeIds['wellness'];
+            $typeIds['other_code_by_id'][$typeIds['wellness']] = 'WL';
+        }
+
+        $typeIds['other'] = array_values(array_unique(array_filter(
+            array_map(
+                static fn (mixed $typeId): int => (int) $typeId,
+                $typeIds['other']
+            ),
+            static fn (int $typeId): bool => $typeId > 0
+        )));
+        $typeIds['other_usage_only'] = array_values(array_unique(array_filter(
+            array_map(
+                static fn (mixed $typeId): int => (int) $typeId,
+                $typeIds['other_usage_only']
+            ),
+            static fn (int $typeId): bool => $typeId > 0
+        )));
+        $normalizedOtherCodeById = [];
+        foreach ($typeIds['other'] as $typeId) {
+            $normalizedOtherCodeById[$typeId] = $this->normalizeLedgerOtherTypeCodeValue(
+                $typeIds['other_code_by_id'][$typeId] ?? null,
+                $typeId,
+            );
+        }
+        $typeIds['other_code_by_id'] = $normalizedOtherCodeById;
+
         return $typeIds;
+    }
+
+    private function resolveLedgerTypeCode(
+        ?string $typeKey,
+        ?string $otherTypeCode = null,
+        bool $isForcedLeave = false
+    ): ?string {
+        if ($isForcedLeave) {
+            return 'FL';
+        }
+
+        return match ($typeKey) {
+            'vacation' => 'VL',
+            'sick' => 'SL',
+            'other' => $this->normalizeLedgerOtherTypeCodeValue($otherTypeCode),
+            default => null,
+        };
+    }
+
+    private function resolveLedgerOtherTypeCode(mixed $leaveTypeName, ?int $leaveTypeId = null): ?string
+    {
+        if (LeaveType::isSpecialPrivilegeAliasName($leaveTypeName)) {
+            return 'MC06';
+        }
+
+        $normalizedName = strtolower(trim((string) ($leaveTypeName ?? '')));
+        if ($normalizedName === '') {
+            return $this->normalizeLedgerOtherTypeCodeValue(null, $leaveTypeId);
+        }
+
+        if (in_array($normalizedName, ['wellness leave', 'wellness'], true)) {
+            return 'WL';
+        }
+        if (in_array($normalizedName, ['solo parent leave', 'solo parent'], true)) {
+            return 'SPL';
+        }
+        if (in_array($normalizedName, ['special emergency calamity leave', 'special emergency (calamity) leave', 'calamity leave'], true)) {
+            return 'CL';
+        }
+        if (in_array($normalizedName, ['violence against women and children leave', 'vawc leave', 'vawc'], true)) {
+            return 'VAWC';
+        }
+
+        $tokens = preg_split('/[^a-z0-9]+/', $normalizedName, -1, PREG_SPLIT_NO_EMPTY);
+        if (! is_array($tokens) || $tokens === []) {
+            return $this->normalizeLedgerOtherTypeCodeValue(null, $leaveTypeId);
+        }
+
+        $ignoredWords = [
+            'leave',
+            'special',
+            'type',
+            'of',
+            'and',
+            'for',
+            'with',
+            'without',
+            'pay',
+            'policy',
+            'credited',
+        ];
+        $filteredTokens = array_values(array_filter(
+            $tokens,
+            static fn (string $token): bool => ! in_array($token, $ignoredWords, true)
+        ));
+
+        if ($filteredTokens === []) {
+            $filteredTokens = $tokens;
+        }
+
+        if (count($filteredTokens) === 1) {
+            $singleTokenCode = strtoupper(substr($filteredTokens[0], 0, 4));
+
+            return $this->normalizeLedgerOtherTypeCodeValue($singleTokenCode, $leaveTypeId);
+        }
+
+        $initials = '';
+        foreach ($filteredTokens as $token) {
+            $initials .= strtoupper(substr($token, 0, 1));
+            if (strlen($initials) >= 4) {
+                break;
+            }
+        }
+
+        return $this->normalizeLedgerOtherTypeCodeValue($initials, $leaveTypeId);
+    }
+
+    private function normalizeLedgerOtherTypeCodeValue(mixed $value, ?int $fallbackTypeId = null): ?string
+    {
+        $rawCode = strtoupper(trim((string) ($value ?? '')));
+        $sanitizedCode = preg_replace('/[^A-Z0-9]+/', '', $rawCode);
+        if (is_string($sanitizedCode) && $sanitizedCode !== '') {
+            return substr($sanitizedCode, 0, 10);
+        }
+
+        if (is_int($fallbackTypeId) && $fallbackTypeId > 0) {
+            return 'OT'.$fallbackTypeId;
+        }
+
+        return null;
     }
 
     /**

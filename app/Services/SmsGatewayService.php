@@ -62,6 +62,50 @@ class SmsGatewayService
         );
     }
 
+    public function sendLeaveReadyForReleaseMessage(LeaveApplication $application): bool
+    {
+        $controlNo = $this->resolveApplicationControlNo($application);
+        if ($controlNo === null) {
+            Log::warning('Unable to resolve employee control number for leave release-ready SMS.', [
+                'leave_application_id' => (int) ($application->id ?? 0),
+            ]);
+
+            return false;
+        }
+
+        return $this->sendToEmployeeControlNo(
+            $controlNo,
+            $this->buildLeaveReadyForReleaseMessage($application),
+            SmsLog::TYPE_LEAVE_READY_FOR_RELEASE,
+            [
+                'leave_application_id' => (int) ($application->id ?? 0),
+                'employee_control_no' => $controlNo,
+            ]
+        );
+    }
+
+    public function sendCocReadyForReleaseMessage(COCApplication $application): bool
+    {
+        $controlNo = trim((string) ($application->employee_control_no ?? ''));
+        if ($controlNo === '') {
+            Log::warning('Unable to resolve employee control number for COC release-ready SMS.', [
+                'coc_application_id' => (int) ($application->id ?? 0),
+            ]);
+
+            return false;
+        }
+
+        return $this->sendToEmployeeControlNo(
+            $controlNo,
+            $this->buildCocReadyForReleaseMessage($application),
+            SmsLog::TYPE_COC_READY_FOR_RELEASE,
+            [
+                'coc_application_id' => (int) ($application->id ?? 0),
+                'employee_control_no' => $controlNo,
+            ]
+        );
+    }
+
     public function sendLeaveRejectedMessage(LeaveApplication $application): bool
     {
         $controlNo = $this->resolveApplicationControlNo($application);
@@ -302,6 +346,25 @@ class SmsGatewayService
         return 'Good day! This is CHRMO. Your COC application has been approved.';
     }
 
+    private function buildLeaveReadyForReleaseMessage(LeaveApplication $application): string
+    {
+        $application->loadMissing('leaveType');
+
+        $leaveTypeName = trim((string) ($application->leaveType?->name ?? 'leave'));
+        $isMonetization = (bool) ($application->is_monetization ?? false);
+
+        if ($isMonetization) {
+            return 'Good day! This is the CHRMO. Your approved monetization request form is now ready for release.';
+        }
+
+        return "Good day! This is the CHRMO. Your approved {$leaveTypeName} application form is now ready for release.";
+    }
+
+    private function buildCocReadyForReleaseMessage(COCApplication $application): string
+    {
+        return 'Good day! This is CHRMO. Your approved COC application form is now ready for release.';
+    }
+
     private function buildLeaveRejectedMessage(LeaveApplication $application): string
     {
         $application->loadMissing('leaveType');
@@ -450,7 +513,11 @@ class SmsGatewayService
             return null;
         }
 
-        if (preg_match('/\bresponse\s*:\s*error\b/i', $trimmedBody) === 1) {
+        if (preg_match('/\bresponse\s*:\s*(error|failed)\b/i', $trimmedBody) === 1) {
+            return $this->truncateResponseBody($trimmedBody);
+        }
+
+        if (preg_match('/\bmessage\s*:\s*commit\s+failed\b/i', $trimmedBody) === 1) {
             return $this->truncateResponseBody($trimmedBody);
         }
 

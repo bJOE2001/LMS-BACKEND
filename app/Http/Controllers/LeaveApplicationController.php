@@ -2863,6 +2863,7 @@ class LeaveApplicationController extends Controller
                 'created_at' => now(),
             ]);
             $app->load('logs');
+            $this->smsGatewayService()->sendLeaveReadyForReleaseMessage($app);
         }
 
         $actorDirectory = $this->buildWorkflowActorDirectory([$app]);

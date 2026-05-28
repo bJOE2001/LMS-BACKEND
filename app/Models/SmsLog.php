@@ -46,6 +46,10 @@ class SmsLog extends Model
 
     public const TYPE_COC_REJECTED = 'COC_REJECTED';
 
+    public const TYPE_LEAVE_READY_FOR_RELEASE = 'LEAVE_READY_FOR_RELEASE';
+
+    public const TYPE_COC_READY_FOR_RELEASE = 'COC_READY_FOR_RELEASE';
+
     protected function casts(): array
     {
         return [

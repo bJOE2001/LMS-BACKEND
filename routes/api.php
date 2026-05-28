@@ -94,14 +94,14 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
     Route::get('/notifications/unread-count', [NotificationController::class, 'unreadCount']);
     Route::get('/notifications', [NotificationController::class, 'index']);
     Route::get('/notifications/{id}/application', [NotificationController::class, 'applicationDetails']);
-    Route::put('/notifications/{id}/read', [NotificationController::class, 'markAsRead']);
-    Route::put('/notifications/read-all', [NotificationController::class, 'markAllAsRead']);
-    Route::delete('/notifications/{id}', [NotificationController::class, 'destroy']);
+    Route::post('/notifications/{id}/read', [NotificationController::class, 'markAsRead']);
+    Route::post('/notifications/read-all', [NotificationController::class, 'markAllAsRead']);
+    Route::post('/notifications/{id}/delete', [NotificationController::class, 'destroy']);
     Route::get('/settings/profile', [SettingsController::class, 'getProfile']);
-    Route::put('/settings/profile', [SettingsController::class, 'updateProfile']);
-    Route::put('/settings/password', [SettingsController::class, 'updatePassword']);
+    Route::post('/settings/profile/update', [SettingsController::class, 'updateProfile']);
+    Route::post('/settings/password/update', [SettingsController::class, 'updatePassword']);
     Route::get('/settings/signatories', [SettingsController::class, 'getSignatories']);
-    Route::put('/settings/signatories/chrmo-leave-in-charge', [SettingsController::class, 'updateChrmoLeaveInCharge']);
+    Route::post('/settings/signatories/chrmo-leave-in-charge/update', [SettingsController::class, 'updateChrmoLeaveInCharge']);
     Route::get('/illnesses/options', [HRIllnessLibraryController::class, 'options']);
 
     Route::middleware('department_admin')->prefix('admin')->group(function () {
@@ -109,12 +109,12 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::get('/employee-options', [EmployeeController::class, 'adminEmployeeOptions']);
         Route::get('/employees/{controlNo}/leave-history', [EmployeeController::class, 'leaveHistory']);
         Route::post('/employees', [EmployeeController::class, 'store']);
-        Route::put('/employees/{controlNo}', [EmployeeController::class, 'update']);
-        Route::delete('/employees/{controlNo}', [EmployeeController::class, 'destroy']);
+        Route::post('/employees/{controlNo}/update', [EmployeeController::class, 'update']);
+        Route::post('/employees/{controlNo}/delete', [EmployeeController::class, 'destroy']);
         Route::get('/department-head', [EmployeeController::class, 'departmentHead']);
         Route::post('/department-head', [EmployeeController::class, 'upsertDepartmentHead']);
-        Route::put('/department-head', [EmployeeController::class, 'upsertDepartmentHead']);
-        Route::delete('/department-head', [EmployeeController::class, 'deleteDepartmentHead']);
+        Route::post('/department-head/update', [EmployeeController::class, 'upsertDepartmentHead']);
+        Route::post('/department-head/delete', [EmployeeController::class, 'deleteDepartmentHead']);
 
         // Dashboard
         Route::get('/dashboard', [AdminDashboardController::class, 'index']);
@@ -155,7 +155,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             // Leave balance management
             Route::get('/leave-balances/available-types', [HRLeaveBalanceImportController::class, 'availableTypes']);
             Route::post('/leave-balances', [HRLeaveBalanceImportController::class, 'store']);
-            Route::put('/leave-balances', [HRLeaveBalanceImportController::class, 'update']);
+            Route::post('/leave-balances/update', [HRLeaveBalanceImportController::class, 'update']);
         });
 
         Route::middleware('hr.module:dashboard')->group(function () {
@@ -168,10 +168,10 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::middleware('hr.module:work_schedules')->group(function () {
             // Work schedule and leave deduction settings
             Route::get('/work-schedules', [HRWorkScheduleController::class, 'index']);
-            Route::put('/work-schedules/default', [HRWorkScheduleController::class, 'updateDefault']);
+            Route::post('/work-schedules/default/update', [HRWorkScheduleController::class, 'updateDefault']);
             Route::post('/work-schedules/overrides', [HRWorkScheduleController::class, 'storeOverride']);
-            Route::put('/work-schedules/overrides/{id}', [HRWorkScheduleController::class, 'updateOverride']);
-            Route::delete('/work-schedules/overrides/{id}', [HRWorkScheduleController::class, 'destroyOverride']);
+            Route::post('/work-schedules/overrides/{id}/update', [HRWorkScheduleController::class, 'updateOverride']);
+            Route::post('/work-schedules/overrides/{id}/delete', [HRWorkScheduleController::class, 'destroyOverride']);
         });
 
         Route::middleware('hr.module:user_management')->group(function () {
@@ -180,12 +180,12 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::get('/user-management/eligible-employees', [HRUserManagementController::class, 'eligibleEmployees']);
             Route::get('/user-management/departments/{departmentId}/eligible-employees', [HRUserManagementController::class, 'eligibleEmployees']);
             Route::post('/user-management/department-admins', [HRUserManagementController::class, 'store']);
-            Route::put('/user-management/department-admins/{id}', [HRUserManagementController::class, 'update']);
+            Route::post('/user-management/department-admins/{id}/update', [HRUserManagementController::class, 'update']);
             Route::post('/user-management/department-admins/{id}/reactivate', [HRUserManagementController::class, 'reactivate']);
             Route::post('/user-management/department-admins/{id}/reset-password', [HRUserManagementController::class, 'resetDepartmentAdminPassword']);
             Route::post('/user-management/hr-accounts/{id}/reset-password', [HRUserManagementController::class, 'resetHrAccountPassword']);
-            Route::delete('/user-management/department-admins/{id}', [HRUserManagementController::class, 'destroy']);
-            Route::delete('/user-management/hr-accounts/{id}', [HRUserManagementController::class, 'destroyHrAccount']);
+            Route::post('/user-management/department-admins/{id}/delete', [HRUserManagementController::class, 'destroy']);
+            Route::post('/user-management/hr-accounts/{id}/delete', [HRUserManagementController::class, 'destroyHrAccount']);
         });
 
         Route::middleware('hr.module:access_control')->prefix('access-control')->group(function () {
@@ -197,22 +197,22 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::middleware('hr.module:office_library')->prefix('departments')->group(function () {
             Route::get('/', [HRDepartmentLibraryController::class, 'index']);
             Route::post('/', [HRDepartmentLibraryController::class, 'store']);
-            Route::put('/{id}', [HRDepartmentLibraryController::class, 'update']);
-            Route::delete('/{id}', [HRDepartmentLibraryController::class, 'destroy']);
+            Route::post('/{id}/update', [HRDepartmentLibraryController::class, 'update']);
+            Route::post('/{id}/delete', [HRDepartmentLibraryController::class, 'destroy']);
         });
 
         Route::middleware('hr.module:illness_library')->prefix('illnesses')->group(function () {
             Route::get('/', [HRIllnessLibraryController::class, 'index']);
             Route::post('/', [HRIllnessLibraryController::class, 'store']);
-            Route::put('/{id}', [HRIllnessLibraryController::class, 'update']);
-            Route::delete('/{id}', [HRIllnessLibraryController::class, 'destroy']);
+            Route::post('/{id}/update', [HRIllnessLibraryController::class, 'update']);
+            Route::post('/{id}/delete', [HRIllnessLibraryController::class, 'destroy']);
         });
 
         Route::middleware('hr.module:leave_types')->prefix('leave-types')->group(function () {
             Route::get('/', [HRLeaveTypeController::class, 'index']);
             Route::post('/', [HRLeaveTypeController::class, 'store']);
-            Route::put('/{id}', [HRLeaveTypeController::class, 'update']);
-            Route::delete('/{id}', [HRLeaveTypeController::class, 'destroy']);
+            Route::post('/{id}/update', [HRLeaveTypeController::class, 'update']);
+            Route::post('/{id}/delete', [HRLeaveTypeController::class, 'destroy']);
         });
 
         Route::middleware('hr.module:applications')->group(function () {
