@@ -2584,6 +2584,131 @@ class LeaveApplicationController extends Controller
     }
 
     /**
+     * HR may override WP/WOP only during the initial CHRMO certification stage.
+     */
+    public function hrUpdatePayStatus(Request $request, int $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can override pay status.'], 403);
+        }
+
+        $validated = $request->validate([
+            'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
+            'selected_date_pay_status' => ['nullable', 'array'],
+            'selected_date_pay_status.*' => ['nullable', 'string', 'in:WP,WOP'],
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $app = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        if ($app->status !== LeaveApplication::STATUS_PENDING_HR || $this->hasPendingApprovedUpdateRequest($app)) {
+            return response()->json([
+                'message' => 'WOP/WP can only be overridden during CHRMO Certification before final approval.',
+            ], 422);
+        }
+
+        if ((bool) $app->is_monetization) {
+            return response()->json([
+                'message' => 'Monetization applications must remain with pay.',
+            ], 422);
+        }
+
+        $leaveType = $app->leaveType ?? LeaveType::find((int) $app->leave_type_id);
+        if (! $leaveType) {
+            return response()->json([
+                'message' => 'Selected leave type is no longer available.',
+            ], 422);
+        }
+        $app->setRelation('leaveType', $leaveType);
+
+        $selectedDates = $app->resolvedSelectedDates();
+        if (! is_array($selectedDates) || $selectedDates === []) {
+            return response()->json([
+                'message' => 'This application has no selected dates available for pay status override.',
+            ], 422);
+        }
+
+        $requestedPayStatus = $this->normalizeSelectedDatePayStatusMap(
+            array_key_exists('selected_date_pay_status', $validated)
+                ? $validated['selected_date_pay_status']
+                : $request->input('selected_date_pay_status')
+        );
+        $requestedPayMode = $this->resolveRequestedPayMode(
+            $request,
+            $validated,
+            false,
+            $app->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY
+        );
+        $requestedPayStatus = $this->compactSelectedDatePayStatusMap(
+            $requestedPayStatus,
+            $selectedDates,
+            $requestedPayMode
+        );
+
+        $policyResolution = $this->applyRegularLeavePolicy(
+            $leaveType,
+            (float) $app->total_days,
+            $selectedDates,
+            is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
+            $requestedPayStatus,
+            $requestedPayMode,
+            false,
+            (bool) ($app->attachment_submitted ?? false),
+            $this->trimNullableString($app->attachment_reference ?? null),
+            false,
+            $app->created_at ?? null,
+            $app->start_date?->toDateString(),
+            $app->end_date?->toDateString(),
+            (string) ($app->employee_control_no ?? ''),
+            true
+        );
+        if ($policyResolution instanceof JsonResponse) {
+            return $policyResolution;
+        }
+
+        DB::transaction(function () use ($app, $hr, $request, $policyResolution): void {
+            $app->update([
+                'pay_mode' => $policyResolution['pay_mode'],
+                'selected_date_pay_status' => $policyResolution['selected_date_pay_status'],
+                'deductible_days' => (float) ($policyResolution['deductible_days'] ?? 0),
+                'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn()
+                    ? ($policyResolution['cto_deducted_hours'] ?? null)
+                    : null,
+            ]);
+
+            LeaveApplicationLog::create([
+                'leave_application_id' => $app->id,
+                'action' => LeaveApplicationLog::ACTION_HR_PAY_STATUS_OVERRIDDEN,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
+                'performed_by_id' => $hr->id,
+                'remarks' => $request->input('remarks') ?: 'HR updated the application pay status.',
+                'created_at' => now(),
+            ]);
+        });
+
+        $freshApplication = $app->fresh(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests']);
+        $actorDirectory = $freshApplication
+            ? $this->buildWorkflowActorDirectory([$freshApplication])
+            : [];
+
+        return response()->json([
+            'message' => 'Application pay status updated.',
+            'application' => $freshApplication
+                ? array_replace(
+                    $this->formatErmsApplication($freshApplication, $actorDirectory),
+                    $this->formatApplication($freshApplication)
+                )
+                : null,
+        ]);
+    }
+
+    /**
      * HR confirms the hard-copy leave application form was received.
      * This action is informational only and does not change approval status.
      */
@@ -3125,7 +3250,8 @@ class LeaveApplicationController extends Controller
             $app->created_at ?? null,
             $app->start_date?->toDateString(),
             $app->end_date?->toDateString(),
-            (string) ($app->employee_control_no ?? '')
+            (string) ($app->employee_control_no ?? ''),
+            true
         );
         if ($policyResolution instanceof JsonResponse) {
             return $policyResolution;
@@ -5726,6 +5852,7 @@ class LeaveApplicationController extends Controller
             LeaveApplicationLog::ACTION_HR_REJECTED => 'hr rejected',
             LeaveApplicationLog::ACTION_HR_RECALLED => 'hr recalled',
             LeaveApplicationLog::ACTION_HR_RECEIVED => 'received application',
+            LeaveApplicationLog::ACTION_HR_PAY_STATUS_OVERRIDDEN => 'hr updated pay status',
             LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED => 'cmo/cvmo reviewed',
             LeaveApplicationLog::ACTION_HR_RELEASED => 'released application',
             default => strtolower(str_replace('_', ' ', (string) $log->action)),
@@ -8918,7 +9045,8 @@ class LeaveApplicationController extends Controller
         mixed $filedAt = null,
         ?string $absenceStartDate = null,
         ?string $absenceEndDate = null,
-        ?string $employeeControlNo = null
+        ?string $employeeControlNo = null,
+        bool $allowPayStatusOverride = false
     ): array|JsonResponse {
         $normalizedTotalDays = round(max((float) $totalDays, 0.0), 3);
 
@@ -9028,7 +9156,7 @@ class LeaveApplicationController extends Controller
                 $absenceEndDate
             );
 
-            if ($graceWindowPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
+            if ($graceWindowPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY && ! $allowPayStatusOverride) {
                 $normalizedPayMode = LeaveApplication::PAY_MODE_WITHOUT_PAY;
                 $normalizedSelectedDatePayStatus = null;
             } else {

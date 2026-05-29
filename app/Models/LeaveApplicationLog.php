@@ -34,17 +34,29 @@ class LeaveApplicationLog extends Model
     // ─── Action Constants ────────────────────────────────────────────
 
     public const ACTION_SUBMITTED = 'SUBMITTED';
+
     public const ACTION_ADMIN_APPROVED = 'ADMIN_APPROVED';
+
     public const ACTION_ADMIN_REJECTED = 'ADMIN_REJECTED';
+
     public const ACTION_HR_APPROVED = 'HR_APPROVED';
+
     public const ACTION_HR_REJECTED = 'HR_REJECTED';
+
     public const ACTION_HR_RECALLED = 'HR_RECALLED';
+
     public const ACTION_HR_RECEIVED = 'HR_RECEIVED';
+
+    public const ACTION_HR_PAY_STATUS_OVERRIDDEN = 'HR_PAY_STATUS_OVERRIDDEN';
+
     public const ACTION_CMO_CBMO_REVIEWED = 'CMO_CBMO_REVIEWED';
+
     public const ACTION_HR_RELEASED = 'HR_RELEASED';
 
     public const PERFORMER_EMPLOYEE = 'EMPLOYEE';
+
     public const PERFORMER_ADMIN = 'ADMIN';
+
     public const PERFORMER_HR = 'HR';
 
     // ─── Relationships ───────────────────────────────────────────────

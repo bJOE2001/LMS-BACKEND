@@ -222,6 +222,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::get('/leave-applications/{id}/attachment', [LeaveApplicationController::class, 'hrViewAttachment']);
             Route::post('/leave-applications/{id}/receive', [LeaveApplicationController::class, 'hrReceive']);
             Route::post('/leave-applications/{id}/undo-receive', [LeaveApplicationController::class, 'hrUndoReceive']);
+            Route::post('/leave-applications/{id}/pay-status/update', [LeaveApplicationController::class, 'hrUpdatePayStatus']);
             Route::post('/leave-applications/{id}/cmo-cbmo-review', [LeaveApplicationController::class, 'hrCmoCbmoReview']);
             Route::post('/leave-applications/{id}/release', [LeaveApplicationController::class, 'hrRelease']);
             Route::post('/leave-applications/{id}/undo-release', [LeaveApplicationController::class, 'hrUndoRelease']);

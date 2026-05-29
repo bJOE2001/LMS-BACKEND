@@ -1048,10 +1048,14 @@ class EmployeeController extends Controller
                 }
 
                 $isMonetization = (bool) $application->is_monetization;
-                $withPayAmount = $isMonetization
-                    ? $deductibleDays
-                    : ($payMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $deductibleDays);
-                $withPayAmount = round(max($withPayAmount, 0.0), 3);
+                $payAmounts = $this->resolveLedgerApplicationPayAmounts(
+                    $application,
+                    $totalDays,
+                    $deductibleDays,
+                    $payMode,
+                    $isMonetization
+                );
+                $withPayAmount = round(max((float) ($payAmounts['with_pay'] ?? 0.0), 0.0), 3);
                 $linkedVacationWithPayAmount = round(
                     max((float) ($application->linked_vacation_leave_deducted_days ?? 0), 0.0),
                     3
@@ -1062,9 +1066,10 @@ class EmployeeController extends Controller
                 $linkedVacationWithPayAmount = round(min($linkedVacationWithPayAmount, $withPayAmount), self::LEDGER_DECIMAL_PRECISION);
                 $primaryWithPayAmount = round(max($withPayAmount - $linkedVacationWithPayAmount, 0.0), self::LEDGER_DECIMAL_PRECISION);
 
-                $withoutPayAmount = $isMonetization
-                    ? 0.0
-                    : round(max($totalDays - $withPayAmount, 0.0), self::LEDGER_DECIMAL_PRECISION);
+                $withoutPayAmount = round(
+                    max((float) ($payAmounts['without_pay'] ?? 0.0), 0.0),
+                    self::LEDGER_DECIMAL_PRECISION
+                );
 
                 $monetizationComponents = $isMonetization
                     ? $this->resolveLedgerMonetizationComponents(
@@ -3209,6 +3214,90 @@ class EmployeeController extends Controller
             : $totalDays;
     }
 
+    /**
+     * @return array{with_pay: float, without_pay: float}
+     */
+    private function resolveLedgerApplicationPayAmounts(
+        LeaveApplication $application,
+        float $totalDays,
+        float $deductibleDays,
+        string $payMode,
+        bool $isMonetization
+    ): array {
+        $normalizedDeductibleDays = round(max($deductibleDays, 0.0), self::LEDGER_DECIMAL_PRECISION);
+        if ($isMonetization) {
+            return [
+                'with_pay' => $normalizedDeductibleDays,
+                'without_pay' => 0.0,
+            ];
+        }
+
+        $normalizedPayMode = $this->normalizeLedgerPayMode($payMode, false);
+        $selectedDates = $application->resolvedSelectedDates();
+        if (! is_array($selectedDates) || $selectedDates === []) {
+            $withPayAmount = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
+                ? 0.0
+                : $normalizedDeductibleDays;
+
+            return [
+                'with_pay' => $withPayAmount,
+                'without_pay' => round(max($totalDays - $withPayAmount, 0.0), self::LEDGER_DECIMAL_PRECISION),
+            ];
+        }
+
+        $normalizedPayStatus = $this->compactLedgerSelectedDatePayStatusMap(
+            is_array($application->selected_date_pay_status) ? $application->selected_date_pay_status : null,
+            $selectedDates,
+            $normalizedPayMode
+        );
+        $normalizedCoverage = $this->compactLedgerSelectedDateCoverageMap(
+            is_array($application->selected_date_coverage) ? $application->selected_date_coverage : null,
+            $selectedDates
+        );
+        $coverageWeights = $this->resolveLedgerDateCoverageWeights(
+            $selectedDates,
+            $normalizedCoverage,
+            round(max($totalDays, 0.0), self::LEDGER_DECIMAL_PRECISION),
+            trim((string) ($application->employee_control_no ?? '')) ?: null
+        );
+
+        $weightedWithPay = 0.0;
+        $weightedWithoutPay = 0.0;
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeLedgerDateKey($rawDate) ?? trim((string) $rawDate);
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $weight = round(
+                max((float) ($coverageWeights[$dateKey] ?? 0.0), 0.0),
+                self::LEDGER_DECIMAL_PRECISION
+            );
+            if ($weight <= 0.0) {
+                continue;
+            }
+
+            $effectiveMode = $normalizedPayStatus[$dateKey] ?? $normalizedPayMode;
+            $resolvedMode = $this->resolveLedgerPayModeFromStatusValue($effectiveMode) ?? $normalizedPayMode;
+            if ($resolvedMode === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
+                $weightedWithoutPay += $weight;
+
+                continue;
+            }
+
+            $weightedWithPay += $weight;
+        }
+
+        $withPayAmount = $weightedWithPay > 0.0
+            ? ($normalizedDeductibleDays > 0.0 ? $normalizedDeductibleDays : $weightedWithPay)
+            : 0.0;
+
+        return [
+            'with_pay' => round(max($withPayAmount, 0.0), self::LEDGER_DECIMAL_PRECISION),
+            'without_pay' => round(max($weightedWithoutPay, 0.0), self::LEDGER_DECIMAL_PRECISION),
+        ];
+    }
+
     private function resolveLedgerRecallRestorableDetails(
         LeaveApplication $application,
         array $selectedRecallDateKeys = [],
@@ -3578,7 +3667,7 @@ class EmployeeController extends Controller
         $dateCount = count($resolvedDates);
         if ($dateCount > 0) {
             $halfMatch = abs(($dateCount * $defaultHalfDayWeight) - $totalDays) < 0.00001;
-            $wholeMatch = abs(($dateCount * $defaultWholeDayWeight) - $totalDays) < 0.00001;
+            $wholeMatch = abs(((float) $dateCount) - $totalDays) < 0.00001;
             if ($halfMatch) {
                 $defaultCoverageWeight = $defaultHalfDayWeight;
             } elseif (! $wholeMatch) {
