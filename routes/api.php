@@ -6,6 +6,7 @@ use App\Http\Controllers\Auth\PasswordResetController;
 use App\Http\Controllers\COCApplicationController;
 use App\Http\Controllers\EmployeeController;
 use App\Http\Controllers\HRAccessControlController;
+use App\Http\Controllers\HRAnalyticsController;
 use App\Http\Controllers\HRDashboardController;
 use App\Http\Controllers\HRDepartmentLibraryController;
 use App\Http\Controllers\HRIllnessLibraryController;
@@ -248,18 +249,22 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::post('/coc-balances/import', [COCApplicationController::class, 'hrImportBalances']);
         });
 
-        Route::middleware('hr.module:reports_monitoring')->prefix('reports')->group(function () {
-            // Reports
-            Route::get('/lwop', [HRReportController::class, 'lwopReports']);
-            Route::get('/leave-balances', [HRReportController::class, 'leaveBalancesReports']);
-            Route::get('/monetization', [HRReportController::class, 'monetizationReports']);
-            Route::get('/cto-availment', [HRReportController::class, 'ctoAvailmentReports']);
-            Route::get('/coc-balances', [HRReportController::class, 'cocBalanceReports']);
-            Route::get('/leave-availment', [HRReportController::class, 'leaveAvailmentReports']);
-            Route::get('/summary', [HRReportController::class, 'getSummaryStats']);
-            Route::get('/departments', [HRReportController::class, 'getDepartmentStats']);
-            Route::get('/leave-types', [HRReportController::class, 'getLeaveTypeStats']);
-            Route::get('/generate', [HRReportController::class, 'generateReport']);
+        Route::middleware('hr.module:reports_monitoring')->group(function () {
+            Route::get('/analytics', [HRAnalyticsController::class, 'index']);
+
+            Route::prefix('reports')->group(function () {
+                // Reports
+                Route::get('/lwop', [HRReportController::class, 'lwopReports']);
+                Route::get('/leave-balances', [HRReportController::class, 'leaveBalancesReports']);
+                Route::get('/monetization', [HRReportController::class, 'monetizationReports']);
+                Route::get('/cto-availment', [HRReportController::class, 'ctoAvailmentReports']);
+                Route::get('/coc-balances', [HRReportController::class, 'cocBalanceReports']);
+                Route::get('/leave-availment', [HRReportController::class, 'leaveAvailmentReports']);
+                Route::get('/summary', [HRReportController::class, 'getSummaryStats']);
+                Route::get('/departments', [HRReportController::class, 'getDepartmentStats']);
+                Route::get('/leave-types', [HRReportController::class, 'getLeaveTypeStats']);
+                Route::get('/generate', [HRReportController::class, 'generateReport']);
+            });
         });
     });
 });
