@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Controllers\Concerns\FiltersEmployeeControlNos;
 use App\Models\COCApplication;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
@@ -26,6 +27,8 @@ use Illuminate\Support\Facades\Schema;
  */
 class AdminDashboardController extends Controller
 {
+    use FiltersEmployeeControlNos;
+
     public function __construct() {}
 
     private function workScheduleService(): WorkScheduleService
@@ -68,7 +71,7 @@ class AdminDashboardController extends Controller
                 // Include employee leaves currently assigned to this department.
                 $query->when(
                     $departmentEmployeeControlNos !== [],
-                    fn ($nestedQuery) => $nestedQuery->whereIn('employee_control_no', $departmentEmployeeControlNos),
+                    fn ($nestedQuery) => $this->whereInEmployeeControlNos($nestedQuery, $departmentEmployeeControlNos),
                     fn ($nestedQuery) => $nestedQuery->whereRaw('1 = 0')
                 )
                     // OR admin self-apply leaves for this department (no employee assignment target)
@@ -94,7 +97,7 @@ class AdminDashboardController extends Controller
             ->with(['rows', 'reviewedByAdmin', 'reviewedByHr', 'ctoLeaveType'])
             ->when(
                 $departmentEmployeeControlNos !== [],
-                fn ($query) => $query->whereIn('employee_control_no', $departmentEmployeeControlNos),
+                fn ($query) => $this->whereInEmployeeControlNos($query, $departmentEmployeeControlNos),
                 fn ($query) => $query->whereRaw('1 = 0')
             )
             ->orderByDesc('created_at')
@@ -2435,7 +2438,7 @@ class AdminDashboardController extends Controller
             ? []
             : LeaveBalance::query()
                 ->with('leaveType:id,name')
-                ->whereIn('employee_control_no', $employeeControlNos->all())
+                ->tap(fn ($query) => $this->whereInEmployeeControlNos($query, $employeeControlNos->all()))
                 ->get()
                 ->groupBy(fn (LeaveBalance $balance) => $this->normalizeControlNo($balance->employee_control_no))
                 ->map(fn (Collection $balances) => $this->formatLeaveBalanceSnapshot($balances))
@@ -2476,7 +2479,7 @@ class AdminDashboardController extends Controller
                 ? []
                 : LeaveBalance::query()
                     ->with('leaveType:id,name')
-                    ->whereIn('employee_control_no', $adminEmployeeControlNoCandidates)
+                    ->tap(fn ($query) => $this->whereInEmployeeControlNos($query, $adminEmployeeControlNoCandidates))
                     ->get()
                     ->groupBy(fn (LeaveBalance $balance) => $this->normalizeControlNo($balance->employee_control_no))
                     ->all();
@@ -2937,7 +2940,7 @@ class AdminDashboardController extends Controller
             return $query->whereRaw('1 = 0');
         }
 
-        return $query->whereIn('employee_control_no', $candidateEmployeeControlNos);
+        return $this->whereInEmployeeControlNos($query, $candidateEmployeeControlNos);
     }
 
     private function findAdminEmployeeBalanceByLeaveType(DepartmentAdmin $admin, int $leaveTypeId): ?LeaveBalance
