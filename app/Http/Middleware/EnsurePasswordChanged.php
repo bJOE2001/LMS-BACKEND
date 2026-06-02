@@ -26,8 +26,8 @@ class EnsurePasswordChanged
         if (
             $request->is('api/logout')
             || $request->is('api/me')
-            || $request->is('api/settings/profile')
-            || $request->is('api/settings/password')
+            || $request->is('api/settings/profile*')
+            || $request->is('api/settings/password*')
         ) {
             return $next($request);
         }
