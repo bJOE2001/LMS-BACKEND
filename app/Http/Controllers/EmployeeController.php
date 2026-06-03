@@ -37,6 +37,12 @@ class EmployeeController extends Controller
 
     private const LEDGER_DECIMAL_PRECISION = 3;
 
+    private const TERMINAL_LEAVE_CONSTANT_FACTOR = 0.0478087;
+
+    private const TERMINAL_LEAVE_RATE_PRECISION = 2;
+
+    private const TERMINAL_LEAVE_AMOUNT_PRECISION = 12;
+
     /**
      * List departments for the filter dropdown.
      */
@@ -762,6 +768,36 @@ class EmployeeController extends Controller
             })
             ->values();
 
+        $trackedTypeIdsByKey = $this->resolveLedgerTrackedLeaveTypeIds();
+        $vacationLeaveTypeId = $trackedTypeIdsByKey['vacation'] ?? null;
+        $sickLeaveTypeId = $trackedTypeIdsByKey['sick'] ?? null;
+        $trackedTerminalLeaveTypeIds = [];
+        if (is_int($vacationLeaveTypeId) && $vacationLeaveTypeId > 0) {
+            $trackedTerminalLeaveTypeIds[] = $vacationLeaveTypeId;
+        }
+        if (is_int($sickLeaveTypeId) && $sickLeaveTypeId > 0) {
+            $trackedTerminalLeaveTypeIds[] = $sickLeaveTypeId;
+        }
+
+        $balancesByType = $this->loadPreferredLedgerBalancesByType(
+            $controlNoCandidates,
+            $trackedTerminalLeaveTypeIds
+        );
+        $vacationLeaveBalance = $this->resolveLedgerBalance($balancesByType, $vacationLeaveTypeId);
+        $sickLeaveBalance = $this->resolveLedgerBalance($balancesByType, $sickLeaveTypeId);
+        $monthlyRate = $employee->rate_mon !== null
+            ? round((float) $employee->rate_mon, self::TERMINAL_LEAVE_RATE_PRECISION)
+            : null;
+        $terminalLeaveEstimatedAmount = null;
+        if ($monthlyRate !== null) {
+            $terminalLeaveEstimatedAmount = round(
+                ($sickLeaveBalance + $vacationLeaveBalance)
+                    * $monthlyRate
+                    * self::TERMINAL_LEAVE_CONSTANT_FACTOR,
+                self::TERMINAL_LEAVE_AMOUNT_PRECISION
+            );
+        }
+
         return response()->json([
             'employee' => [
                 'control_no' => $employee->control_no,
@@ -779,6 +815,10 @@ class EmployeeController extends Controller
                 'assigned_department_acronym' => $this->trimOrBlank($employee->assignedDepartmentAcronym ?? $employee->assigned_department_acronym ?? null),
                 'designation' => $employee->designation,
                 'status' => $employee->status,
+                'rate_mon' => $monthlyRate,
+                'vl_balance' => $vacationLeaveBalance,
+                'sl_balance' => $sickLeaveBalance,
+                'terminal_leave_estimated_amount' => $terminalLeaveEstimatedAmount,
             ],
             'applications' => $applications,
         ]);

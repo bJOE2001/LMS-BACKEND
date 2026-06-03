@@ -29,6 +29,10 @@ class AdminDashboardController extends Controller
 {
     use FiltersEmployeeControlNos;
 
+    private const TERMINAL_LEAVE_ESTIMATE_FACTOR = 0.0478087;
+
+    private const TERMINAL_LEAVE_AMOUNT_PRECISION = 12;
+
     public function __construct() {}
 
     private function workScheduleService(): WorkScheduleService
@@ -284,6 +288,7 @@ class AdminDashboardController extends Controller
         return response()->json([
             'leave_initialized' => $leaveInitialized,
             'salary' => $adminSalary,
+            'rate_mon' => $adminSalary,
             'employment_status' => $adminEmploymentStatus ? strtoupper(trim((string) $adminEmploymentStatus)) : null,
             'accrued' => $accrued,
             'resettable' => $resettable,
@@ -454,6 +459,7 @@ class AdminDashboardController extends Controller
             'leave_type_name' => $leaveType->name,
             'balance' => $balance ? (float) $balance->balance : 0,
             'salary' => $this->resolveAdminEmployeeSalary($admin),
+            'rate_mon' => $this->resolveAdminEmployeeSalary($admin),
         ]);
     }
 
@@ -507,6 +513,8 @@ class AdminDashboardController extends Controller
             'leave_type_id' => $leaveType->id,
             'leave_type_name' => $leaveType->name,
             'balance' => $balance ? (float) $balance->balance : 0,
+            'salary' => $employee->rate_mon !== null ? (float) $employee->rate_mon : null,
+            'rate_mon' => $employee->rate_mon !== null ? (float) $employee->rate_mon : null,
         ]);
     }
 
@@ -530,11 +538,16 @@ class AdminDashboardController extends Controller
             return $this->storeSelfMonetization($request, $admin);
         }
 
+        $isTerminalLeave = $this->isTerminalLeaveTypeId(
+            $this->resolveCanonicalLeaveTypeId((int) $request->input('leave_type_id'))
+                ?? (int) $request->input('leave_type_id')
+        );
+
         $validated = $request->validate([
             'leave_type_id' => 'required|exists:tblLeaveTypes,id',
-            'start_date' => 'required|date',
-            'end_date' => 'required|date|after_or_equal:start_date',
-            'total_days' => 'required|numeric|min:0.5',
+            'start_date' => $isTerminalLeave ? ['nullable', 'date'] : ['required', 'date'],
+            'end_date' => $isTerminalLeave ? ['nullable', 'date'] : ['required', 'date', 'after_or_equal:start_date'],
+            'total_days' => ['required', 'numeric', 'min:0.5', 'max:'.($isTerminalLeave ? '999' : '365')],
             'reason' => ['nullable', 'string', 'max:2000'],
             'details_of_leave' => ['nullable', 'string', 'max:2000'],
             'selected_dates' => ['nullable', 'array'],
@@ -558,8 +571,8 @@ class AdminDashboardController extends Controller
         $requestedPayMode = $this->normalizePayMode($validated['pay_mode'] ?? null);
         $requestedTotalDays = round((float) $validated['total_days'], 2);
         $resolvedSelectedDates = LeaveApplication::resolveSelectedDates(
-            $validated['start_date'],
-            $validated['end_date'],
+            $validated['start_date'] ?? null,
+            $validated['end_date'] ?? null,
             is_array($validated['selected_dates'] ?? null) ? $validated['selected_dates'] : null,
             $requestedTotalDays
         );
@@ -668,8 +681,8 @@ class AdminDashboardController extends Controller
             $graceWindowPayMode = $this->resolveSickLeavePayModeFromFilingWindow(
                 $resolvedSelectedDates,
                 $request->input('date_filed') ?? now(),
-                (string) $validated['start_date'],
-                (string) $validated['end_date']
+                (string) ($validated['start_date'] ?? ''),
+                (string) ($validated['end_date'] ?? '')
             );
 
             if ($graceWindowPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
@@ -801,8 +814,8 @@ class AdminDashboardController extends Controller
 
         $duplicateDateValidation = $this->validateNoDuplicateLeaveDates(
             $adminEmployeeControlNo,
-            (string) $validated['start_date'],
-            (string) $validated['end_date'],
+            (string) ($validated['start_date'] ?? ''),
+            (string) ($validated['end_date'] ?? ''),
             $resolvedSelectedDates,
             $requestedTotalDays
         );
@@ -829,8 +842,8 @@ class AdminDashboardController extends Controller
                 'applicant_admin_id' => $admin->id,
                 'employee_control_no' => $this->canonicalizeControlNo($adminEmployeeControlNo),
                 'leave_type_id' => $leaveType->id,
-                'start_date' => $validated['start_date'],
-                'end_date' => $validated['end_date'],
+                'start_date' => $validated['start_date'] ?? null,
+                'end_date' => $validated['end_date'] ?? null,
                 'total_days' => $validated['total_days'],
                 'deductible_days' => $deductibleDays,
                 'reason' => $validated['reason'] ?? null,
@@ -2034,6 +2047,17 @@ class AdminDashboardController extends Controller
         }
 
         $currentLeaveBalances = $this->getCurrentLeaveBalancesForApp($app, $leaveBalanceDirectory);
+        $vacationLeaveBalance = $this->roundLeaveCreditValue(
+            $this->findLeaveBalanceByName($currentLeaveBalances, 'Vacation Leave')
+        );
+        $sickLeaveBalance = $this->roundLeaveCreditValue(
+            $this->findLeaveBalanceByName($currentLeaveBalances, 'Sick Leave')
+        );
+        $terminalLeaveEstimatedAmount = $this->resolveTerminalLeaveEstimatedAmount(
+            $salary,
+            $vacationLeaveBalance,
+            $sickLeaveBalance
+        );
         $durationDays = (float) $app->total_days;
         $monetizationComponents = (bool) $app->is_monetization
             ? $this->resolveStoredMonetizationLeaveCreditComponents($app)
@@ -2121,6 +2145,7 @@ class AdminDashboardController extends Controller
             'office' => $office,
             'position' => $position,
             'salary' => $salary,
+            'rate_mon' => $salary,
             'surname' => $surname,
             'firstname' => $firstname,
             'middlename' => $middlename,
@@ -2186,6 +2211,9 @@ class AdminDashboardController extends Controller
                 ? $this->formatMonetizationComponentsLabel($monetizationComponents)
                 : null,
             'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
+            'vl_balance' => $vacationLeaveBalance,
+            'sl_balance' => $sickLeaveBalance,
+            'terminal_leave_estimated_amount' => $terminalLeaveEstimatedAmount,
             'admin_id' => $app->admin_id,
             'hr_id' => $app->hr_id,
             'filedBy' => $filedBy,
@@ -2925,6 +2953,23 @@ class AdminDashboardController extends Controller
         return round(max($value, 0.0), 3);
     }
 
+    private function resolveTerminalLeaveEstimatedAmount(
+        ?float $monthlyRate,
+        float $vacationLeaveBalance,
+        float $sickLeaveBalance
+    ): ?float {
+        if ($monthlyRate === null || $monthlyRate <= 0) {
+            return null;
+        }
+
+        return round(
+            ($vacationLeaveBalance + $sickLeaveBalance)
+                * $monthlyRate
+                * self::TERMINAL_LEAVE_ESTIMATE_FACTOR,
+            self::TERMINAL_LEAVE_AMOUNT_PRECISION
+        );
+    }
+
     private function resolveLeaveInitializedState(DepartmentAdmin $admin): bool
     {
         return $this->queryAdminEmployeeBalances($admin)->exists();
@@ -2964,6 +3009,31 @@ class AdminDashboardController extends Controller
             ->value('id');
 
         return $value !== null ? (int) $value : null;
+    }
+
+    private function resolveTerminalLeaveTypeId(): ?int
+    {
+        $value = LeaveType::query()
+            ->whereRaw('LOWER(name) = ?', ['terminal leave'])
+            ->value('id');
+
+        return $value !== null ? (int) $value : null;
+    }
+
+    private function isTerminalLeaveTypeId(?int $leaveTypeId): bool
+    {
+        if ($leaveTypeId === null || $leaveTypeId <= 0) {
+            return false;
+        }
+
+        $terminalLeaveTypeId = $this->resolveTerminalLeaveTypeId();
+        if ($terminalLeaveTypeId === null) {
+            return false;
+        }
+
+        $resolvedLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+
+        return $resolvedLeaveTypeId === $terminalLeaveTypeId;
     }
 
     private function isWellnessLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool

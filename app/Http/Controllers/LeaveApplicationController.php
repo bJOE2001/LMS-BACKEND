@@ -36,6 +36,10 @@ class LeaveApplicationController extends Controller
 {
     private const CTO_STANDARD_DAY_HOURS = WorkScheduleService::STANDARD_WORKDAY_HOURS;
 
+    private const TERMINAL_LEAVE_ESTIMATE_FACTOR = 0.0478087;
+
+    private const TERMINAL_LEAVE_AMOUNT_PRECISION = 12;
+
     private const DETAILS_OF_LEAVE_FIELDS = [
         'vacation_detail',
         'vacation_specify',
@@ -376,6 +380,7 @@ class LeaveApplicationController extends Controller
         return response()->json([
             ...$this->employeeControlNoResponse((string) $employee->control_no),
             'salary' => $employee->rate_mon !== null ? (float) $employee->rate_mon : null,
+            'rate_mon' => $employee->rate_mon !== null ? (float) $employee->rate_mon : null,
             'balances' => $balances,
             'latest_accrued_credits' => $this->buildErmsLatestAccruedCreditsPayload(
                 $employee,
@@ -580,11 +585,16 @@ class LeaveApplicationController extends Controller
             return $this->storeMonetization($request, $employee, $actor);
         }
 
+        $isTerminalLeave = $this->isTerminalLeaveTypeId(
+            $this->resolveCanonicalLeaveTypeId((int) $request->input('leave_type_id'))
+                ?? (int) $request->input('leave_type_id')
+        );
+
         $validated = $request->validate([
             'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
-            'start_date' => ['required', 'date'],
-            'end_date' => ['required', 'date', 'after_or_equal:start_date'],
-            'total_days' => ['required', 'numeric', 'min:0.5', 'max:365'],
+            'start_date' => $isTerminalLeave ? ['nullable', 'date'] : ['required', 'date'],
+            'end_date' => $isTerminalLeave ? ['nullable', 'date'] : ['required', 'date', 'after_or_equal:start_date'],
+            'total_days' => ['required', 'numeric', 'min:0.5', 'max:'.($isTerminalLeave ? '999' : '365')],
             'reason' => ['nullable', 'string', 'max:2000'],
             'details_of_leave' => ['nullable', 'string', 'max:2000'],
             'selected_dates' => ['nullable', 'array'],
@@ -628,8 +638,8 @@ class LeaveApplicationController extends Controller
                 : $request->input('selected_date_half_day_portion')
         );
         $resolvedSelectedDates = LeaveApplication::resolveSelectedDates(
-            $validated['start_date'],
-            $validated['end_date'],
+            $validated['start_date'] ?? null,
+            $validated['end_date'] ?? null,
             is_array($validated['selected_dates'] ?? null) ? $validated['selected_dates'] : null,
             (float) $validated['total_days']
         );
@@ -670,8 +680,8 @@ class LeaveApplicationController extends Controller
             $attachmentState['attachment_reference'] ?? null,
             true,
             $request->input('date_filed') ?? $request->input('dateOfFiling') ?? now(),
-            (string) $validated['start_date'],
-            (string) $validated['end_date'],
+            (string) ($validated['start_date'] ?? ''),
+            (string) ($validated['end_date'] ?? ''),
             (string) $employee->control_no
         );
         if ($policyResolution instanceof JsonResponse) {
@@ -688,8 +698,8 @@ class LeaveApplicationController extends Controller
 
         $duplicateDateValidation = $this->validateNoDuplicateLeaveDates(
             (string) $employee->control_no,
-            (string) $validated['start_date'],
-            (string) $validated['end_date'],
+            (string) ($validated['start_date'] ?? ''),
+            (string) ($validated['end_date'] ?? ''),
             $resolvedSelectedDates,
             $validated['total_days']
         );
@@ -745,8 +755,8 @@ class LeaveApplicationController extends Controller
             $application = LeaveApplication::create([
                 'employee_control_no' => (string) $employee->control_no,
                 'leave_type_id' => $validated['leave_type_id'],
-                'start_date' => $validated['start_date'],
-                'end_date' => $validated['end_date'],
+                'start_date' => $validated['start_date'] ?? null,
+                'end_date' => $validated['end_date'] ?? null,
                 'total_days' => $validated['total_days'],
                 'deductible_days' => $deductibleDays,
                 'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn() && $ctoDeductedHours > 0 ? $ctoDeductedHours : null,
@@ -1420,12 +1430,17 @@ class LeaveApplicationController extends Controller
             return $this->storeMonetization($request, $employee, $account);
         }
 
+        $isTerminalLeave = $this->isTerminalLeaveTypeId(
+            $this->resolveCanonicalLeaveTypeId((int) $request->input('leave_type_id'))
+                ?? (int) $request->input('leave_type_id')
+        );
+
         $validated = $request->validate([
             'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
-            'start_date' => ['required', 'date'],
-            'end_date' => ['required', 'date', 'after_or_equal:start_date'],
-            'total_days' => ['required', 'numeric', 'min:0.5', 'max:365'],
+            'start_date' => $isTerminalLeave ? ['nullable', 'date'] : ['required', 'date'],
+            'end_date' => $isTerminalLeave ? ['nullable', 'date'] : ['required', 'date', 'after_or_equal:start_date'],
+            'total_days' => ['required', 'numeric', 'min:0.5', 'max:'.($isTerminalLeave ? '999' : '365')],
             'reason' => ['nullable', 'string', 'max:2000'],
             'details_of_leave' => ['nullable', 'string', 'max:2000'],
             'selected_dates' => ['nullable', 'array'],
@@ -1469,8 +1484,8 @@ class LeaveApplicationController extends Controller
                 : $request->input('selected_date_half_day_portion')
         );
         $resolvedSelectedDates = LeaveApplication::resolveSelectedDates(
-            $validated['start_date'],
-            $validated['end_date'],
+            $validated['start_date'] ?? null,
+            $validated['end_date'] ?? null,
             is_array($validated['selected_dates'] ?? null) ? $validated['selected_dates'] : null,
             (float) $validated['total_days']
         );
@@ -1511,8 +1526,8 @@ class LeaveApplicationController extends Controller
             $attachmentState['attachment_reference'] ?? null,
             true,
             $request->input('date_filed') ?? $request->input('dateOfFiling') ?? now(),
-            (string) $validated['start_date'],
-            (string) $validated['end_date'],
+            (string) ($validated['start_date'] ?? ''),
+            (string) ($validated['end_date'] ?? ''),
             (string) $employee->control_no
         );
         if ($policyResolution instanceof JsonResponse) {
@@ -1529,8 +1544,8 @@ class LeaveApplicationController extends Controller
 
         $duplicateDateValidation = $this->validateNoDuplicateLeaveDates(
             (string) $employee->control_no,
-            (string) $validated['start_date'],
-            (string) $validated['end_date'],
+            (string) ($validated['start_date'] ?? ''),
+            (string) ($validated['end_date'] ?? ''),
             $resolvedSelectedDates,
             $validated['total_days']
         );
@@ -1586,8 +1601,8 @@ class LeaveApplicationController extends Controller
             $application = LeaveApplication::create([
                 'employee_control_no' => (string) $employee->control_no,
                 'leave_type_id' => $validated['leave_type_id'],
-                'start_date' => $validated['start_date'],
-                'end_date' => $validated['end_date'],
+                'start_date' => $validated['start_date'] ?? null,
+                'end_date' => $validated['end_date'] ?? null,
                 'total_days' => $validated['total_days'],
                 'deductible_days' => $deductibleDays,
                 'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn() && $ctoDeductedHours > 0 ? $ctoDeductedHours : null,
@@ -3994,6 +4009,7 @@ class LeaveApplicationController extends Controller
                 'designation' => $employee->designation ?? null,
                 'office' => $employee->office ?? null,
                 'salary' => $employee->rate_mon !== null ? (float) $employee->rate_mon : null,
+                'rate_mon' => $employee->rate_mon !== null ? (float) $employee->rate_mon : null,
                 'leave_balances' => collect($leaveBalances)->map(fn (LeaveBalance $leaveBalance) => [
                     'leave_type_id' => $leaveBalance->leave_type_id,
                     'leave_type_name' => trim((string) ($leaveBalance->leave_type_name ?? $leaveBalance->leaveType?->name ?? '')),
@@ -4041,12 +4057,17 @@ class LeaveApplicationController extends Controller
             return $this->adminStoreMonetization($request, $admin);
         }
 
+        $isTerminalLeave = $this->isTerminalLeaveTypeId(
+            $this->resolveCanonicalLeaveTypeId((int) $request->input('leave_type_id'))
+                ?? (int) $request->input('leave_type_id')
+        );
+
         $validated = $request->validate([
             'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
             'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
-            'start_date' => ['required', 'date'],
-            'end_date' => ['required', 'date', 'after_or_equal:start_date'],
-            'total_days' => ['required', 'numeric', 'min:0.5', 'max:365'],
+            'start_date' => $isTerminalLeave ? ['nullable', 'date'] : ['required', 'date'],
+            'end_date' => $isTerminalLeave ? ['nullable', 'date'] : ['required', 'date', 'after_or_equal:start_date'],
+            'total_days' => ['required', 'numeric', 'min:0.5', 'max:'.($isTerminalLeave ? '999' : '365')],
             'reason' => ['nullable', 'string', 'max:2000'],
             'details_of_leave' => ['nullable', 'string', 'max:2000'],
             'selected_dates' => ['nullable', 'array'],
@@ -4090,8 +4111,8 @@ class LeaveApplicationController extends Controller
                 : $request->input('selected_date_half_day_portion')
         );
         $resolvedSelectedDates = LeaveApplication::resolveSelectedDates(
-            $validated['start_date'],
-            $validated['end_date'],
+            $validated['start_date'] ?? null,
+            $validated['end_date'] ?? null,
             is_array($validated['selected_dates'] ?? null) ? $validated['selected_dates'] : null,
             (float) $validated['total_days']
         );
@@ -4132,8 +4153,8 @@ class LeaveApplicationController extends Controller
             $attachmentState['attachment_reference'] ?? null,
             true,
             $request->input('date_filed') ?? now(),
-            (string) $validated['start_date'],
-            (string) $validated['end_date'],
+            (string) ($validated['start_date'] ?? ''),
+            (string) ($validated['end_date'] ?? ''),
             (string) ($validated['employee_control_no'] ?? '')
         );
         if ($policyResolution instanceof JsonResponse) {
@@ -4169,8 +4190,8 @@ class LeaveApplicationController extends Controller
 
         $duplicateDateValidation = $this->validateNoDuplicateLeaveDates(
             (string) $employee->control_no,
-            (string) $validated['start_date'],
-            (string) $validated['end_date'],
+            (string) ($validated['start_date'] ?? ''),
+            (string) ($validated['end_date'] ?? ''),
             $resolvedSelectedDates,
             $validated['total_days']
         );
@@ -4226,8 +4247,8 @@ class LeaveApplicationController extends Controller
             $application = LeaveApplication::create([
                 'employee_control_no' => (string) $employee->control_no,
                 'leave_type_id' => $validated['leave_type_id'],
-                'start_date' => $validated['start_date'],
-                'end_date' => $validated['end_date'],
+                'start_date' => $validated['start_date'] ?? null,
+                'end_date' => $validated['end_date'] ?? null,
                 'total_days' => $validated['total_days'],
                 'deductible_days' => $deductibleDays,
                 'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn() && $ctoDeductedHours > 0 ? $ctoDeductedHours : null,
@@ -8273,6 +8294,31 @@ class LeaveApplicationController extends Controller
         return $value !== null ? (int) $value : null;
     }
 
+    private function resolveTerminalLeaveTypeId(): ?int
+    {
+        $value = LeaveType::query()
+            ->whereRaw('LOWER(name) = ?', ['terminal leave'])
+            ->value('id');
+
+        return $value !== null ? (int) $value : null;
+    }
+
+    private function isTerminalLeaveTypeId(?int $leaveTypeId): bool
+    {
+        if ($leaveTypeId === null || $leaveTypeId <= 0) {
+            return false;
+        }
+
+        $terminalLeaveTypeId = $this->resolveTerminalLeaveTypeId();
+        if ($terminalLeaveTypeId === null) {
+            return false;
+        }
+
+        $resolvedLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+
+        return $resolvedLeaveTypeId === $terminalLeaveTypeId;
+    }
+
     private function shouldDeductForcedLeaveWithVacation(LeaveApplication $app, ?int $forcedLeaveTypeId): bool
     {
         $leaveType = $app->leaveType;
@@ -11315,6 +11361,14 @@ class LeaveApplicationController extends Controller
         $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
         $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
         $leaveBalanceSnapshot = $this->getApplicationLeaveBalanceSnapshot($app);
+        $vacationLeaveBalance = $this->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Vacation Leave');
+        $sickLeaveBalance = $this->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Sick Leave');
+        $monthlyRate = $resolvedEmployee?->rate_mon !== null ? (float) $resolvedEmployee->rate_mon : null;
+        $terminalLeaveEstimatedAmount = $this->resolveTerminalLeaveEstimatedAmount(
+            $monthlyRate,
+            $vacationLeaveBalance,
+            $sickLeaveBalance
+        );
         $monetizationComponents = (bool) $app->is_monetization
             ? $this->resolveStoredMonetizationLeaveCreditComponents($app)
             : [];
@@ -11439,6 +11493,10 @@ class LeaveApplicationController extends Controller
                 ? $this->formatMonetizationComponentsLabel($monetizationComponents)
                 : null,
             'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
+            'rate_mon' => $monthlyRate,
+            'vl_balance' => $vacationLeaveBalance,
+            'sl_balance' => $sickLeaveBalance,
+            'terminal_leave_estimated_amount' => $terminalLeaveEstimatedAmount,
             'deductible_days' => $deductibleDays,
             'cto_deducted_hours' => $ctoDeductedHours,
             'leaveBalance' => $currentLeaveBalance,
@@ -12102,6 +12160,23 @@ class LeaveApplicationController extends Controller
         }
 
         return 0.0;
+    }
+
+    private function resolveTerminalLeaveEstimatedAmount(
+        ?float $monthlyRate,
+        float $vacationLeaveBalance,
+        float $sickLeaveBalance
+    ): ?float {
+        if ($monthlyRate === null || $monthlyRate <= 0) {
+            return null;
+        }
+
+        return round(
+            ($vacationLeaveBalance + $sickLeaveBalance)
+                * $monthlyRate
+                * self::TERMINAL_LEAVE_ESTIMATE_FACTOR,
+            self::TERMINAL_LEAVE_AMOUNT_PRECISION
+        );
     }
 
     private function roundLeaveCreditValue(float $value): float
