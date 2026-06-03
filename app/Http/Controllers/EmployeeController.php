@@ -901,6 +901,14 @@ class EmployeeController extends Controller
         }
 
         $trackedTypeIds = array_keys($typeIdToKey);
+        $balanceKeyByTypeId = [];
+        foreach ($typeIdToKey as $typeId => $mappedTypeKey) {
+            $balanceKey = $this->resolveLedgerRunningBalanceKey($mappedTypeKey, (int) $typeId);
+            if (is_string($balanceKey) && $balanceKey !== '') {
+                $balanceKeyByTypeId[(int) $typeId] = $balanceKey;
+            }
+        }
+
         $vacationLeaveTypeId = $trackedTypeIdsByKey['vacation'] ?? null;
         $sickLeaveTypeId = $trackedTypeIdsByKey['sick'] ?? null;
         $queryTrackedTypeIds = $trackedTypeIds;
@@ -908,33 +916,63 @@ class EmployeeController extends Controller
         if (is_int($forcedLeaveTypeId) && $forcedLeaveTypeId > 0) {
             $queryTrackedTypeIds[] = $forcedLeaveTypeId;
             $queryTrackedTypeIds = array_values(array_unique($queryTrackedTypeIds));
+            $balanceKeyByTypeId[$forcedLeaveTypeId] = 'vacation';
         }
         $balancesByType = $this->loadPreferredLedgerBalancesByType($controlNoCandidates, $trackedTypeIds);
-        $otherRunningBalance = 0.0;
-        foreach ($otherTypeIds as $otherTypeId) {
-            $otherRunningBalance += $this->resolveLedgerBalance($balancesByType, $otherTypeId);
+        $preferredBalancesByBalanceKey = [];
+        foreach ($balancesByType as $typeId => $balance) {
+            if (! $balance instanceof LeaveBalance) {
+                continue;
+            }
+
+            $balanceKey = $balanceKeyByTypeId[(int) $typeId] ?? null;
+            if (! is_string($balanceKey) || $balanceKey === '') {
+                continue;
+            }
+
+            if (
+                ! array_key_exists($balanceKey, $preferredBalancesByBalanceKey)
+                || $this->shouldPreferLedgerBalanceRecord($balance, $preferredBalancesByBalanceKey[$balanceKey])
+            ) {
+                $preferredBalancesByBalanceKey[$balanceKey] = $balance;
+            }
         }
-        $otherRunningBalance = $this->roundLedgerValue($otherRunningBalance);
         $runningBalances = [
-            'vacation' => $this->resolveLedgerBalance($balancesByType, $trackedTypeIdsByKey['vacation'] ?? null),
-            'sick' => $this->resolveLedgerBalance($balancesByType, $trackedTypeIdsByKey['sick'] ?? null),
-            'other' => $otherRunningBalance,
+            'vacation' => $this->resolveLedgerBalanceByKey($preferredBalancesByBalanceKey, 'vacation'),
+            'sick' => $this->resolveLedgerBalanceByKey($preferredBalancesByBalanceKey, 'sick'),
         ];
+        foreach ($otherTypeIds as $otherTypeId) {
+            $balanceKey = $balanceKeyByTypeId[$otherTypeId] ?? null;
+            if (! is_string($balanceKey) || $balanceKey === '' || array_key_exists($balanceKey, $runningBalances)) {
+                continue;
+            }
+
+            $runningBalances[$balanceKey] = $this->resolveLedgerBalanceByKey(
+                $preferredBalancesByBalanceKey,
+                $balanceKey
+            );
+        }
 
         $transactions = [];
         if ($trackedTypeIds !== []) {
-            $balanceIds = array_values(array_map(
-                static fn (LeaveBalance $balance): int => (int) $balance->id,
-                $balancesByType
-            ));
+            $balanceIds = [];
             $balanceTypeLookup = [];
-            foreach ($balancesByType as $balance) {
+            $balanceKeyLookup = [];
+            foreach ($preferredBalancesByBalanceKey as $balanceKey => $balance) {
                 if (! $balance instanceof LeaveBalance) {
                     continue;
                 }
 
-                $balanceTypeLookup[(int) $balance->id] = (int) $balance->leave_type_id;
+                $balanceId = (int) $balance->id;
+                if ($balanceId <= 0) {
+                    continue;
+                }
+
+                $balanceIds[] = $balanceId;
+                $balanceTypeLookup[$balanceId] = (int) $balance->leave_type_id;
+                $balanceKeyLookup[$balanceId] = $balanceKey;
             }
+            $balanceIds = array_values(array_unique($balanceIds));
 
             if ($balanceIds !== []) {
                 $accrualEntries = LeaveBalanceAccrualHistory::query()
@@ -947,7 +985,9 @@ class EmployeeController extends Controller
                     $balanceId = (int) $entry->leave_balance_id;
                     $typeId = $balanceTypeLookup[$balanceId] ?? null;
                     $typeKey = $typeId !== null ? ($typeIdToKey[(int) $typeId] ?? null) : null;
-                    if ($typeKey === null) {
+                    $balanceKey = $balanceKeyLookup[$balanceId]
+                        ?? ($typeId !== null ? ($balanceKeyByTypeId[(int) $typeId] ?? null) : null);
+                    if ($typeKey === null || ! is_string($balanceKey) || $balanceKey === '') {
                         continue;
                     }
 
@@ -1006,6 +1046,7 @@ class EmployeeController extends Controller
                         'row_id' => 'accrual-'.(int) $entry->id,
                         'merge_key' => $accrualMergeKey,
                         'type_key' => $typeKey,
+                        'balance_key' => $balanceKey,
                         'leave_type_code' => $leaveTypeCode,
                         'transaction_date' => $accrualDate,
                         'sort_date' => $accrualDate,
@@ -1069,6 +1110,11 @@ class EmployeeController extends Controller
                     $typeKey = 'vacation';
                 }
                 if ($typeKey === null) {
+                    continue;
+                }
+                $balanceKey = $balanceKeyByTypeId[$typeId]
+                    ?? $this->resolveLedgerRunningBalanceKey($typeKey, $typeId, $isForcedLeave);
+                if (! is_string($balanceKey) || $balanceKey === '') {
                     continue;
                 }
                 $isUsageOnlyOtherType = $typeKey === 'other'
@@ -1179,6 +1225,7 @@ class EmployeeController extends Controller
                             'row_id' => $mergeKey.'-monetization-'.$componentTypeKey,
                             'merge_key' => $mergeKey,
                             'type_key' => $componentTypeKey,
+                            'balance_key' => $this->resolveLedgerRunningBalanceKey($componentTypeKey),
                             'leave_type_code' => $this->resolveLedgerTypeCode($componentTypeKey),
                             'transaction_date' => $transactionDate,
                             'sort_date' => $transactionDate,
@@ -1202,6 +1249,7 @@ class EmployeeController extends Controller
                         'row_id' => $mergeKey.'-wp',
                         'merge_key' => $mergeKey,
                         'type_key' => $typeKey,
+                        'balance_key' => $balanceKey,
                         'leave_type_code' => $leaveTypeCode,
                         'transaction_date' => $transactionDate,
                         'sort_date' => $transactionDate,
@@ -1226,6 +1274,7 @@ class EmployeeController extends Controller
                         'row_id' => $mergeKey.'-vl-topup',
                         'merge_key' => $mergeKey,
                         'type_key' => 'vacation',
+                        'balance_key' => 'vacation',
                         'leave_type_code' => $this->resolveLedgerTypeCode('vacation'),
                         'transaction_date' => $transactionDate,
                         'sort_date' => $transactionDate,
@@ -1250,6 +1299,7 @@ class EmployeeController extends Controller
                         'row_id' => $mergeKey.'-wop',
                         'merge_key' => $mergeKey,
                         'type_key' => $typeKey,
+                        'balance_key' => $balanceKey,
                         'leave_type_code' => $leaveTypeCode,
                         'transaction_date' => $transactionDate,
                         'sort_date' => $transactionDate,
@@ -1291,9 +1341,16 @@ class EmployeeController extends Controller
                         : [];
 
                     $restoreTypeKey = $isForcedLeave ? 'vacation' : $typeKey;
+                    $restoreBalanceKey = $this->resolveLedgerRunningBalanceKey(
+                        $restoreTypeKey,
+                        $typeId,
+                        $isForcedLeave
+                    );
                     if (
                         $restoreTypeKey !== null
-                        && array_key_exists($restoreTypeKey, $runningBalances)
+                        && is_string($restoreBalanceKey)
+                        && $restoreBalanceKey !== ''
+                        && array_key_exists($restoreBalanceKey, $runningBalances)
                         && $restoredAmount > 0.0
                     ) {
                         $recallDate = $recallEffectiveAt?->toDateString() ?? $recallOccurredAt?->toDateString();
@@ -1302,6 +1359,7 @@ class EmployeeController extends Controller
                                 'row_id' => $mergeKey.'-recall',
                                 'merge_key' => $mergeKey.'-recall',
                                 'type_key' => $restoreTypeKey,
+                                'balance_key' => $restoreBalanceKey,
                                 'leave_type_code' => $this->resolveLedgerTypeCode(
                                     $restoreTypeKey,
                                     is_string($otherTypeCode) ? $otherTypeCode : null,
@@ -1359,7 +1417,12 @@ class EmployeeController extends Controller
         $rowIndexByMergeKey = [];
         foreach ($transactions as $transaction) {
             $typeKey = $transaction['type_key'] ?? null;
-            if (! is_string($typeKey) || ! array_key_exists($typeKey, $runningBalances)) {
+            $balanceKey = trim((string) ($transaction['balance_key'] ?? ''));
+            if (
+                ! is_string($typeKey)
+                || $balanceKey === ''
+                || ! array_key_exists($balanceKey, $runningBalances)
+            ) {
                 continue;
             }
 
@@ -1369,8 +1432,8 @@ class EmployeeController extends Controller
                 continue;
             }
 
-            $currentBalance = $this->roundLedgerValue($runningBalances[$typeKey] ?? 0);
-            $runningBalances[$typeKey] = $this->roundLedgerValue(
+            $currentBalance = $this->roundLedgerValue($runningBalances[$balanceKey] ?? 0);
+            $runningBalances[$balanceKey] = $this->roundLedgerValue(
                 $currentBalance - (float) ($transaction['balance_delta'] ?? 0)
             );
 
@@ -1405,6 +1468,7 @@ class EmployeeController extends Controller
                     'period' => $period,
                     'particulars' => $particulars,
                     'leave_type_code' => $leaveTypeCode !== '' ? $leaveTypeCode : null,
+                    'balance_key' => $balanceKey,
                     'action_date' => $actionDate,
                     'action_taken' => $actionTaken,
                     'inclusive_start_date' => $inclusiveStartDate !== '' ? $inclusiveStartDate : null,
@@ -3076,6 +3140,74 @@ class EmployeeController extends Controller
         }
 
         return $preferredBalancesByType;
+    }
+
+    private function resolveLedgerRunningBalanceKey(
+        ?string $typeKey,
+        ?int $leaveTypeId = null,
+        bool $isForcedLeave = false
+    ): ?string {
+        if ($isForcedLeave || $typeKey === 'vacation') {
+            return 'vacation';
+        }
+
+        if ($typeKey === 'sick') {
+            return 'sick';
+        }
+
+        if ($typeKey !== 'other') {
+            return null;
+        }
+
+        $canonicalLeaveTypeId = LeaveType::resolveCanonicalLeaveTypeId($leaveTypeId) ?? (int) ($leaveTypeId ?? 0);
+        if ($canonicalLeaveTypeId <= 0) {
+            return null;
+        }
+
+        return 'other:'.$canonicalLeaveTypeId;
+    }
+
+    private function shouldPreferLedgerBalanceRecord(LeaveBalance $candidate, LeaveBalance $current): bool
+    {
+        $candidateTypeId = (int) ($candidate->leave_type_id ?? 0);
+        $currentTypeId = (int) ($current->leave_type_id ?? 0);
+        $specialPrivilegeLeaveTypeId = LeaveType::resolveSpecialPrivilegeLeaveTypeId();
+        if (
+            $specialPrivilegeLeaveTypeId !== null
+            && LeaveType::isSpecialPrivilegeType(null, $candidateTypeId)
+            && LeaveType::isSpecialPrivilegeType(null, $currentTypeId)
+            && $candidateTypeId !== $currentTypeId
+        ) {
+            if ($candidateTypeId === $specialPrivilegeLeaveTypeId) {
+                return true;
+            }
+
+            if ($currentTypeId === $specialPrivilegeLeaveTypeId) {
+                return false;
+            }
+        }
+
+        $candidateUpdatedAt = $candidate->updated_at?->timestamp ?? 0;
+        $currentUpdatedAt = $current->updated_at?->timestamp ?? 0;
+
+        if ($candidateUpdatedAt !== $currentUpdatedAt) {
+            return $candidateUpdatedAt > $currentUpdatedAt;
+        }
+
+        return (int) $candidate->id > (int) $current->id;
+    }
+
+    private function resolveLedgerBalanceByKey(array $balancesByKey, ?string $balanceKey): float
+    {
+        if (
+            $balanceKey === null
+            || ! isset($balancesByKey[$balanceKey])
+            || ! $balancesByKey[$balanceKey] instanceof LeaveBalance
+        ) {
+            return 0.0;
+        }
+
+        return $this->roundLedgerValue($balancesByKey[$balanceKey]->balance ?? 0);
     }
 
     private function resolveLedgerBalance(array $balancesByType, ?int $leaveTypeId): float
