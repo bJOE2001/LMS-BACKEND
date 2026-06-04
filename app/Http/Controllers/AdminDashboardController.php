@@ -817,7 +817,9 @@ class AdminDashboardController extends Controller
             (string) ($validated['start_date'] ?? ''),
             (string) ($validated['end_date'] ?? ''),
             $resolvedSelectedDates,
-            $requestedTotalDays
+            $requestedTotalDays,
+            $selectedDateCoverage,
+            $selectedDateHalfDayPortion
         );
         if ($duplicateDateValidation instanceof JsonResponse) {
             return $duplicateDateValidation;
@@ -3774,15 +3776,32 @@ class AdminDashboardController extends Controller
         string $startDate,
         string $endDate,
         ?array $selectedDates = null,
-        mixed $totalDays = null
+        mixed $totalDays = null,
+        ?array $selectedDateCoverage = null,
+        ?array $selectedDateHalfDayPortion = null
     ): ?JsonResponse {
-        $requestedDates = LeaveApplication::resolveDateSet($startDate, $endDate, $selectedDates, $totalDays);
-        if ($requestedDates === []) {
+        $requestedDateOccupancy = LeaveApplication::resolveDateOccupancyMap(
+            $startDate,
+            $endDate,
+            $selectedDates,
+            $totalDays,
+            $selectedDateCoverage,
+            $selectedDateHalfDayPortion
+        );
+        if ($requestedDateOccupancy === []) {
             return null;
         }
 
         $existingApplications = LeaveApplication::query()
-            ->select(['id', 'start_date', 'end_date', 'selected_dates', 'total_days'])
+            ->select([
+                'id',
+                'start_date',
+                'end_date',
+                'selected_dates',
+                'selected_date_coverage',
+                'selected_date_half_day_portion',
+                'total_days',
+            ])
             ->whereIn('status', [
                 LeaveApplication::STATUS_PENDING_ADMIN,
                 LeaveApplication::STATUS_PENDING_HR,
@@ -3793,14 +3812,16 @@ class AdminDashboardController extends Controller
 
         $duplicateDateMap = [];
         foreach ($existingApplications as $existingApplication) {
-            $existingDates = LeaveApplication::resolveDateSet(
+            $existingDateOccupancy = LeaveApplication::resolveDateOccupancyMap(
                 $existingApplication->start_date?->toDateString(),
                 $existingApplication->end_date?->toDateString(),
                 is_array($existingApplication->selected_dates) ? $existingApplication->selected_dates : null,
-                $existingApplication->total_days
+                $existingApplication->total_days,
+                is_array($existingApplication->selected_date_coverage) ? $existingApplication->selected_date_coverage : null,
+                is_array($existingApplication->selected_date_half_day_portion) ? $existingApplication->selected_date_half_day_portion : null
             );
 
-            foreach (array_intersect($requestedDates, $existingDates) as $duplicateDate) {
+            foreach (LeaveApplication::resolveOverlappingOccupancyDates($requestedDateOccupancy, $existingDateOccupancy) as $duplicateDate) {
                 $duplicateDateMap[$duplicateDate] = true;
             }
         }

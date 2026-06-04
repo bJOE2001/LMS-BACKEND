@@ -701,7 +701,10 @@ class LeaveApplicationController extends Controller
             (string) ($validated['start_date'] ?? ''),
             (string) ($validated['end_date'] ?? ''),
             $resolvedSelectedDates,
-            $validated['total_days']
+            $validated['total_days'],
+            null,
+            $selectedDateCoverage,
+            $selectedDateHalfDayPortion
         );
         if ($duplicateDateValidation instanceof JsonResponse) {
             return $duplicateDateValidation;
@@ -1239,7 +1242,13 @@ class LeaveApplicationController extends Controller
                     ? $requestedUpdatePayload['selected_dates']
                     : null,
                 $requestedUpdatePayload['total_days'] ?? null,
-                (int) $app->id
+                (int) $app->id,
+                is_array($requestedUpdatePayload['selected_date_coverage'] ?? null)
+                    ? $requestedUpdatePayload['selected_date_coverage']
+                    : null,
+                is_array($requestedUpdatePayload['selected_date_half_day_portion'] ?? null)
+                    ? $requestedUpdatePayload['selected_date_half_day_portion']
+                    : null
             );
             if ($duplicateDateValidation instanceof JsonResponse) {
                 return $duplicateDateValidation;
@@ -1547,7 +1556,10 @@ class LeaveApplicationController extends Controller
             (string) ($validated['start_date'] ?? ''),
             (string) ($validated['end_date'] ?? ''),
             $resolvedSelectedDates,
-            $validated['total_days']
+            $validated['total_days'],
+            null,
+            $selectedDateCoverage,
+            $selectedDateHalfDayPortion
         );
         if ($duplicateDateValidation instanceof JsonResponse) {
             return $duplicateDateValidation;
@@ -4193,7 +4205,10 @@ class LeaveApplicationController extends Controller
             (string) ($validated['start_date'] ?? ''),
             (string) ($validated['end_date'] ?? ''),
             $resolvedSelectedDates,
-            $validated['total_days']
+            $validated['total_days'],
+            null,
+            $selectedDateCoverage,
+            $selectedDateHalfDayPortion
         );
         if ($duplicateDateValidation instanceof JsonResponse) {
             return $duplicateDateValidation;
@@ -6840,7 +6855,9 @@ class LeaveApplicationController extends Controller
                 (string) $targetEndDate,
                 is_array($targetSelectedDates) ? $targetSelectedDates : null,
                 $targetTotalDays,
-                (int) $app->id
+                (int) $app->id,
+                is_array($targetSelectedDateCoverage) ? $targetSelectedDateCoverage : null,
+                is_array($targetSelectedDateHalfDayPortion) ? $targetSelectedDateHalfDayPortion : null
             );
             if ($duplicateDateValidation instanceof JsonResponse) {
                 return $duplicateDateValidation;
@@ -10829,15 +10846,32 @@ class LeaveApplicationController extends Controller
         string $endDate,
         ?array $selectedDates = null,
         mixed $totalDays = null,
-        ?int $excludeApplicationId = null
+        ?int $excludeApplicationId = null,
+        ?array $selectedDateCoverage = null,
+        ?array $selectedDateHalfDayPortion = null
     ): ?JsonResponse {
-        $requestedDates = $this->resolveLeaveDateSet($startDate, $endDate, $selectedDates, $totalDays);
-        if ($requestedDates === []) {
+        $requestedDateOccupancy = LeaveApplication::resolveDateOccupancyMap(
+            $startDate,
+            $endDate,
+            $selectedDates,
+            $totalDays,
+            $selectedDateCoverage,
+            $selectedDateHalfDayPortion
+        );
+        if ($requestedDateOccupancy === []) {
             return null;
         }
 
         $existingApplications = LeaveApplication::query()
-            ->select(['id', 'start_date', 'end_date', 'selected_dates', 'total_days'])
+            ->select([
+                'id',
+                'start_date',
+                'end_date',
+                'selected_dates',
+                'selected_date_coverage',
+                'selected_date_half_day_portion',
+                'total_days',
+            ])
             ->whereIn('status', [
                 LeaveApplication::STATUS_PENDING_ADMIN,
                 LeaveApplication::STATUS_PENDING_HR,
@@ -10851,14 +10885,16 @@ class LeaveApplicationController extends Controller
 
         $duplicateDateMap = [];
         foreach ($existingApplications as $existingApplication) {
-            $existingDates = $this->resolveLeaveDateSet(
+            $existingDateOccupancy = LeaveApplication::resolveDateOccupancyMap(
                 $existingApplication->start_date?->toDateString(),
                 $existingApplication->end_date?->toDateString(),
                 is_array($existingApplication->selected_dates) ? $existingApplication->selected_dates : null,
-                $existingApplication->total_days
+                $existingApplication->total_days,
+                is_array($existingApplication->selected_date_coverage) ? $existingApplication->selected_date_coverage : null,
+                is_array($existingApplication->selected_date_half_day_portion) ? $existingApplication->selected_date_half_day_portion : null
             );
 
-            foreach (array_intersect($requestedDates, $existingDates) as $duplicateDate) {
+            foreach (LeaveApplication::resolveOverlappingOccupancyDates($requestedDateOccupancy, $existingDateOccupancy) as $duplicateDate) {
                 $duplicateDateMap[$duplicateDate] = true;
             }
         }

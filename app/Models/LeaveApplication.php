@@ -250,6 +250,82 @@ class LeaveApplication extends Model
         );
     }
 
+    /**
+     * @return array<string, array{AM: bool, PM: bool}>
+     */
+    public static function resolveDateOccupancyMap(
+        mixed $startDate,
+        mixed $endDate,
+        mixed $selectedDates = null,
+        mixed $totalDays = null,
+        mixed $selectedDateCoverage = null,
+        mixed $selectedDateHalfDayPortion = null
+    ): array {
+        $resolvedDates = self::resolveSelectedDates($startDate, $endDate, $selectedDates, $totalDays)
+            ?? self::buildDateRange($startDate, $endDate);
+        if ($resolvedDates === []) {
+            return [];
+        }
+
+        $coverageMap = self::normalizeSelectedDateCoverageMap($selectedDateCoverage);
+        $halfDayPortionMap = self::mergeSelectedDateHalfDayPortionMaps(
+            self::normalizeSelectedDateHalfDayPortionMap($selectedDateHalfDayPortion),
+            self::normalizeSelectedDateHalfDayPortionMap($selectedDateCoverage)
+        );
+
+        $occupancyMap = [];
+        foreach ($resolvedDates as $resolvedDate) {
+            $dateKey = self::normalizeDateKey($resolvedDate);
+            if ($dateKey === null) {
+                continue;
+            }
+
+            $coverage = $coverageMap[$dateKey] ?? null;
+            $halfDayPortion = $halfDayPortionMap[$dateKey] ?? null;
+
+            $occupancyMap[$dateKey] = match (true) {
+                $coverage === 'half' && $halfDayPortion === 'AM' => ['AM' => true, 'PM' => false],
+                $coverage === 'half' && $halfDayPortion === 'PM' => ['AM' => false, 'PM' => true],
+                default => ['AM' => true, 'PM' => true],
+            };
+        }
+
+        ksort($occupancyMap);
+
+        return $occupancyMap;
+    }
+
+    /**
+     * @param  array<string, array{AM: bool, PM: bool}>  $requestedDateOccupancy
+     * @param  array<string, array{AM: bool, PM: bool}>  $existingDateOccupancy
+     * @return array<int, string>
+     */
+    public static function resolveOverlappingOccupancyDates(
+        array $requestedDateOccupancy,
+        array $existingDateOccupancy
+    ): array {
+        $overlappingDates = [];
+
+        foreach ($requestedDateOccupancy as $dateKey => $requestedSlots) {
+            $existingSlots = $existingDateOccupancy[$dateKey] ?? null;
+            if ($existingSlots === null) {
+                continue;
+            }
+
+            $amConflict = (bool) ($requestedSlots['AM'] ?? false) && (bool) ($existingSlots['AM'] ?? false);
+            $pmConflict = (bool) ($requestedSlots['PM'] ?? false) && (bool) ($existingSlots['PM'] ?? false);
+
+            if ($amConflict || $pmConflict) {
+                $overlappingDates[$dateKey] = true;
+            }
+        }
+
+        $resolvedDates = array_keys($overlappingDates);
+        sort($resolvedDates);
+
+        return $resolvedDates;
+    }
+
     private static function normalizeDateList(mixed $selectedDates): array
     {
         if ($selectedDates === null || $selectedDates === '') {
@@ -290,6 +366,151 @@ class LeaveApplication extends Model
         sort($normalizedDates);
 
         return $normalizedDates;
+    }
+
+    private static function normalizeDateKey(mixed $rawDate): ?string
+    {
+        if ($rawDate === null || $rawDate === '') {
+            return null;
+        }
+
+        if ($rawDate instanceof \DateTimeInterface) {
+            return CarbonImmutable::instance($rawDate)->toDateString();
+        }
+
+        try {
+            return CarbonImmutable::parse((string) $rawDate)->toDateString();
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private static function normalizeSelectedDateCoverageValue(mixed $value): ?string
+    {
+        $normalized = strtolower(trim((string) $value));
+        if ($normalized === '') {
+            return null;
+        }
+
+        $normalized = str_replace([' ', '-'], '_', $normalized);
+        if (in_array($normalized, ['whole', 'whole_day', 'wholeday'], true)) {
+            return 'whole';
+        }
+
+        if (in_array($normalized, ['half', 'half_day', 'halfday'], true)) {
+            return 'half';
+        }
+
+        return self::normalizeSelectedDateHalfDayPortionValue($value) !== null ? 'half' : null;
+    }
+
+    private static function normalizeSelectedDateHalfDayPortionValue(mixed $value): ?string
+    {
+        $normalized = strtoupper(str_replace([' ', '-', '_'], '', trim((string) $value)));
+        if ($normalized === '') {
+            return null;
+        }
+
+        return match ($normalized) {
+            'AM', 'MORNING' => 'AM',
+            'PM', 'AFTERNOON' => 'PM',
+            default => null,
+        };
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private static function normalizeSelectedDateCoverageMap(mixed $value): array
+    {
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $value = $decoded;
+            }
+        }
+
+        if (! is_array($value) || $value === []) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach ($value as $rawDate => $rawCoverage) {
+            $dateKey = self::normalizeDateKey($rawDate);
+            if ($dateKey === null) {
+                continue;
+            }
+
+            $coverage = self::normalizeSelectedDateCoverageValue($rawCoverage);
+            if ($coverage === null) {
+                continue;
+            }
+
+            $normalized[$dateKey] = $coverage;
+        }
+
+        ksort($normalized);
+
+        return $normalized;
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private static function normalizeSelectedDateHalfDayPortionMap(mixed $value): array
+    {
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $value = $decoded;
+            }
+        }
+
+        if (! is_array($value) || $value === []) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach ($value as $rawDate => $rawPortion) {
+            $dateKey = self::normalizeDateKey($rawDate);
+            if ($dateKey === null) {
+                continue;
+            }
+
+            $portion = self::normalizeSelectedDateHalfDayPortionValue($rawPortion);
+            if ($portion === null) {
+                continue;
+            }
+
+            $normalized[$dateKey] = $portion;
+        }
+
+        ksort($normalized);
+
+        return $normalized;
+    }
+
+    /**
+     * @param  array<string, string>  ...$maps
+     * @return array<string, string>
+     */
+    private static function mergeSelectedDateHalfDayPortionMaps(array ...$maps): array
+    {
+        $merged = [];
+
+        foreach ($maps as $map) {
+            foreach ($map as $dateKey => $portion) {
+                if ($portion !== 'AM' && $portion !== 'PM') {
+                    continue;
+                }
+
+                $merged[$dateKey] = $portion;
+            }
+        }
+
+        ksort($merged);
+
+        return $merged;
     }
 
     private static function buildDateRange(mixed $startDate, mixed $endDate): array
