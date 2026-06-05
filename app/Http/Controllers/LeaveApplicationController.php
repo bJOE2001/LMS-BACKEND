@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Controllers\Concerns\FiltersEmployeeControlNos;
 use App\Models\DepartmentAdmin;
 use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HRAccount;
@@ -34,6 +35,8 @@ use Illuminate\Support\Facades\Storage;
  */
 class LeaveApplicationController extends Controller
 {
+    use FiltersEmployeeControlNos;
+
     private const CTO_STANDARD_DAY_HOURS = WorkScheduleService::STANDARD_WORKDAY_HOURS;
 
     private const TERMINAL_LEAVE_ESTIMATE_FACTOR = 0.0478087;
@@ -1868,7 +1871,7 @@ class LeaveApplicationController extends Controller
                 $hasVisibilityConstraint = false;
 
                 if ($departmentEmployeeControlNos !== []) {
-                    $query->whereIn('employee_control_no', $departmentEmployeeControlNos);
+                    $this->whereInEmployeeControlNos($query, $departmentEmployeeControlNos);
                     $hasVisibilityConstraint = true;
                 }
 
@@ -4741,10 +4744,12 @@ class LeaveApplicationController extends Controller
             return [];
         }
 
-        $balances = LeaveBalance::query()
-            ->with('leaveType')
-            ->whereIn('employee_control_no', $candidateControlNos)
-            ->get();
+        $balanceQuery = LeaveBalance::query()
+            ->with('leaveType');
+
+        $this->whereInEmployeeControlNos($balanceQuery, $candidateControlNos);
+
+        $balances = $balanceQuery->get();
 
         $lookup = [];
         foreach ($balances as $balance) {
