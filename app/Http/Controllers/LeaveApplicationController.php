@@ -685,7 +685,9 @@ class LeaveApplicationController extends Controller
             $request->input('date_filed') ?? $request->input('dateOfFiling') ?? now(),
             (string) ($validated['start_date'] ?? ''),
             (string) ($validated['end_date'] ?? ''),
-            (string) $employee->control_no
+            (string) $employee->control_no,
+            false,
+            $resolvedDetailsOfLeave
         );
         if ($policyResolution instanceof JsonResponse) {
             return $policyResolution;
@@ -735,7 +737,9 @@ class LeaveApplicationController extends Controller
                 (float) $validated['total_days'],
                 (float) ($eligibility['available_balance'] ?? 0.0),
                 $selectedDatePayStatus,
-                (string) $employee->control_no
+                (string) $employee->control_no,
+                $leaveType,
+                $resolvedDetailsOfLeave
             );
             $requestedPayMode = $allocation['pay_mode'];
             $selectedDatePayStatus = $allocation['selected_date_pay_status'];
@@ -1540,7 +1544,9 @@ class LeaveApplicationController extends Controller
             $request->input('date_filed') ?? $request->input('dateOfFiling') ?? now(),
             (string) ($validated['start_date'] ?? ''),
             (string) ($validated['end_date'] ?? ''),
-            (string) $employee->control_no
+            (string) $employee->control_no,
+            false,
+            $resolvedDetailsOfLeave
         );
         if ($policyResolution instanceof JsonResponse) {
             return $policyResolution;
@@ -1590,7 +1596,9 @@ class LeaveApplicationController extends Controller
                 (float) $validated['total_days'],
                 (float) ($eligibility['available_balance'] ?? 0.0),
                 $selectedDatePayStatus,
-                (string) $employee->control_no
+                (string) $employee->control_no,
+                $leaveType,
+                $resolvedDetailsOfLeave
             );
             $requestedPayMode = $allocation['pay_mode'];
             $selectedDatePayStatus = $allocation['selected_date_pay_status'];
@@ -2696,7 +2704,8 @@ class LeaveApplicationController extends Controller
             $app->start_date?->toDateString(),
             $app->end_date?->toDateString(),
             (string) ($app->employee_control_no ?? ''),
-            true
+            true,
+            $this->trimNullableString($app->details_of_leave ?? null)
         );
         if ($policyResolution instanceof JsonResponse) {
             return $policyResolution;
@@ -3281,7 +3290,8 @@ class LeaveApplicationController extends Controller
             $app->start_date?->toDateString(),
             $app->end_date?->toDateString(),
             (string) ($app->employee_control_no ?? ''),
-            true
+            true,
+            $this->trimNullableString($app->details_of_leave ?? null)
         );
         if ($policyResolution instanceof JsonResponse) {
             return $policyResolution;
@@ -4170,7 +4180,9 @@ class LeaveApplicationController extends Controller
             $request->input('date_filed') ?? now(),
             (string) ($validated['start_date'] ?? ''),
             (string) ($validated['end_date'] ?? ''),
-            (string) ($validated['employee_control_no'] ?? '')
+            (string) ($validated['employee_control_no'] ?? ''),
+            false,
+            $resolvedDetailsOfLeave
         );
         if ($policyResolution instanceof JsonResponse) {
             return $policyResolution;
@@ -4239,7 +4251,9 @@ class LeaveApplicationController extends Controller
                 (float) $validated['total_days'],
                 (float) ($eligibility['available_balance'] ?? 0.0),
                 $selectedDatePayStatus,
-                (string) ($employee->control_no ?? $validated['employee_control_no'] ?? '')
+                (string) ($employee->control_no ?? $validated['employee_control_no'] ?? ''),
+                $leaveType,
+                $resolvedDetailsOfLeave
             );
             $requestedPayMode = $allocation['pay_mode'];
             $selectedDatePayStatus = $allocation['selected_date_pay_status'];
@@ -6395,7 +6409,9 @@ class LeaveApplicationController extends Controller
             $request->input('date_filed') ?? $request->input('dateOfFiling') ?? now(),
             $resolvedStartDate,
             $resolvedEndDate,
-            (string) ($app->employee_control_no ?? '')
+            (string) ($app->employee_control_no ?? ''),
+            false,
+            $requestedDetailsOfLeave
         );
         if ($policyResolution instanceof JsonResponse) {
             return $policyResolution;
@@ -6833,7 +6849,9 @@ class LeaveApplicationController extends Controller
             $pendingUpdateRequest?->created_at ?? now(),
             $targetStartDate,
             $targetEndDate,
-            (string) ($app->employee_control_no ?? '')
+            (string) ($app->employee_control_no ?? ''),
+            false,
+            $this->trimNullableString($payload['details_of_leave'] ?? $payload['detailsOfLeave'] ?? null)
         );
         if ($policyResolution instanceof JsonResponse) {
             return $policyResolution;
@@ -7777,7 +7795,9 @@ class LeaveApplicationController extends Controller
                 $payload['date_filed'] ?? null,
                 $startDate,
                 $endDate,
-                isset($payload['employee_control_no']) ? (string) $payload['employee_control_no'] : null
+                isset($payload['employee_control_no']) ? (string) $payload['employee_control_no'] : null,
+                false,
+                $this->trimNullableString($payload['details_of_leave'] ?? $payload['detailsOfLeave'] ?? null)
             );
 
             if (! ($policyResolution instanceof JsonResponse)) {
@@ -9114,7 +9134,8 @@ class LeaveApplicationController extends Controller
         ?string $absenceStartDate = null,
         ?string $absenceEndDate = null,
         ?string $employeeControlNo = null,
-        bool $allowPayStatusOverride = false
+        bool $allowPayStatusOverride = false,
+        ?string $detailsOfLeave = null
     ): array|JsonResponse {
         $normalizedTotalDays = round(max((float) $totalDays, 0.0), 3);
 
@@ -9228,10 +9249,13 @@ class LeaveApplicationController extends Controller
                 $normalizedPayMode = LeaveApplication::PAY_MODE_WITHOUT_PAY;
                 $normalizedSelectedDatePayStatus = null;
             } else {
-                $normalizedSelectedDatePayStatus = $this->compactSelectedDatePayStatusMap(
-                    $normalizedSelectedDatePayStatus,
+                $normalizedSelectedDatePayStatus = $this->enforceAbroadWeekendWithoutPayStatus(
                     $selectedDates,
-                    $normalizedPayMode
+                    $normalizedSelectedDatePayStatus,
+                    $normalizedPayMode,
+                    $leaveType,
+                    (int) $leaveType->id,
+                    $detailsOfLeave
                 );
             }
 
@@ -9246,10 +9270,13 @@ class LeaveApplicationController extends Controller
             );
             $ctoDeductedHours = null;
         } else {
-            $normalizedSelectedDatePayStatus = $this->compactSelectedDatePayStatusMap(
-                $normalizedSelectedDatePayStatus,
+            $normalizedSelectedDatePayStatus = $this->enforceAbroadWeekendWithoutPayStatus(
                 $selectedDates,
-                $normalizedPayMode
+                $normalizedSelectedDatePayStatus,
+                $normalizedPayMode,
+                $leaveType,
+                (int) $leaveType->id,
+                $detailsOfLeave
             );
 
             $deductibleDays = $this->computeDeductibleDays(
@@ -9269,6 +9296,17 @@ class LeaveApplicationController extends Controller
 
             $ctoDeductedHours = null;
         }
+
+        $normalizedPayMode = $this->resolvePayModeFromSelectedDates(
+            $selectedDates,
+            $normalizedSelectedDatePayStatus,
+            $normalizedPayMode
+        );
+        $normalizedSelectedDatePayStatus = $this->compactSelectedDatePayStatusMap(
+            $normalizedSelectedDatePayStatus,
+            $selectedDates,
+            $normalizedPayMode
+        );
 
         if (! $attachmentSubmitted) {
             $attachmentReference = null;
@@ -9659,7 +9697,9 @@ class LeaveApplicationController extends Controller
         float $totalDays,
         float $availableCredits,
         ?array $preferredSelectedDatePayStatus = null,
-        ?string $employeeControlNo = null
+        ?string $employeeControlNo = null,
+        ?LeaveType $leaveType = null,
+        ?string $detailsOfLeave = null
     ): array {
         $normalizedTotalDays = round(max($totalDays, 0.0), 3);
         $normalizedAvailableCredits = round(max($availableCredits, 0.0), 3);
@@ -9672,49 +9712,49 @@ class LeaveApplicationController extends Controller
             ];
         }
 
-        if ($normalizedAvailableCredits + 1e-9 >= $normalizedTotalDays) {
-            return [
-                'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
-                'selected_date_pay_status' => $this->compactSelectedDatePayStatusMap(
-                    $preferredSelectedDatePayStatus,
-                    $selectedDates,
-                    LeaveApplication::PAY_MODE_WITH_PAY
-                ),
-                'deductible_days' => $normalizedTotalDays,
-            ];
-        }
-
-        $preferredCompactedPayStatus = $this->compactSelectedDatePayStatusMap(
-            $preferredSelectedDatePayStatus,
+        $preferredCompactedPayStatus = $this->enforceAbroadWeekendWithoutPayStatus(
             $selectedDates,
+            $preferredSelectedDatePayStatus,
+            LeaveApplication::PAY_MODE_WITH_PAY,
+            $leaveType,
+            $leaveType?->id !== null ? (int) $leaveType->id : null,
+            $detailsOfLeave
+        );
+        $preferredPayMode = $this->resolvePayModeFromSelectedDates(
+            $selectedDates,
+            $preferredCompactedPayStatus,
             LeaveApplication::PAY_MODE_WITH_PAY
         );
-        if ($preferredCompactedPayStatus !== null) {
-            $preferredDeductibleDays = $this->computeDeductibleDays(
-                $normalizedTotalDays,
-                $selectedDates,
-                $preferredCompactedPayStatus,
-                $selectedDateCoverage,
-                false,
-                LeaveApplication::PAY_MODE_WITH_PAY,
-                $employeeControlNo
-            );
+        $preferredCompactedPayStatus = $this->compactSelectedDatePayStatusMap(
+            $preferredCompactedPayStatus,
+            $selectedDates,
+            $preferredPayMode
+        );
 
-            if ($preferredDeductibleDays <= $normalizedAvailableCredits + 1e-9) {
-                if ($preferredDeductibleDays <= 0.0) {
-                    return [
-                        'pay_mode' => LeaveApplication::PAY_MODE_WITHOUT_PAY,
-                        'selected_date_pay_status' => null,
-                        'deductible_days' => 0.0,
-                    ];
-                }
+        $preferredDeductibleDays = $this->computeDeductibleDays(
+            $normalizedTotalDays,
+            $selectedDates,
+            $preferredCompactedPayStatus,
+            $selectedDateCoverage,
+            false,
+            $preferredPayMode,
+            $employeeControlNo
+        );
 
+        if ($normalizedAvailableCredits + 1e-9 >= $normalizedTotalDays || $preferredDeductibleDays <= $normalizedAvailableCredits + 1e-9) {
+            if ($preferredDeductibleDays <= 0.0) {
                 return [
-                    'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
-                    'selected_date_pay_status' => $preferredCompactedPayStatus,
-                    'deductible_days' => round(max($preferredDeductibleDays, 0.0), 3),
+                    'pay_mode' => LeaveApplication::PAY_MODE_WITHOUT_PAY,
+                    'selected_date_pay_status' => null,
+                    'deductible_days' => 0.0,
                 ];
             }
+
+            return [
+                'pay_mode' => $preferredPayMode,
+                'selected_date_pay_status' => $preferredCompactedPayStatus,
+                'deductible_days' => round(max($preferredDeductibleDays, 0.0), 3),
+            ];
         }
 
         if (! is_array($selectedDates) || $selectedDates === []) {
@@ -9732,10 +9772,23 @@ class LeaveApplicationController extends Controller
             $normalizedAvailableCredits,
             $employeeControlNo
         );
-        $compactedPayStatusOverrides = $this->compactSelectedDatePayStatusMap(
-            $payStatusOverrides,
+        $compactedPayStatusOverrides = $this->enforceAbroadWeekendWithoutPayStatus(
             $selectedDates,
+            $payStatusOverrides,
+            LeaveApplication::PAY_MODE_WITH_PAY,
+            $leaveType,
+            $leaveType?->id !== null ? (int) $leaveType->id : null,
+            $detailsOfLeave
+        );
+        $resolvedPayMode = $this->resolvePayModeFromSelectedDates(
+            $selectedDates,
+            $compactedPayStatusOverrides,
             LeaveApplication::PAY_MODE_WITH_PAY
+        );
+        $compactedPayStatusOverrides = $this->compactSelectedDatePayStatusMap(
+            $compactedPayStatusOverrides,
+            $selectedDates,
+            $resolvedPayMode
         );
 
         $deductibleDays = $this->computeDeductibleDays(
@@ -9744,7 +9797,7 @@ class LeaveApplicationController extends Controller
             $compactedPayStatusOverrides,
             $selectedDateCoverage,
             false,
-            LeaveApplication::PAY_MODE_WITH_PAY,
+            $resolvedPayMode,
             $employeeControlNo
         );
 
@@ -9761,7 +9814,7 @@ class LeaveApplicationController extends Controller
         }
 
         return [
-            'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
+            'pay_mode' => $resolvedPayMode,
             'selected_date_pay_status' => $compactedPayStatusOverrides,
             'deductible_days' => round(max($deductibleDays, 0.0), 3),
         ];
@@ -9975,6 +10028,140 @@ class LeaveApplicationController extends Controller
         }
 
         return null;
+    }
+
+    private function normalizeVacationDetailValue(mixed $value): ?string
+    {
+        $normalized = strtolower(trim((string) ($value ?? '')));
+        if ($normalized === '') {
+            return null;
+        }
+
+        $normalized = preg_replace('/[^a-z0-9]+/', ' ', $normalized) ?? $normalized;
+        $normalized = trim($normalized);
+        if ($normalized === '') {
+            return null;
+        }
+
+        if (str_contains($normalized, 'abroad')) {
+            return 'Abroad';
+        }
+
+        if (str_contains($normalized, 'within') && str_contains($normalized, 'philippines')) {
+            return 'Within the Philippines';
+        }
+
+        return null;
+    }
+
+    private function resolveVacationDetailFromDetailsOfLeave(mixed $detailsOfLeave): ?string
+    {
+        $normalizedPayload = $this->normalizeDetailsOfLeavePayload($detailsOfLeave);
+        if (! is_array($normalizedPayload)) {
+            return null;
+        }
+
+        return $this->normalizeVacationDetailValue($normalizedPayload['vacation_detail'] ?? null);
+    }
+
+    private function shouldForceAbroadWeekendWithoutPay(
+        ?LeaveType $leaveType = null,
+        ?int $leaveTypeId = null,
+        mixed $detailsOfLeave = null
+    ): bool {
+        $resolvedLeaveTypeId = $leaveTypeId !== null && $leaveTypeId > 0
+            ? $leaveTypeId
+            : (($leaveType?->id !== null && (int) $leaveType->id > 0) ? (int) $leaveType->id : null);
+
+        $isEligibleLeaveType = $this->isVacationLeaveType($leaveType, $resolvedLeaveTypeId)
+            || LeaveType::isSpecialPrivilegeType($leaveType, $resolvedLeaveTypeId);
+
+        if (! $isEligibleLeaveType) {
+            return false;
+        }
+
+        return $this->resolveVacationDetailFromDetailsOfLeave($detailsOfLeave) === 'Abroad';
+    }
+
+    private function isWeekendDateKey(string $dateKey): bool
+    {
+        try {
+            $dayOfWeek = \Carbon\CarbonImmutable::parse($dateKey)->dayOfWeek;
+        } catch (\Throwable) {
+            return false;
+        }
+
+        return $dayOfWeek === 0 || $dayOfWeek === 6;
+    }
+
+    private function enforceAbroadWeekendWithoutPayStatus(
+        ?array $selectedDates,
+        ?array $selectedDatePayStatus,
+        string $payMode,
+        ?LeaveType $leaveType = null,
+        ?int $leaveTypeId = null,
+        mixed $detailsOfLeave = null
+    ): ?array {
+        $compactedPayStatus = $this->compactSelectedDatePayStatusMap(
+            $selectedDatePayStatus,
+            $selectedDates,
+            $payMode
+        );
+
+        if (! $this->shouldForceAbroadWeekendWithoutPay($leaveType, $leaveTypeId, $detailsOfLeave)) {
+            return $compactedPayStatus;
+        }
+
+        if (! is_array($selectedDates) || $selectedDates === []) {
+            return $compactedPayStatus;
+        }
+
+        $resolvedPayStatus = is_array($compactedPayStatus) ? $compactedPayStatus : [];
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeDateKey($rawDate) ?? trim((string) $rawDate);
+            if ($dateKey === '' || ! $this->isWeekendDateKey($dateKey)) {
+                continue;
+            }
+
+            $resolvedPayStatus[$dateKey] = LeaveApplication::PAY_MODE_WITHOUT_PAY;
+        }
+
+        return $this->compactSelectedDatePayStatusMap(
+            $resolvedPayStatus,
+            $selectedDates,
+            LeaveApplication::PAY_MODE_WITH_PAY
+        );
+    }
+
+    private function resolvePayModeFromSelectedDates(
+        ?array $selectedDates,
+        ?array $selectedDatePayStatus,
+        string $fallbackPayMode
+    ): string {
+        $normalizedFallbackPayMode = $this->normalizePayMode($fallbackPayMode, false);
+        $selectedDateStatusMap = is_array($selectedDatePayStatus) ? $selectedDatePayStatus : [];
+        if (! is_array($selectedDates) || $selectedDates === []) {
+            return $normalizedFallbackPayMode;
+        }
+
+        $selectedDateLookup = [];
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeDateKey($rawDate) ?? trim((string) $rawDate);
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $selectedDateLookup[$dateKey] = true;
+            $resolvedMode = $this->resolvePayModeFromStatusValue($selectedDateStatusMap[$dateKey] ?? null)
+                ?? $normalizedFallbackPayMode;
+            if ($resolvedMode === LeaveApplication::PAY_MODE_WITH_PAY) {
+                return LeaveApplication::PAY_MODE_WITH_PAY;
+            }
+        }
+
+        return $selectedDateLookup === []
+            ? $normalizedFallbackPayMode
+            : LeaveApplication::PAY_MODE_WITHOUT_PAY;
     }
 
     private function normalizeBooleanFlag(mixed $value): ?bool
@@ -11757,7 +11944,9 @@ class LeaveApplicationController extends Controller
                 $application->created_at ?? null,
                 $application->start_date?->toDateString(),
                 $application->end_date?->toDateString(),
-                (string) ($application->employee_control_no ?? '')
+                (string) ($application->employee_control_no ?? ''),
+                false,
+                $this->trimNullableString($application->details_of_leave ?? null)
             );
 
             if ($policyResolution instanceof JsonResponse) {
