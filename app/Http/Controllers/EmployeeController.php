@@ -22,6 +22,7 @@ use Illuminate\Http\Request;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\Rule;
 
 /**
@@ -42,6 +43,17 @@ class EmployeeController extends Controller
     private const TERMINAL_LEAVE_RATE_PRECISION = 2;
 
     private const TERMINAL_LEAVE_AMOUNT_PRECISION = 12;
+
+    private function hasLeaveApplicationLinkedSickDeductedDaysColumn(): bool
+    {
+        static $hasColumn;
+
+        if ($hasColumn === null) {
+            $hasColumn = Schema::hasColumn('tblLeaveApplications', 'linked_sick_leave_deducted_days');
+        }
+
+        return $hasColumn;
+    }
 
     /**
      * List departments for the filter dropdown.
@@ -1060,6 +1072,33 @@ class EmployeeController extends Controller
                 }
             }
 
+            $approvedApplicationColumns = [
+                'id',
+                'leave_type_id',
+                'total_days',
+                'deductible_days',
+                'without_pay_days',
+                'linked_vacation_leave_deducted_days',
+                'pay_mode',
+                'is_monetization',
+                'monetization_leave_credits',
+                'status',
+                'remarks',
+                'start_date',
+                'end_date',
+                'selected_dates',
+                'selected_date_pay_status',
+                'selected_date_coverage',
+                'recall_effective_date',
+                'recall_selected_dates',
+                'hr_approved_at',
+                'created_at',
+                'updated_at',
+            ];
+            if ($this->hasLeaveApplicationLinkedSickDeductedDaysColumn()) {
+                $approvedApplicationColumns[] = 'linked_sick_leave_deducted_days';
+            }
+
             $approvedApplications = LeaveApplication::query()
                 ->with(['logs' => function ($query) {
                     $query
@@ -1076,28 +1115,7 @@ class EmployeeController extends Controller
                 ->orderByDesc('hr_approved_at')
                 ->orderByDesc('created_at')
                 ->orderByDesc('id')
-                ->get([
-                    'id',
-                    'leave_type_id',
-                    'total_days',
-                    'deductible_days',
-                    'linked_vacation_leave_deducted_days',
-                    'pay_mode',
-                    'is_monetization',
-                    'monetization_leave_credits',
-                    'status',
-                    'remarks',
-                    'start_date',
-                    'end_date',
-                    'selected_dates',
-                    'selected_date_pay_status',
-                    'selected_date_coverage',
-                    'recall_effective_date',
-                    'recall_selected_dates',
-                    'hr_approved_at',
-                    'created_at',
-                    'updated_at',
-                ]);
+                ->get($approvedApplicationColumns);
 
             foreach ($approvedApplications as $application) {
                 $typeId = (int) $application->leave_type_id;
@@ -1146,11 +1164,22 @@ class EmployeeController extends Controller
                     max((float) ($application->linked_vacation_leave_deducted_days ?? 0), 0.0),
                     3
                 );
+                $linkedSickWithPayAmount = round(
+                    max((float) ($application->linked_sick_leave_deducted_days ?? 0), 0.0),
+                    3
+                );
                 if ($typeKey === 'vacation') {
                     $linkedVacationWithPayAmount = 0.0;
                 }
+                if ($typeKey === 'sick') {
+                    $linkedSickWithPayAmount = 0.0;
+                }
                 $linkedVacationWithPayAmount = round(min($linkedVacationWithPayAmount, $withPayAmount), self::LEDGER_DECIMAL_PRECISION);
-                $primaryWithPayAmount = round(max($withPayAmount - $linkedVacationWithPayAmount, 0.0), self::LEDGER_DECIMAL_PRECISION);
+                $linkedSickWithPayAmount = round(min($linkedSickWithPayAmount, $withPayAmount), self::LEDGER_DECIMAL_PRECISION);
+                $primaryWithPayAmount = round(
+                    max($withPayAmount - $linkedVacationWithPayAmount - $linkedSickWithPayAmount, 0.0),
+                    self::LEDGER_DECIMAL_PRECISION
+                );
 
                 $withoutPayAmount = round(
                     max((float) ($payAmounts['without_pay'] ?? 0.0), 0.0),
@@ -1174,6 +1203,7 @@ class EmployeeController extends Controller
                     ! $isMonetization
                     && $primaryWithPayAmount <= 0
                     && $linkedVacationWithPayAmount <= 0
+                    && $linkedSickWithPayAmount <= 0
                     && $withoutPayAmount <= 0
                 ) {
                     continue;
@@ -1190,13 +1220,19 @@ class EmployeeController extends Controller
                     is_string($otherTypeCode) ? $otherTypeCode : null,
                     $isForcedLeave,
                 );
+                $particularsPrefixOverride = $this->resolveLedgerParticularsPrefixOverride(
+                    $typeKey,
+                    $linkedVacationWithPayAmount,
+                    $linkedSickWithPayAmount
+                );
                 $particulars = $this->buildLedgerParticulars(
                     'deduction',
                     $typeKey,
                     $totalDays,
                     $isMonetization,
                     $isForcedLeave,
-                    is_string($otherTypeCode) ? $otherTypeCode : null
+                    is_string($otherTypeCode) ? $otherTypeCode : null,
+                    $particularsPrefixOverride
                 );
                 $applicationId = (int) $application->id;
                 $actionTaken = sprintf(
@@ -1294,6 +1330,31 @@ class EmployeeController extends Controller
                     ];
                 }
 
+                if (! $isMonetization && $linkedSickWithPayAmount > 0) {
+                    $transactions[] = [
+                        'row_id' => $mergeKey.'-sl-topup',
+                        'merge_key' => $mergeKey,
+                        'type_key' => 'sick',
+                        'balance_key' => 'sick',
+                        'leave_type_code' => $this->resolveLedgerTypeCode('sick'),
+                        'transaction_date' => $transactionDate,
+                        'sort_date' => $transactionDate,
+                        'sort_timestamp' => (string) (
+                            $application->hr_approved_at?->toIso8601String()
+                            ?? $application->created_at?->toIso8601String()
+                            ?? $transactionDate
+                        ),
+                        'particulars' => $particulars,
+                        'action_taken' => $actionTaken,
+                        'inclusive_start_date' => $inclusiveStartDate,
+                        'inclusive_end_date' => $inclusiveEndDate,
+                        'inclusive_dates' => $inclusiveDates,
+                        'category' => 'deduction_with_pay',
+                        'amount' => $linkedSickWithPayAmount,
+                        'balance_delta' => -$linkedSickWithPayAmount,
+                    ];
+                }
+
                 if (! $isMonetization && $withoutPayAmount > 0) {
                     $transactions[] = [
                         'row_id' => $mergeKey.'-wop',
@@ -1378,7 +1439,8 @@ class EmployeeController extends Controller
                                     $restoredAmount,
                                     false,
                                     $isForcedLeave,
-                                    is_string($otherTypeCode) ? $otherTypeCode : null
+                                    is_string($otherTypeCode) ? $otherTypeCode : null,
+                                    $particularsPrefixOverride
                                 ),
                                 'action_taken' => 'Recalled by HR',
                                 'inclusive_dates' => $restoredDates,
@@ -3244,15 +3306,19 @@ class EmployeeController extends Controller
         float $days,
         bool $isMonetization = false,
         bool $isForcedLeave = false,
-        ?string $otherTypeCode = null
+        ?string $otherTypeCode = null,
+        ?string $prefixOverride = null
     ): string {
-        $prefix = match (true) {
-            $isForcedLeave => 'FL',
-            $typeKey === 'vacation' => 'VL',
-            $typeKey === 'sick' => 'SL',
-            $typeKey === 'other' && trim((string) $otherTypeCode) !== '' => strtoupper(trim((string) $otherTypeCode)),
-            default => null,
-        };
+        $normalizedPrefixOverride = strtoupper(trim((string) $prefixOverride));
+        $prefix = $normalizedPrefixOverride !== ''
+            ? $normalizedPrefixOverride
+            : match (true) {
+                $isForcedLeave => 'FL',
+                $typeKey === 'vacation' => 'VL',
+                $typeKey === 'sick' => 'SL',
+                $typeKey === 'other' && trim((string) $otherTypeCode) !== '' => strtoupper(trim((string) $otherTypeCode)),
+                default => null,
+            };
 
         if ($entryKind === 'earned') {
             return $prefix !== null ? $prefix.' 0-0-0' : '0-0-0';
@@ -3270,6 +3336,22 @@ class EmployeeController extends Controller
         return $entryKind === 'recall'
             ? $baseParticulars.' Recalled'
             : $baseParticulars;
+    }
+
+    private function resolveLedgerParticularsPrefixOverride(
+        ?string $typeKey,
+        float $linkedVacationDays,
+        float $linkedSickDays
+    ): ?string {
+        if ($typeKey === 'sick' && $linkedVacationDays > 0.0) {
+            return 'VL/SL';
+        }
+
+        if ($typeKey === 'vacation' && $linkedSickDays > 0.0) {
+            return 'SL/VL';
+        }
+
+        return null;
     }
 
     private function formatLedgerDaysHoursMinutes(float $days): string
@@ -3401,6 +3483,16 @@ class EmployeeController extends Controller
             return [
                 'with_pay' => $normalizedDeductibleDays,
                 'without_pay' => 0.0,
+            ];
+        }
+
+        $storedWithoutPayDays = $application->without_pay_days !== null
+            ? round(max((float) $application->without_pay_days, 0.0), self::LEDGER_DECIMAL_PRECISION)
+            : null;
+        if ($storedWithoutPayDays !== null) {
+            return [
+                'with_pay' => $normalizedDeductibleDays,
+                'without_pay' => $storedWithoutPayDays,
             ];
         }
 

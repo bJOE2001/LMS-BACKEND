@@ -26,7 +26,7 @@ class HRDashboardController extends Controller
     public function index(Request $request): JsonResponse
     {
         $hr = $request->user();
-        if (!$hr instanceof HRAccount) {
+        if (! $hr instanceof HRAccount) {
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
@@ -35,7 +35,7 @@ class HRDashboardController extends Controller
             ->orderByDesc('created_at')
             ->get();
         $applications = $applications
-            ->reject(fn(LeaveApplication $application): bool => $this->isCancelledLeaveApplication($application))
+            ->reject(fn (LeaveApplication $application): bool => $this->isCancelledLeaveApplication($application))
             ->values();
 
         $cocApplications = COCApplication::query()
@@ -69,20 +69,22 @@ class HRDashboardController extends Controller
         // Count employees/admins currently on approved leave today
         $today = now()->toDateString();
         $onLeaveToday = $applications->filter(function ($app) use ($today) {
-            if ($app->status !== LeaveApplication::STATUS_APPROVED)
+            if ($app->status !== LeaveApplication::STATUS_APPROVED) {
                 return false;
+            }
 
             $startStr = $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : null;
             $endStr = $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : null;
 
-            if (!$startStr || !$endStr)
+            if (! $startStr || ! $endStr) {
                 return false;
+            }
 
             return $startStr <= $today && $endStr >= $today;
         })->count();
 
         $formatted = $applications->map(
-            fn($app) => $this->formatApplication(
+            fn ($app) => $this->formatApplication(
                 $app,
                 $employeeDirectoryByControlNo,
                 $employeeStatusByControlNo,
@@ -118,7 +120,7 @@ class HRDashboardController extends Controller
     public function departmentStatistics(Request $request): JsonResponse
     {
         $hr = $request->user();
-        if (!$hr instanceof HRAccount) {
+        if (! $hr instanceof HRAccount) {
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
@@ -157,7 +159,7 @@ class HRDashboardController extends Controller
             }
 
             $createdAt = $this->resolveDepartmentStatisticsCreatedAt($application);
-            if (!$createdAt) {
+            if (! $createdAt) {
                 continue;
             }
 
@@ -172,9 +174,9 @@ class HRDashboardController extends Controller
             }
 
             $groupMeta = $this->resolveDepartmentStatisticsGroupMeta($createdAt, $groupBy);
-            $rowKey = $groupMeta['groupKey'] . '|' . $departmentName;
+            $rowKey = $groupMeta['groupKey'].'|'.$departmentName;
 
-            if (!array_key_exists($rowKey, $rowsByGroupAndDepartment)) {
+            if (! array_key_exists($rowKey, $rowsByGroupAndDepartment)) {
                 $rowsByGroupAndDepartment[$rowKey] = $this->emptyDepartmentStatisticsRow(
                     groupBy: $groupBy,
                     groupKey: $groupMeta['groupKey'],
@@ -218,6 +220,7 @@ class HRDashboardController extends Controller
             })
             ->map(function (array $row): array {
                 unset($row['groupSortValue']);
+
                 return $row;
             })
             ->values()
@@ -243,9 +246,9 @@ class HRDashboardController extends Controller
 
         if ($application->relationLoaded('logs')) {
             return $application->logs
-                ->filter(fn($log) => $log instanceof LeaveApplicationLog)
+                ->filter(fn ($log) => $log instanceof LeaveApplicationLog)
                 ->contains(
-                    fn(LeaveApplicationLog $log): bool => (bool) preg_match(
+                    fn (LeaveApplicationLog $log): bool => (bool) preg_match(
                         '/^cancelled\b/i',
                         trim((string) ($log->remarks ?? ''))
                     )
@@ -273,6 +276,7 @@ class HRDashboardController extends Controller
 
         if ($groupBy === 'weekly') {
             $selectedDate = $this->resolveDepartmentStatisticsFilterDate($request) ?? $now;
+
             return [$selectedDate->startOfWeek(), $selectedDate->endOfWeek()];
         }
 
@@ -308,6 +312,7 @@ class HRDashboardController extends Controller
         }
 
         $selectedDate = $this->resolveDepartmentStatisticsFilterDate($request) ?? $now;
+
         return [$selectedDate->startOfDay(), $selectedDate->endOfDay()];
     }
 
@@ -333,6 +338,7 @@ class HRDashboardController extends Controller
         }
 
         $month = (int) $rawFilterMonth;
+
         return $month >= 1 && $month <= 12 ? $month : null;
     }
 
@@ -344,6 +350,7 @@ class HRDashboardController extends Controller
         }
 
         $year = (int) $rawFilterYear;
+
         return $year >= 1900 && $year <= 3000 ? $year : null;
     }
 
@@ -456,6 +463,7 @@ class HRDashboardController extends Controller
         }
 
         $fallbackDepartment = trim((string) ($application->applicantAdmin?->department?->name ?? ''));
+
         return $fallbackDepartment !== '' ? $fallbackDepartment : null;
     }
 
@@ -485,7 +493,7 @@ class HRDashboardController extends Controller
         $leaveTypeMonthlyTrend = [];
 
         foreach ($applications as $application) {
-            if (!$application instanceof LeaveApplication) {
+            if (! $application instanceof LeaveApplication) {
                 continue;
             }
 
@@ -494,7 +502,7 @@ class HRDashboardController extends Controller
             }
 
             $trendDate = $this->resolveDashboardTrendDate($application);
-            if (!$trendDate || (int) $trendDate->year !== $trendYear) {
+            if (! $trendDate || (int) $trendDate->year !== $trendYear) {
                 continue;
             }
 
@@ -502,7 +510,7 @@ class HRDashboardController extends Controller
             $monthlyTrend[$monthIndex]++;
 
             $leaveTypeName = $this->resolveDashboardTrendLeaveTypeName($application);
-            if (!array_key_exists($leaveTypeName, $leaveTypeMonthlyTrend)) {
+            if (! array_key_exists($leaveTypeName, $leaveTypeMonthlyTrend)) {
                 $leaveTypeMonthlyTrend[$leaveTypeName] = array_fill(0, 12, 0);
             }
 
@@ -550,6 +558,7 @@ class HRDashboardController extends Controller
     private function resolveDashboardTrendLeaveTypeName(LeaveApplication $application): string
     {
         $name = trim((string) ($application->leaveType?->name ?? ''));
+
         return $name !== '' ? $name : 'Unknown';
     }
 
@@ -558,8 +567,7 @@ class HRDashboardController extends Controller
         array $employeeDirectoryByControlNo = [],
         array $employeeStatusByControlNo = [],
         array $leaveBalanceDirectory = []
-    ): array
-    {
+    ): array {
         $statusMap = [
             LeaveApplication::STATUS_PENDING_ADMIN => 'Pending Admin',
             LeaveApplication::STATUS_PENDING_HR => 'Pending HR',
@@ -573,7 +581,7 @@ class HRDashboardController extends Controller
         $employeeName = trim((string) ($app->employee_name ?? ''));
         if ($employeeName === '') {
             $employeeName = $resolvedEmployee
-                ? trim(($resolvedEmployee->firstname ?? '') . ' ' . ($resolvedEmployee->surname ?? ''))
+                ? trim(($resolvedEmployee->firstname ?? '').' '.($resolvedEmployee->surname ?? ''))
                 : null;
         }
         $employmentStatus = $employeeStatusByControlNo[$this->normalizeControlNo($app->employee_control_no)] ?? ($resolvedEmployee?->status ?? null);
@@ -585,12 +593,15 @@ class HRDashboardController extends Controller
         $selectedDatePayStatus = is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null;
         $selectedDateCoverage = is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null;
         $normalizedPayMode = strtoupper(trim((string) ($app->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY)));
-        if (!in_array($normalizedPayMode, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
+        if (! in_array($normalizedPayMode, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
             $normalizedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
         }
         $deductibleDays = $app->deductible_days !== null
             ? round((float) $app->deductible_days, 3)
             : ($normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $durationDays);
+        $withoutPayDays = $app->without_pay_days !== null
+            ? round(max((float) $app->without_pay_days, 0.0), 3)
+            : round(max($durationDays - $deductibleDays, 0.0), 3);
 
         return [
             'id' => $app->id,
@@ -610,8 +621,8 @@ class HRDashboardController extends Controller
             'duration_value' => $durationDays,
             'duration_unit' => 'day',
             'duration_label' => $durationDays == (int) $durationDays
-                ? ((int) $durationDays) . ' ' . ((int) $durationDays === 1 ? 'day' : 'days')
-                : $durationDays . ' days',
+                ? ((int) $durationDays).' '.((int) $durationDays === 1 ? 'day' : 'days')
+                : $durationDays.' days',
             'reason' => $app->reason,
             'details_of_leave' => $app->details_of_leave,
             'detailsOfLeave' => $app->details_of_leave,
@@ -647,6 +658,7 @@ class HRDashboardController extends Controller
             'without_pay' => $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY,
             'with_pay' => $normalizedPayMode !== LeaveApplication::PAY_MODE_WITHOUT_PAY,
             'deductible_days' => $deductibleDays,
+            'without_pay_days' => $withoutPayDays,
             'is_monetization' => (bool) $app->is_monetization,
             'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
             'leaveBalance' => $this->getBalanceForApp($app, $leaveBalanceDirectory),
@@ -672,7 +684,7 @@ class HRDashboardController extends Controller
         $breakdown = $this->emptyEmploymentBreakdown();
 
         foreach ($applications as $application) {
-            if (!is_object($application)) {
+            if (! is_object($application)) {
                 continue;
             }
 
@@ -724,14 +736,14 @@ class HRDashboardController extends Controller
 
     private function getPendingApprovedUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
     {
-        if (!$app->id) {
+        if (! $app->id) {
             return null;
         }
 
         if ($app->relationLoaded('updateRequests')) {
             $record = $app->updateRequests
-                ->filter(fn($item) => $item instanceof LeaveApplicationUpdateRequest)
-                ->sortByDesc(fn(LeaveApplicationUpdateRequest $item) => (int) $item->id)
+                ->filter(fn ($item) => $item instanceof LeaveApplicationUpdateRequest)
+                ->sortByDesc(fn (LeaveApplicationUpdateRequest $item) => (int) $item->id)
                 ->first(function (LeaveApplicationUpdateRequest $item): bool {
                     return strtoupper(trim((string) $item->status)) === LeaveApplicationUpdateRequest::STATUS_PENDING
                         && strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED;
@@ -746,11 +758,12 @@ class HRDashboardController extends Controller
             ->latest('id')
             ->first();
 
-        if (!$record) {
+        if (! $record) {
             return null;
         }
 
         $previousStatus = strtoupper(trim((string) ($record->previous_status ?? '')));
+
         return $previousStatus === LeaveApplication::STATUS_APPROVED ? $record : null;
     }
 
@@ -778,14 +791,14 @@ class HRDashboardController extends Controller
 
     private function getLatestApprovedUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
     {
-        if (!$app->id) {
+        if (! $app->id) {
             return null;
         }
 
         if ($app->relationLoaded('updateRequests')) {
             $record = $app->updateRequests
-                ->filter(fn($item) => $item instanceof LeaveApplicationUpdateRequest)
-                ->sortByDesc(fn(LeaveApplicationUpdateRequest $item) => (int) $item->id)
+                ->filter(fn ($item) => $item instanceof LeaveApplicationUpdateRequest)
+                ->sortByDesc(fn (LeaveApplicationUpdateRequest $item) => (int) $item->id)
                 ->first(function (LeaveApplicationUpdateRequest $item): bool {
                     return strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED;
                 });
@@ -798,11 +811,12 @@ class HRDashboardController extends Controller
             ->latest('id')
             ->first();
 
-        if (!$record) {
+        if (! $record) {
             return null;
         }
 
         $previousStatus = strtoupper(trim((string) ($record->previous_status ?? '')));
+
         return $previousStatus === LeaveApplication::STATUS_APPROVED ? $record : null;
     }
 
@@ -841,6 +855,7 @@ class HRDashboardController extends Controller
         }
 
         $trimmed = trim((string) $value);
+
         return $trimmed === '' ? null : $trimmed;
     }
 
@@ -850,7 +865,7 @@ class HRDashboardController extends Controller
         $candidateControlNos = [];
 
         foreach ($applications as $application) {
-            if (!$application instanceof LeaveApplication) {
+            if (! $application instanceof LeaveApplication) {
                 continue;
             }
 
@@ -930,7 +945,7 @@ class HRDashboardController extends Controller
             return $this->controlNoCandidates($adminControlNo);
         }
 
-        if (!$app->applicant_admin_id) {
+        if (! $app->applicant_admin_id) {
             return [];
         }
 
@@ -950,7 +965,7 @@ class HRDashboardController extends Controller
         }
 
         $admin = DepartmentAdmin::query()->find($adminId);
-        if (!$admin) {
+        if (! $admin) {
             return null;
         }
 
@@ -960,6 +975,7 @@ class HRDashboardController extends Controller
         }
 
         $employee = HrisEmployee::findByControlNo($rawControlNo);
+
         return trim((string) ($employee?->control_no ?? $rawControlNo));
     }
 
@@ -992,7 +1008,7 @@ class HRDashboardController extends Controller
 
         return array_values(array_unique(array_filter(
             [$rawControlNo, $normalizedControlNo],
-            fn(string $value): bool => $value !== ''
+            fn (string $value): bool => $value !== ''
         )));
     }
 
@@ -1003,7 +1019,7 @@ class HRDashboardController extends Controller
     public function calendarLeaves(Request $request): JsonResponse
     {
         $hr = $request->user();
-        if (!$hr instanceof HRAccount) {
+        if (! $hr instanceof HRAccount) {
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
@@ -1034,7 +1050,7 @@ class HRDashboardController extends Controller
                     fn ($nestedQuery) => $nestedQuery->whereIn('employee_control_no', $departmentControlNoCandidates),
                     fn ($nestedQuery) => $nestedQuery->whereRaw('1 = 0')
                 )
-                    ->orWhereHas('applicantAdmin.department', fn($sq) => $sq->where('name', $dept));
+                    ->orWhereHas('applicantAdmin.department', fn ($sq) => $sq->where('name', $dept));
             });
         }
 
@@ -1049,7 +1065,7 @@ class HRDashboardController extends Controller
             $resolvedEmployeeName = trim((string) ($app->employee_name ?? ''));
             if ($resolvedEmployeeName === '') {
                 $resolvedEmployeeName = $employee
-                    ? trim(($employee->firstname ?? '') . ' ' . ($employee->surname ?? ''))
+                    ? trim(($employee->firstname ?? '').' '.($employee->surname ?? ''))
                     : '';
             }
 
@@ -1068,8 +1084,8 @@ class HRDashboardController extends Controller
                 'duration_value' => (float) $app->total_days,
                 'duration_unit' => 'day',
                 'duration_label' => ((float) $app->total_days == (int) $app->total_days)
-                    ? ((int) $app->total_days) . ' ' . ((int) $app->total_days === 1 ? 'day' : 'days')
-                    : ((float) $app->total_days) . ' days',
+                    ? ((int) $app->total_days).' '.((int) $app->total_days === 1 ? 'day' : 'days')
+                    : ((float) $app->total_days).' days',
                 'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
                 'status' => 'Approved',
             ];

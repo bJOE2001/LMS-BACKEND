@@ -43,6 +43,8 @@ class LeaveApplicationController extends Controller
 
     private const TERMINAL_LEAVE_AMOUNT_PRECISION = 12;
 
+    private const CERTIFICATION_SELECTED_LEAVE_TYPE_BUCKET = 'selected_leave_type';
+
     private const DETAILS_OF_LEAVE_FIELDS = [
         'vacation_detail',
         'vacation_specify',
@@ -610,6 +612,7 @@ class LeaveApplicationController extends Controller
             'selected_date_half_day_portion.*' => ['nullable', 'string', 'in:AM,PM'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
+            'allow_sl_vl_cross_deduction' => ['nullable', 'boolean'],
             'attachment' => ['nullable', 'file', 'max:10240'],
             'attachment_submitted' => ['nullable', 'boolean'],
             'attachment_attached' => ['nullable', 'boolean'],
@@ -671,6 +674,10 @@ class LeaveApplicationController extends Controller
         }
 
         $attachmentState = $this->resolveAttachmentStateFromRequest($request, $validated);
+        $allowSlVlCrossDeduction = $this->resolveRequestSlVlCrossDeductionFlag($request, $validated);
+        $appliedAllowSlVlCrossDeduction = false;
+        $linkedVacationLeaveReservedDays = 0.0;
+        $linkedSickLeaveReservedDays = 0.0;
         $policyResolution = $this->applyRegularLeavePolicy(
             $leaveType,
             (float) $validated['total_days'],
@@ -731,6 +738,13 @@ class LeaveApplicationController extends Controller
                 return $this->buildInsufficientCtoBalanceResponse($eligibility);
             }
 
+            $crossDeductionAvailableCredits = $this->resolveAvailableSlVlCrossDeductionBalanceForControlNo(
+                (string) $employee->control_no,
+                $leaveType,
+                (int) $validated['leave_type_id'],
+                false,
+                $allowSlVlCrossDeduction
+            );
             $allocation = $this->resolveCreditBasedPayAllocation(
                 $resolvedSelectedDates,
                 $selectedDateCoverage,
@@ -739,11 +753,35 @@ class LeaveApplicationController extends Controller
                 $selectedDatePayStatus,
                 (string) $employee->control_no,
                 $leaveType,
-                $resolvedDetailsOfLeave
+                $resolvedDetailsOfLeave,
+                $allowSlVlCrossDeduction,
+                $crossDeductionAvailableCredits
             );
             $requestedPayMode = $allocation['pay_mode'];
             $selectedDatePayStatus = $allocation['selected_date_pay_status'];
             $deductibleDays = (float) ($allocation['deductible_days'] ?? 0.0);
+            $appliedAllowSlVlCrossDeduction = $allowSlVlCrossDeduction
+                && $deductibleDays > round(max((float) ($eligibility['available_balance'] ?? 0.0), 0.0), 3) + 1e-9;
+            if ($appliedAllowSlVlCrossDeduction) {
+                $crossBreakdown = $this->resolveSlVlCrossDeductionBreakdown(
+                    $leaveType,
+                    (int) $validated['leave_type_id'],
+                    false,
+                    $deductibleDays,
+                    true,
+                    $this->resolveSickLeaveTypeId(),
+                    $this->resolveVacationLeaveTypeId(),
+                    (float) ($eligibility['available_balance'] ?? 0.0),
+                    $crossDeductionAvailableCredits,
+                    $resolvedSelectedDates,
+                    $selectedDatePayStatus,
+                    $selectedDateCoverage,
+                    (float) $validated['total_days'],
+                    (string) $employee->control_no
+                );
+                $linkedVacationLeaveReservedDays = (float) ($crossBreakdown['linked_vacation_deduction_days'] ?? 0.0);
+                $linkedSickLeaveReservedDays = (float) ($crossBreakdown['linked_sick_deduction_days'] ?? 0.0);
+            }
         }
 
         $app = DB::transaction(function () use (
@@ -760,7 +798,10 @@ class LeaveApplicationController extends Controller
             $resolvedDetailsOfLeave,
             $attachmentRequired,
             $attachmentSubmitted,
-            $attachmentReference
+            $attachmentReference,
+            $appliedAllowSlVlCrossDeduction,
+            $linkedVacationLeaveReservedDays,
+            $linkedSickLeaveReservedDays
         ) {
             $application = LeaveApplication::create([
                 'employee_control_no' => (string) $employee->control_no,
@@ -778,6 +819,9 @@ class LeaveApplicationController extends Controller
                 'selected_date_half_day_portion' => $selectedDateHalfDayPortion,
                 'commutation' => $validated['commutation'] ?? 'Not Requested',
                 'pay_mode' => $requestedPayMode,
+                'allow_sl_vl_cross_deduction' => $appliedAllowSlVlCrossDeduction,
+                'linked_vacation_leave_deducted_days' => $linkedVacationLeaveReservedDays > 0.0 ? $linkedVacationLeaveReservedDays : null,
+                'linked_sick_leave_deducted_days' => $linkedSickLeaveReservedDays > 0.0 ? $linkedSickLeaveReservedDays : null,
                 'attachment_required' => $attachmentRequired,
                 'attachment_submitted' => $attachmentSubmitted,
                 'attachment_reference' => $attachmentReference,
@@ -1163,6 +1207,7 @@ class LeaveApplicationController extends Controller
             'total_days' => ['nullable', 'numeric', 'min:0.5', 'max:365'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
+            'allow_sl_vl_cross_deduction' => ['nullable', 'boolean'],
             'attachment' => ['nullable', 'file', 'max:10240'],
             'attachment_submitted' => ['nullable', 'boolean'],
             'attachment_attached' => ['nullable', 'boolean'],
@@ -1469,6 +1514,7 @@ class LeaveApplicationController extends Controller
             'selected_date_half_day_portion.*' => ['nullable', 'string', 'in:AM,PM'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
+            'allow_sl_vl_cross_deduction' => ['nullable', 'boolean'],
             'attachment' => ['nullable', 'file', 'max:10240'],
             'attachment_submitted' => ['nullable', 'boolean'],
             'attachment_attached' => ['nullable', 'boolean'],
@@ -1530,6 +1576,10 @@ class LeaveApplicationController extends Controller
         }
 
         $attachmentState = $this->resolveAttachmentStateFromRequest($request, $validated);
+        $allowSlVlCrossDeduction = $this->resolveRequestSlVlCrossDeductionFlag($request, $validated);
+        $appliedAllowSlVlCrossDeduction = false;
+        $linkedVacationLeaveReservedDays = 0.0;
+        $linkedSickLeaveReservedDays = 0.0;
         $policyResolution = $this->applyRegularLeavePolicy(
             $leaveType,
             (float) $validated['total_days'],
@@ -1590,6 +1640,13 @@ class LeaveApplicationController extends Controller
                 return $this->buildInsufficientCtoBalanceResponse($eligibility);
             }
 
+            $crossDeductionAvailableCredits = $this->resolveAvailableSlVlCrossDeductionBalanceForControlNo(
+                (string) $employee->control_no,
+                $leaveType,
+                (int) $validated['leave_type_id'],
+                false,
+                $allowSlVlCrossDeduction
+            );
             $allocation = $this->resolveCreditBasedPayAllocation(
                 $resolvedSelectedDates,
                 $selectedDateCoverage,
@@ -1598,11 +1655,35 @@ class LeaveApplicationController extends Controller
                 $selectedDatePayStatus,
                 (string) $employee->control_no,
                 $leaveType,
-                $resolvedDetailsOfLeave
+                $resolvedDetailsOfLeave,
+                $allowSlVlCrossDeduction,
+                $crossDeductionAvailableCredits
             );
             $requestedPayMode = $allocation['pay_mode'];
             $selectedDatePayStatus = $allocation['selected_date_pay_status'];
             $deductibleDays = (float) ($allocation['deductible_days'] ?? 0.0);
+            $appliedAllowSlVlCrossDeduction = $allowSlVlCrossDeduction
+                && $deductibleDays > round(max((float) ($eligibility['available_balance'] ?? 0.0), 0.0), 3) + 1e-9;
+            if ($appliedAllowSlVlCrossDeduction) {
+                $crossBreakdown = $this->resolveSlVlCrossDeductionBreakdown(
+                    $leaveType,
+                    (int) $validated['leave_type_id'],
+                    false,
+                    $deductibleDays,
+                    true,
+                    $this->resolveSickLeaveTypeId(),
+                    $this->resolveVacationLeaveTypeId(),
+                    (float) ($eligibility['available_balance'] ?? 0.0),
+                    $crossDeductionAvailableCredits,
+                    $resolvedSelectedDates,
+                    $selectedDatePayStatus,
+                    $selectedDateCoverage,
+                    (float) $validated['total_days'],
+                    (string) $employee->control_no
+                );
+                $linkedVacationLeaveReservedDays = (float) ($crossBreakdown['linked_vacation_deduction_days'] ?? 0.0);
+                $linkedSickLeaveReservedDays = (float) ($crossBreakdown['linked_sick_deduction_days'] ?? 0.0);
+            }
         }
 
         $app = DB::transaction(function () use (
@@ -1619,7 +1700,10 @@ class LeaveApplicationController extends Controller
             $resolvedDetailsOfLeave,
             $attachmentRequired,
             $attachmentSubmitted,
-            $attachmentReference
+            $attachmentReference,
+            $appliedAllowSlVlCrossDeduction,
+            $linkedVacationLeaveReservedDays,
+            $linkedSickLeaveReservedDays
         ) {
             $application = LeaveApplication::create([
                 'employee_control_no' => (string) $employee->control_no,
@@ -1637,6 +1721,9 @@ class LeaveApplicationController extends Controller
                 'selected_date_half_day_portion' => $selectedDateHalfDayPortion,
                 'commutation' => $validated['commutation'] ?? 'Not Requested',
                 'pay_mode' => $requestedPayMode,
+                'allow_sl_vl_cross_deduction' => $appliedAllowSlVlCrossDeduction,
+                'linked_vacation_leave_deducted_days' => $linkedVacationLeaveReservedDays > 0.0 ? $linkedVacationLeaveReservedDays : null,
+                'linked_sick_leave_deducted_days' => $linkedSickLeaveReservedDays > 0.0 ? $linkedSickLeaveReservedDays : null,
                 'attachment_required' => $attachmentRequired,
                 'attachment_submitted' => $attachmentSubmitted,
                 'attachment_reference' => $attachmentReference,
@@ -2633,6 +2720,7 @@ class LeaveApplicationController extends Controller
 
         $validated = $request->validate([
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
+            'allow_sl_vl_cross_deduction' => ['nullable', 'boolean'],
             'selected_date_pay_status' => ['nullable', 'array'],
             'selected_date_pay_status.*' => ['nullable', 'string', 'in:WP,WOP'],
             'remarks' => ['nullable', 'string', 'max:2000'],
@@ -2677,6 +2765,11 @@ class LeaveApplicationController extends Controller
                 ? $validated['selected_date_pay_status']
                 : $request->input('selected_date_pay_status')
         );
+        $requestedAllowSlVlCrossDeduction = $this->resolveRequestSlVlCrossDeductionFlag(
+            $request,
+            $validated,
+            (bool) ($app->allow_sl_vl_cross_deduction ?? false)
+        );
         $requestedPayMode = $this->resolveRequestedPayMode(
             $request,
             $validated,
@@ -2711,13 +2804,169 @@ class LeaveApplicationController extends Controller
             return $policyResolution;
         }
 
-        DB::transaction(function () use ($app, $hr, $request, $policyResolution): void {
+        $requestedPayMode = $policyResolution['pay_mode'];
+        $requestedPayStatus = $policyResolution['selected_date_pay_status'];
+        $deductibleDays = (float) ($policyResolution['deductible_days'] ?? 0.0);
+        $ctoDeductedHours = ($policyResolution['cto_deducted_hours'] ?? null) !== null
+            ? (float) $policyResolution['cto_deducted_hours']
+            : null;
+        $resolvedAllowSlVlCrossDeduction = false;
+        $linkedVacationLeaveReservedDays = 0.0;
+        $linkedSickLeaveReservedDays = 0.0;
+        $sourcePayMode = $this->normalizePayMode($app->pay_mode ?? null, false);
+        $sourceDeductibleDays = $this->resolveApplicationDeductibleDays($app);
+        $sourceDeductsBalance = $this->applicationDeductsEmployeeBalance(
+            false,
+            $leaveType,
+            $sourcePayMode
+        );
+        $sourcePrimaryDeduction = $sourceDeductsBalance
+            ? $this->resolveStoredPrimaryLeaveDeduction($app, $leaveType, $sourceDeductibleDays)
+            : 0.0;
+        $sourceLinkedVacationDeduction = $sourceDeductsBalance
+            ? $this->resolveStoredLinkedVacationLeaveDeduction($app, $leaveType, $sourceDeductibleDays)
+            : 0.0;
+        $sourceLinkedSickDeduction = $sourceDeductsBalance
+            ? $this->resolveStoredLinkedSickLeaveDeduction($app)
+            : 0.0;
+        $effectivePrimaryAvailableBalance = $this->resolvePendingTrackedLeaveBalanceAvailableToApplication(
+            $app,
+            (int) $app->leave_type_id,
+            $sourcePrimaryDeduction
+        );
+
+        $eligibility = $this->validateRegularLeaveEligibility(
+            (string) ($app->employee_control_no ?? ''),
+            (int) $app->leave_type_id,
+            (float) $app->total_days,
+            $requestedPayMode,
+            $deductibleDays,
+            $ctoDeductedHours !== null && $ctoDeductedHours > 0.0
+                ? $ctoDeductedHours
+                : null
+        );
+        if ($eligibility instanceof JsonResponse) {
+            return $eligibility;
+        }
+
+        if (($eligibility['insufficient_balance'] ?? false) === true) {
+            if ($this->isCtoLeaveType($leaveType, (int) $app->leave_type_id)) {
+                return $this->buildInsufficientCtoBalanceResponse($eligibility);
+            }
+
+            if ($deductibleDays <= $effectivePrimaryAvailableBalance + 1e-9) {
+                // This override is reusing credits already reserved by the same pending application.
+            } elseif (! $requestedAllowSlVlCrossDeduction) {
+                return $this->buildInsufficientPrimaryLeaveBalanceResponse(
+                    $leaveType,
+                    $effectivePrimaryAvailableBalance,
+                    $deductibleDays
+                );
+            } else {
+                $sickLeaveTypeId = $this->resolveSickLeaveTypeId();
+                $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+                $linkedLeaveTypeId = $this->resolveSlVlCrossDeductionTargetLeaveTypeId(
+                    $leaveType,
+                    (int) $app->leave_type_id,
+                    false,
+                    true,
+                    $sickLeaveTypeId,
+                    $vacationLeaveTypeId
+                );
+                $crossDeductionAvailableCredits = $linkedLeaveTypeId === $vacationLeaveTypeId
+                    ? $this->resolvePendingTrackedLeaveBalanceAvailableToApplication(
+                        $app,
+                        $vacationLeaveTypeId,
+                        $sourceLinkedVacationDeduction
+                    )
+                    : (
+                        $linkedLeaveTypeId === $sickLeaveTypeId
+                            ? $this->resolvePendingTrackedLeaveBalanceAvailableToApplication(
+                                $app,
+                                $sickLeaveTypeId,
+                                $sourceLinkedSickDeduction
+                            )
+                            : 0.0
+                    );
+                $allocation = $this->resolveCreditBasedPayAllocation(
+                    $selectedDates,
+                    is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
+                    (float) $app->total_days,
+                    $effectivePrimaryAvailableBalance,
+                    $requestedPayStatus,
+                    (string) ($app->employee_control_no ?? ''),
+                    $leaveType,
+                    $this->trimNullableString($app->details_of_leave ?? null),
+                    $requestedAllowSlVlCrossDeduction,
+                    $crossDeductionAvailableCredits
+                );
+
+                if (
+                    ($allocation['pay_mode'] ?? LeaveApplication::PAY_MODE_WITH_PAY) !== $requestedPayMode
+                    || (($allocation['selected_date_pay_status'] ?? null) !== $requestedPayStatus)
+                    || abs((float) ($allocation['deductible_days'] ?? 0.0) - $deductibleDays) > 0.0005
+                ) {
+                    return $this->buildInsufficientPrimaryLeaveBalanceResponse(
+                        $leaveType,
+                        $effectivePrimaryAvailableBalance,
+                        $deductibleDays
+                    );
+                }
+
+                $requestedPayMode = $allocation['pay_mode'];
+                $requestedPayStatus = $allocation['selected_date_pay_status'];
+                $deductibleDays = (float) ($allocation['deductible_days'] ?? 0.0);
+                $resolvedAllowSlVlCrossDeduction = $requestedAllowSlVlCrossDeduction
+                    && $deductibleDays > $effectivePrimaryAvailableBalance + 1e-9;
+
+                if ($resolvedAllowSlVlCrossDeduction) {
+                    $crossBreakdown = $this->resolveSlVlCrossDeductionBreakdown(
+                        $leaveType,
+                        (int) $app->leave_type_id,
+                        false,
+                        $deductibleDays,
+                        true,
+                        $sickLeaveTypeId,
+                        $vacationLeaveTypeId,
+                        $effectivePrimaryAvailableBalance,
+                        $crossDeductionAvailableCredits,
+                        $selectedDates,
+                        $requestedPayStatus,
+                        is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
+                        (float) $app->total_days,
+                        (string) ($app->employee_control_no ?? '')
+                    );
+                    $linkedVacationLeaveReservedDays = (float) ($crossBreakdown['linked_vacation_deduction_days'] ?? 0.0);
+                    $linkedSickLeaveReservedDays = (float) ($crossBreakdown['linked_sick_deduction_days'] ?? 0.0);
+                }
+            }
+        }
+
+        DB::transaction(function () use (
+            $app,
+            $hr,
+            $request,
+            $requestedPayMode,
+            $requestedPayStatus,
+            $deductibleDays,
+            $ctoDeductedHours,
+            $resolvedAllowSlVlCrossDeduction,
+            $linkedVacationLeaveReservedDays,
+            $linkedSickLeaveReservedDays
+        ): void {
             $app->update([
-                'pay_mode' => $policyResolution['pay_mode'],
-                'selected_date_pay_status' => $policyResolution['selected_date_pay_status'],
-                'deductible_days' => (float) ($policyResolution['deductible_days'] ?? 0),
+                'pay_mode' => $requestedPayMode,
+                'selected_date_pay_status' => $requestedPayStatus,
+                'deductible_days' => $deductibleDays,
                 'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn()
-                    ? ($policyResolution['cto_deducted_hours'] ?? null)
+                    ? $ctoDeductedHours
+                    : null,
+                'allow_sl_vl_cross_deduction' => $resolvedAllowSlVlCrossDeduction,
+                'linked_vacation_leave_deducted_days' => $linkedVacationLeaveReservedDays > 0.0
+                    ? $linkedVacationLeaveReservedDays
+                    : null,
+                'linked_sick_leave_deducted_days' => $linkedSickLeaveReservedDays > 0.0
+                    ? $linkedSickLeaveReservedDays
                     : null,
             ]);
 
@@ -3334,15 +3583,28 @@ class LeaveApplicationController extends Controller
             $forcedLeaveTypeId,
             $vacationLeaveTypeId
         );
-        $requiredVacationLeaveDays = $this->resolveLeaveTypeVacationLeaveDeductionDays(
+        $requiredVacationLeaveDays = 0.0;
+        $requiredLinkedSickLeaveDays = 0.0;
+        $storedSlVlCrossDeductionBreakdown = $this->resolveStoredSlVlCrossDeductionBreakdown(
+            $app,
             $leaveType,
-            (int) $app->leave_type_id,
-            (bool) $app->is_monetization,
-            $requestedTotalDays,
-            $daysToDeduct,
-            $forcedLeaveTypeId,
-            $vacationLeaveTypeId
+            $daysToDeduct
         );
+        if (is_array($storedSlVlCrossDeductionBreakdown)) {
+            $requiredPrimaryLeaveDays = (float) ($storedSlVlCrossDeductionBreakdown['primary_deduction_days'] ?? $requiredPrimaryLeaveDays);
+            $requiredVacationLeaveDays = (float) ($storedSlVlCrossDeductionBreakdown['linked_vacation_deduction_days'] ?? 0.0);
+            $requiredLinkedSickLeaveDays = (float) ($storedSlVlCrossDeductionBreakdown['linked_sick_deduction_days'] ?? 0.0);
+        } else {
+            $requiredVacationLeaveDays = $this->resolveLeaveTypeVacationLeaveDeductionDays(
+                $leaveType,
+                (int) $app->leave_type_id,
+                (bool) $app->is_monetization,
+                $requestedTotalDays,
+                $daysToDeduct,
+                $forcedLeaveTypeId,
+                $vacationLeaveTypeId
+            );
+        }
 
         // Determine if balance deduction is needed
         $needsDeduction = $this->applicationDeductsEmployeeBalance(
@@ -3408,6 +3670,47 @@ class LeaveApplicationController extends Controller
                     ], 422);
                 }
 
+                if ($requiredVacationLeaveDays > 0.0 && $vacationLeaveTypeId !== null) {
+                    $vacationBalance = $this->findPreferredEmployeeLeaveBalanceRecord(
+                        (string) $app->employee_control_no,
+                        $vacationLeaveTypeId
+                    );
+                    $currentVacationBalance = $vacationBalance ? (float) $vacationBalance->balance : 0.0;
+                    if ($currentVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
+                        if ($usesVacationLeaveTopUpForScheduleExcess) {
+                            return $this->buildInsufficientVacationLeaveTopUpResponse(
+                                $leaveType,
+                                $currentVacationBalance,
+                                $requiredVacationLeaveDays
+                            );
+                        }
+
+                        return response()->json([
+                            'message' => 'Insufficient Vacation Leave balance for leave approval.'
+                                .' Current: '.self::formatDays($currentVacationBalance)
+                                .', Required: '.self::formatDays($requiredVacationLeaveDays).'.',
+                        ], 422);
+                    }
+                }
+
+                if ($requiredLinkedSickLeaveDays > 0.0) {
+                    $sickLeaveTypeId = $this->resolveSickLeaveTypeId();
+                    $sickBalance = $sickLeaveTypeId !== null
+                        ? $this->findPreferredEmployeeLeaveBalanceRecord(
+                            (string) $app->employee_control_no,
+                            $sickLeaveTypeId
+                        )
+                        : null;
+                    $currentSickBalance = $sickBalance ? (float) $sickBalance->balance : 0.0;
+                    if ($currentSickBalance + 1e-9 < $requiredLinkedSickLeaveDays) {
+                        return response()->json([
+                            'message' => 'Insufficient Sick Leave balance for leave approval.'
+                                .' Current: '.self::formatDays($currentSickBalance)
+                                .', Required: '.self::formatDays($requiredLinkedSickLeaveDays).'.',
+                        ], 422);
+                    }
+                }
+
                 // Business rule: approving Forced Leave also consumes Vacation Leave credits.
                 if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null && $requiredVacationLeaveDays > 0.0) {
                     $vacationBalance = $this->findPreferredEmployeeLeaveBalanceRecord(
@@ -3461,6 +3764,47 @@ class LeaveApplicationController extends Controller
                     ], 422);
                 }
 
+                if ($requiredVacationLeaveDays > 0.0 && $vacationLeaveTypeId !== null) {
+                    $vacationBalance = $this->findAdminEmployeeLeaveBalance(
+                        (int) $app->applicant_admin_id,
+                        $vacationLeaveTypeId
+                    );
+                    $currentVacationBalance = $vacationBalance ? (float) $vacationBalance->balance : 0.0;
+                    if ($currentVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
+                        if ($usesVacationLeaveTopUpForScheduleExcess) {
+                            return $this->buildInsufficientVacationLeaveTopUpResponse(
+                                $leaveType,
+                                $currentVacationBalance,
+                                $requiredVacationLeaveDays
+                            );
+                        }
+
+                        return response()->json([
+                            'message' => 'Insufficient Vacation Leave balance for leave approval.'
+                                .' Current: '.self::formatDays($currentVacationBalance)
+                                .', Required: '.self::formatDays($requiredVacationLeaveDays).'.',
+                        ], 422);
+                    }
+                }
+
+                if ($requiredLinkedSickLeaveDays > 0.0) {
+                    $sickLeaveTypeId = $this->resolveSickLeaveTypeId();
+                    $sickBalance = $sickLeaveTypeId !== null
+                        ? $this->findAdminEmployeeLeaveBalance(
+                            (int) $app->applicant_admin_id,
+                            $sickLeaveTypeId
+                        )
+                        : null;
+                    $currentSickBalance = $sickBalance ? (float) $sickBalance->balance : 0.0;
+                    if ($currentSickBalance + 1e-9 < $requiredLinkedSickLeaveDays) {
+                        return response()->json([
+                            'message' => 'Insufficient Sick Leave balance for leave approval.'
+                                .' Current: '.self::formatDays($currentSickBalance)
+                                .', Required: '.self::formatDays($requiredLinkedSickLeaveDays).'.',
+                        ], 422);
+                    }
+                }
+
                 if ($app->is_monetization) {
                     $monetizationBalanceRestriction = $this->validateMonetizationBalanceRules(
                         (float) $balance->balance,
@@ -3499,6 +3843,7 @@ class LeaveApplicationController extends Controller
         $balanceConflictError = 'HR_APPROVAL_BALANCE_CONFLICT';
         $linkedForcedLeaveDeductedDays = 0.0;
         $linkedVacationLeaveDeductedDays = 0.0;
+        $linkedSickLeaveDeductedDays = 0.0;
 
         try {
             DB::transaction(function () use (
@@ -3521,7 +3866,8 @@ class LeaveApplicationController extends Controller
                 $attachmentSubmitted,
                 $attachmentReference,
                 &$linkedForcedLeaveDeductedDays,
-                &$linkedVacationLeaveDeductedDays
+                &$linkedVacationLeaveDeductedDays,
+                &$linkedSickLeaveDeductedDays
             ) {
                 // Deduct balance for credit-based leave types and monetization.
                 // Locking the exact target row avoids race conditions and cross-row side effects.
@@ -3536,10 +3882,14 @@ class LeaveApplicationController extends Controller
                         $forcedLeaveTypeId,
                         $shouldDeductVacationLeave,
                         $vacationLeaveTypeId,
-                        $balanceConflictError
+                        (bool) ($app->allow_sl_vl_cross_deduction ?? false),
+                        $this->resolveSickLeaveTypeId(),
+                        $balanceConflictError,
+                        true
                     );
                     $linkedForcedLeaveDeductedDays = (float) ($linkedDeductions['linked_forced_leave_deducted_days'] ?? 0.0);
                     $linkedVacationLeaveDeductedDays = (float) ($linkedDeductions['linked_vacation_leave_deducted_days'] ?? 0.0);
+                    $linkedSickLeaveDeductedDays = (float) ($linkedDeductions['linked_sick_leave_deducted_days'] ?? 0.0);
                 }
 
                 $app->update([
@@ -3553,6 +3903,7 @@ class LeaveApplicationController extends Controller
                     'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn() && $isCtoDeduction && $ctoDeductedHours > 0 ? $ctoDeductedHours : null,
                     'linked_forced_leave_deducted_days' => $linkedForcedLeaveDeductedDays,
                     'linked_vacation_leave_deducted_days' => $linkedVacationLeaveDeductedDays,
+                    'linked_sick_leave_deducted_days' => $linkedSickLeaveDeductedDays,
                     'attachment_required' => $attachmentRequired,
                     'attachment_submitted' => $attachmentSubmitted,
                     'attachment_reference' => $attachmentReference,
@@ -3624,6 +3975,25 @@ class LeaveApplicationController extends Controller
                     }
                 }
 
+                if ($requiredLinkedSickLeaveDays > 0.0) {
+                    $sickLeaveTypeId = $this->resolveSickLeaveTypeId();
+                    $currentSickBalance = $sickLeaveTypeId !== null
+                        ? (float) (
+                            $this->findPreferredEmployeeLeaveBalanceRecord(
+                                (string) $app->employee_control_no,
+                                $sickLeaveTypeId
+                            )?->balance ?? 0.0
+                        )
+                        : 0.0;
+                    if ($currentSickBalance + 1e-9 < $requiredLinkedSickLeaveDays) {
+                        return response()->json([
+                            'message' => 'Insufficient Sick Leave balance for leave approval.'
+                                .' Current: '.self::formatDays($currentSickBalance)
+                                .', Required: '.self::formatDays($requiredLinkedSickLeaveDays).'.',
+                        ], 422);
+                    }
+                }
+
                 $label = $app->is_monetization ? 'monetization' : 'leave';
 
                 return response()->json([
@@ -3666,6 +4036,25 @@ class LeaveApplicationController extends Controller
                         'message' => 'Insufficient Vacation Leave balance for Mandatory / Forced Leave approval.'
                             .' Current: '.self::formatDays($currentVacationBalance)
                             .', Required: '.self::formatDays($requiredVacationLeaveDays).'.',
+                    ], 422);
+                }
+            }
+
+            if ($requiredLinkedSickLeaveDays > 0.0) {
+                $sickLeaveTypeId = $this->resolveSickLeaveTypeId();
+                $currentSickBalance = $sickLeaveTypeId !== null
+                    ? (float) (
+                        $this->findAdminEmployeeLeaveBalance(
+                            (int) $app->applicant_admin_id,
+                            $sickLeaveTypeId
+                        )?->balance ?? 0.0
+                    )
+                    : 0.0;
+                if ($currentSickBalance + 1e-9 < $requiredLinkedSickLeaveDays) {
+                    return response()->json([
+                        'message' => 'Insufficient Sick Leave balance for leave approval.'
+                            .' Current: '.self::formatDays($currentSickBalance)
+                            .', Required: '.self::formatDays($requiredLinkedSickLeaveDays).'.',
                     ], 422);
                 }
             }
@@ -4105,6 +4494,7 @@ class LeaveApplicationController extends Controller
             'selected_date_half_day_portion.*' => ['nullable', 'string', 'in:AM,PM'],
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
+            'allow_sl_vl_cross_deduction' => ['nullable', 'boolean'],
             'attachment' => ['nullable', 'file', 'max:10240'],
             'attachment_submitted' => ['nullable', 'boolean'],
             'attachment_attached' => ['nullable', 'boolean'],
@@ -4166,6 +4556,10 @@ class LeaveApplicationController extends Controller
         }
 
         $attachmentState = $this->resolveAttachmentStateFromRequest($request, $validated);
+        $allowSlVlCrossDeduction = $this->resolveRequestSlVlCrossDeductionFlag($request, $validated);
+        $appliedAllowSlVlCrossDeduction = false;
+        $linkedVacationLeaveReservedDays = 0.0;
+        $linkedSickLeaveReservedDays = 0.0;
         $policyResolution = $this->applyRegularLeavePolicy(
             $leaveType,
             (float) $validated['total_days'],
@@ -4245,6 +4639,13 @@ class LeaveApplicationController extends Controller
                 return $this->buildInsufficientCtoBalanceResponse($eligibility);
             }
 
+            $crossDeductionAvailableCredits = $this->resolveAvailableSlVlCrossDeductionBalanceForControlNo(
+                (string) ($employee->control_no ?? $validated['employee_control_no'] ?? ''),
+                $leaveType,
+                (int) $validated['leave_type_id'],
+                false,
+                $allowSlVlCrossDeduction
+            );
             $allocation = $this->resolveCreditBasedPayAllocation(
                 $resolvedSelectedDates,
                 $selectedDateCoverage,
@@ -4253,11 +4654,35 @@ class LeaveApplicationController extends Controller
                 $selectedDatePayStatus,
                 (string) ($employee->control_no ?? $validated['employee_control_no'] ?? ''),
                 $leaveType,
-                $resolvedDetailsOfLeave
+                $resolvedDetailsOfLeave,
+                $allowSlVlCrossDeduction,
+                $crossDeductionAvailableCredits
             );
             $requestedPayMode = $allocation['pay_mode'];
             $selectedDatePayStatus = $allocation['selected_date_pay_status'];
             $deductibleDays = (float) ($allocation['deductible_days'] ?? 0.0);
+            $appliedAllowSlVlCrossDeduction = $allowSlVlCrossDeduction
+                && $deductibleDays > round(max((float) ($eligibility['available_balance'] ?? 0.0), 0.0), 3) + 1e-9;
+            if ($appliedAllowSlVlCrossDeduction) {
+                $crossBreakdown = $this->resolveSlVlCrossDeductionBreakdown(
+                    $leaveType,
+                    (int) $validated['leave_type_id'],
+                    false,
+                    $deductibleDays,
+                    true,
+                    $this->resolveSickLeaveTypeId(),
+                    $this->resolveVacationLeaveTypeId(),
+                    (float) ($eligibility['available_balance'] ?? 0.0),
+                    $crossDeductionAvailableCredits,
+                    $resolvedSelectedDates,
+                    $selectedDatePayStatus,
+                    $selectedDateCoverage,
+                    (float) $validated['total_days'],
+                    (string) ($employee->control_no ?? $validated['employee_control_no'] ?? '')
+                );
+                $linkedVacationLeaveReservedDays = (float) ($crossBreakdown['linked_vacation_deduction_days'] ?? 0.0);
+                $linkedSickLeaveReservedDays = (float) ($crossBreakdown['linked_sick_deduction_days'] ?? 0.0);
+            }
         }
 
         $app = DB::transaction(function () use (
@@ -4274,7 +4699,10 @@ class LeaveApplicationController extends Controller
             $resolvedDetailsOfLeave,
             $attachmentRequired,
             $attachmentSubmitted,
-            $attachmentReference
+            $attachmentReference,
+            $appliedAllowSlVlCrossDeduction,
+            $linkedVacationLeaveReservedDays,
+            $linkedSickLeaveReservedDays
         ) {
             $application = LeaveApplication::create([
                 'employee_control_no' => (string) $employee->control_no,
@@ -4292,6 +4720,9 @@ class LeaveApplicationController extends Controller
                 'selected_date_half_day_portion' => $selectedDateHalfDayPortion,
                 'commutation' => $validated['commutation'] ?? 'Not Requested',
                 'pay_mode' => $requestedPayMode,
+                'allow_sl_vl_cross_deduction' => $appliedAllowSlVlCrossDeduction,
+                'linked_vacation_leave_deducted_days' => $linkedVacationLeaveReservedDays > 0.0 ? $linkedVacationLeaveReservedDays : null,
+                'linked_sick_leave_deducted_days' => $linkedSickLeaveReservedDays > 0.0 ? $linkedSickLeaveReservedDays : null,
                 'attachment_required' => $attachmentRequired,
                 'attachment_submitted' => $attachmentSubmitted,
                 'attachment_reference' => $attachmentReference,
@@ -5916,9 +6347,10 @@ class LeaveApplicationController extends Controller
 
     private function formatErmsApplication(LeaveApplication $app, array $actorDirectory): array
     {
+        $resolvedEmployee = $this->resolveApplicationEmployee($app);
         $employeeName = trim((string) ($app->employee_name ?? ''));
         if ($employeeName === '') {
-            $employeeName = $this->formatEmployeeFullName($this->resolveApplicationEmployee($app));
+            $employeeName = $this->formatEmployeeFullName($resolvedEmployee);
         }
         if ($employeeName === '') {
             $employeeName = trim((string) ($app->applicantAdmin?->full_name ?? ''));
@@ -5926,6 +6358,7 @@ class LeaveApplicationController extends Controller
         if ($employeeName === '') {
             $employeeName = $this->resolveEmployeeDisplayName($app);
         }
+        $office = $resolvedEmployee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
 
         $logs = $app->relationLoaded('logs')
             ? $app->logs->sortBy(fn (LeaveApplicationLog $log) => $log->created_at?->timestamp ?? 0)->values()
@@ -6125,9 +6558,12 @@ class LeaveApplicationController extends Controller
             'details_of_leave' => $resolvedDetailsOfLeave,
             'detailsOfLeave' => $resolvedDetailsOfLeave,
             'pay_mode' => $normalizedPayMode,
+            'allow_sl_vl_cross_deduction' => (bool) ($app->allow_sl_vl_cross_deduction ?? false),
             'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
             'without_pay' => $withoutPay,
             'with_pay' => ! $withoutPay,
+            'linked_vacation_leave_deducted_days' => round(max((float) ($app->linked_vacation_leave_deducted_days ?? 0.0), 0.0), 3),
+            'linked_sick_leave_deducted_days' => round(max((float) ($app->linked_sick_leave_deducted_days ?? 0.0), 0.0), 3),
             'attachment_required' => (bool) ($app->attachment_required ?? false),
             'attachment_submitted' => (bool) ($app->attachment_submitted ?? false),
             'attachment_reference' => $this->trimNullableString($app->attachment_reference ?? null),
@@ -6168,6 +6604,13 @@ class LeaveApplicationController extends Controller
             'latest_update_review_remarks' => $latestUpdateMeta['review_remarks'],
             'rejection_reason' => $app->status === LeaveApplication::STATUS_REJECTED && ! $isCancelled ? $app->remarks : null,
             'employee_name' => $employeeName,
+            'office' => $office,
+            'officeAcronym' => $resolvedEmployee?->officeAcronym,
+            'office_acronym' => $resolvedEmployee?->officeAcronym,
+            'hrisOfficeAcronym' => $resolvedEmployee?->hrisOfficeAcronym,
+            'hris_office_acronym' => $resolvedEmployee?->hrisOfficeAcronym,
+            'employment_status' => $resolvedEmployee?->status,
+            'employment_status_key' => LeaveType::normalizeEmploymentStatusKey($resolvedEmployee?->status),
             'filed_by' => $filedBy,
             'approver_name' => $approverName,
             'admin_action_by' => $adminActionBy,
@@ -6211,6 +6654,22 @@ class LeaveApplicationController extends Controller
             'has_hr_released' => $hrReleasedLog !== null,
             'hasHrReleased' => $hrReleasedLog !== null,
             'status_history' => $statusHistory,
+            'employee' => $resolvedEmployee ? [
+                'control_no' => $resolvedEmployee->control_no,
+                'firstname' => $resolvedEmployee->firstname,
+                'middlename' => $resolvedEmployee->middlename,
+                'surname' => $resolvedEmployee->surname,
+                'full_name' => $this->formatEmployeeFullName($resolvedEmployee),
+                'designation' => $resolvedEmployee->designation,
+                'office' => $resolvedEmployee->office,
+                'officeAcronym' => $resolvedEmployee->officeAcronym,
+                'office_acronym' => $resolvedEmployee->officeAcronym,
+                'hrisOfficeAcronym' => $resolvedEmployee->hrisOfficeAcronym,
+                'hris_office_acronym' => $resolvedEmployee->hrisOfficeAcronym,
+                'employment_status' => $resolvedEmployee->status,
+                'employment_status_key' => LeaveType::normalizeEmploymentStatusKey($resolvedEmployee->status),
+                'status' => $resolvedEmployee->status,
+            ] : null,
         ];
     }
 
@@ -6230,6 +6689,7 @@ class LeaveApplicationController extends Controller
             'selected_date_half_day_portion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
             'total_days' => round((float) ($app->total_days ?? 0), 2),
             'deductible_days' => $this->resolveApplicationDeductibleDays($app),
+            'allow_sl_vl_cross_deduction' => (bool) ($app->allow_sl_vl_cross_deduction ?? false),
             'reason' => $this->trimNullableString($requestReason) ?? $this->trimNullableString($app->reason ?? null),
             'details_of_leave' => $this->trimNullableString($app->details_of_leave ?? null),
             'cancel_reason' => $this->trimNullableString($requestReason),
@@ -6262,6 +6722,7 @@ class LeaveApplicationController extends Controller
             'selected_date_half_day_portion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
             'total_days' => round((float) ($app->total_days ?? 0), 2),
             'deductible_days' => $this->resolveApplicationDeductibleDays($app),
+            'allow_sl_vl_cross_deduction' => (bool) ($app->allow_sl_vl_cross_deduction ?? false),
             'reason' => $this->trimNullableString($requestReason) ?? $this->trimNullableString($app->reason ?? null),
             'recall_reason' => $this->trimNullableString($requestReason),
             'recall_selected_dates' => $normalizedRecallDateKeys,
@@ -6348,6 +6809,11 @@ class LeaveApplicationController extends Controller
             $validated,
             $requestedIsMonetization,
             $app->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY
+        );
+        $requestedAllowSlVlCrossDeduction = $this->resolveRequestSlVlCrossDeductionFlag(
+            $request,
+            $validated,
+            (bool) ($app->allow_sl_vl_cross_deduction ?? false)
         );
         $requestedSelectedDatePayStatus = $requestedIsMonetization
             ? null
@@ -6446,6 +6912,7 @@ class LeaveApplicationController extends Controller
                         : ($app->commutation ?? 'Not Requested')
                 ),
             'pay_mode' => $resolvedPayMode,
+            'allow_sl_vl_cross_deduction' => $requestedAllowSlVlCrossDeduction,
             'is_monetization' => $requestedIsMonetization,
             'attachment_required' => $attachmentRequired,
             'attachment_submitted' => $attachmentSubmitted,
@@ -6970,6 +7437,7 @@ class LeaveApplicationController extends Controller
         $balanceConflictError = 'HR_UPDATE_BALANCE_CONFLICT';
         $linkedForcedLeaveDeductedDays = 0.0;
         $linkedVacationLeaveDeductedDays = 0.0;
+        $linkedSickLeaveDeductedDays = 0.0;
 
         try {
             DB::transaction(function () use (
@@ -7006,7 +7474,8 @@ class LeaveApplicationController extends Controller
                 $updatedRecallDateKeys,
                 $updatedRecallEffectiveDate,
                 &$linkedForcedLeaveDeductedDays,
-                &$linkedVacationLeaveDeductedDays
+                &$linkedVacationLeaveDeductedDays,
+                &$linkedSickLeaveDeductedDays
             ): void {
                 if ($sourceDeductsBalance && $sourceDeductibleDays > 0.0) {
                     $this->refundApplicationTrackedDeductions(
@@ -7028,10 +7497,13 @@ class LeaveApplicationController extends Controller
                         $forcedLeaveTypeId,
                         $targetShouldDeductVacationLeave,
                         $vacationLeaveTypeId,
+                        (bool) ($payload['allow_sl_vl_cross_deduction'] ?? $app->allow_sl_vl_cross_deduction ?? false),
+                        $this->resolveSickLeaveTypeId(),
                         $balanceConflictError
                     );
                     $linkedForcedLeaveDeductedDays = (float) ($linkedDeductions['linked_forced_leave_deducted_days'] ?? 0.0);
                     $linkedVacationLeaveDeductedDays = (float) ($linkedDeductions['linked_vacation_leave_deducted_days'] ?? 0.0);
+                    $linkedSickLeaveDeductedDays = (float) ($linkedDeductions['linked_sick_leave_deducted_days'] ?? 0.0);
                 }
 
                 $app->update([
@@ -7049,8 +7521,10 @@ class LeaveApplicationController extends Controller
                     'selected_date_half_day_portion' => $targetIsMonetization ? null : $targetSelectedDateHalfDayPortion,
                     'commutation' => (string) ($payload['commutation'] ?? 'Not Requested'),
                     'pay_mode' => $targetPayMode,
+                    'allow_sl_vl_cross_deduction' => (bool) ($payload['allow_sl_vl_cross_deduction'] ?? $app->allow_sl_vl_cross_deduction ?? false),
                     'linked_forced_leave_deducted_days' => $linkedForcedLeaveDeductedDays,
                     'linked_vacation_leave_deducted_days' => $linkedVacationLeaveDeductedDays,
+                    'linked_sick_leave_deducted_days' => $linkedSickLeaveDeductedDays,
                     'attachment_required' => $targetAttachmentRequired,
                     'attachment_submitted' => $targetAttachmentSubmitted,
                     'attachment_reference' => $targetAttachmentReference,
@@ -7193,6 +7667,7 @@ class LeaveApplicationController extends Controller
                     'deductible_days' => 0,
                     'linked_forced_leave_deducted_days' => 0,
                     'linked_vacation_leave_deducted_days' => 0,
+                    'linked_sick_leave_deducted_days' => 0,
                 ]);
 
                 if ($app->employee_control_no) {
@@ -7698,6 +8173,7 @@ class LeaveApplicationController extends Controller
 
         $isMonetization = (bool) ($payload['is_monetization'] ?? false);
         $payMode = $this->normalizePayMode($payload['pay_mode'] ?? null, $isMonetization);
+        $allowSlVlCrossDeduction = $this->resolvePayloadSlVlCrossDeductionFlag($payload);
         $selectedDatesInput = is_array($payload['selected_dates'] ?? null)
             ? LeaveApplication::resolveDateSet(null, null, $payload['selected_dates'], null)
             : null;
@@ -7853,6 +8329,7 @@ class LeaveApplicationController extends Controller
             'details_of_leave' => $this->trimNullableString($payload['details_of_leave'] ?? $payload['detailsOfLeave'] ?? null),
             'commutation' => $commutation,
             'pay_mode' => $payMode,
+            'allow_sl_vl_cross_deduction' => $allowSlVlCrossDeduction,
             'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
             'without_pay' => $withoutPay,
             'with_pay' => ! $withoutPay,
@@ -7907,6 +8384,12 @@ class LeaveApplicationController extends Controller
         if ($vacationLeaveTypeId !== null && $linkedVacationRefundDays > 0.0) {
             $this->incrementEmployeeLeaveBalance($employeeControlNo, $vacationLeaveTypeId, $linkedVacationRefundDays);
         }
+
+        $sickLeaveTypeId = $this->resolveSickLeaveTypeId();
+        $linkedSickRefundDays = $this->resolveStoredLinkedSickLeaveDeduction($app);
+        if ($sickLeaveTypeId !== null && $linkedSickRefundDays > 0.0) {
+            $this->incrementEmployeeLeaveBalance($employeeControlNo, $sickLeaveTypeId, $linkedSickRefundDays);
+        }
     }
 
     private function deductApplicationTrackedBalances(
@@ -7919,7 +8402,10 @@ class LeaveApplicationController extends Controller
         ?int $forcedLeaveTypeId,
         bool $shouldDeductVacationLeave,
         ?int $vacationLeaveTypeId,
-        string $balanceConflictError
+        bool $allowSlVlCrossDeduction,
+        ?int $sickLeaveTypeId,
+        string $balanceConflictError,
+        bool $preferStoredSlVlCrossDeductionBreakdown = false
     ): array {
         $employeeControlNo = $this->resolveApplicationBalanceOwnerControlNo($app);
         if ($employeeControlNo === null) {
@@ -7932,6 +8418,7 @@ class LeaveApplicationController extends Controller
             return [
                 'linked_forced_leave_deducted_days' => 0.0,
                 'linked_vacation_leave_deducted_days' => 0.0,
+                'linked_sick_leave_deducted_days' => 0.0,
             ];
         }
 
@@ -7951,6 +8438,7 @@ class LeaveApplicationController extends Controller
             return [
                 'linked_forced_leave_deducted_days' => 0.0,
                 'linked_vacation_leave_deducted_days' => 0.0,
+                'linked_sick_leave_deducted_days' => 0.0,
             ];
         }
 
@@ -8001,14 +8489,65 @@ class LeaveApplicationController extends Controller
         }
 
         $primaryBalance = $this->lockEmployeeLeaveBalance($employeeControlNo, $primaryLeaveTypeId);
+        $vacationBalance = null;
+        $sickBalance = null;
+        $linkedSickLeaveRequiredDays = 0.0;
+        $storedSlVlCrossDeductionBreakdown = $preferStoredSlVlCrossDeductionBreakdown
+            ? $this->resolveStoredSlVlCrossDeductionBreakdown($app, $primaryLeaveType, $normalizedDaysToDeduct)
+            : null;
         if ($usesVacationLeaveTopUpForScheduleExcess) {
             $primaryAvailable = $primaryBalance ? max((float) $primaryBalance->balance, 0.0) : 0.0;
             $primaryDaysToDeduct = round(min($normalizedDaysToDeduct, $primaryAvailable), 3);
             $linkedVacationLeaveRequiredDays = round(max($normalizedDaysToDeduct - $primaryDaysToDeduct, 0.0), 3);
+        } elseif (is_array($storedSlVlCrossDeductionBreakdown)) {
+            $primaryDaysToDeduct = (float) ($storedSlVlCrossDeductionBreakdown['primary_deduction_days'] ?? $primaryDaysToDeduct);
+            $linkedVacationLeaveRequiredDays = (float) ($storedSlVlCrossDeductionBreakdown['linked_vacation_deduction_days'] ?? 0.0);
+            $linkedSickLeaveRequiredDays = (float) ($storedSlVlCrossDeductionBreakdown['linked_sick_deduction_days'] ?? 0.0);
+        } elseif ($primaryLeaveType instanceof LeaveType) {
+            $linkedPrimaryAvailable = $primaryBalance ? max((float) $primaryBalance->balance, 0.0) : 0.0;
+            $linkedLeaveTypeId = $this->resolveSlVlCrossDeductionTargetLeaveTypeId(
+                $primaryLeaveType,
+                $primaryLeaveTypeId,
+                (bool) $app->is_monetization,
+                $allowSlVlCrossDeduction,
+                $sickLeaveTypeId,
+                $vacationLeaveTypeId
+            );
+            $linkedAvailable = 0.0;
+            if ($linkedLeaveTypeId !== null) {
+                if ($vacationLeaveTypeId !== null && $linkedLeaveTypeId === $vacationLeaveTypeId) {
+                    $vacationBalance = $this->lockEmployeeLeaveBalance($employeeControlNo, $vacationLeaveTypeId);
+                    $linkedAvailable = $vacationBalance ? max((float) $vacationBalance->balance, 0.0) : 0.0;
+                } elseif ($sickLeaveTypeId !== null && $linkedLeaveTypeId === $sickLeaveTypeId) {
+                    $sickBalance = $this->lockEmployeeLeaveBalance($employeeControlNo, $sickLeaveTypeId);
+                    $linkedAvailable = $sickBalance ? max((float) $sickBalance->balance, 0.0) : 0.0;
+                }
+            }
+
+            $crossDeductionBreakdown = $this->resolveSlVlCrossDeductionBreakdown(
+                $primaryLeaveType,
+                $primaryLeaveTypeId,
+                (bool) $app->is_monetization,
+                $normalizedDaysToDeduct,
+                $allowSlVlCrossDeduction,
+                $sickLeaveTypeId,
+                $vacationLeaveTypeId,
+                $linkedPrimaryAvailable,
+                $linkedAvailable,
+                $app->resolvedSelectedDates(),
+                is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null,
+                is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
+                $resolvedRequestedTotalDays,
+                $employeeControlNo
+            );
+            $primaryDaysToDeduct = (float) ($crossDeductionBreakdown['primary_deduction_days'] ?? $primaryDaysToDeduct);
+            $linkedVacationLeaveRequiredDays = (float) ($crossDeductionBreakdown['linked_vacation_deduction_days'] ?? 0.0);
+            $linkedSickLeaveRequiredDays = (float) ($crossDeductionBreakdown['linked_sick_deduction_days'] ?? 0.0);
         }
 
         if (
             ! $usesVacationLeaveTopUpForScheduleExcess
+            && $primaryDaysToDeduct > 0.0
             && (
                 ! $primaryBalance
                 || (float) $primaryBalance->balance + 1e-9 < $primaryDaysToDeduct
@@ -8021,6 +8560,7 @@ class LeaveApplicationController extends Controller
             return [
                 'linked_forced_leave_deducted_days' => 0.0,
                 'linked_vacation_leave_deducted_days' => 0.0,
+                'linked_sick_leave_deducted_days' => 0.0,
             ];
         }
 
@@ -8040,8 +8580,15 @@ class LeaveApplicationController extends Controller
         }
 
         $linkedVacationLeaveDeductedDays = 0.0;
-        if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null && $linkedVacationLeaveRequiredDays > 0.0) {
-            $vacationBalance = $this->lockEmployeeLeaveBalance($employeeControlNo, $vacationLeaveTypeId);
+        if (
+            $this->shouldApplyLinkedVacationLeaveDeduction(
+                $shouldDeductVacationLeave,
+                $allowSlVlCrossDeduction,
+                $linkedVacationLeaveRequiredDays
+            )
+            && $vacationLeaveTypeId !== null
+        ) {
+            $vacationBalance ??= $this->lockEmployeeLeaveBalance($employeeControlNo, $vacationLeaveTypeId);
             if (! $vacationBalance || (float) $vacationBalance->balance < $linkedVacationLeaveRequiredDays) {
                 throw new \RuntimeException($balanceConflictError);
             }
@@ -8050,10 +8597,34 @@ class LeaveApplicationController extends Controller
             $linkedVacationLeaveDeductedDays = $linkedVacationLeaveRequiredDays;
         }
 
+        $linkedSickLeaveDeductedDays = 0.0;
+        if ($sickLeaveTypeId !== null && $linkedSickLeaveRequiredDays > 0.0) {
+            $sickBalance ??= $this->lockEmployeeLeaveBalance($employeeControlNo, $sickLeaveTypeId);
+            if (! $sickBalance || (float) $sickBalance->balance < $linkedSickLeaveRequiredDays) {
+                throw new \RuntimeException($balanceConflictError);
+            }
+
+            $sickBalance->decrement('balance', $linkedSickLeaveRequiredDays);
+            $linkedSickLeaveDeductedDays = $linkedSickLeaveRequiredDays;
+        }
+
         return [
             'linked_forced_leave_deducted_days' => $linkedForcedLeaveDeductedDays,
             'linked_vacation_leave_deducted_days' => $linkedVacationLeaveDeductedDays,
+            'linked_sick_leave_deducted_days' => $linkedSickLeaveDeductedDays,
         ];
+    }
+
+    private function shouldApplyLinkedVacationLeaveDeduction(
+        bool $shouldDeductVacationLeave,
+        bool $allowSlVlCrossDeduction,
+        float $linkedVacationLeaveRequiredDays
+    ): bool {
+        if (round(max($linkedVacationLeaveRequiredDays, 0.0), 3) <= 0.0) {
+            return false;
+        }
+
+        return $shouldDeductVacationLeave || $allowSlVlCrossDeduction;
     }
 
     private function resolveApplicationBalanceOwnerControlNo(LeaveApplication $app): ?string
@@ -8125,6 +8696,17 @@ class LeaveApplicationController extends Controller
             return $normalizedFallbackDeductibleDays;
         }
 
+        if ((bool) ($app->allow_sl_vl_cross_deduction ?? false)) {
+            $linkedVacationRefundDays = $this->resolveStoredLinkedVacationLeaveDeduction(
+                $app,
+                $sourceLeaveType,
+                $fallbackDeductibleDays
+            );
+            $linkedSickRefundDays = $this->resolveStoredLinkedSickLeaveDeduction($app);
+
+            return round(max($normalizedFallbackDeductibleDays - $linkedVacationRefundDays - $linkedSickRefundDays, 0.0), 3);
+        }
+
         $leaveTypeId = $this->resolveCanonicalLeaveTypeId((int) $app->leave_type_id)
             ?? (int) $app->leave_type_id;
         $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
@@ -8144,6 +8726,44 @@ class LeaveApplicationController extends Controller
         );
 
         return round(max($normalizedFallbackDeductibleDays - $linkedVacationRefundDays, 0.0), 3);
+    }
+
+    /**
+     * @return array{
+     *     primary_deduction_days: float,
+     *     linked_vacation_deduction_days: float,
+     *     linked_sick_deduction_days: float
+     * }|null
+     */
+    private function resolveStoredSlVlCrossDeductionBreakdown(
+        LeaveApplication $app,
+        ?LeaveType $sourceLeaveType,
+        float $fallbackDeductibleDays
+    ): ?array {
+        if (
+            (bool) $app->is_monetization
+            || ! (bool) ($app->allow_sl_vl_cross_deduction ?? false)
+            || (
+                $app->linked_vacation_leave_deducted_days === null
+                && $app->linked_sick_leave_deducted_days === null
+            )
+        ) {
+            return null;
+        }
+
+        return [
+            'primary_deduction_days' => $this->resolveStoredPrimaryLeaveDeduction(
+                $app,
+                $sourceLeaveType,
+                $fallbackDeductibleDays
+            ),
+            'linked_vacation_deduction_days' => $this->resolveStoredLinkedVacationLeaveDeduction(
+                $app,
+                $sourceLeaveType,
+                $fallbackDeductibleDays
+            ),
+            'linked_sick_deduction_days' => $this->resolveStoredLinkedSickLeaveDeduction($app),
+        ];
     }
 
     private function resolveStoredLinkedForcedLeaveDeduction(
@@ -8198,6 +8818,15 @@ class LeaveApplicationController extends Controller
             $forcedLeaveTypeId,
             $vacationLeaveTypeId
         );
+    }
+
+    private function resolveStoredLinkedSickLeaveDeduction(LeaveApplication $app): float
+    {
+        if ($app->linked_sick_leave_deducted_days === null) {
+            return 0.0;
+        }
+
+        return round(max((float) $app->linked_sick_leave_deducted_days, 0.0), 3);
     }
 
     private function resolveCtoLeaveTypeId(): ?int
@@ -8331,6 +8960,15 @@ class LeaveApplicationController extends Controller
     {
         $value = LeaveType::query()
             ->whereRaw('LOWER(name) = ?', ['vacation leave'])
+            ->value('id');
+
+        return $value !== null ? (int) $value : null;
+    }
+
+    private function resolveSickLeaveTypeId(): ?int
+    {
+        $value = LeaveType::query()
+            ->whereRaw('LOWER(name) = ?', ['sick leave'])
             ->value('id');
 
         return $value !== null ? (int) $value : null;
@@ -8529,6 +9167,309 @@ class LeaveApplicationController extends Controller
         );
 
         return round(max($normalizedDeductibleDays - $linkedVacationLeaveDays, 0.0), 3);
+    }
+
+    private function shouldLeaveTypeAllowSlVlCrossDeduction(
+        LeaveType $leaveType,
+        int $leaveTypeId,
+        bool $isMonetization,
+        bool $allowSlVlCrossDeduction,
+        ?int $sickLeaveTypeId,
+        ?int $vacationLeaveTypeId
+    ): bool {
+        if (! $allowSlVlCrossDeduction || $isMonetization || $sickLeaveTypeId === null || $vacationLeaveTypeId === null) {
+            return false;
+        }
+
+        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+
+        return $this->isSickLeaveType($leaveType, $canonicalLeaveTypeId)
+            || $this->isVacationLeaveType($leaveType, $canonicalLeaveTypeId);
+    }
+
+    private function resolveSlVlCrossDeductionTargetLeaveTypeId(
+        LeaveType $leaveType,
+        int $leaveTypeId,
+        bool $isMonetization,
+        bool $allowSlVlCrossDeduction,
+        ?int $sickLeaveTypeId,
+        ?int $vacationLeaveTypeId
+    ): ?int {
+        if (! $this->shouldLeaveTypeAllowSlVlCrossDeduction(
+            $leaveType,
+            $leaveTypeId,
+            $isMonetization,
+            $allowSlVlCrossDeduction,
+            $sickLeaveTypeId,
+            $vacationLeaveTypeId
+        )) {
+            return null;
+        }
+
+        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+
+        if ($this->isSickLeaveType($leaveType, $canonicalLeaveTypeId)) {
+            return $vacationLeaveTypeId;
+        }
+
+        if ($this->isVacationLeaveType($leaveType, $canonicalLeaveTypeId)) {
+            return $sickLeaveTypeId;
+        }
+
+        return null;
+    }
+
+    /**
+     * @return array{primary_deduction_days:float,linked_vacation_deduction_days:float,linked_sick_deduction_days:float}
+     */
+    private function resolveSlVlCrossDeductionDateWeightBreakdown(
+        ?array $selectedDates,
+        ?array $selectedDatePayStatus,
+        ?array $selectedDateCoverage,
+        float $requestedTotalDays,
+        float $deductibleDays,
+        float $primaryAvailableDays,
+        ?string $employeeControlNo = null
+    ): ?array {
+        if (! is_array($selectedDates) || $selectedDates === []) {
+            return null;
+        }
+
+        $normalizedDeductibleDays = round(max($deductibleDays, 0.0), 3);
+        if ($normalizedDeductibleDays <= 0.0) {
+            return [
+                'primary_deduction_days' => 0.0,
+                'linked_deduction_days' => 0.0,
+            ];
+        }
+
+        $normalizedRequestedTotalDays = round(max($requestedTotalDays, 0.0), 3);
+        $compactedPayStatus = $this->compactSelectedDatePayStatusMap(
+            is_array($selectedDatePayStatus) ? $selectedDatePayStatus : null,
+            $selectedDates,
+            LeaveApplication::PAY_MODE_WITH_PAY
+        );
+        $normalizedEmployeeControlNo = trim((string) ($employeeControlNo ?? ''));
+        if ($normalizedEmployeeControlNo !== '') {
+            $coverageWeights = $this->resolveDateCoverageWeights(
+                $selectedDates,
+                is_array($selectedDateCoverage) ? $selectedDateCoverage : null,
+                $normalizedRequestedTotalDays,
+                $normalizedEmployeeControlNo
+            );
+        } else {
+            $coverageMap = is_array($selectedDateCoverage) ? $selectedDateCoverage : [];
+            $hasCoverageOverrides = $coverageMap !== [];
+            $defaultWholeDayWeight = 1.0;
+            $defaultHalfDayWeight = 0.5;
+            $defaultCoverageWeight = $defaultWholeDayWeight;
+            $dateCount = count($selectedDates);
+            if ($dateCount > 0) {
+                $halfMatch = abs(($dateCount * $defaultHalfDayWeight) - $normalizedRequestedTotalDays) < 0.00001;
+                $wholeMatch = abs(((float) $dateCount) - $normalizedRequestedTotalDays) < 0.00001;
+                if ($halfMatch) {
+                    $defaultCoverageWeight = $defaultHalfDayWeight;
+                } elseif (! $wholeMatch) {
+                    $defaultCoverageWeight = round(max(min(
+                        $normalizedRequestedTotalDays / $dateCount,
+                        $defaultWholeDayWeight
+                    ), $defaultHalfDayWeight), 3);
+                }
+            }
+
+            $coverageWeights = [];
+            foreach ($selectedDates as $rawDate) {
+                $dateKey = $this->normalizeDateKey($rawDate) ?? trim((string) $rawDate);
+                if ($dateKey === '') {
+                    continue;
+                }
+
+                $hasCoverageValue = array_key_exists($dateKey, $coverageMap);
+                $coverage = strtolower(trim((string) ($coverageMap[$dateKey] ?? '')));
+                if ($coverage === 'half') {
+                    $coverageWeights[$dateKey] = $defaultHalfDayWeight;
+
+                    continue;
+                }
+
+                if ($coverage === 'whole') {
+                    $coverageWeights[$dateKey] = $defaultWholeDayWeight;
+
+                    continue;
+                }
+
+                if ($hasCoverageOverrides && ! $hasCoverageValue) {
+                    $coverageWeights[$dateKey] = $defaultWholeDayWeight;
+
+                    continue;
+                }
+
+                $coverageWeights[$dateKey] = $defaultCoverageWeight;
+            }
+        }
+
+        $remainingPrimaryDays = round(max($primaryAvailableDays, 0.0), 3);
+        $remainingDeductibleDays = $normalizedDeductibleDays;
+        $primaryDeductionDays = 0.0;
+        $linkedDeductionDays = 0.0;
+
+        foreach ($selectedDates as $rawDate) {
+            if ($remainingDeductibleDays <= 1e-9) {
+                break;
+            }
+
+            $dateKey = $this->normalizeDateKey($rawDate) ?? trim((string) $rawDate);
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $effectiveStatus = $compactedPayStatus[$dateKey] ?? LeaveApplication::PAY_MODE_WITH_PAY;
+            $resolvedPayMode = $this->resolvePayModeFromStatusValue($effectiveStatus) ?? LeaveApplication::PAY_MODE_WITH_PAY;
+            if ($resolvedPayMode !== LeaveApplication::PAY_MODE_WITH_PAY) {
+                continue;
+            }
+
+            $dateWeight = round(min(
+                max((float) ($coverageWeights[$dateKey] ?? 1.0), 0.0),
+                $remainingDeductibleDays
+            ), 3);
+            if ($dateWeight <= 0.0) {
+                continue;
+            }
+
+            if ($remainingPrimaryDays + 1e-9 >= $dateWeight) {
+                $primaryDeductionDays = round($primaryDeductionDays + $dateWeight, 3);
+                $remainingPrimaryDays = round(max($remainingPrimaryDays - $dateWeight, 0.0), 3);
+            } else {
+                $linkedDeductionDays = round($linkedDeductionDays + $dateWeight, 3);
+            }
+
+            $remainingDeductibleDays = round(max($remainingDeductibleDays - $dateWeight, 0.0), 3);
+        }
+
+        if ($remainingDeductibleDays > 0.001) {
+            $fallbackPrimaryDeductionDays = round(min($remainingPrimaryDays, $remainingDeductibleDays), 3);
+            $primaryDeductionDays = round($primaryDeductionDays + $fallbackPrimaryDeductionDays, 3);
+            $linkedDeductionDays = round(
+                $linkedDeductionDays + max($remainingDeductibleDays - $fallbackPrimaryDeductionDays, 0.0),
+                3
+            );
+        }
+
+        return [
+            'primary_deduction_days' => round(max($primaryDeductionDays, 0.0), 3),
+            'linked_deduction_days' => round(max($linkedDeductionDays, 0.0), 3),
+        ];
+    }
+
+    /**
+     * @return array{primary_deduction_days:float,linked_vacation_deduction_days:float,linked_sick_deduction_days:float}
+     */
+    private function resolveSlVlCrossDeductionBreakdown(
+        ?LeaveType $leaveType,
+        int $leaveTypeId,
+        bool $isMonetization,
+        float $deductibleDays,
+        bool $allowSlVlCrossDeduction,
+        ?int $sickLeaveTypeId,
+        ?int $vacationLeaveTypeId,
+        float $primaryAvailableDays,
+        float $linkedAvailableDays,
+        ?array $selectedDates = null,
+        ?array $selectedDatePayStatus = null,
+        ?array $selectedDateCoverage = null,
+        ?float $requestedTotalDays = null,
+        ?string $employeeControlNo = null
+    ): array {
+        $normalizedDeductibleDays = round(max($deductibleDays, 0.0), 3);
+        $baseBreakdown = [
+            'primary_deduction_days' => $normalizedDeductibleDays,
+            'linked_vacation_deduction_days' => 0.0,
+            'linked_sick_deduction_days' => 0.0,
+        ];
+
+        if (! $leaveType instanceof LeaveType || $normalizedDeductibleDays <= 0.0) {
+            return $baseBreakdown;
+        }
+
+        $linkedLeaveTypeId = $this->resolveSlVlCrossDeductionTargetLeaveTypeId(
+            $leaveType,
+            $leaveTypeId,
+            $isMonetization,
+            $allowSlVlCrossDeduction,
+            $sickLeaveTypeId,
+            $vacationLeaveTypeId
+        );
+        if ($linkedLeaveTypeId === null) {
+            return $baseBreakdown;
+        }
+
+        $normalizedPrimaryAvailableDays = round(max($primaryAvailableDays, 0.0), 3);
+        $normalizedLinkedAvailableDays = round(max($linkedAvailableDays, 0.0), 3);
+        $dateWeightBreakdown = $this->resolveSlVlCrossDeductionDateWeightBreakdown(
+            $selectedDates,
+            $selectedDatePayStatus,
+            $selectedDateCoverage,
+            (float) ($requestedTotalDays ?? $normalizedDeductibleDays),
+            $normalizedDeductibleDays,
+            $normalizedPrimaryAvailableDays,
+            $employeeControlNo
+        );
+        if ($dateWeightBreakdown !== null) {
+            $primaryDeductionDays = round(max((float) ($dateWeightBreakdown['primary_deduction_days'] ?? 0.0), 0.0), 3);
+            $linkedDeductionDays = round(max((float) ($dateWeightBreakdown['linked_deduction_days'] ?? 0.0), 0.0), 3);
+        } else {
+            $primaryDeductionDays = round(min($normalizedDeductibleDays, $normalizedPrimaryAvailableDays), 3);
+            $linkedDeductionDays = round(max($normalizedDeductibleDays - $primaryDeductionDays, 0.0), 3);
+        }
+
+        $breakdown = [
+            'primary_deduction_days' => $primaryDeductionDays,
+            'linked_vacation_deduction_days' => 0.0,
+            'linked_sick_deduction_days' => 0.0,
+        ];
+
+        if ($linkedDeductionDays <= 0.0 || $linkedDeductionDays > $normalizedLinkedAvailableDays + 1e-9) {
+            return $breakdown;
+        }
+
+        if ($linkedLeaveTypeId === $vacationLeaveTypeId) {
+            $breakdown['linked_vacation_deduction_days'] = $linkedDeductionDays;
+        } elseif ($linkedLeaveTypeId === $sickLeaveTypeId) {
+            $breakdown['linked_sick_deduction_days'] = $linkedDeductionDays;
+        }
+
+        return $breakdown;
+    }
+
+    private function resolveAvailableSlVlCrossDeductionBalanceForControlNo(
+        string $employeeControlNo,
+        ?LeaveType $leaveType,
+        int $leaveTypeId,
+        bool $isMonetization,
+        bool $allowSlVlCrossDeduction
+    ): float {
+        if (! $leaveType instanceof LeaveType) {
+            return 0.0;
+        }
+
+        $sickLeaveTypeId = $this->resolveSickLeaveTypeId();
+        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+        $linkedLeaveTypeId = $this->resolveSlVlCrossDeductionTargetLeaveTypeId(
+            $leaveType,
+            $leaveTypeId,
+            $isMonetization,
+            $allowSlVlCrossDeduction,
+            $sickLeaveTypeId,
+            $vacationLeaveTypeId
+        );
+        if ($linkedLeaveTypeId === null) {
+            return 0.0;
+        }
+
+        $balance = $this->findPreferredEmployeeLeaveBalanceRecord($employeeControlNo, $linkedLeaveTypeId);
+
+        return round(max((float) ($balance?->balance ?? 0.0), 0.0), 3);
     }
 
     private function shouldLeaveTypeDeductVacationLeave(
@@ -9000,6 +9941,53 @@ class LeaveApplicationController extends Controller
         }
 
         return round(max($currentBalance, 0.0), 3);
+    }
+
+    private function resolveTrackedLeaveBalanceBeforeApplicationDeduction(
+        LeaveApplication $app,
+        ?int $leaveTypeId,
+        float $storedDeduction
+    ): float {
+        $resolvedLeaveTypeId = $leaveTypeId !== null
+            ? ($this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId)
+            : null;
+        if ($resolvedLeaveTypeId === null || $resolvedLeaveTypeId <= 0) {
+            return 0.0;
+        }
+
+        $employeeControlNo = $this->resolveApplicationBalanceOwnerControlNo($app);
+        if ($employeeControlNo === null) {
+            return round(max($storedDeduction, 0.0), 3);
+        }
+
+        $currentBalance = (float) (
+            $this->findPreferredEmployeeLeaveBalanceRecord($employeeControlNo, $resolvedLeaveTypeId)?->balance ?? 0.0
+        );
+
+        return round(max($currentBalance + max($storedDeduction, 0.0), 0.0), 3);
+    }
+
+    private function resolvePendingTrackedLeaveBalanceAvailableToApplication(
+        LeaveApplication $app,
+        ?int $leaveTypeId,
+        float $storedDeduction
+    ): float {
+        $resolvedLeaveTypeId = $leaveTypeId !== null
+            ? ($this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId)
+            : null;
+        if ($resolvedLeaveTypeId === null || $resolvedLeaveTypeId <= 0) {
+            return 0.0;
+        }
+
+        $employeeControlNo = $this->resolveApplicationBalanceOwnerControlNo($app);
+        if ($employeeControlNo === null) {
+            return round(max($storedDeduction, 0.0), 3);
+        }
+
+        $balanceSnapshot = $this->resolveEmployeeLeaveBalanceSnapshot($employeeControlNo, $resolvedLeaveTypeId);
+        $availableBalance = (float) ($balanceSnapshot['available_balance'] ?? 0.0);
+
+        return round(max($availableBalance + max($storedDeduction, 0.0), 0.0), 3);
     }
 
     private function resolveAttachmentStateFromRequest(
@@ -9699,7 +10687,9 @@ class LeaveApplicationController extends Controller
         ?array $preferredSelectedDatePayStatus = null,
         ?string $employeeControlNo = null,
         ?LeaveType $leaveType = null,
-        ?string $detailsOfLeave = null
+        ?string $detailsOfLeave = null,
+        bool $allowSlVlCrossDeduction = false,
+        ?float $crossDeductionAvailableCredits = null
     ): array {
         $normalizedTotalDays = round(max($totalDays, 0.0), 3);
         $normalizedAvailableCredits = round(max($availableCredits, 0.0), 3);
@@ -9740,8 +10730,28 @@ class LeaveApplicationController extends Controller
             $preferredPayMode,
             $employeeControlNo
         );
+        $normalizedCrossDeductionAvailableCredits = round(max((float) ($crossDeductionAvailableCredits ?? 0.0), 0.0), 3);
+        $combinedAvailableCredits = round($normalizedAvailableCredits + $normalizedCrossDeductionAvailableCredits, 3);
 
-        if ($normalizedAvailableCredits + 1e-9 >= $normalizedTotalDays || $preferredDeductibleDays <= $normalizedAvailableCredits + 1e-9) {
+        if (
+            $normalizedAvailableCredits + 1e-9 >= $normalizedTotalDays
+            || $preferredDeductibleDays <= $normalizedAvailableCredits + 1e-9
+            || (
+                $preferredDeductibleDays > 0.0
+                && $allowSlVlCrossDeduction
+                && $leaveType instanceof LeaveType
+                && $combinedAvailableCredits > $normalizedAvailableCredits + 1e-9
+                && $preferredDeductibleDays <= $combinedAvailableCredits + 1e-9
+                && $this->resolveSlVlCrossDeductionTargetLeaveTypeId(
+                    $leaveType,
+                    (int) ($leaveType->id ?? 0),
+                    false,
+                    true,
+                    $this->resolveSickLeaveTypeId(),
+                    $this->resolveVacationLeaveTypeId()
+                ) !== null
+            )
+        ) {
             if ($preferredDeductibleDays <= 0.0) {
                 return [
                     'pay_mode' => LeaveApplication::PAY_MODE_WITHOUT_PAY,
@@ -10188,6 +11198,58 @@ class LeaveApplicationController extends Controller
         }
 
         return null;
+    }
+
+    private function resolveRequestSlVlCrossDeductionFlag(
+        Request $request,
+        array $validated,
+        ?bool $fallback = null
+    ): bool {
+        $candidateKeys = [
+            'allow_sl_vl_cross_deduction',
+            'allowSlVlCrossDeduction',
+            'use_other_sl_vl_balance',
+            'useOtherSlVlBalance',
+        ];
+
+        foreach ($candidateKeys as $key) {
+            $value = array_key_exists($key, $validated)
+                ? $validated[$key]
+                : $request->input($key);
+            if ($value === null) {
+                continue;
+            }
+
+            $normalizedFlag = $this->normalizeBooleanFlag($value);
+            if ($normalizedFlag !== null) {
+                return $normalizedFlag;
+            }
+        }
+
+        return $fallback === true;
+    }
+
+    private function resolvePayloadSlVlCrossDeductionFlag(array $payload, ?bool $fallback = null): bool
+    {
+        $candidateKeys = [
+            'allow_sl_vl_cross_deduction',
+            'allowSlVlCrossDeduction',
+            'use_other_sl_vl_balance',
+            'useOtherSlVlBalance',
+        ];
+
+        foreach ($candidateKeys as $key) {
+            if (! array_key_exists($key, $payload)) {
+                continue;
+            }
+
+            $normalizedFlag = $this->normalizeBooleanFlag($payload[$key]);
+            if ($normalizedFlag !== null) {
+                return $normalizedFlag;
+            }
+        }
+
+        return $fallback === true;
     }
 
     private function normalizeSelectedDatePayStatusMap(mixed $value): ?array
@@ -11496,6 +12558,7 @@ class LeaveApplicationController extends Controller
 
         $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
         $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+        $sickLeaveTypeId = $this->resolveSickLeaveTypeId();
         $pendingReservedDays = 0.0;
 
         foreach ($pendingApplications as $pendingApplication) {
@@ -11518,7 +12581,8 @@ class LeaveApplicationController extends Controller
                 $applicationTotalDays,
                 $applicationDeductibleDays,
                 $forcedLeaveTypeId,
-                $vacationLeaveTypeId
+                $vacationLeaveTypeId,
+                $sickLeaveTypeId
             );
         }
 
@@ -11533,20 +12597,17 @@ class LeaveApplicationController extends Controller
         float $applicationTotalDays,
         float $applicationDeductibleDays,
         ?int $forcedLeaveTypeId,
-        ?int $vacationLeaveTypeId
+        ?int $vacationLeaveTypeId,
+        ?int $sickLeaveTypeId
     ): float {
         if ($targetLeaveTypeId <= 0) {
             return 0.0;
         }
 
-        $primaryReservedDays = $this->resolvePrimaryLeaveTrackedDeductionDays(
+        $primaryReservedDays = $this->resolveStoredPrimaryLeaveDeduction(
+            $app,
             $applicationLeaveType,
-            $applicationLeaveTypeId,
-            (bool) $app->is_monetization,
-            $applicationTotalDays,
-            $applicationDeductibleDays,
-            $forcedLeaveTypeId,
-            $vacationLeaveTypeId
+            $applicationDeductibleDays
         );
         if ($applicationLeaveTypeId === $targetLeaveTypeId) {
             return $primaryReservedDays;
@@ -11566,6 +12627,10 @@ class LeaveApplicationController extends Controller
                 $applicationLeaveType,
                 $applicationDeductibleDays
             );
+        }
+
+        if ($sickLeaveTypeId !== null && $targetLeaveTypeId === $sickLeaveTypeId) {
+            return $this->resolveStoredLinkedSickLeaveDeduction($app);
         }
 
         return 0.0;
@@ -11706,9 +12771,12 @@ class LeaveApplicationController extends Controller
             'selected_date_halfday_period' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
             'commutation' => $app->commutation ?? 'Not Requested',
             'pay_mode' => $normalizedPayMode,
+            'allow_sl_vl_cross_deduction' => (bool) ($app->allow_sl_vl_cross_deduction ?? false),
             'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
             'without_pay' => $withoutPay,
             'with_pay' => ! $withoutPay,
+            'linked_vacation_leave_deducted_days' => round(max((float) ($app->linked_vacation_leave_deducted_days ?? 0.0), 0.0), 3),
+            'linked_sick_leave_deducted_days' => round(max((float) ($app->linked_sick_leave_deducted_days ?? 0.0), 0.0), 3),
             'attachment_required' => (bool) ($app->attachment_required ?? false),
             'attachment_submitted' => (bool) ($app->attachment_submitted ?? false),
             'attachment_reference' => $this->trimNullableString($app->attachment_reference ?? null),
@@ -11906,6 +12974,7 @@ class LeaveApplicationController extends Controller
         $today = now()->toDateString();
         $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
         $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+        $sickLeaveTypeId = $this->resolveSickLeaveTypeId();
 
         foreach ($applications as $application) {
             $stats['checked']++;
@@ -11999,16 +13068,74 @@ class LeaveApplicationController extends Controller
             $sourceLinkedVacationDeduction = $sourceDeductsBalance
                 ? $this->resolveStoredLinkedVacationLeaveDeduction($application, $leaveType, $sourceDeductibleDays)
                 : 0.0;
+            $sourceLinkedSickDeduction = $sourceDeductsBalance
+                ? $this->resolveStoredLinkedSickLeaveDeduction($application)
+                : 0.0;
 
-            $targetPrimaryDeduction = $targetDeductsBalance
-                ? $this->resolvePrimaryLeaveTrackedDeductionDays(
+            $targetAllowSlVlCrossDeduction = (bool) ($application->allow_sl_vl_cross_deduction ?? false);
+            $targetPrimaryAvailableBeforeApplication = $this->resolveTrackedLeaveBalanceBeforeApplicationDeduction(
+                $application,
+                $canonicalLeaveTypeId,
+                $sourcePrimaryDeduction
+            );
+            $targetVacationAvailableBeforeApplication = $this->resolveTrackedLeaveBalanceBeforeApplicationDeduction(
+                $application,
+                $vacationLeaveTypeId,
+                $sourceLinkedVacationDeduction
+            );
+            $targetSickAvailableBeforeApplication = $this->resolveTrackedLeaveBalanceBeforeApplicationDeduction(
+                $application,
+                $sickLeaveTypeId,
+                $sourceLinkedSickDeduction
+            );
+            $targetSlVlCrossLeaveTypeId = $leaveType instanceof LeaveType
+                ? $this->resolveSlVlCrossDeductionTargetLeaveTypeId(
                     $leaveType,
                     $canonicalLeaveTypeId,
                     false,
-                    $requestedTotalDays,
-                    $targetDeductibleDays,
-                    $forcedLeaveTypeId,
+                    $targetAllowSlVlCrossDeduction,
+                    $sickLeaveTypeId,
                     $vacationLeaveTypeId
+                )
+                : null;
+            $targetSlVlCrossBreakdown = $targetDeductsBalance && $leaveType instanceof LeaveType
+                ? $this->resolveSlVlCrossDeductionBreakdown(
+                    $leaveType,
+                    $canonicalLeaveTypeId,
+                    false,
+                    $targetDeductibleDays,
+                    $targetAllowSlVlCrossDeduction,
+                    $sickLeaveTypeId,
+                    $vacationLeaveTypeId,
+                    $targetPrimaryAvailableBeforeApplication,
+                    $targetSlVlCrossLeaveTypeId === $vacationLeaveTypeId
+                        ? $targetVacationAvailableBeforeApplication
+                        : $targetSickAvailableBeforeApplication,
+                    $application->resolvedSelectedDates(),
+                    $targetSelectedDatePayStatus,
+                    is_array($application->selected_date_coverage) ? $application->selected_date_coverage : null,
+                    $requestedTotalDays,
+                    (string) ($application->employee_control_no ?? '')
+                )
+                : [
+                    'primary_deduction_days' => 0.0,
+                    'linked_vacation_deduction_days' => 0.0,
+                    'linked_sick_deduction_days' => 0.0,
+                ];
+
+            $targetPrimaryDeduction = $targetDeductsBalance
+                ? (
+                    $targetAllowSlVlCrossDeduction && $targetSlVlCrossLeaveTypeId !== null
+                        ? (float) ($targetSlVlCrossBreakdown['primary_deduction_days'] ?? 0.0)
+                        : $this->resolvePrimaryLeaveTrackedDeductionDays(
+                            $leaveType,
+                            $canonicalLeaveTypeId,
+                            false,
+                            $requestedTotalDays,
+                            $targetDeductibleDays,
+                            $forcedLeaveTypeId,
+                            $vacationLeaveTypeId
+                        )
                 )
                 : 0.0;
 
@@ -12022,20 +13149,28 @@ class LeaveApplicationController extends Controller
                 : 0.0;
 
             $targetLinkedVacationDeduction = $targetDeductsBalance
-                ? $this->resolveLeaveTypeVacationLeaveDeductionDays(
-                    $leaveType,
-                    $canonicalLeaveTypeId,
-                    false,
-                    $requestedTotalDays,
-                    $targetDeductibleDays,
-                    $forcedLeaveTypeId,
-                    $vacationLeaveTypeId
+                ? (
+                    $targetAllowSlVlCrossDeduction && $targetSlVlCrossLeaveTypeId === $vacationLeaveTypeId
+                        ? (float) ($targetSlVlCrossBreakdown['linked_vacation_deduction_days'] ?? 0.0)
+                        : $this->resolveLeaveTypeVacationLeaveDeductionDays(
+                            $leaveType,
+                            $canonicalLeaveTypeId,
+                            false,
+                            $requestedTotalDays,
+                            $targetDeductibleDays,
+                            $forcedLeaveTypeId,
+                            $vacationLeaveTypeId
+                        )
                 )
+                : 0.0;
+            $targetLinkedSickDeduction = $targetDeductsBalance
+                ? (float) ($targetSlVlCrossBreakdown['linked_sick_deduction_days'] ?? 0.0)
                 : 0.0;
 
             $deltaPrimaryDeduction = round($targetPrimaryDeduction - $sourcePrimaryDeduction, 3);
             $deltaLinkedForcedDeduction = round($targetLinkedForcedDeduction - $sourceLinkedForcedDeduction, 3);
             $deltaLinkedVacationDeduction = round($targetLinkedVacationDeduction - $sourceLinkedVacationDeduction, 3);
+            $deltaLinkedSickDeduction = round($targetLinkedSickDeduction - $sourceLinkedSickDeduction, 3);
 
             if (abs($deltaPrimaryDeduction) < 0.001) {
                 $deltaPrimaryDeduction = 0.0;
@@ -12046,11 +13181,15 @@ class LeaveApplicationController extends Controller
             if (abs($deltaLinkedVacationDeduction) < 0.001) {
                 $deltaLinkedVacationDeduction = 0.0;
             }
+            if (abs($deltaLinkedSickDeduction) < 0.001) {
+                $deltaLinkedSickDeduction = 0.0;
+            }
 
             if (! $shouldReconcileBalances) {
                 $deltaPrimaryDeduction = 0.0;
                 $deltaLinkedForcedDeduction = 0.0;
                 $deltaLinkedVacationDeduction = 0.0;
+                $deltaLinkedSickDeduction = 0.0;
             }
 
             $targetStoredCtoDeductedHours = $this->hasLeaveApplicationCtoHoursColumn()
@@ -12064,13 +13203,15 @@ class LeaveApplicationController extends Controller
                 || round($sourceCtoDeductedHours, 2) !== round(max((float) ($targetStoredCtoDeductedHours ?? 0.0), 0.0), 2)
                 || (is_array($application->selected_date_pay_status) ? $application->selected_date_pay_status : null) !== $targetSelectedDatePayStatus
                 || round(max((float) ($application->linked_forced_leave_deducted_days ?? 0.0), 0.0), 3) !== $targetLinkedForcedDeduction
-                || round(max((float) ($application->linked_vacation_leave_deducted_days ?? 0.0), 0.0), 3) !== $targetLinkedVacationDeduction;
+                || round(max((float) ($application->linked_vacation_leave_deducted_days ?? 0.0), 0.0), 3) !== $targetLinkedVacationDeduction
+                || round(max((float) ($application->linked_sick_leave_deducted_days ?? 0.0), 0.0), 3) !== $targetLinkedSickDeduction;
 
             if (
                 ! $hasApplicationFieldChanges
                 && $deltaPrimaryDeduction === 0.0
                 && $deltaLinkedForcedDeduction === 0.0
                 && $deltaLinkedVacationDeduction === 0.0
+                && $deltaLinkedSickDeduction === 0.0
             ) {
                 $stats['skipped']++;
 
@@ -12085,9 +13226,11 @@ class LeaveApplicationController extends Controller
                     $canonicalLeaveTypeId,
                     $forcedLeaveTypeId,
                     $vacationLeaveTypeId,
+                    $sickLeaveTypeId,
                     $deltaPrimaryDeduction,
                     $deltaLinkedForcedDeduction,
                     $deltaLinkedVacationDeduction,
+                    $deltaLinkedSickDeduction,
                     $shouldReconcileBalances,
                     $balanceConflictCode,
                     $targetPayMode,
@@ -12096,6 +13239,7 @@ class LeaveApplicationController extends Controller
                     $targetStoredCtoDeductedHours,
                     $targetLinkedForcedDeduction,
                     $targetLinkedVacationDeduction,
+                    $targetLinkedSickDeduction,
                     $leaveType
                 ): void {
                     if ($shouldReconcileBalances) {
@@ -12123,6 +13267,15 @@ class LeaveApplicationController extends Controller
                                 $balanceConflictCode
                             );
                         }
+
+                        if ($sickLeaveTypeId !== null) {
+                            $this->applyScheduleRepricingBalanceDelta(
+                                $application,
+                                $sickLeaveTypeId,
+                                $deltaLinkedSickDeduction,
+                                $balanceConflictCode
+                            );
+                        }
                     }
 
                     $application->update([
@@ -12132,6 +13285,7 @@ class LeaveApplicationController extends Controller
                         'cto_deducted_hours' => $targetStoredCtoDeductedHours,
                         'linked_forced_leave_deducted_days' => $targetLinkedForcedDeduction,
                         'linked_vacation_leave_deducted_days' => $targetLinkedVacationDeduction,
+                        'linked_sick_leave_deducted_days' => $targetLinkedSickDeduction,
                     ]);
 
                     if ($application->employee_control_no && $this->isCtoLeaveType($leaveType, $canonicalLeaveTypeId)) {
@@ -12417,7 +13571,10 @@ class LeaveApplicationController extends Controller
     private function resolveCertificationLeaveCredits(LeaveApplication $app, array $leaveBalanceSnapshot = []): array
     {
         $storedSnapshot = $this->resolveStoredCertificationLeaveCreditsSnapshot($app);
-        if ($storedSnapshot !== null) {
+        $storedSnapshotNeedsRefresh = $storedSnapshot !== null
+            && $this->shouldRefreshStoredCertificationLeaveCreditsSnapshot($app, $storedSnapshot);
+
+        if ($storedSnapshot !== null && ! $storedSnapshotNeedsRefresh) {
             return $storedSnapshot;
         }
 
@@ -12426,6 +13583,12 @@ class LeaveApplicationController extends Controller
             $this->persistCertificationLeaveCreditsSnapshot($app, $reconstructedSnapshot);
 
             return $reconstructedSnapshot;
+        }
+
+        if ($storedSnapshot !== null) {
+            return $storedSnapshotNeedsRefresh
+                ? $this->buildCertificationLeaveCredits($app, $leaveBalanceSnapshot)
+                : $storedSnapshot;
         }
 
         return $this->buildCertificationLeaveCredits($app, $leaveBalanceSnapshot);
@@ -12463,11 +13626,26 @@ class LeaveApplicationController extends Controller
             ?? $app->created_at?->format('F j, Y')
             ?? now()->format('F j, Y');
 
-        return [
+        $normalizedPayload = [
             'vacation' => $vacation,
             'sick' => $sick,
             'as_of_date' => $asOfDate,
         ];
+
+        foreach ($payload as $key => $bucket) {
+            if (in_array($key, ['vacation', 'sick', 'as_of_date'], true)) {
+                continue;
+            }
+
+            $normalizedBucket = $this->normalizeCertificationLeaveCreditsBucket($bucket);
+            if ($normalizedBucket === null) {
+                continue;
+            }
+
+            $normalizedPayload[(string) $key] = $normalizedBucket;
+        }
+
+        return $normalizedPayload;
     }
 
     private function normalizeCertificationLeaveCreditsBucket(mixed $bucket): ?array
@@ -12487,12 +13665,99 @@ class LeaveApplicationController extends Controller
             )
         );
 
-        return [
+        $normalizedBucket = [
             'total_earned' => $totalEarned,
             'less_this_application' => $lessThisApplication,
             'balance' => $balance,
             'balance_after_application' => $balanceAfterApplication,
         ];
+
+        $leaveTypeName = LeaveType::canonicalizeLeaveTypeName(
+            $this->trimNullableString($bucket['leave_type_name'] ?? null)
+        );
+        if ($leaveTypeName !== null) {
+            $normalizedBucket['leave_type_name'] = $leaveTypeName;
+        }
+
+        $leaveTypeId = (int) ($bucket['leave_type_id'] ?? 0);
+        if ($leaveTypeId > 0) {
+            $normalizedBucket['leave_type_id'] = $leaveTypeId;
+        }
+
+        return $normalizedBucket;
+    }
+
+    private function shouldRefreshStoredCertificationLeaveCreditsSnapshot(
+        LeaveApplication $app,
+        array $snapshot
+    ): bool {
+        if (strtoupper(trim((string) ($app->status ?? ''))) !== LeaveApplication::STATUS_APPROVED) {
+            return false;
+        }
+
+        $vacationBucket = $snapshot['vacation'] ?? null;
+        $sickBucket = $snapshot['sick'] ?? null;
+        if (! is_array($vacationBucket) || ! is_array($sickBucket)) {
+            return true;
+        }
+
+        $expectedDeductions = $this->resolveCertificationLeaveDeductionsByType($app);
+        $selectedLeaveTypeDeduction = $this->resolveSelectedCertificationLeaveTypeDeduction($app);
+        if ($selectedLeaveTypeDeduction !== null) {
+            $selectedBucket = $snapshot[self::CERTIFICATION_SELECTED_LEAVE_TYPE_BUCKET] ?? null;
+            if (! is_array($selectedBucket)) {
+                return true;
+            }
+
+            $storedSelectedLeaveTypeName = LeaveType::canonicalizeLeaveTypeName(
+                $this->trimNullableString($selectedBucket['leave_type_name'] ?? null)
+            );
+            if ($storedSelectedLeaveTypeName !== (string) $selectedLeaveTypeDeduction['leave_type_name']) {
+                return true;
+            }
+
+            if ($this->certificationLeaveCreditsBucketNeedsRefresh(
+                $selectedBucket,
+                (float) $selectedLeaveTypeDeduction['less_this_application']
+            )) {
+                return true;
+            }
+        }
+
+        return $this->certificationLeaveCreditsBucketNeedsRefresh(
+            $vacationBucket,
+            (float) ($expectedDeductions['vacation'] ?? 0.0)
+        ) || $this->certificationLeaveCreditsBucketNeedsRefresh(
+            $sickBucket,
+            (float) ($expectedDeductions['sick'] ?? 0.0)
+        );
+    }
+
+    private function certificationLeaveCreditsBucketNeedsRefresh(
+        array $bucket,
+        float $expectedLessThisApplication
+    ): bool {
+        $normalizedExpectedLessThisApplication = $this->roundLeaveCreditValue($expectedLessThisApplication);
+        $storedLessThisApplication = $this->roundLeaveCreditValue(
+            (float) ($bucket['less_this_application'] ?? 0.0)
+        );
+        if (abs($storedLessThisApplication - $normalizedExpectedLessThisApplication) > 0.0005) {
+            return true;
+        }
+
+        $storedBalanceAfterApplication = $this->roundLeaveCreditValue(
+            (float) (
+                $bucket['balance_after_application']
+                ?? $bucket['balance']
+                ?? 0.0
+            )
+        );
+        $storedTotalEarned = $this->roundLeaveCreditValue((float) ($bucket['total_earned'] ?? 0.0));
+        $expectedTotalEarned = $this->roundLeaveCreditValue(
+            $storedBalanceAfterApplication + $normalizedExpectedLessThisApplication
+        );
+
+        return abs($storedTotalEarned - $expectedTotalEarned) > 0.0005;
     }
 
     private function reconstructApprovedCertificationLeaveCredits(
@@ -12519,9 +13784,10 @@ class LeaveApplicationController extends Controller
 
         $currentVacationBalance = $this->findLeaveTypeBalanceByNameInSnapshot($snapshot, 'Vacation Leave');
         $currentSickBalance = $this->findLeaveTypeBalanceByNameInSnapshot($snapshot, 'Sick Leave');
+        $selectedLeaveTypeDeduction = $this->resolveSelectedCertificationLeaveTypeDeduction($app);
 
         $laterApprovedApplications = LeaveApplication::query()
-            ->with('leaveType:id,name')
+            ->with('leaveType:id,name,is_credit_based')
             ->where('status', LeaveApplication::STATUS_APPROVED)
             ->whereIn('employee_control_no', $this->controlNoCandidates($employeeControlNo))
             ->where(function ($query) use ($referenceDateTime, $app): void {
@@ -12537,6 +13803,7 @@ class LeaveApplicationController extends Controller
                 'total_days',
                 'deductible_days',
                 'linked_vacation_leave_deducted_days',
+                'linked_sick_leave_deducted_days',
                 'pay_mode',
                 'is_monetization',
                 'monetization_leave_credits',
@@ -12546,6 +13813,7 @@ class LeaveApplicationController extends Controller
 
         $laterVacationDeductions = 0.0;
         $laterSickDeductions = 0.0;
+        $laterSelectedLeaveTypeDeductions = 0.0;
         foreach ($laterApprovedApplications as $laterApplication) {
             if (! $laterApplication instanceof LeaveApplication) {
                 continue;
@@ -12554,6 +13822,21 @@ class LeaveApplicationController extends Controller
             $laterDeductions = $this->resolveCertificationLeaveDeductionsByType($laterApplication);
             $laterVacationDeductions += (float) ($laterDeductions['vacation'] ?? 0.0);
             $laterSickDeductions += (float) ($laterDeductions['sick'] ?? 0.0);
+
+            if ($selectedLeaveTypeDeduction === null) {
+                continue;
+            }
+
+            $laterSelectedLeaveTypeDeduction = $this->resolveSelectedCertificationLeaveTypeDeduction($laterApplication);
+            if (
+                $laterSelectedLeaveTypeDeduction !== null
+                && strcasecmp(
+                    (string) $laterSelectedLeaveTypeDeduction['leave_type_name'],
+                    (string) $selectedLeaveTypeDeduction['leave_type_name']
+                ) === 0
+            ) {
+                $laterSelectedLeaveTypeDeductions += (float) $laterSelectedLeaveTypeDeduction['less_this_application'];
+            }
         }
 
         $appDeductions = $this->resolveCertificationLeaveDeductionsByType($app);
@@ -12574,7 +13857,7 @@ class LeaveApplicationController extends Controller
             $sickBalanceAfterApplication + $sickLessThisApplication
         );
 
-        return [
+        $snapshotPayload = [
             'vacation' => [
                 'total_earned' => $vacationTotalEarned,
                 'less_this_application' => $vacationLessThisApplication,
@@ -12589,6 +13872,26 @@ class LeaveApplicationController extends Controller
             ],
             'as_of_date' => $referenceDateTime->format('F j, Y'),
         ];
+
+        if ($selectedLeaveTypeDeduction !== null) {
+            $currentSelectedLeaveTypeBalance = $this->findLeaveTypeBalanceByNameInSnapshot(
+                $snapshot,
+                (string) $selectedLeaveTypeDeduction['leave_type_name']
+            );
+
+            $selectedLeaveTypeBalanceAfterApplication = $this->roundLeaveCreditValue(
+                (float) ($currentSelectedLeaveTypeBalance ?? 0.0)
+                    + $this->roundLeaveCreditValue($laterSelectedLeaveTypeDeductions)
+            );
+
+            $snapshotPayload[self::CERTIFICATION_SELECTED_LEAVE_TYPE_BUCKET] = $this->buildSelectedCertificationLeaveTypeBucket(
+                $selectedLeaveTypeBalanceAfterApplication,
+                $selectedLeaveTypeDeduction,
+                true
+            );
+        }
+
+        return $snapshotPayload;
     }
 
     private function resolveCertificationLeaveDeductionsByType(LeaveApplication $app): array
@@ -12598,6 +13901,7 @@ class LeaveApplicationController extends Controller
             ? 0.0
             : $this->roundLeaveCreditValue($this->resolveApplicationDeductibleDays($app));
         $linkedVacationDeduction = $this->roundLeaveCreditValue((float) ($app->linked_vacation_leave_deducted_days ?? 0.0));
+        $linkedSickDeduction = $this->roundLeaveCreditValue((float) ($app->linked_sick_leave_deducted_days ?? 0.0));
         $leaveTypeName = trim((string) ($app->leaveType?->name ?? ''));
 
         $vacation = 0.0;
@@ -12611,9 +13915,29 @@ class LeaveApplicationController extends Controller
                 }
             }
         } elseif (strcasecmp($leaveTypeName, 'Vacation Leave') === 0) {
-            $vacation = $deductibleDays;
+            $primaryDeductionDays = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
+                ? 0.0
+                : $this->roundLeaveCreditValue(
+                    $this->resolveStoredPrimaryLeaveDeduction(
+                        $app,
+                        $app->leaveType,
+                        $deductibleDays
+                    )
+                );
+            $vacation = $primaryDeductionDays;
+            $sick = $linkedSickDeduction;
         } elseif (strcasecmp($leaveTypeName, 'Sick Leave') === 0) {
-            $sick = $deductibleDays;
+            $primaryDeductionDays = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
+                ? 0.0
+                : $this->roundLeaveCreditValue(
+                    $this->resolveStoredPrimaryLeaveDeduction(
+                        $app,
+                        $app->leaveType,
+                        $deductibleDays
+                    )
+                );
+            $sick = $primaryDeductionDays;
+            $vacation = $linkedVacationDeduction;
         } elseif ($linkedVacationDeduction > 0.0) {
             $vacation = $linkedVacationDeduction;
         }
@@ -12621,6 +13945,80 @@ class LeaveApplicationController extends Controller
         return [
             'vacation' => $this->roundLeaveCreditValue($vacation),
             'sick' => $this->roundLeaveCreditValue($sick),
+        ];
+    }
+
+    /**
+     * @return array{leave_type_id:int, leave_type_name:string, less_this_application:float}|null
+     */
+    private function resolveSelectedCertificationLeaveTypeDeduction(LeaveApplication $app): ?array
+    {
+        $leaveType = $app->leaveType;
+        if (! $leaveType instanceof LeaveType || (bool) $app->is_monetization || ! (bool) $leaveType->is_credit_based) {
+            return null;
+        }
+
+        $leaveTypeName = LeaveType::canonicalizeLeaveTypeName($leaveType->name ?? null);
+        if ($leaveTypeName === null || strcasecmp($leaveTypeName, 'Mandatory / Forced Leave') === 0) {
+            return null;
+        }
+
+        if (in_array(strtolower($leaveTypeName), ['vacation leave', 'sick leave'], true)) {
+            return null;
+        }
+
+        $leaveTypeId = (int) ($leaveType->id ?? $app->leave_type_id);
+        if ($leaveTypeId <= 0) {
+            $leaveTypeId = (int) $app->leave_type_id;
+        }
+        if ($leaveTypeId <= 0) {
+            return null;
+        }
+
+        $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, false);
+        $deductibleDays = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
+            ? 0.0
+            : $this->roundLeaveCreditValue($this->resolveApplicationDeductibleDays($app));
+        $linkedVacationDeduction = $this->roundLeaveCreditValue((float) ($app->linked_vacation_leave_deducted_days ?? 0.0));
+        $linkedSickDeduction = $this->roundLeaveCreditValue((float) ($app->linked_sick_leave_deducted_days ?? 0.0));
+        $lessThisApplication = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
+            ? 0.0
+            : $this->roundLeaveCreditValue(max($deductibleDays - $linkedVacationDeduction - $linkedSickDeduction, 0.0));
+
+        return [
+            'leave_type_id' => $leaveTypeId,
+            'leave_type_name' => $leaveTypeName,
+            'less_this_application' => $lessThisApplication,
+        ];
+    }
+
+    /**
+     * @param  array{leave_type_id:int, leave_type_name:string, less_this_application:float}  $selectedLeaveTypeDeduction
+     * @return array{leave_type_id:int, leave_type_name:string, total_earned:float, less_this_application:float, balance:float, balance_after_application:float}
+     */
+    private function buildSelectedCertificationLeaveTypeBucket(
+        float $currentBalance,
+        array $selectedLeaveTypeDeduction,
+        bool $deductionAlreadyApplied
+    ): array {
+        $selectedLeaveTypeBalance = $this->roundLeaveCreditValue($currentBalance);
+        $selectedLeaveTypeLessThisApplication = $this->roundLeaveCreditValue(
+            (float) $selectedLeaveTypeDeduction['less_this_application']
+        );
+        $selectedLeaveTypeTotalEarned = $this->roundLeaveCreditValue($deductionAlreadyApplied
+            ? ($selectedLeaveTypeBalance + $selectedLeaveTypeLessThisApplication)
+            : $selectedLeaveTypeBalance);
+        $selectedLeaveTypeBalanceAfterApplication = $this->roundLeaveCreditValue($deductionAlreadyApplied
+            ? $selectedLeaveTypeBalance
+            : ($selectedLeaveTypeBalance - $selectedLeaveTypeLessThisApplication));
+
+        return [
+            'leave_type_id' => (int) $selectedLeaveTypeDeduction['leave_type_id'],
+            'leave_type_name' => (string) $selectedLeaveTypeDeduction['leave_type_name'],
+            'total_earned' => $selectedLeaveTypeTotalEarned,
+            'less_this_application' => $selectedLeaveTypeLessThisApplication,
+            'balance' => $selectedLeaveTypeBalance,
+            'balance_after_application' => $selectedLeaveTypeBalanceAfterApplication,
         ];
     }
 
@@ -12668,6 +14066,7 @@ class LeaveApplicationController extends Controller
 
         $leaveTypeName = trim((string) ($app->leaveType?->name ?? ''));
         $linkedVacationDeduction = $this->roundLeaveCreditValue((float) ($app->linked_vacation_leave_deducted_days ?? 0.0));
+        $linkedSickDeduction = $this->roundLeaveCreditValue((float) ($app->linked_sick_leave_deducted_days ?? 0.0));
 
         $vacationLessThisApplication = 0.0;
         $sickLessThisApplication = 0.0;
@@ -12681,9 +14080,29 @@ class LeaveApplicationController extends Controller
                 }
             }
         } elseif (strcasecmp($leaveTypeName, 'Vacation Leave') === 0) {
-            $vacationLessThisApplication = $deductibleDays;
+            $primaryDeductionDays = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
+                ? 0.0
+                : $this->roundLeaveCreditValue(
+                    $this->resolveStoredPrimaryLeaveDeduction(
+                        $app,
+                        $app->leaveType,
+                        $deductibleDays
+                    )
+                );
+            $vacationLessThisApplication = $primaryDeductionDays;
+            $sickLessThisApplication = $linkedSickDeduction;
         } elseif (strcasecmp($leaveTypeName, 'Sick Leave') === 0) {
-            $sickLessThisApplication = $deductibleDays;
+            $primaryDeductionDays = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
+                ? 0.0
+                : $this->roundLeaveCreditValue(
+                    $this->resolveStoredPrimaryLeaveDeduction(
+                        $app,
+                        $app->leaveType,
+                        $deductibleDays
+                    )
+                );
+            $sickLessThisApplication = $primaryDeductionDays;
+            $vacationLessThisApplication = $linkedVacationDeduction;
         } elseif ($linkedVacationDeduction > 0.0) {
             $vacationLessThisApplication = $linkedVacationDeduction;
         }
@@ -12704,7 +14123,7 @@ class LeaveApplicationController extends Controller
             ? $sickCurrentBalance
             : ($sickCurrentBalance - $sickLessThisApplication));
 
-        return [
+        $snapshotPayload = [
             'vacation' => [
                 'total_earned' => $vacationTotalEarned,
                 'less_this_application' => $vacationLessThisApplication,
@@ -12719,6 +14138,22 @@ class LeaveApplicationController extends Controller
             ],
             'as_of_date' => $app->created_at?->format('F j, Y') ?? now()->format('F j, Y'),
         ];
+
+        $selectedLeaveTypeDeduction = $this->resolveSelectedCertificationLeaveTypeDeduction($app);
+        if ($selectedLeaveTypeDeduction !== null) {
+            $selectedLeaveTypeCurrentBalance = $this->findLeaveTypeBalanceByNameInSnapshot(
+                $leaveBalanceSnapshot,
+                (string) $selectedLeaveTypeDeduction['leave_type_name']
+            );
+
+            $snapshotPayload[self::CERTIFICATION_SELECTED_LEAVE_TYPE_BUCKET] = $this->buildSelectedCertificationLeaveTypeBucket(
+                (float) ($selectedLeaveTypeCurrentBalance ?? 0.0),
+                $selectedLeaveTypeDeduction,
+                $deductionAlreadyApplied
+            );
+        }
+
+        return $snapshotPayload;
     }
 
     private function mergeEmployeeControlNoInput(Request $request): void

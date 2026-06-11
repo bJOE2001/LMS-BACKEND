@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Services\WorkScheduleService;
 use Carbon\CarbonImmutable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -48,6 +49,7 @@ class LeaveApplication extends Model
                 $application->selected_date_coverage = null;
                 $application->selected_date_half_day_portion = null;
                 $application->deductible_days = round((float) ($application->total_days ?? 0), 3);
+                $application->without_pay_days = 0.0;
                 $application->cto_deducted_hours = null;
 
                 return;
@@ -72,6 +74,25 @@ class LeaveApplication extends Model
             }
 
             $application->deductible_days = $deductibleDays;
+            if (self::shouldRefreshWithoutPayDaysSnapshot($application)) {
+                $employeeControlNo = trim((string) ($application->employee_control_no ?? ''));
+                $resolvedEmployeeControlNo = $employeeControlNo !== '' ? $employeeControlNo : null;
+                $workScheduleService = app(WorkScheduleService::class);
+
+                $application->without_pay_days = self::calculateWithoutPayDays(
+                    $application->total_days,
+                    $application->deductible_days,
+                    $application->pay_mode,
+                    $application->selected_dates,
+                    $application->selected_date_pay_status,
+                    $application->selected_date_coverage,
+                    $application->selected_date_half_day_portion,
+                    $workScheduleService->resolveCoverageDeductionDays('whole', $resolvedEmployeeControlNo),
+                    $workScheduleService->resolveCoverageDeductionDays('half', $resolvedEmployeeControlNo)
+                );
+            } elseif ($application->without_pay_days !== null) {
+                $application->without_pay_days = round(max((float) $application->without_pay_days, 0.0), 3);
+            }
             $application->cto_deducted_hours = $application->cto_deducted_hours !== null
                 ? round(max((float) $application->cto_deducted_hours, 0.0), 2)
                 : null;
@@ -92,6 +113,7 @@ class LeaveApplication extends Model
         'reason',
         'details_of_leave',
         'deductible_days',
+        'without_pay_days',
         'cto_deducted_hours',
         'status',
         'admin_id',
@@ -107,8 +129,10 @@ class LeaveApplication extends Model
         'selected_date_half_day_portion',
         'commutation',
         'pay_mode',
+        'allow_sl_vl_cross_deduction',
         'linked_forced_leave_deducted_days',
         'linked_vacation_leave_deducted_days',
+        'linked_sick_leave_deducted_days',
         'requires_documents',
         'attachment_required',
         'attachment_submitted',
@@ -127,6 +151,7 @@ class LeaveApplication extends Model
             'end_date' => 'date',
             'total_days' => 'decimal:2',
             'deductible_days' => 'decimal:3',
+            'without_pay_days' => 'decimal:3',
             'cto_deducted_hours' => 'decimal:2',
             'admin_approved_at' => 'datetime',
             'hr_approved_at' => 'datetime',
@@ -137,8 +162,10 @@ class LeaveApplication extends Model
             'selected_date_coverage' => 'array',
             'selected_date_half_day_portion' => 'array',
             'pay_mode' => 'string',
+            'allow_sl_vl_cross_deduction' => 'boolean',
             'linked_forced_leave_deducted_days' => 'decimal:3',
             'linked_vacation_leave_deducted_days' => 'decimal:3',
+            'linked_sick_leave_deducted_days' => 'decimal:3',
             'requires_documents' => 'boolean',
             'attachment_required' => 'boolean',
             'attachment_submitted' => 'boolean',
@@ -248,6 +275,74 @@ class LeaveApplication extends Model
             $this->selected_dates,
             $this->total_days
         );
+    }
+
+    public static function calculateWithoutPayDays(
+        mixed $totalDays,
+        mixed $deductibleDays = null,
+        mixed $payMode = null,
+        mixed $selectedDates = null,
+        mixed $selectedDatePayStatus = null,
+        mixed $selectedDateCoverage = null,
+        mixed $selectedDateHalfDayPortion = null,
+        ?float $wholeDayWeight = null,
+        ?float $halfDayWeight = null
+    ): float {
+        $normalizedTotalDays = round(max((float) ($totalDays ?? 0), 0.0), 3);
+        if ($normalizedTotalDays <= 0.0) {
+            return 0.0;
+        }
+
+        $normalizedPayMode = strtoupper(trim((string) ($payMode ?? self::PAY_MODE_WITH_PAY)));
+        if (! in_array($normalizedPayMode, [self::PAY_MODE_WITH_PAY, self::PAY_MODE_WITHOUT_PAY], true)) {
+            $normalizedPayMode = self::PAY_MODE_WITH_PAY;
+        }
+
+        $normalizedDeductibleDays = $deductibleDays !== null
+            ? round(max((float) $deductibleDays, 0.0), 3)
+            : ($normalizedPayMode === self::PAY_MODE_WITHOUT_PAY ? 0.0 : $normalizedTotalDays);
+
+        $resolvedSelectedDates = self::normalizeDateList($selectedDates);
+        if ($resolvedSelectedDates === []) {
+            if ($normalizedPayMode === self::PAY_MODE_WITHOUT_PAY) {
+                return $normalizedTotalDays;
+            }
+
+            return round(max($normalizedTotalDays - $normalizedDeductibleDays, 0.0), 3);
+        }
+
+        $normalizedCoverage = self::normalizeSelectedDateCoverageMap($selectedDateCoverage);
+        $normalizedHalfDayPortion = self::mergeSelectedDateHalfDayPortionMaps(
+            self::normalizeSelectedDateHalfDayPortionMap($selectedDateHalfDayPortion),
+            self::normalizeSelectedDateHalfDayPortionMap($selectedDateCoverage)
+        );
+        foreach (array_keys($normalizedHalfDayPortion) as $dateKey) {
+            $normalizedCoverage[$dateKey] = 'half';
+        }
+
+        $normalizedPayStatus = self::normalizeSelectedDatePayStatusMap($selectedDatePayStatus);
+        $resolvedWholeDayWeight = round(max((float) ($wholeDayWeight ?? 1.0), 0.0), 3);
+        $resolvedHalfDayWeight = round(
+            max((float) ($halfDayWeight ?? ($resolvedWholeDayWeight / 2)), 0.0),
+            3
+        );
+
+        $withoutPayDays = 0.0;
+        foreach ($resolvedSelectedDates as $dateKey) {
+            $weight = ($normalizedCoverage[$dateKey] ?? 'whole') === 'half'
+                ? $resolvedHalfDayWeight
+                : $resolvedWholeDayWeight;
+            if ($weight <= 0.0) {
+                continue;
+            }
+
+            $effectivePayMode = $normalizedPayStatus[$dateKey] ?? $normalizedPayMode;
+            if ($effectivePayMode === self::PAY_MODE_WITHOUT_PAY) {
+                $withoutPayDays += $weight;
+            }
+        }
+
+        return round(max($withoutPayDays, 0.0), 3);
     }
 
     /**
@@ -402,6 +497,42 @@ class LeaveApplication extends Model
         }
 
         return self::normalizeSelectedDateHalfDayPortionValue($value) !== null ? 'half' : null;
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private static function normalizeSelectedDatePayStatusMap(mixed $value): array
+    {
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $value = $decoded;
+            }
+        }
+
+        if (! is_array($value) || $value === []) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach ($value as $rawDate => $rawStatus) {
+            $dateKey = self::normalizeDateKey($rawDate);
+            if ($dateKey === null) {
+                continue;
+            }
+
+            $status = strtoupper(trim((string) $rawStatus));
+            if (! in_array($status, [self::PAY_MODE_WITH_PAY, self::PAY_MODE_WITHOUT_PAY], true)) {
+                continue;
+            }
+
+            $normalized[$dateKey] = $status;
+        }
+
+        ksort($normalized);
+
+        return $normalized;
     }
 
     private static function normalizeSelectedDateHalfDayPortionValue(mixed $value): ?string
@@ -595,5 +726,30 @@ class LeaveApplication extends Model
         ], static fn (string $part): bool => $part !== '')));
 
         return $fullName !== '' ? $fullName : null;
+    }
+
+    private static function shouldRefreshWithoutPayDaysSnapshot(self $application): bool
+    {
+        if ($application->isDirty('without_pay_days')) {
+            return false;
+        }
+
+        if (! $application->exists || $application->without_pay_days === null) {
+            return true;
+        }
+
+        return $application->isDirty([
+            'employee_control_no',
+            'start_date',
+            'end_date',
+            'total_days',
+            'deductible_days',
+            'selected_dates',
+            'selected_date_pay_status',
+            'selected_date_coverage',
+            'selected_date_half_day_portion',
+            'pay_mode',
+            'is_monetization',
+        ]);
     }
 }
