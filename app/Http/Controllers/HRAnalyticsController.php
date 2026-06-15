@@ -17,12 +17,12 @@ class HRAnalyticsController extends Controller
      * @var array<int, string>
      */
     private const EMPLOYMENT_STATUS_LABELS = [
-        'Regular',
+        'Permanent',
         'Casual',
         'Co-terminous',
-        'Contractual / Temporary',
+        'Honorarium',
+        'Contractual',
         'Elective',
-        'Others',
     ];
 
     /**
@@ -136,8 +136,6 @@ class HRAnalyticsController extends Controller
         $genderTrendSeries = $this->initializeTrendSeries(self::GENDER_LABELS, $monthBucketCount);
 
         $leaveTypeByGenderCounts = [];
-        $leaveDaysByAgeGroupTotals = $this->initializeFloatMap(self::AGE_GROUP_LABELS);
-        $leaveDaysByAgeGroupCounts = $this->initializeCountMap(self::AGE_GROUP_LABELS);
 
         foreach ($applications as $application) {
             if (! $application instanceof LeaveApplication) {
@@ -187,25 +185,36 @@ class HRAnalyticsController extends Controller
                 ];
             }
             $leaveTypeByGenderCounts[$leaveTypeName][$genderLabel]++;
-
-            if ($leaveDurationDays > 0) {
-                $leaveDaysByAgeGroupTotals[$ageGroupLabel] += $leaveDurationDays;
-                $leaveDaysByAgeGroupCounts[$ageGroupLabel]++;
-            }
         }
 
-        $averageLeaveDaysByAgeGroup = $this->initializeFloatMap(self::AGE_GROUP_LABELS);
-        foreach (self::AGE_GROUP_LABELS as $ageGroupLabel) {
-            $count = $leaveDaysByAgeGroupCounts[$ageGroupLabel];
-            if ($count <= 0) {
-                continue;
-            }
-
-            $averageLeaveDaysByAgeGroup[$ageGroupLabel] = round(
-                $leaveDaysByAgeGroupTotals[$ageGroupLabel] / $count,
-                2
-            );
-        }
+        $employmentStatusDistributionChartValues = $this->removeChartLabel(
+            $workforceEmploymentCounts,
+            'Others'
+        );
+        $leaveUsageByEmploymentStatusChartValues = $this->removeChartLabel(
+            $leaveUsageByEmploymentStatus,
+            'Others'
+        );
+        $employmentStatusTrendChartSeries = $this->removeTrendSeries(
+            $employmentTrendSeries,
+            'Others'
+        );
+        $ageGroupDistributionChartValues = $this->removeChartLabel(
+            $workforceAgeGroupCounts,
+            'Unknown'
+        );
+        $leaveUsageByAgeGroupChartValues = $this->removeChartLabel(
+            $leaveUsageByAgeGroup,
+            'Unknown'
+        );
+        $genderDistributionChartValues = $this->removeChartLabel(
+            $workforceGenderCounts,
+            'Unknown'
+        );
+        $genderLeaveTrendSeries = $this->removeTrendSeries(
+            $genderTrendSeries,
+            'Unknown'
+        );
 
         ksort($leaveTypeByGenderCounts, SORT_NATURAL | SORT_FLAG_CASE);
         $leaveTypeLabels = array_values(array_keys($leaveTypeByGenderCounts));
@@ -217,16 +226,27 @@ class HRAnalyticsController extends Controller
         }
 
         $charts = [
-            'employmentStatusDistribution' => $this->buildCountChart($workforceEmploymentCounts),
-            'leaveUsageByEmploymentStatus' => $this->buildCountChart($leaveUsageByEmploymentStatus),
-            'employmentStatusTrend' => $this->buildTrendChart($monthLabels, $employmentTrendSeries),
+            'employmentStatusDistribution' => $this->buildCountChart($employmentStatusDistributionChartValues),
+            'leaveUsageByEmploymentStatus' => $this->buildSingleSeriesChart(
+                $leaveUsageByEmploymentStatusChartValues,
+                'Leave Days'
+            ),
+            'employmentStatusTrend' => $this->buildTrendChart($monthLabels, $employmentStatusTrendChartSeries),
             'generationDistribution' => $this->buildCountChart($workforceGenerationCounts),
-            'leaveUsageByGeneration' => $this->buildCountChart($leaveUsageByGeneration),
+            'leaveUsageByGeneration' => $this->buildSingleSeriesChart(
+                $leaveUsageByGeneration,
+                'Leave Days'
+            ),
             'generationLeaveTrend' => $this->buildTrendChart($monthLabels, $generationTrendSeries),
-            'ageGroupDistribution' => $this->buildCountChart($workforceAgeGroupCounts),
-            'leaveUsageByAgeGroup' => $this->buildCountChart($leaveUsageByAgeGroup),
-            'averageLeaveDaysByAgeGroup' => $this->buildCountChart($averageLeaveDaysByAgeGroup),
-            'genderDistribution' => $this->buildCountChart($workforceGenderCounts),
+            'ageGroupDistribution' => $this->buildSingleSeriesChart(
+                $ageGroupDistributionChartValues,
+                'Employees'
+            ),
+            'leaveUsageByAgeGroup' => $this->buildSingleSeriesChart(
+                $leaveUsageByAgeGroupChartValues,
+                'Leave Days'
+            ),
+            'genderDistribution' => $this->buildCountChart($genderDistributionChartValues),
             'leaveTypeByGender' => [
                 'labels' => $leaveTypeLabels,
                 'series' => [
@@ -240,7 +260,7 @@ class HRAnalyticsController extends Controller
                     ],
                 ],
             ],
-            'genderLeaveTrend' => $this->buildTrendChart($monthLabels, $genderTrendSeries),
+            'genderLeaveTrend' => $this->buildTrendChart($monthLabels, $genderLeaveTrendSeries),
         ];
 
         return response()->json([
@@ -374,6 +394,49 @@ class HRAnalyticsController extends Controller
     }
 
     /**
+     * @param  array<string, int|float>  $values
+     * @return array{
+     *     labels: array<int, string>,
+     *     series: array<int, array{name:string,data:array<int, int|float>}>
+     * }
+     */
+    private function buildSingleSeriesChart(array $values, string $seriesName): array
+    {
+        return [
+            'labels' => array_values(array_keys($values)),
+            'series' => [[
+                'name' => $seriesName,
+                'data' => array_values(array_map(
+                    static fn (int|float $value): int|float => $value,
+                    $values
+                )),
+            ]],
+        ];
+    }
+
+    /**
+     * @param  array<string, int|float>  $values
+     * @return array<string, int|float>
+     */
+    private function removeChartLabel(array $values, string $label): array
+    {
+        unset($values[$label]);
+
+        return $values;
+    }
+
+    /**
+     * @param  array<string, array<int, int>>  $seriesByName
+     * @return array<string, array<int, int>>
+     */
+    private function removeTrendSeries(array $seriesByName, string $seriesName): array
+    {
+        unset($seriesByName[$seriesName]);
+
+        return $seriesByName;
+    }
+
+    /**
      * @param  array<int, string>  $labels
      * @param  array<string, array<int, int>>  $seriesByName
      * @return array{
@@ -421,7 +484,7 @@ class HRAnalyticsController extends Controller
                 continue;
             }
 
-            $age = $this->resolveAgeFromBirthDate($employee->birth_date ?? null);
+            $age = $this->resolveEmployeeAge($employee);
             $profiles[$normalizedControlNo] = [
                 'employment_status' => $this->normalizeEmploymentStatusLabel($employee->status ?? null),
                 'generation' => $this->normalizeGenerationLabel($age),
@@ -431,6 +494,34 @@ class HRAnalyticsController extends Controller
         }
 
         return $profiles;
+    }
+
+    private function resolveEmployeeAge(object $employee): ?int
+    {
+        foreach (['age', 'Age', 'employee_age', 'employeeAge'] as $ageField) {
+            $rawAge = $employee->{$ageField} ?? null;
+            if ($rawAge === null || $rawAge === '') {
+                continue;
+            }
+
+            if (! is_numeric($rawAge)) {
+                continue;
+            }
+
+            $resolvedAge = (int) round((float) $rawAge);
+            if ($resolvedAge >= 0 && $resolvedAge <= 120) {
+                return $resolvedAge;
+            }
+        }
+
+        foreach (['birth_date', 'birthDate', 'BirthDate', 'date_of_birth', 'dateOfBirth'] as $birthDateField) {
+            $resolvedAge = $this->resolveAgeFromBirthDate($employee->{$birthDateField} ?? null);
+            if ($resolvedAge !== null) {
+                return $resolvedAge;
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -444,7 +535,7 @@ class HRAnalyticsController extends Controller
     private function unknownDemographicProfile(): array
     {
         return [
-            'employment_status' => 'Others',
+            'employment_status' => 'Contractual',
             'generation' => 'Unknown',
             'age_group' => 'Unknown',
             'gender' => 'Unknown',
@@ -455,12 +546,17 @@ class HRAnalyticsController extends Controller
     {
         $normalizedStatus = strtoupper(trim((string) ($rawStatus ?? '')));
 
-        return match ($normalizedStatus) {
-            'REGULAR', 'PERMANENT', 'APPOINTED' => 'Regular',
-            'CASUAL' => 'Casual',
-            'CO-TERMINOUS', 'CO TERMINOUS', 'COTERMINOUS' => 'Co-terminous',
-            'CONTRACTUAL', 'TEMPORARY' => 'Contractual / Temporary',
-            'ELECTIVE' => 'Elective',
+        return match (true) {
+            in_array($normalizedStatus, ['REGULAR', 'PERMANENT', 'APPOINTED'], true) => 'Permanent',
+            $normalizedStatus === 'CASUAL' => 'Casual',
+            in_array($normalizedStatus, ['CO-TERMINOUS', 'CO TERMINOUS', 'COTERMINOUS'], true)
+                || str_contains($normalizedStatus, 'TERMINOUS') => 'Co-terminous',
+            str_contains($normalizedStatus, 'HONORARIUM') => 'Honorarium',
+            in_array($normalizedStatus, ['CONTRACTUAL', 'TEMPORARY', 'JOB ORDER'], true)
+                || str_contains($normalizedStatus, 'JOB ORDER')
+                || str_contains($normalizedStatus, 'CONTRACTUAL')
+                || str_contains($normalizedStatus, 'TEMPORARY') => 'Contractual',
+            $normalizedStatus === 'ELECTIVE' => 'Elective',
             default => 'Others',
         };
     }
@@ -660,8 +756,15 @@ class HRAnalyticsController extends Controller
             $normalizedControlNo = '0';
         }
 
+        $paddedControlNo = str_pad(
+            $normalizedControlNo,
+            max(6, strlen($rawControlNo)),
+            '0',
+            STR_PAD_LEFT
+        );
+
         return array_values(array_unique(array_filter(
-            [$rawControlNo, $normalizedControlNo],
+            [$rawControlNo, $normalizedControlNo, $paddedControlNo],
             fn (string $value): bool => $value !== ''
         )));
     }
