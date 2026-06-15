@@ -22,6 +22,7 @@ use Illuminate\Http\Request;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\Rule;
 
 /**
@@ -36,6 +37,23 @@ class EmployeeController extends Controller
     private const LEDGER_MINUTES_PER_HOUR = 60;
 
     private const LEDGER_DECIMAL_PRECISION = 3;
+
+    private const TERMINAL_LEAVE_CONSTANT_FACTOR = 0.0478087;
+
+    private const TERMINAL_LEAVE_RATE_PRECISION = 2;
+
+    private const TERMINAL_LEAVE_AMOUNT_PRECISION = 12;
+
+    private function hasLeaveApplicationLinkedSickDeductedDaysColumn(): bool
+    {
+        static $hasColumn;
+
+        if ($hasColumn === null) {
+            $hasColumn = Schema::hasColumn('tblLeaveApplications', 'linked_sick_leave_deducted_days');
+        }
+
+        return $hasColumn;
+    }
 
     /**
      * List departments for the filter dropdown.
@@ -762,6 +780,36 @@ class EmployeeController extends Controller
             })
             ->values();
 
+        $trackedTypeIdsByKey = $this->resolveLedgerTrackedLeaveTypeIds();
+        $vacationLeaveTypeId = $trackedTypeIdsByKey['vacation'] ?? null;
+        $sickLeaveTypeId = $trackedTypeIdsByKey['sick'] ?? null;
+        $trackedTerminalLeaveTypeIds = [];
+        if (is_int($vacationLeaveTypeId) && $vacationLeaveTypeId > 0) {
+            $trackedTerminalLeaveTypeIds[] = $vacationLeaveTypeId;
+        }
+        if (is_int($sickLeaveTypeId) && $sickLeaveTypeId > 0) {
+            $trackedTerminalLeaveTypeIds[] = $sickLeaveTypeId;
+        }
+
+        $balancesByType = $this->loadPreferredLedgerBalancesByType(
+            $controlNoCandidates,
+            $trackedTerminalLeaveTypeIds
+        );
+        $vacationLeaveBalance = $this->resolveLedgerBalance($balancesByType, $vacationLeaveTypeId);
+        $sickLeaveBalance = $this->resolveLedgerBalance($balancesByType, $sickLeaveTypeId);
+        $monthlyRate = $employee->rate_mon !== null
+            ? round((float) $employee->rate_mon, self::TERMINAL_LEAVE_RATE_PRECISION)
+            : null;
+        $terminalLeaveEstimatedAmount = null;
+        if ($monthlyRate !== null) {
+            $terminalLeaveEstimatedAmount = round(
+                ($sickLeaveBalance + $vacationLeaveBalance)
+                    * $monthlyRate
+                    * self::TERMINAL_LEAVE_CONSTANT_FACTOR,
+                self::TERMINAL_LEAVE_AMOUNT_PRECISION
+            );
+        }
+
         return response()->json([
             'employee' => [
                 'control_no' => $employee->control_no,
@@ -779,6 +827,10 @@ class EmployeeController extends Controller
                 'assigned_department_acronym' => $this->trimOrBlank($employee->assignedDepartmentAcronym ?? $employee->assigned_department_acronym ?? null),
                 'designation' => $employee->designation,
                 'status' => $employee->status,
+                'rate_mon' => $monthlyRate,
+                'vl_balance' => $vacationLeaveBalance,
+                'sl_balance' => $sickLeaveBalance,
+                'terminal_leave_estimated_amount' => $terminalLeaveEstimatedAmount,
             ],
             'applications' => $applications,
         ]);
@@ -861,6 +913,14 @@ class EmployeeController extends Controller
         }
 
         $trackedTypeIds = array_keys($typeIdToKey);
+        $balanceKeyByTypeId = [];
+        foreach ($typeIdToKey as $typeId => $mappedTypeKey) {
+            $balanceKey = $this->resolveLedgerRunningBalanceKey($mappedTypeKey, (int) $typeId);
+            if (is_string($balanceKey) && $balanceKey !== '') {
+                $balanceKeyByTypeId[(int) $typeId] = $balanceKey;
+            }
+        }
+
         $vacationLeaveTypeId = $trackedTypeIdsByKey['vacation'] ?? null;
         $sickLeaveTypeId = $trackedTypeIdsByKey['sick'] ?? null;
         $queryTrackedTypeIds = $trackedTypeIds;
@@ -868,33 +928,63 @@ class EmployeeController extends Controller
         if (is_int($forcedLeaveTypeId) && $forcedLeaveTypeId > 0) {
             $queryTrackedTypeIds[] = $forcedLeaveTypeId;
             $queryTrackedTypeIds = array_values(array_unique($queryTrackedTypeIds));
+            $balanceKeyByTypeId[$forcedLeaveTypeId] = 'vacation';
         }
         $balancesByType = $this->loadPreferredLedgerBalancesByType($controlNoCandidates, $trackedTypeIds);
-        $otherRunningBalance = 0.0;
-        foreach ($otherTypeIds as $otherTypeId) {
-            $otherRunningBalance += $this->resolveLedgerBalance($balancesByType, $otherTypeId);
+        $preferredBalancesByBalanceKey = [];
+        foreach ($balancesByType as $typeId => $balance) {
+            if (! $balance instanceof LeaveBalance) {
+                continue;
+            }
+
+            $balanceKey = $balanceKeyByTypeId[(int) $typeId] ?? null;
+            if (! is_string($balanceKey) || $balanceKey === '') {
+                continue;
+            }
+
+            if (
+                ! array_key_exists($balanceKey, $preferredBalancesByBalanceKey)
+                || $this->shouldPreferLedgerBalanceRecord($balance, $preferredBalancesByBalanceKey[$balanceKey])
+            ) {
+                $preferredBalancesByBalanceKey[$balanceKey] = $balance;
+            }
         }
-        $otherRunningBalance = $this->roundLedgerValue($otherRunningBalance);
         $runningBalances = [
-            'vacation' => $this->resolveLedgerBalance($balancesByType, $trackedTypeIdsByKey['vacation'] ?? null),
-            'sick' => $this->resolveLedgerBalance($balancesByType, $trackedTypeIdsByKey['sick'] ?? null),
-            'other' => $otherRunningBalance,
+            'vacation' => $this->resolveLedgerBalanceByKey($preferredBalancesByBalanceKey, 'vacation'),
+            'sick' => $this->resolveLedgerBalanceByKey($preferredBalancesByBalanceKey, 'sick'),
         ];
+        foreach ($otherTypeIds as $otherTypeId) {
+            $balanceKey = $balanceKeyByTypeId[$otherTypeId] ?? null;
+            if (! is_string($balanceKey) || $balanceKey === '' || array_key_exists($balanceKey, $runningBalances)) {
+                continue;
+            }
+
+            $runningBalances[$balanceKey] = $this->resolveLedgerBalanceByKey(
+                $preferredBalancesByBalanceKey,
+                $balanceKey
+            );
+        }
 
         $transactions = [];
         if ($trackedTypeIds !== []) {
-            $balanceIds = array_values(array_map(
-                static fn (LeaveBalance $balance): int => (int) $balance->id,
-                $balancesByType
-            ));
+            $balanceIds = [];
             $balanceTypeLookup = [];
-            foreach ($balancesByType as $balance) {
+            $balanceKeyLookup = [];
+            foreach ($preferredBalancesByBalanceKey as $balanceKey => $balance) {
                 if (! $balance instanceof LeaveBalance) {
                     continue;
                 }
 
-                $balanceTypeLookup[(int) $balance->id] = (int) $balance->leave_type_id;
+                $balanceId = (int) $balance->id;
+                if ($balanceId <= 0) {
+                    continue;
+                }
+
+                $balanceIds[] = $balanceId;
+                $balanceTypeLookup[$balanceId] = (int) $balance->leave_type_id;
+                $balanceKeyLookup[$balanceId] = $balanceKey;
             }
+            $balanceIds = array_values(array_unique($balanceIds));
 
             if ($balanceIds !== []) {
                 $accrualEntries = LeaveBalanceAccrualHistory::query()
@@ -907,7 +997,9 @@ class EmployeeController extends Controller
                     $balanceId = (int) $entry->leave_balance_id;
                     $typeId = $balanceTypeLookup[$balanceId] ?? null;
                     $typeKey = $typeId !== null ? ($typeIdToKey[(int) $typeId] ?? null) : null;
-                    if ($typeKey === null) {
+                    $balanceKey = $balanceKeyLookup[$balanceId]
+                        ?? ($typeId !== null ? ($balanceKeyByTypeId[(int) $typeId] ?? null) : null);
+                    if ($typeKey === null || ! is_string($balanceKey) || $balanceKey === '') {
                         continue;
                     }
 
@@ -966,6 +1058,7 @@ class EmployeeController extends Controller
                         'row_id' => 'accrual-'.(int) $entry->id,
                         'merge_key' => $accrualMergeKey,
                         'type_key' => $typeKey,
+                        'balance_key' => $balanceKey,
                         'leave_type_code' => $leaveTypeCode,
                         'transaction_date' => $accrualDate,
                         'sort_date' => $accrualDate,
@@ -977,6 +1070,33 @@ class EmployeeController extends Controller
                         'balance_delta' => $creditsAdded,
                     ];
                 }
+            }
+
+            $approvedApplicationColumns = [
+                'id',
+                'leave_type_id',
+                'total_days',
+                'deductible_days',
+                'without_pay_days',
+                'linked_vacation_leave_deducted_days',
+                'pay_mode',
+                'is_monetization',
+                'monetization_leave_credits',
+                'status',
+                'remarks',
+                'start_date',
+                'end_date',
+                'selected_dates',
+                'selected_date_pay_status',
+                'selected_date_coverage',
+                'recall_effective_date',
+                'recall_selected_dates',
+                'hr_approved_at',
+                'created_at',
+                'updated_at',
+            ];
+            if ($this->hasLeaveApplicationLinkedSickDeductedDaysColumn()) {
+                $approvedApplicationColumns[] = 'linked_sick_leave_deducted_days';
             }
 
             $approvedApplications = LeaveApplication::query()
@@ -995,28 +1115,7 @@ class EmployeeController extends Controller
                 ->orderByDesc('hr_approved_at')
                 ->orderByDesc('created_at')
                 ->orderByDesc('id')
-                ->get([
-                    'id',
-                    'leave_type_id',
-                    'total_days',
-                    'deductible_days',
-                    'linked_vacation_leave_deducted_days',
-                    'pay_mode',
-                    'is_monetization',
-                    'monetization_leave_credits',
-                    'status',
-                    'remarks',
-                    'start_date',
-                    'end_date',
-                    'selected_dates',
-                    'selected_date_pay_status',
-                    'selected_date_coverage',
-                    'recall_effective_date',
-                    'recall_selected_dates',
-                    'hr_approved_at',
-                    'created_at',
-                    'updated_at',
-                ]);
+                ->get($approvedApplicationColumns);
 
             foreach ($approvedApplications as $application) {
                 $typeId = (int) $application->leave_type_id;
@@ -1029,6 +1128,11 @@ class EmployeeController extends Controller
                     $typeKey = 'vacation';
                 }
                 if ($typeKey === null) {
+                    continue;
+                }
+                $balanceKey = $balanceKeyByTypeId[$typeId]
+                    ?? $this->resolveLedgerRunningBalanceKey($typeKey, $typeId, $isForcedLeave);
+                if (! is_string($balanceKey) || $balanceKey === '') {
                     continue;
                 }
                 $isUsageOnlyOtherType = $typeKey === 'other'
@@ -1048,23 +1152,39 @@ class EmployeeController extends Controller
                 }
 
                 $isMonetization = (bool) $application->is_monetization;
-                $withPayAmount = $isMonetization
-                    ? $deductibleDays
-                    : ($payMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $deductibleDays);
-                $withPayAmount = round(max($withPayAmount, 0.0), 3);
+                $payAmounts = $this->resolveLedgerApplicationPayAmounts(
+                    $application,
+                    $totalDays,
+                    $deductibleDays,
+                    $payMode,
+                    $isMonetization
+                );
+                $withPayAmount = round(max((float) ($payAmounts['with_pay'] ?? 0.0), 0.0), 3);
                 $linkedVacationWithPayAmount = round(
                     max((float) ($application->linked_vacation_leave_deducted_days ?? 0), 0.0),
+                    3
+                );
+                $linkedSickWithPayAmount = round(
+                    max((float) ($application->linked_sick_leave_deducted_days ?? 0), 0.0),
                     3
                 );
                 if ($typeKey === 'vacation') {
                     $linkedVacationWithPayAmount = 0.0;
                 }
+                if ($typeKey === 'sick') {
+                    $linkedSickWithPayAmount = 0.0;
+                }
                 $linkedVacationWithPayAmount = round(min($linkedVacationWithPayAmount, $withPayAmount), self::LEDGER_DECIMAL_PRECISION);
-                $primaryWithPayAmount = round(max($withPayAmount - $linkedVacationWithPayAmount, 0.0), self::LEDGER_DECIMAL_PRECISION);
+                $linkedSickWithPayAmount = round(min($linkedSickWithPayAmount, $withPayAmount), self::LEDGER_DECIMAL_PRECISION);
+                $primaryWithPayAmount = round(
+                    max($withPayAmount - $linkedVacationWithPayAmount - $linkedSickWithPayAmount, 0.0),
+                    self::LEDGER_DECIMAL_PRECISION
+                );
 
-                $withoutPayAmount = $isMonetization
-                    ? 0.0
-                    : round(max($totalDays - $withPayAmount, 0.0), self::LEDGER_DECIMAL_PRECISION);
+                $withoutPayAmount = round(
+                    max((float) ($payAmounts['without_pay'] ?? 0.0), 0.0),
+                    self::LEDGER_DECIMAL_PRECISION
+                );
 
                 $monetizationComponents = $isMonetization
                     ? $this->resolveLedgerMonetizationComponents(
@@ -1083,6 +1203,7 @@ class EmployeeController extends Controller
                     ! $isMonetization
                     && $primaryWithPayAmount <= 0
                     && $linkedVacationWithPayAmount <= 0
+                    && $linkedSickWithPayAmount <= 0
                     && $withoutPayAmount <= 0
                 ) {
                     continue;
@@ -1099,13 +1220,19 @@ class EmployeeController extends Controller
                     is_string($otherTypeCode) ? $otherTypeCode : null,
                     $isForcedLeave,
                 );
+                $particularsPrefixOverride = $this->resolveLedgerParticularsPrefixOverride(
+                    $typeKey,
+                    $linkedVacationWithPayAmount,
+                    $linkedSickWithPayAmount
+                );
                 $particulars = $this->buildLedgerParticulars(
                     'deduction',
                     $typeKey,
                     $totalDays,
                     $isMonetization,
                     $isForcedLeave,
-                    is_string($otherTypeCode) ? $otherTypeCode : null
+                    is_string($otherTypeCode) ? $otherTypeCode : null,
+                    $particularsPrefixOverride
                 );
                 $applicationId = (int) $application->id;
                 $actionTaken = sprintf(
@@ -1134,6 +1261,7 @@ class EmployeeController extends Controller
                             'row_id' => $mergeKey.'-monetization-'.$componentTypeKey,
                             'merge_key' => $mergeKey,
                             'type_key' => $componentTypeKey,
+                            'balance_key' => $this->resolveLedgerRunningBalanceKey($componentTypeKey),
                             'leave_type_code' => $this->resolveLedgerTypeCode($componentTypeKey),
                             'transaction_date' => $transactionDate,
                             'sort_date' => $transactionDate,
@@ -1157,6 +1285,7 @@ class EmployeeController extends Controller
                         'row_id' => $mergeKey.'-wp',
                         'merge_key' => $mergeKey,
                         'type_key' => $typeKey,
+                        'balance_key' => $balanceKey,
                         'leave_type_code' => $leaveTypeCode,
                         'transaction_date' => $transactionDate,
                         'sort_date' => $transactionDate,
@@ -1181,6 +1310,7 @@ class EmployeeController extends Controller
                         'row_id' => $mergeKey.'-vl-topup',
                         'merge_key' => $mergeKey,
                         'type_key' => 'vacation',
+                        'balance_key' => 'vacation',
                         'leave_type_code' => $this->resolveLedgerTypeCode('vacation'),
                         'transaction_date' => $transactionDate,
                         'sort_date' => $transactionDate,
@@ -1200,11 +1330,37 @@ class EmployeeController extends Controller
                     ];
                 }
 
+                if (! $isMonetization && $linkedSickWithPayAmount > 0) {
+                    $transactions[] = [
+                        'row_id' => $mergeKey.'-sl-topup',
+                        'merge_key' => $mergeKey,
+                        'type_key' => 'sick',
+                        'balance_key' => 'sick',
+                        'leave_type_code' => $this->resolveLedgerTypeCode('sick'),
+                        'transaction_date' => $transactionDate,
+                        'sort_date' => $transactionDate,
+                        'sort_timestamp' => (string) (
+                            $application->hr_approved_at?->toIso8601String()
+                            ?? $application->created_at?->toIso8601String()
+                            ?? $transactionDate
+                        ),
+                        'particulars' => $particulars,
+                        'action_taken' => $actionTaken,
+                        'inclusive_start_date' => $inclusiveStartDate,
+                        'inclusive_end_date' => $inclusiveEndDate,
+                        'inclusive_dates' => $inclusiveDates,
+                        'category' => 'deduction_with_pay',
+                        'amount' => $linkedSickWithPayAmount,
+                        'balance_delta' => -$linkedSickWithPayAmount,
+                    ];
+                }
+
                 if (! $isMonetization && $withoutPayAmount > 0) {
                     $transactions[] = [
                         'row_id' => $mergeKey.'-wop',
                         'merge_key' => $mergeKey,
                         'type_key' => $typeKey,
+                        'balance_key' => $balanceKey,
                         'leave_type_code' => $leaveTypeCode,
                         'transaction_date' => $transactionDate,
                         'sort_date' => $transactionDate,
@@ -1246,9 +1402,16 @@ class EmployeeController extends Controller
                         : [];
 
                     $restoreTypeKey = $isForcedLeave ? 'vacation' : $typeKey;
+                    $restoreBalanceKey = $this->resolveLedgerRunningBalanceKey(
+                        $restoreTypeKey,
+                        $typeId,
+                        $isForcedLeave
+                    );
                     if (
                         $restoreTypeKey !== null
-                        && array_key_exists($restoreTypeKey, $runningBalances)
+                        && is_string($restoreBalanceKey)
+                        && $restoreBalanceKey !== ''
+                        && array_key_exists($restoreBalanceKey, $runningBalances)
                         && $restoredAmount > 0.0
                     ) {
                         $recallDate = $recallEffectiveAt?->toDateString() ?? $recallOccurredAt?->toDateString();
@@ -1257,6 +1420,7 @@ class EmployeeController extends Controller
                                 'row_id' => $mergeKey.'-recall',
                                 'merge_key' => $mergeKey.'-recall',
                                 'type_key' => $restoreTypeKey,
+                                'balance_key' => $restoreBalanceKey,
                                 'leave_type_code' => $this->resolveLedgerTypeCode(
                                     $restoreTypeKey,
                                     is_string($otherTypeCode) ? $otherTypeCode : null,
@@ -1275,7 +1439,8 @@ class EmployeeController extends Controller
                                     $restoredAmount,
                                     false,
                                     $isForcedLeave,
-                                    is_string($otherTypeCode) ? $otherTypeCode : null
+                                    is_string($otherTypeCode) ? $otherTypeCode : null,
+                                    $particularsPrefixOverride
                                 ),
                                 'action_taken' => 'Recalled by HR',
                                 'inclusive_dates' => $restoredDates,
@@ -1314,7 +1479,12 @@ class EmployeeController extends Controller
         $rowIndexByMergeKey = [];
         foreach ($transactions as $transaction) {
             $typeKey = $transaction['type_key'] ?? null;
-            if (! is_string($typeKey) || ! array_key_exists($typeKey, $runningBalances)) {
+            $balanceKey = trim((string) ($transaction['balance_key'] ?? ''));
+            if (
+                ! is_string($typeKey)
+                || $balanceKey === ''
+                || ! array_key_exists($balanceKey, $runningBalances)
+            ) {
                 continue;
             }
 
@@ -1324,8 +1494,8 @@ class EmployeeController extends Controller
                 continue;
             }
 
-            $currentBalance = $this->roundLedgerValue($runningBalances[$typeKey] ?? 0);
-            $runningBalances[$typeKey] = $this->roundLedgerValue(
+            $currentBalance = $this->roundLedgerValue($runningBalances[$balanceKey] ?? 0);
+            $runningBalances[$balanceKey] = $this->roundLedgerValue(
                 $currentBalance - (float) ($transaction['balance_delta'] ?? 0)
             );
 
@@ -1360,6 +1530,7 @@ class EmployeeController extends Controller
                     'period' => $period,
                     'particulars' => $particulars,
                     'leave_type_code' => $leaveTypeCode !== '' ? $leaveTypeCode : null,
+                    'balance_key' => $balanceKey,
                     'action_date' => $actionDate,
                     'action_taken' => $actionTaken,
                     'inclusive_start_date' => $inclusiveStartDate !== '' ? $inclusiveStartDate : null,
@@ -3033,6 +3204,74 @@ class EmployeeController extends Controller
         return $preferredBalancesByType;
     }
 
+    private function resolveLedgerRunningBalanceKey(
+        ?string $typeKey,
+        ?int $leaveTypeId = null,
+        bool $isForcedLeave = false
+    ): ?string {
+        if ($isForcedLeave || $typeKey === 'vacation') {
+            return 'vacation';
+        }
+
+        if ($typeKey === 'sick') {
+            return 'sick';
+        }
+
+        if ($typeKey !== 'other') {
+            return null;
+        }
+
+        $canonicalLeaveTypeId = LeaveType::resolveCanonicalLeaveTypeId($leaveTypeId) ?? (int) ($leaveTypeId ?? 0);
+        if ($canonicalLeaveTypeId <= 0) {
+            return null;
+        }
+
+        return 'other:'.$canonicalLeaveTypeId;
+    }
+
+    private function shouldPreferLedgerBalanceRecord(LeaveBalance $candidate, LeaveBalance $current): bool
+    {
+        $candidateTypeId = (int) ($candidate->leave_type_id ?? 0);
+        $currentTypeId = (int) ($current->leave_type_id ?? 0);
+        $specialPrivilegeLeaveTypeId = LeaveType::resolveSpecialPrivilegeLeaveTypeId();
+        if (
+            $specialPrivilegeLeaveTypeId !== null
+            && LeaveType::isSpecialPrivilegeType(null, $candidateTypeId)
+            && LeaveType::isSpecialPrivilegeType(null, $currentTypeId)
+            && $candidateTypeId !== $currentTypeId
+        ) {
+            if ($candidateTypeId === $specialPrivilegeLeaveTypeId) {
+                return true;
+            }
+
+            if ($currentTypeId === $specialPrivilegeLeaveTypeId) {
+                return false;
+            }
+        }
+
+        $candidateUpdatedAt = $candidate->updated_at?->timestamp ?? 0;
+        $currentUpdatedAt = $current->updated_at?->timestamp ?? 0;
+
+        if ($candidateUpdatedAt !== $currentUpdatedAt) {
+            return $candidateUpdatedAt > $currentUpdatedAt;
+        }
+
+        return (int) $candidate->id > (int) $current->id;
+    }
+
+    private function resolveLedgerBalanceByKey(array $balancesByKey, ?string $balanceKey): float
+    {
+        if (
+            $balanceKey === null
+            || ! isset($balancesByKey[$balanceKey])
+            || ! $balancesByKey[$balanceKey] instanceof LeaveBalance
+        ) {
+            return 0.0;
+        }
+
+        return $this->roundLedgerValue($balancesByKey[$balanceKey]->balance ?? 0);
+    }
+
     private function resolveLedgerBalance(array $balancesByType, ?int $leaveTypeId): float
     {
         if ($leaveTypeId === null || ! isset($balancesByType[$leaveTypeId])) {
@@ -3067,15 +3306,19 @@ class EmployeeController extends Controller
         float $days,
         bool $isMonetization = false,
         bool $isForcedLeave = false,
-        ?string $otherTypeCode = null
+        ?string $otherTypeCode = null,
+        ?string $prefixOverride = null
     ): string {
-        $prefix = match (true) {
-            $isForcedLeave => 'FL',
-            $typeKey === 'vacation' => 'VL',
-            $typeKey === 'sick' => 'SL',
-            $typeKey === 'other' && trim((string) $otherTypeCode) !== '' => strtoupper(trim((string) $otherTypeCode)),
-            default => null,
-        };
+        $normalizedPrefixOverride = strtoupper(trim((string) $prefixOverride));
+        $prefix = $normalizedPrefixOverride !== ''
+            ? $normalizedPrefixOverride
+            : match (true) {
+                $isForcedLeave => 'FL',
+                $typeKey === 'vacation' => 'VL',
+                $typeKey === 'sick' => 'SL',
+                $typeKey === 'other' && trim((string) $otherTypeCode) !== '' => strtoupper(trim((string) $otherTypeCode)),
+                default => null,
+            };
 
         if ($entryKind === 'earned') {
             return $prefix !== null ? $prefix.' 0-0-0' : '0-0-0';
@@ -3093,6 +3336,22 @@ class EmployeeController extends Controller
         return $entryKind === 'recall'
             ? $baseParticulars.' Recalled'
             : $baseParticulars;
+    }
+
+    private function resolveLedgerParticularsPrefixOverride(
+        ?string $typeKey,
+        float $linkedVacationDays,
+        float $linkedSickDays
+    ): ?string {
+        if ($typeKey === 'sick' && $linkedVacationDays > 0.0) {
+            return 'VL/SL';
+        }
+
+        if ($typeKey === 'vacation' && $linkedSickDays > 0.0) {
+            return 'SL/VL';
+        }
+
+        return null;
     }
 
     private function formatLedgerDaysHoursMinutes(float $days): string
@@ -3207,6 +3466,100 @@ class EmployeeController extends Controller
         return $this->normalizeLedgerPayMode($application->pay_mode ?? null, false) === LeaveApplication::PAY_MODE_WITHOUT_PAY
             ? 0.0
             : $totalDays;
+    }
+
+    /**
+     * @return array{with_pay: float, without_pay: float}
+     */
+    private function resolveLedgerApplicationPayAmounts(
+        LeaveApplication $application,
+        float $totalDays,
+        float $deductibleDays,
+        string $payMode,
+        bool $isMonetization
+    ): array {
+        $normalizedDeductibleDays = round(max($deductibleDays, 0.0), self::LEDGER_DECIMAL_PRECISION);
+        if ($isMonetization) {
+            return [
+                'with_pay' => $normalizedDeductibleDays,
+                'without_pay' => 0.0,
+            ];
+        }
+
+        $storedWithoutPayDays = $application->without_pay_days !== null
+            ? round(max((float) $application->without_pay_days, 0.0), self::LEDGER_DECIMAL_PRECISION)
+            : null;
+        if ($storedWithoutPayDays !== null) {
+            return [
+                'with_pay' => $normalizedDeductibleDays,
+                'without_pay' => $storedWithoutPayDays,
+            ];
+        }
+
+        $normalizedPayMode = $this->normalizeLedgerPayMode($payMode, false);
+        $selectedDates = $application->resolvedSelectedDates();
+        if (! is_array($selectedDates) || $selectedDates === []) {
+            $withPayAmount = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
+                ? 0.0
+                : $normalizedDeductibleDays;
+
+            return [
+                'with_pay' => $withPayAmount,
+                'without_pay' => round(max($totalDays - $withPayAmount, 0.0), self::LEDGER_DECIMAL_PRECISION),
+            ];
+        }
+
+        $normalizedPayStatus = $this->compactLedgerSelectedDatePayStatusMap(
+            is_array($application->selected_date_pay_status) ? $application->selected_date_pay_status : null,
+            $selectedDates,
+            $normalizedPayMode
+        );
+        $normalizedCoverage = $this->compactLedgerSelectedDateCoverageMap(
+            is_array($application->selected_date_coverage) ? $application->selected_date_coverage : null,
+            $selectedDates
+        );
+        $coverageWeights = $this->resolveLedgerDateCoverageWeights(
+            $selectedDates,
+            $normalizedCoverage,
+            round(max($totalDays, 0.0), self::LEDGER_DECIMAL_PRECISION),
+            trim((string) ($application->employee_control_no ?? '')) ?: null
+        );
+
+        $weightedWithPay = 0.0;
+        $weightedWithoutPay = 0.0;
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeLedgerDateKey($rawDate) ?? trim((string) $rawDate);
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $weight = round(
+                max((float) ($coverageWeights[$dateKey] ?? 0.0), 0.0),
+                self::LEDGER_DECIMAL_PRECISION
+            );
+            if ($weight <= 0.0) {
+                continue;
+            }
+
+            $effectiveMode = $normalizedPayStatus[$dateKey] ?? $normalizedPayMode;
+            $resolvedMode = $this->resolveLedgerPayModeFromStatusValue($effectiveMode) ?? $normalizedPayMode;
+            if ($resolvedMode === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
+                $weightedWithoutPay += $weight;
+
+                continue;
+            }
+
+            $weightedWithPay += $weight;
+        }
+
+        $withPayAmount = $weightedWithPay > 0.0
+            ? ($normalizedDeductibleDays > 0.0 ? $normalizedDeductibleDays : $weightedWithPay)
+            : 0.0;
+
+        return [
+            'with_pay' => round(max($withPayAmount, 0.0), self::LEDGER_DECIMAL_PRECISION),
+            'without_pay' => round(max($weightedWithoutPay, 0.0), self::LEDGER_DECIMAL_PRECISION),
+        ];
     }
 
     private function resolveLedgerRecallRestorableDetails(
@@ -3578,7 +3931,7 @@ class EmployeeController extends Controller
         $dateCount = count($resolvedDates);
         if ($dateCount > 0) {
             $halfMatch = abs(($dateCount * $defaultHalfDayWeight) - $totalDays) < 0.00001;
-            $wholeMatch = abs(($dateCount * $defaultWholeDayWeight) - $totalDays) < 0.00001;
+            $wholeMatch = abs(((float) $dateCount) - $totalDays) < 0.00001;
             if ($halfMatch) {
                 $defaultCoverageWeight = $defaultHalfDayWeight;
             } elseif (! $wholeMatch) {

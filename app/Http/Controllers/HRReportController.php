@@ -14,11 +14,11 @@ use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\Schema;
 
 class HRReportController extends Controller
 {
     private const HOURS_PER_WORKDAY = 8.0;
+
     private const EMPLOYEE_DIRECTORY_CACHE_KEY = 'hr_reports.employee_directory.v6';
 
     /**
@@ -103,12 +103,13 @@ class HRReportController extends Controller
                     return false;
                 }
 
-                if (!$application->start_date || !$application->end_date) {
+                if (! $application->start_date || ! $application->end_date) {
                     return false;
                 }
 
                 $start = Carbon::parse($application->start_date)->toDateString();
                 $end = Carbon::parse($application->end_date)->toDateString();
+
                 return $today >= $start && $today <= $end;
             })->count();
 
@@ -191,7 +192,7 @@ class HRReportController extends Controller
         $applications = $query->get()->map(function (LeaveApplication $application): array {
             $employee = $this->resolveApplicationEmployee($application);
             $applicantName = $employee
-                ? trim(($employee->firstname ?? '') . ' ' . ($employee->surname ?? ''))
+                ? trim(($employee->firstname ?? '').' '.($employee->surname ?? ''))
                 : ($application->applicantAdmin ? $application->applicantAdmin->full_name : 'Unknown');
             $deptName = $employee?->office ?? $application->applicantAdmin?->department?->name ?? 'N/A';
 
@@ -234,6 +235,7 @@ class HRReportController extends Controller
                 'selected_date_pay_status',
                 'total_days',
                 'deductible_days',
+                'without_pay_days',
                 'pay_mode',
                 'reason',
                 'remarks',
@@ -247,7 +249,7 @@ class HRReportController extends Controller
         $rows = [];
 
         foreach ($applications as $application) {
-            if (!$this->isEmployeeInDirectory($application->employee_control_no, $employeeDirectory)) {
+            if (! $this->isEmployeeInDirectory($application->employee_control_no, $employeeDirectory)) {
                 continue;
             }
 
@@ -345,7 +347,7 @@ class HRReportController extends Controller
         $aggregates = [];
 
         foreach (($employeeDirectory['by_raw'] ?? []) as $directoryEmployee) {
-            if (!((bool) ($directoryEmployee['is_active'] ?? false))) {
+            if (! ((bool) ($directoryEmployee['is_active'] ?? false))) {
                 continue;
             }
 
@@ -355,7 +357,7 @@ class HRReportController extends Controller
                 continue;
             }
 
-            if (!array_key_exists($employeeKey, $aggregates)) {
+            if (! array_key_exists($employeeKey, $aggregates)) {
                 $aggregates[$employeeKey] = $this->emptyLeaveBalanceAggregate(
                     $controlNo,
                     (string) ($directoryEmployee['name'] ?? '')
@@ -365,7 +367,7 @@ class HRReportController extends Controller
 
         foreach ($balanceRows as $balanceRow) {
             $controlNo = trim((string) $balanceRow->employee_control_no);
-            if (!$this->isEmployeeInDirectory($controlNo, $employeeDirectory)) {
+            if (! $this->isEmployeeInDirectory($controlNo, $employeeDirectory)) {
                 continue;
             }
 
@@ -375,7 +377,7 @@ class HRReportController extends Controller
             }
 
             $aggregate = &$aggregates[$employeeKey];
-            if (!is_array($aggregate)) {
+            if (! is_array($aggregate)) {
                 $aggregate = $this->emptyLeaveBalanceAggregate($controlNo, (string) ($balanceRow->employee_name ?? ''));
             }
 
@@ -399,12 +401,12 @@ class HRReportController extends Controller
         unset($aggregate);
 
         foreach ($applications as $application) {
-            if (!$this->isEmployeeInDirectory($application->employee_control_no, $employeeDirectory)) {
+            if (! $this->isEmployeeInDirectory($application->employee_control_no, $employeeDirectory)) {
                 continue;
             }
 
             $referenceDate = $this->resolveApplicationReferenceDate($application);
-            if (!$referenceDate || (int) $referenceDate->year !== $currentYear) {
+            if (! $referenceDate || (int) $referenceDate->year !== $currentYear) {
                 continue;
             }
 
@@ -415,7 +417,7 @@ class HRReportController extends Controller
             }
 
             $aggregate = &$aggregates[$employeeKey];
-            if (!is_array($aggregate)) {
+            if (! is_array($aggregate)) {
                 $aggregate = $this->emptyLeaveBalanceAggregate($controlNo, (string) ($application->employee_name ?? ''));
             }
 
@@ -532,7 +534,7 @@ class HRReportController extends Controller
         $rows = [];
 
         foreach ($applications as $application) {
-            if (!$this->isEmployeeInDirectory($application->employee_control_no, $employeeDirectory)) {
+            if (! $this->isEmployeeInDirectory($application->employee_control_no, $employeeDirectory)) {
                 continue;
             }
 
@@ -543,7 +545,7 @@ class HRReportController extends Controller
             $remarks = $this->trimNullableString($application->remarks);
 
             if ($remarks === null && $application->equivalent_amount !== null) {
-                $remarks = 'Equivalent amount: ' . number_format((float) $application->equivalent_amount, 2);
+                $remarks = 'Equivalent amount: '.number_format((float) $application->equivalent_amount, 2);
             }
 
             $rows[] = [
@@ -633,7 +635,7 @@ class HRReportController extends Controller
             }
 
             $creditedAt = $cocApplication->cto_credited_at ?? $cocApplication->reviewed_at ?? $cocApplication->created_at;
-            if (!$creditedAt) {
+            if (! $creditedAt) {
                 continue;
             }
 
@@ -646,7 +648,7 @@ class HRReportController extends Controller
 
         $approvedCtoRowsByEmployee = [];
         foreach ($applications as $application) {
-            if (!$this->isEmployeeInDirectory($application->employee_control_no, $employeeDirectory)) {
+            if (! $this->isEmployeeInDirectory($application->employee_control_no, $employeeDirectory)) {
                 continue;
             }
 
@@ -656,7 +658,7 @@ class HRReportController extends Controller
             }
 
             $referenceDate = $this->resolveApplicationReferenceDate($application) ?? $application->created_at;
-            if (!$referenceDate) {
+            if (! $referenceDate) {
                 continue;
             }
 
@@ -669,7 +671,7 @@ class HRReportController extends Controller
 
         $rows = [];
         foreach ($applications as $application) {
-            if (!$this->isEmployeeInDirectory($application->employee_control_no, $employeeDirectory)) {
+            if (! $this->isEmployeeInDirectory($application->employee_control_no, $employeeDirectory)) {
                 continue;
             }
 
@@ -680,7 +682,7 @@ class HRReportController extends Controller
             }
 
             $referenceDate = $this->resolveApplicationReferenceDate($application) ?? $application->created_at;
-            if (!$referenceDate) {
+            if (! $referenceDate) {
                 continue;
             }
 
@@ -811,7 +813,7 @@ class HRReportController extends Controller
 
         foreach ($currentBalances as $balanceRow) {
             $controlNo = trim((string) $balanceRow->employee_control_no);
-            if (!$this->isEmployeeInDirectory($controlNo, $employeeDirectory)) {
+            if (! $this->isEmployeeInDirectory($controlNo, $employeeDirectory)) {
                 continue;
             }
 
@@ -821,7 +823,7 @@ class HRReportController extends Controller
             }
 
             $aggregate = &$aggregates[$employeeKey];
-            if (!is_array($aggregate)) {
+            if (! is_array($aggregate)) {
                 $aggregate = [
                     'control_no' => $controlNo,
                     'fallback_name' => trim((string) ($balanceRow->employee_name ?? '')),
@@ -840,7 +842,7 @@ class HRReportController extends Controller
         unset($aggregate);
         foreach ($approvedCocApplications as $cocApplication) {
             $controlNo = trim((string) $cocApplication->employee_control_no);
-            if (!$this->isEmployeeInDirectory($controlNo, $employeeDirectory)) {
+            if (! $this->isEmployeeInDirectory($controlNo, $employeeDirectory)) {
                 continue;
             }
 
@@ -850,7 +852,7 @@ class HRReportController extends Controller
             }
 
             $aggregate = &$aggregates[$employeeKey];
-            if (!is_array($aggregate)) {
+            if (! is_array($aggregate)) {
                 $aggregate = [
                     'control_no' => $controlNo,
                     'fallback_name' => trim((string) ($cocApplication->employee_name ?? '')),
@@ -875,7 +877,7 @@ class HRReportController extends Controller
                     $aggregate['expiry_dates'][] = $resolvedExpiry;
                 }
 
-                if (!$aggregate['latest_earned_at'] || $creditedAt->gt($aggregate['latest_earned_at'])) {
+                if (! $aggregate['latest_earned_at'] || $creditedAt->gt($aggregate['latest_earned_at'])) {
                     $aggregate['latest_earned_at'] = $creditedAt->copy();
                 }
             }
@@ -884,7 +886,7 @@ class HRReportController extends Controller
 
         foreach ($approvedCtoApplications as $application) {
             $controlNo = trim((string) $application->employee_control_no);
-            if (!$this->isEmployeeInDirectory($controlNo, $employeeDirectory)) {
+            if (! $this->isEmployeeInDirectory($controlNo, $employeeDirectory)) {
                 continue;
             }
 
@@ -894,7 +896,7 @@ class HRReportController extends Controller
             }
 
             $aggregate = &$aggregates[$employeeKey];
-            if (!is_array($aggregate)) {
+            if (! is_array($aggregate)) {
                 $aggregate = [
                     'control_no' => $controlNo,
                     'fallback_name' => trim((string) ($application->employee_name ?? '')),
@@ -988,12 +990,12 @@ class HRReportController extends Controller
         $aggregates = [];
 
         foreach ($applications as $application) {
-            if (!$this->isEmployeeInDirectory($application->employee_control_no, $employeeDirectory)) {
+            if (! $this->isEmployeeInDirectory($application->employee_control_no, $employeeDirectory)) {
                 continue;
             }
 
             $referenceDate = $this->resolveApplicationReferenceDate($application) ?? $application->created_at;
-            if (!$referenceDate) {
+            if (! $referenceDate) {
                 continue;
             }
 
@@ -1007,7 +1009,7 @@ class HRReportController extends Controller
             $year = (int) $referenceDate->year;
             $periodKey = sprintf('%04d-%02d', $year, $month);
 
-            if (!array_key_exists($employeeKey, $aggregates)) {
+            if (! array_key_exists($employeeKey, $aggregates)) {
                 $aggregates[$employeeKey] = [
                     'control_no' => $controlNo,
                     'fallback_name' => trim((string) ($application->employee_name ?? '')),
@@ -1120,7 +1122,7 @@ class HRReportController extends Controller
     }
 
     /**
-     * @param array{date_from?: string|null, date_to?: string|null} $validated
+     * @param  array{date_from?: string|null, date_to?: string|null}  $validated
      * @return array{0: Carbon|null, 1: Carbon|null}
      */
     private function toDateRange(array $validated): array
@@ -1139,6 +1141,7 @@ class HRReportController extends Controller
     private function filteredApplicationsQuery(?Carbon $dateFrom, ?Carbon $dateTo): Builder
     {
         $query = LeaveApplication::query();
+
         return $this->applyDateRange($query, $dateFrom, $dateTo);
     }
 
@@ -1188,7 +1191,7 @@ class HRReportController extends Controller
 
     private function ensureHr(Request $request): ?JsonResponse
     {
-        if (!$request->user() instanceof HRAccount) {
+        if (! $request->user() instanceof HRAccount) {
             return response()->json([
                 'message' => 'Only HR accounts can access this resource.',
             ], 403);
@@ -1224,12 +1227,12 @@ class HRReportController extends Controller
                     'designation' => $this->trimNullableString($employee->designation ?? null) ?? '',
                 ];
 
-                if (!array_key_exists($controlNo, $byRaw)) {
+                if (! array_key_exists($controlNo, $byRaw)) {
                     $byRaw[$controlNo] = $entry;
                 }
 
                 $normalizedKey = $this->normalizeControlNoKey($controlNo);
-                if ($normalizedKey !== '' && !array_key_exists($normalizedKey, $byKey)) {
+                if ($normalizedKey !== '' && ! array_key_exists($normalizedKey, $byKey)) {
                     $byKey[$normalizedKey] = $entry;
                 }
             }
@@ -1257,7 +1260,7 @@ class HRReportController extends Controller
             return false;
         }
 
-        if (!array_key_exists($normalizedKey, $directory['by_key'] ?? [])) {
+        if (! array_key_exists($normalizedKey, $directory['by_key'] ?? [])) {
             return false;
         }
 
@@ -1328,17 +1331,24 @@ class HRReportController extends Controller
         $deductibleDays = $application->deductible_days !== null
             ? round((float) $application->deductible_days, 3)
             : $totalDays;
+        $storedWithoutPayDays = $application->without_pay_days !== null
+            ? round(max((float) $application->without_pay_days, 0.0), 3)
+            : null;
 
         if ((bool) $application->is_monetization) {
             return [$deductibleDays, 0.0];
         }
 
         $payMode = strtoupper(trim((string) ($application->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY)));
-        if (!in_array($payMode, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
+        if (! in_array($payMode, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
             $payMode = LeaveApplication::PAY_MODE_WITH_PAY;
         }
 
         $withPayDays = $payMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $deductibleDays;
+        if ($storedWithoutPayDays !== null) {
+            return [round(max($withPayDays, 0.0), 3), $storedWithoutPayDays];
+        }
+
         if ($withPayDays > $totalDays) {
             $withPayDays = $totalDays;
         }
@@ -1385,6 +1395,7 @@ class HRReportController extends Controller
         }
 
         [, $withoutPayDays] = $this->resolveApplicationPayBreakdown($application);
+
         return $withoutPayDays > 0 ? $this->resolveApplicationDateKeys($application) : [];
     }
 
@@ -1435,7 +1446,7 @@ class HRReportController extends Controller
                 return $this->formatDateForDisplay($startDate);
             }
 
-            return $this->formatDateForDisplay($startDate) . ' - ' . $this->formatDateForDisplay($endDate);
+            return $this->formatDateForDisplay($startDate).' - '.$this->formatDateForDisplay($endDate);
         }
 
         return '';
@@ -1449,6 +1460,7 @@ class HRReportController extends Controller
             ->map(function (array $row, int $index): array {
                 unset($row['_sort_key']);
                 $row['no'] = $index + 1;
+
                 return $row;
             })
             ->all();
@@ -1507,7 +1519,7 @@ class HRReportController extends Controller
 
     private function buildEmployeeNameFromSnapshot(?object $employee): ?string
     {
-        if (!$employee) {
+        if (! $employee) {
             return null;
         }
 
@@ -1518,6 +1530,7 @@ class HRReportController extends Controller
         ];
 
         $name = trim(implode(' ', array_filter($parts, static fn (?string $part): bool => $part !== null && $part !== '')));
+
         return $name !== '' ? $name : null;
     }
 
@@ -1544,7 +1557,7 @@ class HRReportController extends Controller
 
         foreach ($creditEvents as $creditEvent) {
             $creditedAt = $creditEvent['credited_at'] ?? null;
-            if (!$creditedAt instanceof Carbon || $creditedAt->gt($referenceDate)) {
+            if (! $creditedAt instanceof Carbon || $creditedAt->gt($referenceDate)) {
                 continue;
             }
 
@@ -1559,6 +1572,7 @@ class HRReportController extends Controller
     private function trimNullableString(mixed $value): ?string
     {
         $trimmed = trim((string) ($value ?? ''));
+
         return $trimmed !== '' ? $trimmed : null;
     }
 
@@ -1632,6 +1646,7 @@ class HRReportController extends Controller
             $expectedNext = Carbon::parse($previous)->addDay()->toDateString();
             if ($current === $expectedNext) {
                 $previous = $current;
+
                 continue;
             }
 
@@ -1649,8 +1664,8 @@ class HRReportController extends Controller
             }
 
             return $this->formatDateForDisplay(Carbon::parse($start))
-                . ' - '
-                . $this->formatDateForDisplay(Carbon::parse($end));
+                .' - '
+                .$this->formatDateForDisplay(Carbon::parse($end));
         }, $segments));
     }
 
@@ -1680,7 +1695,7 @@ class HRReportController extends Controller
 
         foreach ($dates as $date) {
             $resolvedDate = $this->asCarbonDate($date);
-            if (!$resolvedDate) {
+            if (! $resolvedDate) {
                 continue;
             }
 
@@ -1730,7 +1745,7 @@ class HRReportController extends Controller
     private function resolveCocApplicationExpiryDate(COCApplication $application): ?\Carbon\CarbonImmutable
     {
         $creditedAtRaw = $application->cto_credited_at ?? $application->reviewed_at ?? $application->created_at;
-        if (!$creditedAtRaw) {
+        if (! $creditedAtRaw) {
             return null;
         }
 

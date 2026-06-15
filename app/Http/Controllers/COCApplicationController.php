@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Controllers\Concerns\FiltersEmployeeControlNos;
 use App\Models\COCApplication;
 use App\Models\COCApplicationRow;
 use App\Models\DepartmentAdmin;
@@ -22,6 +23,8 @@ use RuntimeException;
 
 class COCApplicationController extends Controller
 {
+    use FiltersEmployeeControlNos;
+
     private const MINUTES_PER_WORKDAY = 480;
 
     private const MINUTES_PER_HOUR = 60;
@@ -1795,7 +1798,7 @@ class COCApplicationController extends Controller
             return $query->whereRaw('1 = 0');
         }
 
-        return $query->whereIn('employee_control_no', $candidateControlNos);
+        return $this->whereInEmployeeControlNos($query, $candidateControlNos);
     }
 
     private function normalizeStatusFilter(?string $status): ?string
@@ -2680,7 +2683,7 @@ class COCApplicationController extends Controller
 
         return LeaveBalance::query()
             ->with('leaveType:id,name')
-            ->whereIn('employee_control_no', $employeeControlNos->all())
+            ->tap(fn ($query) => $this->whereInEmployeeControlNos($query, $employeeControlNos->all()))
             ->get()
             ->groupBy(fn (LeaveBalance $balance) => $this->normalizeControlNo($balance->employee_control_no))
             ->map(fn (Collection $balances) => $this->formatLeaveBalanceSnapshot($balances))

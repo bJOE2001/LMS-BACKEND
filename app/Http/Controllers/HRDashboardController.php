@@ -599,6 +599,9 @@ class HRDashboardController extends Controller
         $deductibleDays = $app->deductible_days !== null
             ? round((float) $app->deductible_days, 3)
             : ($normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $durationDays);
+        $withoutPayDays = $app->without_pay_days !== null
+            ? round(max((float) $app->without_pay_days, 0.0), 3)
+            : round(max($durationDays - $deductibleDays, 0.0), 3);
 
         return [
             'id' => $app->id,
@@ -655,6 +658,7 @@ class HRDashboardController extends Controller
             'without_pay' => $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY,
             'with_pay' => $normalizedPayMode !== LeaveApplication::PAY_MODE_WITHOUT_PAY,
             'deductible_days' => $deductibleDays,
+            'without_pay_days' => $withoutPayDays,
             'is_monetization' => (bool) $app->is_monetization,
             'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
             'leaveBalance' => $this->getBalanceForApp($app, $leaveBalanceDirectory),
