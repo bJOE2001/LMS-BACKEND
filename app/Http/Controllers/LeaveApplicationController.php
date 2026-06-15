@@ -676,6 +676,7 @@ class LeaveApplicationController extends Controller
         $attachmentState = $this->resolveAttachmentStateFromRequest($request, $validated);
         $allowSlVlCrossDeduction = $this->resolveRequestSlVlCrossDeductionFlag($request, $validated);
         $appliedAllowSlVlCrossDeduction = false;
+        $linkedForcedLeaveReservedDays = 0.0;
         $linkedVacationLeaveReservedDays = 0.0;
         $linkedSickLeaveReservedDays = 0.0;
         $policyResolution = $this->applyRegularLeavePolicy(
@@ -784,6 +785,27 @@ class LeaveApplicationController extends Controller
             }
         }
 
+        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
+        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+        $linkedForcedLeaveReservedDays = $this->resolveLeaveTypeForcedLeaveDeductionDays(
+            $leaveType,
+            (int) $validated['leave_type_id'],
+            false,
+            $deductibleDays,
+            $forcedLeaveTypeId
+        );
+        if (! $appliedAllowSlVlCrossDeduction) {
+            $linkedVacationLeaveReservedDays = $this->resolveLeaveTypeVacationLeaveDeductionDays(
+                $leaveType,
+                (int) $validated['leave_type_id'],
+                false,
+                (float) $validated['total_days'],
+                $deductibleDays,
+                $forcedLeaveTypeId,
+                $vacationLeaveTypeId
+            );
+        }
+
         $app = DB::transaction(function () use (
             $validated,
             $employee,
@@ -800,6 +822,7 @@ class LeaveApplicationController extends Controller
             $attachmentSubmitted,
             $attachmentReference,
             $appliedAllowSlVlCrossDeduction,
+            $linkedForcedLeaveReservedDays,
             $linkedVacationLeaveReservedDays,
             $linkedSickLeaveReservedDays
         ) {
@@ -820,6 +843,7 @@ class LeaveApplicationController extends Controller
                 'commutation' => $validated['commutation'] ?? 'Not Requested',
                 'pay_mode' => $requestedPayMode,
                 'allow_sl_vl_cross_deduction' => $appliedAllowSlVlCrossDeduction,
+                'linked_forced_leave_deducted_days' => $linkedForcedLeaveReservedDays > 0.0 ? $linkedForcedLeaveReservedDays : null,
                 'linked_vacation_leave_deducted_days' => $linkedVacationLeaveReservedDays > 0.0 ? $linkedVacationLeaveReservedDays : null,
                 'linked_sick_leave_deducted_days' => $linkedSickLeaveReservedDays > 0.0 ? $linkedSickLeaveReservedDays : null,
                 'attachment_required' => $attachmentRequired,
@@ -1578,6 +1602,7 @@ class LeaveApplicationController extends Controller
         $attachmentState = $this->resolveAttachmentStateFromRequest($request, $validated);
         $allowSlVlCrossDeduction = $this->resolveRequestSlVlCrossDeductionFlag($request, $validated);
         $appliedAllowSlVlCrossDeduction = false;
+        $linkedForcedLeaveReservedDays = 0.0;
         $linkedVacationLeaveReservedDays = 0.0;
         $linkedSickLeaveReservedDays = 0.0;
         $policyResolution = $this->applyRegularLeavePolicy(
@@ -1686,6 +1711,27 @@ class LeaveApplicationController extends Controller
             }
         }
 
+        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
+        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+        $linkedForcedLeaveReservedDays = $this->resolveLeaveTypeForcedLeaveDeductionDays(
+            $leaveType,
+            (int) $validated['leave_type_id'],
+            false,
+            $deductibleDays,
+            $forcedLeaveTypeId
+        );
+        if (! $appliedAllowSlVlCrossDeduction) {
+            $linkedVacationLeaveReservedDays = $this->resolveLeaveTypeVacationLeaveDeductionDays(
+                $leaveType,
+                (int) $validated['leave_type_id'],
+                false,
+                (float) $validated['total_days'],
+                $deductibleDays,
+                $forcedLeaveTypeId,
+                $vacationLeaveTypeId
+            );
+        }
+
         $app = DB::transaction(function () use (
             $validated,
             $employee,
@@ -1702,6 +1748,7 @@ class LeaveApplicationController extends Controller
             $attachmentSubmitted,
             $attachmentReference,
             $appliedAllowSlVlCrossDeduction,
+            $linkedForcedLeaveReservedDays,
             $linkedVacationLeaveReservedDays,
             $linkedSickLeaveReservedDays
         ) {
@@ -1722,6 +1769,7 @@ class LeaveApplicationController extends Controller
                 'commutation' => $validated['commutation'] ?? 'Not Requested',
                 'pay_mode' => $requestedPayMode,
                 'allow_sl_vl_cross_deduction' => $appliedAllowSlVlCrossDeduction,
+                'linked_forced_leave_deducted_days' => $linkedForcedLeaveReservedDays > 0.0 ? $linkedForcedLeaveReservedDays : null,
                 'linked_vacation_leave_deducted_days' => $linkedVacationLeaveReservedDays > 0.0 ? $linkedVacationLeaveReservedDays : null,
                 'linked_sick_leave_deducted_days' => $linkedSickLeaveReservedDays > 0.0 ? $linkedSickLeaveReservedDays : null,
                 'attachment_required' => $attachmentRequired,
@@ -2811,6 +2859,7 @@ class LeaveApplicationController extends Controller
             ? (float) $policyResolution['cto_deducted_hours']
             : null;
         $resolvedAllowSlVlCrossDeduction = false;
+        $linkedForcedLeaveReservedDays = 0.0;
         $linkedVacationLeaveReservedDays = 0.0;
         $linkedSickLeaveReservedDays = 0.0;
         $sourcePayMode = $this->normalizePayMode($app->pay_mode ?? null, false);
@@ -2942,6 +2991,27 @@ class LeaveApplicationController extends Controller
             }
         }
 
+        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
+        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+        $linkedForcedLeaveReservedDays = $this->resolveLeaveTypeForcedLeaveDeductionDays(
+            $leaveType,
+            (int) $app->leave_type_id,
+            false,
+            $deductibleDays,
+            $forcedLeaveTypeId
+        );
+        if (! $resolvedAllowSlVlCrossDeduction) {
+            $linkedVacationLeaveReservedDays = $this->resolveLeaveTypeVacationLeaveDeductionDays(
+                $leaveType,
+                (int) $app->leave_type_id,
+                false,
+                (float) ($app->total_days ?? $deductibleDays),
+                $deductibleDays,
+                $forcedLeaveTypeId,
+                $vacationLeaveTypeId
+            );
+        }
+
         DB::transaction(function () use (
             $app,
             $hr,
@@ -2951,6 +3021,7 @@ class LeaveApplicationController extends Controller
             $deductibleDays,
             $ctoDeductedHours,
             $resolvedAllowSlVlCrossDeduction,
+            $linkedForcedLeaveReservedDays,
             $linkedVacationLeaveReservedDays,
             $linkedSickLeaveReservedDays
         ): void {
@@ -2962,6 +3033,9 @@ class LeaveApplicationController extends Controller
                     ? $ctoDeductedHours
                     : null,
                 'allow_sl_vl_cross_deduction' => $resolvedAllowSlVlCrossDeduction,
+                'linked_forced_leave_deducted_days' => $linkedForcedLeaveReservedDays > 0.0
+                    ? $linkedForcedLeaveReservedDays
+                    : null,
                 'linked_vacation_leave_deducted_days' => $linkedVacationLeaveReservedDays > 0.0
                     ? $linkedVacationLeaveReservedDays
                     : null,
@@ -3685,11 +3759,11 @@ class LeaveApplicationController extends Controller
                             );
                         }
 
-                        return response()->json([
-                            'message' => 'Insufficient Vacation Leave balance for leave approval.'
-                                .' Current: '.self::formatDays($currentVacationBalance)
-                                .', Required: '.self::formatDays($requiredVacationLeaveDays).'.',
-                        ], 422);
+                        return $this->buildInsufficientLinkedVacationLeaveBalanceResponse(
+                            $leaveType,
+                            $currentVacationBalance,
+                            $requiredVacationLeaveDays
+                        );
                     }
                 }
 
@@ -3707,30 +3781,6 @@ class LeaveApplicationController extends Controller
                             'message' => 'Insufficient Sick Leave balance for leave approval.'
                                 .' Current: '.self::formatDays($currentSickBalance)
                                 .', Required: '.self::formatDays($requiredLinkedSickLeaveDays).'.',
-                        ], 422);
-                    }
-                }
-
-                // Business rule: approving Forced Leave also consumes Vacation Leave credits.
-                if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null && $requiredVacationLeaveDays > 0.0) {
-                    $vacationBalance = $this->findPreferredEmployeeLeaveBalanceRecord(
-                        (string) $app->employee_control_no,
-                        $vacationLeaveTypeId
-                    );
-                    $currentVacationBalance = $vacationBalance ? (float) $vacationBalance->balance : 0.0;
-                    if ($currentVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
-                        if ($usesVacationLeaveTopUpForScheduleExcess) {
-                            return $this->buildInsufficientVacationLeaveTopUpResponse(
-                                $leaveType,
-                                $currentVacationBalance,
-                                $requiredVacationLeaveDays
-                            );
-                        }
-
-                        return response()->json([
-                            'message' => 'Insufficient Vacation Leave balance for Mandatory / Forced Leave approval.'
-                                .' Current: '.self::formatDays($currentVacationBalance)
-                                .', Required: '.self::formatDays($requiredVacationLeaveDays).'.',
                         ], 422);
                     }
                 }
@@ -3779,11 +3829,11 @@ class LeaveApplicationController extends Controller
                             );
                         }
 
-                        return response()->json([
-                            'message' => 'Insufficient Vacation Leave balance for leave approval.'
-                                .' Current: '.self::formatDays($currentVacationBalance)
-                                .', Required: '.self::formatDays($requiredVacationLeaveDays).'.',
-                        ], 422);
+                        return $this->buildInsufficientLinkedVacationLeaveBalanceResponse(
+                            $leaveType,
+                            $currentVacationBalance,
+                            $requiredVacationLeaveDays
+                        );
                     }
                 }
 
@@ -3812,29 +3862,6 @@ class LeaveApplicationController extends Controller
                     );
                     if ($monetizationBalanceRestriction instanceof JsonResponse) {
                         return $monetizationBalanceRestriction;
-                    }
-                }
-
-                if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null && $requiredVacationLeaveDays > 0.0) {
-                    $vacationBalance = $this->findAdminEmployeeLeaveBalance(
-                        (int) $app->applicant_admin_id,
-                        $vacationLeaveTypeId
-                    );
-                    $currentVacationBalance = $vacationBalance ? (float) $vacationBalance->balance : 0.0;
-                    if ($currentVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
-                        if ($usesVacationLeaveTopUpForScheduleExcess) {
-                            return $this->buildInsufficientVacationLeaveTopUpResponse(
-                                $leaveType,
-                                $currentVacationBalance,
-                                $requiredVacationLeaveDays
-                            );
-                        }
-
-                        return response()->json([
-                            'message' => 'Insufficient Vacation Leave balance for Mandatory / Forced Leave approval.'
-                                .' Current: '.self::formatDays($currentVacationBalance)
-                                .', Required: '.self::formatDays($requiredVacationLeaveDays).'.',
-                        ], 422);
                     }
                 }
             }
@@ -4158,7 +4185,6 @@ class LeaveApplicationController extends Controller
 
     /**
      * HR recalls an already approved leave application.
-     * Tagum policy: restore VL only and never restore FL.
      */
     public function hrRecall(Request $request, int $id): JsonResponse
     {
@@ -4269,27 +4295,31 @@ class LeaveApplicationController extends Controller
             : ['days' => 0.0, 'dates' => []];
         $daysToRestore = round((float) ($recallDetails['days'] ?? 0.0), 3);
 
-        $restoreLeaveTypeId = (int) $app->leave_type_id;
-        if ($forcedLeaveTypeId !== null && (int) $app->leave_type_id === $forcedLeaveTypeId) {
-            if ($vacationLeaveTypeId === null) {
-                return response()->json([
-                    'message' => 'Cannot recall Mandatory / Forced Leave because Vacation Leave type is not configured.',
-                ], 422);
-            }
-            // Tagum policy: FL is not restored; restore VL only.
-            $restoreLeaveTypeId = $vacationLeaveTypeId;
-        }
-        $mainRestoreDays = $daysToRestore;
-        if ($forcedLeaveTypeId !== null && (int) $app->leave_type_id === $forcedLeaveTypeId) {
-            $mainRestoreDays = min(
-                $daysToRestore,
-                $this->resolveStoredLinkedVacationLeaveDeduction(
-                    $app,
-                    $leaveType,
-                    $this->resolveApplicationDeductibleDays($app)
-                )
-            );
-        }
+        $applicationDeductibleDays = $this->resolveApplicationDeductibleDays($app);
+        $primaryRestoreDays = min(
+            $daysToRestore,
+            $this->resolveStoredPrimaryLeaveDeduction(
+                $app,
+                $leaveType,
+                $applicationDeductibleDays
+            )
+        );
+        $linkedForcedRestoreDays = min(
+            $daysToRestore,
+            $this->resolveStoredLinkedForcedLeaveDeduction(
+                $app,
+                $leaveType,
+                $applicationDeductibleDays
+            )
+        );
+        $linkedVacationRestoreDays = min(
+            $daysToRestore,
+            $this->resolveStoredLinkedVacationLeaveDeduction(
+                $app,
+                $leaveType,
+                $applicationDeductibleDays
+            )
+        );
         $recallRemarks = $reason !== ''
             ? "Recalled by HR: {$reason}"
             : 'Recalled by HR';
@@ -4300,8 +4330,11 @@ class LeaveApplicationController extends Controller
             DB::transaction(function () use (
                 $app,
                 $hr,
-                $mainRestoreDays,
-                $restoreLeaveTypeId,
+                $primaryRestoreDays,
+                $linkedForcedRestoreDays,
+                $linkedVacationRestoreDays,
+                $forcedLeaveTypeId,
+                $vacationLeaveTypeId,
                 $recallRemarks,
                 $effectiveRecallDate,
                 $mergedRecallDateKeys,
@@ -4309,8 +4342,16 @@ class LeaveApplicationController extends Controller
                 $pendingUpdateRequest,
                 $pendingReviewRemarks
             ): void {
-                if ($mainRestoreDays > 0.0) {
-                    $this->restoreApplicationBalance($app, $restoreLeaveTypeId, $mainRestoreDays);
+                if ($primaryRestoreDays > 0.0) {
+                    $this->restoreApplicationBalance($app, (int) $app->leave_type_id, $primaryRestoreDays);
+                }
+
+                if ($linkedForcedRestoreDays > 0.0 && $forcedLeaveTypeId !== null) {
+                    $this->restoreApplicationBalance($app, $forcedLeaveTypeId, $linkedForcedRestoreDays);
+                }
+
+                if ($linkedVacationRestoreDays > 0.0 && $vacationLeaveTypeId !== null) {
+                    $this->restoreApplicationBalance($app, $vacationLeaveTypeId, $linkedVacationRestoreDays);
                 }
 
                 $updatePayload = [
@@ -6562,6 +6603,7 @@ class LeaveApplicationController extends Controller
             'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
             'without_pay' => $withoutPay,
             'with_pay' => ! $withoutPay,
+            'linked_forced_leave_deducted_days' => round(max((float) ($app->linked_forced_leave_deducted_days ?? 0.0), 0.0), 3),
             'linked_vacation_leave_deducted_days' => round(max((float) ($app->linked_vacation_leave_deducted_days ?? 0.0), 0.0), 3),
             'linked_sick_leave_deducted_days' => round(max((float) ($app->linked_sick_leave_deducted_days ?? 0.0), 0.0), 3),
             'attachment_required' => (bool) ($app->attachment_required ?? false),
@@ -8503,7 +8545,7 @@ class LeaveApplicationController extends Controller
             $primaryDaysToDeduct = (float) ($storedSlVlCrossDeductionBreakdown['primary_deduction_days'] ?? $primaryDaysToDeduct);
             $linkedVacationLeaveRequiredDays = (float) ($storedSlVlCrossDeductionBreakdown['linked_vacation_deduction_days'] ?? 0.0);
             $linkedSickLeaveRequiredDays = (float) ($storedSlVlCrossDeductionBreakdown['linked_sick_deduction_days'] ?? 0.0);
-        } elseif ($primaryLeaveType instanceof LeaveType) {
+        } elseif ($primaryLeaveType instanceof LeaveType && $allowSlVlCrossDeduction) {
             $linkedPrimaryAvailable = $primaryBalance ? max((float) $primaryBalance->balance, 0.0) : 0.0;
             $linkedLeaveTypeId = $this->resolveSlVlCrossDeductionTargetLeaveTypeId(
                 $primaryLeaveType,
@@ -8571,8 +8613,8 @@ class LeaveApplicationController extends Controller
         $linkedForcedLeaveDeductedDays = 0.0;
         if ($shouldDeductForcedLeave && $forcedLeaveTypeId !== null) {
             $forcedBalance = $this->lockEmployeeLeaveBalance($employeeControlNo, $forcedLeaveTypeId);
-            $forcedAvailable = $forcedBalance ? (float) $forcedBalance->balance : 0.0;
-            $linkedForcedLeaveDeductedDays = round(min($primaryDaysToDeduct, max($forcedAvailable, 0.0)), 3);
+            $forcedAvailable = $forcedBalance ? max((float) $forcedBalance->balance, 0.0) : 0.0;
+            $linkedForcedLeaveDeductedDays = round(min(max($primaryDaysToDeduct, 0.0), $forcedAvailable), 3);
 
             if ($forcedBalance && $linkedForcedLeaveDeductedDays > 0.0) {
                 $forcedBalance->decrement('balance', $linkedForcedLeaveDeductedDays);
@@ -9050,6 +9092,25 @@ class LeaveApplicationController extends Controller
         }
 
         return strcasecmp(trim((string) ($leaveType->name ?? '')), 'Vacation Leave') === 0;
+    }
+
+    private function resolveLeaveTypeForcedLeaveDeductionDays(
+        LeaveType $leaveType,
+        int $leaveTypeId,
+        bool $isMonetization,
+        float $deductibleDays,
+        ?int $forcedLeaveTypeId
+    ): float {
+        if (! $this->shouldLeaveTypeDeductForcedLeave(
+            $leaveType,
+            $leaveTypeId,
+            $isMonetization,
+            $forcedLeaveTypeId
+        )) {
+            return 0.0;
+        }
+
+        return round(max($deductibleDays, 0.0), 3);
     }
 
     private function isWellnessLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
@@ -12225,36 +12286,6 @@ class LeaveApplicationController extends Controller
 
         $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
         $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
-        if ($forcedLeaveTypeId !== null && (int) $leaveTypeId === $forcedLeaveTypeId) {
-            $requiredVacationLeaveDays = round(max($requestedDays, 0.0), 3);
-            if ($requiredVacationLeaveDays > 0) {
-                if ($vacationLeaveTypeId !== null) {
-                    $vacationBalanceSnapshot = $this->resolveEmployeeLeaveBalanceSnapshot(
-                        $employeeControlNo,
-                        $vacationLeaveTypeId
-                    );
-                    $availableVacationBalance = (float) ($vacationBalanceSnapshot['available_balance'] ?? 0.0);
-                    if ($availableVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
-                        return response()->json([
-                            'message' => 'Insufficient Vacation Leave balance to apply Mandatory / Forced Leave.',
-                            'errors' => [
-                                'leave_type_id' => ['Mandatory / Forced Leave requires enough Vacation Leave balance.'],
-                                'vacation_leave_balance' => [
-                                    'Available Vacation Leave is '
-                                    .self::formatDays($availableVacationBalance)
-                                    .', but '
-                                    .self::formatDays($requiredVacationLeaveDays)
-                                    .' is required.',
-                                ],
-                            ],
-                            'available_vacation_leave_days' => $availableVacationBalance,
-                            'required_vacation_leave_days' => $requiredVacationLeaveDays,
-                        ], 422);
-                    }
-                }
-            }
-        }
-
         $normalizedPayMode = $this->normalizePayMode($payMode);
         $requiredBalanceDays = round(max((float) ($requestedDeductibleDays ?? $requestedDays), 0.0), 3);
         $requiresVacationLeaveTopUp = $this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
@@ -12262,6 +12293,13 @@ class LeaveApplicationController extends Controller
             $leaveTypeId,
             false,
             $vacationLeaveTypeId
+        );
+        $requiredForcedLeaveDays = $this->resolveLeaveTypeForcedLeaveDeductionDays(
+            $leaveType,
+            $leaveTypeId,
+            false,
+            $requiredBalanceDays,
+            $forcedLeaveTypeId
         );
         $requiredVacationLeaveDays = $requiresVacationLeaveTopUp
             ? $this->resolveLeaveTypeVacationLeaveDeductionDays(
@@ -12274,6 +12312,17 @@ class LeaveApplicationController extends Controller
                 $vacationLeaveTypeId
             )
             : 0.0;
+        if (! $requiresVacationLeaveTopUp) {
+            $requiredVacationLeaveDays = $this->resolveLeaveTypeVacationLeaveDeductionDays(
+                $leaveType,
+                $leaveTypeId,
+                false,
+                $requestedDays,
+                $requiredBalanceDays,
+                $forcedLeaveTypeId,
+                $vacationLeaveTypeId
+            );
+        }
         if ($requiresVacationLeaveTopUp && $requiredVacationLeaveDays > 0.0) {
             $requiredBalanceDays = $this->resolvePrimaryLeaveTrackedDeductionDays(
                 $leaveType,
@@ -12300,6 +12349,8 @@ class LeaveApplicationController extends Controller
                 'pending_reserved_hours' => 0.0,
                 'required_balance_days' => $requiredBalanceDays,
                 'required_balance_hours' => $requestedCtoHours !== null ? round(max($requestedCtoHours, 0.0), 2) : null,
+                'required_forced_leave_days' => $requiredForcedLeaveDays,
+                'required_vacation_leave_days' => $requiredVacationLeaveDays,
                 'insufficient_balance' => false,
             ];
         }
@@ -12342,6 +12393,21 @@ class LeaveApplicationController extends Controller
             }
         }
 
+        if (! $requiresVacationLeaveTopUp && $requiredVacationLeaveDays > 0.0) {
+            $vacationBalanceSnapshot = $this->resolveEmployeeLeaveBalanceSnapshot(
+                $employeeControlNo,
+                $vacationLeaveTypeId ?? 0
+            );
+            $availableVacationBalance = (float) ($vacationBalanceSnapshot['available_balance'] ?? 0.0);
+            if ($availableVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
+                return $this->buildInsufficientLinkedVacationLeaveBalanceResponse(
+                    $leaveType,
+                    $availableVacationBalance,
+                    $requiredVacationLeaveDays
+                );
+            }
+        }
+
         return [
             'leave_type' => $leaveType,
             'balance' => $currentBalance,
@@ -12352,6 +12418,7 @@ class LeaveApplicationController extends Controller
             'pending_reserved_hours' => $pendingReservedHours,
             'required_balance_days' => $requiredBalanceDays,
             'required_balance_hours' => $requiredBalanceHours,
+            'required_forced_leave_days' => $requiredForcedLeaveDays,
             'required_vacation_leave_days' => $requiredVacationLeaveDays,
             'insufficient_balance' => $insufficientBalance,
         ];
@@ -12447,6 +12514,36 @@ class LeaveApplicationController extends Controller
                     $leaveType->name
                     .' needs Vacation Leave to cover the schedule-based excess deduction.',
                 ],
+                'vacation_leave_balance' => [
+                    'Available Vacation Leave is '
+                    .self::formatDays($availableVacationBalance)
+                    .', but '
+                    .self::formatDays($requiredVacationLeaveDays)
+                    .' is required.',
+                ],
+            ],
+            'available_vacation_leave_days' => $availableVacationBalance,
+            'required_vacation_leave_days' => $requiredVacationLeaveDays,
+        ], 422);
+    }
+
+    private function buildInsufficientLinkedVacationLeaveBalanceResponse(
+        LeaveType $leaveType,
+        float $availableVacationBalance,
+        float $requiredVacationLeaveDays
+    ): JsonResponse {
+        $isForcedLeave = strcasecmp(trim((string) $leaveType->name), 'Mandatory / Forced Leave') === 0;
+        $message = $isForcedLeave
+            ? 'Insufficient Vacation Leave balance to apply Mandatory / Forced Leave.'
+            : 'Insufficient Vacation Leave balance for '.$leaveType->name.'.';
+        $leaveTypeError = $isForcedLeave
+            ? 'Mandatory / Forced Leave requires enough Vacation Leave balance.'
+            : $leaveType->name.' requires matching Vacation Leave balance.';
+
+        return response()->json([
+            'message' => $message,
+            'errors' => [
+                'leave_type_id' => [$leaveTypeError],
                 'vacation_leave_balance' => [
                     'Available Vacation Leave is '
                     .self::formatDays($availableVacationBalance)
@@ -12775,6 +12872,7 @@ class LeaveApplicationController extends Controller
             'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
             'without_pay' => $withoutPay,
             'with_pay' => ! $withoutPay,
+            'linked_forced_leave_deducted_days' => round(max((float) ($app->linked_forced_leave_deducted_days ?? 0.0), 0.0), 3),
             'linked_vacation_leave_deducted_days' => round(max((float) ($app->linked_vacation_leave_deducted_days ?? 0.0), 0.0), 3),
             'linked_sick_leave_deducted_days' => round(max((float) ($app->linked_sick_leave_deducted_days ?? 0.0), 0.0), 3),
             'attachment_required' => (bool) ($app->attachment_required ?? false),
