@@ -11,6 +11,8 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
  */
 class LeaveType extends Model
 {
+    public const FORCED_LEAVE_NAME = 'Mandatory / Forced Leave';
+
     public const SPECIAL_PRIVILEGE_LEAVE_NAME = 'Special Privilege Leave';
     public const SPECIAL_PRIVILEGE_LEGACY_NAMES = [
         'MCO6 Leave',
@@ -270,6 +272,57 @@ class LeaveType extends Model
         return self::isSpecialPrivilegeAliasName($trimmedName)
             ? self::SPECIAL_PRIVILEGE_LEAVE_NAME
             : $trimmedName;
+    }
+
+    public static function isForcedLeaveName(mixed $name): bool
+    {
+        return self::normalizeLeaveTypeName($name) === self::normalizeLeaveTypeName(self::FORCED_LEAVE_NAME);
+    }
+
+    public static function resolveForcedLeaveTypeId(): ?int
+    {
+        static $resolved = false;
+        static $cachedValue = null;
+
+        if ($resolved) {
+            return $cachedValue;
+        }
+
+        $value = self::query()
+            ->whereRaw('UPPER(LTRIM(RTRIM(name))) = ?', [self::normalizeLeaveTypeName(self::FORCED_LEAVE_NAME)])
+            ->value('id');
+
+        $cachedValue = $value !== null ? (int) $value : null;
+        $resolved = true;
+
+        return $cachedValue;
+    }
+
+    public static function isForcedLeaveType(?self $leaveType = null, ?int $leaveTypeId = null): bool
+    {
+        if ($leaveType instanceof self && self::isForcedLeaveName($leaveType->name)) {
+            return true;
+        }
+
+        $normalizedLeaveTypeId = (int) ($leaveTypeId ?? 0);
+        if ($normalizedLeaveTypeId <= 0) {
+            return false;
+        }
+
+        $canonicalLeaveTypeId = self::resolveCanonicalLeaveTypeId($normalizedLeaveTypeId) ?? $normalizedLeaveTypeId;
+        $forcedLeaveTypeId = self::resolveForcedLeaveTypeId();
+        if ($forcedLeaveTypeId !== null && $canonicalLeaveTypeId === $forcedLeaveTypeId) {
+            return true;
+        }
+
+        static $nameCache = [];
+        if (! array_key_exists($canonicalLeaveTypeId, $nameCache)) {
+            $nameCache[$canonicalLeaveTypeId] = self::query()
+                ->whereKey($canonicalLeaveTypeId)
+                ->value('name');
+        }
+
+        return self::isForcedLeaveName($nameCache[$canonicalLeaveTypeId]);
     }
 
     public static function resolveSpecialPrivilegeLeaveTypeId(): ?int

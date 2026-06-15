@@ -56,6 +56,13 @@ class LeaveApplication extends Model
             }
 
             $application->monetization_leave_credits = null;
+            $isForcedLeave = self::isForcedLeaveApplication($application);
+            if ($isForcedLeave) {
+                $application->pay_mode = self::PAY_MODE_WITH_PAY;
+                $application->selected_date_pay_status = null;
+                $application->without_pay_days = 0.0;
+            }
+
             $application->selected_dates = self::resolveSelectedDates(
                 $application->start_date,
                 $application->end_date,
@@ -65,9 +72,11 @@ class LeaveApplication extends Model
 
             $totalDays = round((float) ($application->total_days ?? 0), 2);
             $fallbackDeductible = $application->pay_mode === self::PAY_MODE_WITHOUT_PAY ? 0.0 : $totalDays;
-            $deductibleDays = $application->deductible_days !== null
-                ? round((float) $application->deductible_days, 3)
-                : $fallbackDeductible;
+            $deductibleDays = $isForcedLeave
+                ? $totalDays
+                : ($application->deductible_days !== null
+                    ? round((float) $application->deductible_days, 3)
+                    : $fallbackDeductible);
 
             if ($deductibleDays < 0) {
                 $deductibleDays = 0.0;
@@ -97,6 +106,16 @@ class LeaveApplication extends Model
                 ? round(max((float) $application->cto_deducted_hours, 0.0), 2)
                 : null;
         });
+    }
+
+    private static function isForcedLeaveApplication(self $application): bool
+    {
+        $leaveType = $application->relationLoaded('leaveType') ? $application->leaveType : null;
+
+        return LeaveType::isForcedLeaveType(
+            $leaveType instanceof LeaveType ? $leaveType : null,
+            (int) ($application->leave_type_id ?? 0)
+        );
     }
 
     // This system uses ERMS ControlNo as the authoritative employee identifier.

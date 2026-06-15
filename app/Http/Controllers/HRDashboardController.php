@@ -10,6 +10,7 @@ use App\Models\LeaveApplication;
 use App\Models\LeaveApplicationLog;
 use App\Models\LeaveApplicationUpdateRequest;
 use App\Models\LeaveBalance;
+use App\Models\LeaveType;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -590,18 +591,30 @@ class HRDashboardController extends Controller
         $durationDays = (float) $app->total_days;
         $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
         $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
-        $selectedDatePayStatus = is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null;
+        $isForcedLeave = LeaveType::isForcedLeaveType($app->leaveType, (int) $app->leave_type_id);
+        $selectedDatePayStatus = $isForcedLeave
+            ? null
+            : (is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null);
         $selectedDateCoverage = is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null;
         $normalizedPayMode = strtoupper(trim((string) ($app->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY)));
         if (! in_array($normalizedPayMode, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
             $normalizedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
         }
-        $deductibleDays = $app->deductible_days !== null
-            ? round((float) $app->deductible_days, 3)
-            : ($normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $durationDays);
-        $withoutPayDays = $app->without_pay_days !== null
-            ? round(max((float) $app->without_pay_days, 0.0), 3)
-            : round(max($durationDays - $deductibleDays, 0.0), 3);
+        if ($isForcedLeave) {
+            $normalizedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+        if ($isForcedLeave) {
+            $deductibleDays = round(max($durationDays, 0.0), 3);
+        } else {
+            $deductibleDays = $app->deductible_days !== null
+                ? round((float) $app->deductible_days, 3)
+                : ($normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $durationDays);
+        }
+        $withoutPayDays = $isForcedLeave
+            ? 0.0
+            : ($app->without_pay_days !== null
+                ? round(max((float) $app->without_pay_days, 0.0), 3)
+                : round(max($durationDays - $deductibleDays, 0.0), 3));
 
         return [
             'id' => $app->id,

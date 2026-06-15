@@ -642,8 +642,19 @@ class AdminDashboardController extends Controller
         $appliedAllowSlVlCrossDeduction = false;
         $linkedVacationLeaveReservedDays = 0.0;
         $linkedSickLeaveReservedDays = 0.0;
-        $isForcedLeave = strcasecmp(trim((string) $leaveType->name), 'Mandatory / Forced Leave') === 0;
+        $isForcedLeave = LeaveType::isForcedLeaveType($leaveType, (int) $leaveType->id);
         if ($isForcedLeave) {
+            $requestedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
+            $selectedDatePayStatus = [];
+            $requestedDeductibleDays = $this->resolveRequestedDeductibleDays(
+                $resolvedSelectedDates,
+                $selectedDateCoverage,
+                $selectedDatePayStatus,
+                $requestedPayMode,
+                $requestedTotalDays,
+                $adminEmployeeControlNo
+            );
+
             if ($vacationLeaveTypeId !== null) {
                 $vacationBalance = $this->findAdminEmployeeBalanceByLeaveType($admin, (int) $vacationLeaveTypeId);
                 $availableVacationBalance = $vacationBalance ? (float) $vacationBalance->balance : 0.0;
@@ -735,6 +746,7 @@ class AdminDashboardController extends Controller
         if (
             $leaveType->is_credit_based
             && $requestedPayMode !== LeaveApplication::PAY_MODE_WITHOUT_PAY
+            && ! $isForcedLeave
         ) {
             $balance = $this->findAdminEmployeeBalanceByLeaveType($admin, (int) $leaveType->id);
             $currentBalance = $balance ? (float) $balance->balance : 0.0;
@@ -853,6 +865,12 @@ class AdminDashboardController extends Controller
             $selectedDatePayStatus,
             $deductibleDays
         );
+        if ($isForcedLeave) {
+            $requestedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
+            $selectedDatePayStatus = [];
+            $deductibleDays = $requestedDeductibleDays;
+            $linkedVacationLeaveReservedDays = $deductibleDays;
+        }
         if ($requestedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
             $deductibleDays = 0.0;
         }
@@ -2126,17 +2144,29 @@ class AdminDashboardController extends Controller
             ? $this->formatMonetizationComponentsLabel($monetizationComponents, false)
             : ($app->leaveType?->name ?? 'Unknown');
         $selectedDates = $app->resolvedSelectedDates();
+        $isForcedLeave = LeaveType::isForcedLeaveType($app->leaveType, (int) $app->leave_type_id);
         $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
+        if ($isForcedLeave) {
+            $normalizedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
+        }
         $withoutPay = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
-        $selectedDatePayStatus = is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null;
+        $selectedDatePayStatus = $isForcedLeave
+            ? null
+            : (is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null);
         $selectedDateCoverage = is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null;
-        $deductibleDays = $app->deductible_days !== null
-            ? round((float) $app->deductible_days, 3)
-            : ($withoutPay ? 0.0 : round(max($durationDays, 0.0), 2));
+        if ($isForcedLeave) {
+            $deductibleDays = round(max($durationDays, 0.0), 3);
+        } else {
+            $deductibleDays = $app->deductible_days !== null
+                ? round((float) $app->deductible_days, 3)
+                : ($withoutPay ? 0.0 : round(max($durationDays, 0.0), 2));
+        }
         $deductibleDays = round(max($deductibleDays, 0.0), 3);
-        $withoutPayDays = $app->without_pay_days !== null
-            ? round(max((float) $app->without_pay_days, 0.0), 3)
-            : round(max($durationDays - $deductibleDays, 0.0), 3);
+        $withoutPayDays = $isForcedLeave
+            ? 0.0
+            : ($app->without_pay_days !== null
+                ? round(max((float) $app->without_pay_days, 0.0), 3)
+                : round(max($durationDays - $deductibleDays, 0.0), 3));
         $pendingApprovedUpdateRequest = $this->resolvePendingApprovedUpdateRequestRecord($app);
         $latestApprovedUpdateRequest = $this->resolveLatestApprovedUpdateRequestRecord($app);
         $pendingUpdatePayload = $this->normalizeUpdateRequestPayload(

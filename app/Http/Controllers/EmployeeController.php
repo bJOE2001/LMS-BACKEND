@@ -963,6 +963,7 @@ class EmployeeController extends Controller
                 $balanceKey
             );
         }
+        $currentLedgerBalances = $runningBalances;
 
         $transactions = [];
         if ($trackedTypeIds !== []) {
@@ -1016,6 +1017,9 @@ class EmployeeController extends Controller
                     $isManualAddSource = $source === 'HR_ADD' || str_starts_with($source, 'HR_ADD:');
                     $isManualEditSource = $source === 'HR_EDIT' || str_starts_with($source, 'HR_EDIT:');
                     $isManualBalanceSource = $isManualAddSource || $isManualEditSource;
+                    $isForcedLeaveBalanceEntry = is_int($forcedLeaveTypeId)
+                        && $forcedLeaveTypeId > 0
+                        && (int) $typeId === $forcedLeaveTypeId;
                     $actionTaken = match (true) {
                         $isManualAddSource => 'Initial leave balance',
                         $isManualEditSource => 'Leave credits adjusted',
@@ -1067,6 +1071,7 @@ class EmployeeController extends Controller
                         'category' => $entryCategory,
                         'amount' => $displayAmount,
                         'balance_delta' => $creditsAdded,
+                        'suppress_display' => $isForcedLeaveBalanceEntry && $isManualBalanceSource,
                     ];
                 }
             }
@@ -1116,6 +1121,30 @@ class EmployeeController extends Controller
                 ->orderByDesc('created_at')
                 ->orderByDesc('id')
                 ->get($approvedApplicationColumns);
+
+            $inferredForcedLeaveDeductions = [
+                'by_application_id' => [],
+                'total' => 0.0,
+            ];
+            if (is_int($forcedLeaveTypeId) && $forcedLeaveTypeId > 0) {
+                $forcedBalanceKey = $balanceKeyByTypeId[$forcedLeaveTypeId]
+                    ?? $this->resolveLedgerRunningBalanceKey('other', $forcedLeaveTypeId, true);
+
+                if (is_string($forcedBalanceKey) && $forcedBalanceKey !== '' && array_key_exists($forcedBalanceKey, $runningBalances)) {
+                    $inferredForcedLeaveDeductions = $this->resolveLedgerInferredForcedLeaveDeductions(
+                        $approvedApplications,
+                        $forcedLeaveTypeId,
+                        $this->roundLedgerValue($runningBalances[$forcedBalanceKey])
+                    );
+                    $inferredForcedLeaveTotal = $this->roundLedgerValue($inferredForcedLeaveDeductions['total'] ?? 0.0);
+                    if ($inferredForcedLeaveTotal > 0.0) {
+                        $runningBalances[$forcedBalanceKey] = $this->roundLedgerValue(
+                            (float) $runningBalances[$forcedBalanceKey] - $inferredForcedLeaveTotal
+                        );
+                    }
+                }
+            }
+            $currentLedgerBalances = $runningBalances;
 
             foreach ($approvedApplications as $application) {
                 $typeId = (int) $application->leave_type_id;
@@ -1167,11 +1196,17 @@ class EmployeeController extends Controller
                     max((float) ($application->linked_forced_leave_deducted_days ?? 0), 0.0),
                     3
                 );
+                if ($isForcedLeave && $linkedForcedWithPayAmount <= 0.0) {
+                    $linkedForcedWithPayAmount = round(
+                        max((float) ($inferredForcedLeaveDeductions['by_application_id'][(int) $application->id] ?? 0.0), 0.0),
+                        3
+                    );
+                }
                 $linkedSickWithPayAmount = round(
                     max((float) ($application->linked_sick_leave_deducted_days ?? 0), 0.0),
                     3
                 );
-                if ($typeKey !== 'vacation') {
+                if ($typeKey !== 'vacation' && ! $isForcedLeave) {
                     $linkedForcedWithPayAmount = 0.0;
                 }
                 if ($typeKey === 'vacation') {
@@ -1183,11 +1218,12 @@ class EmployeeController extends Controller
                 $linkedForcedWithPayAmount = round(min($linkedForcedWithPayAmount, $withPayAmount), self::LEDGER_DECIMAL_PRECISION);
                 $linkedVacationWithPayAmount = round(min($linkedVacationWithPayAmount, $withPayAmount), self::LEDGER_DECIMAL_PRECISION);
                 $linkedSickWithPayAmount = round(min($linkedSickWithPayAmount, $withPayAmount), self::LEDGER_DECIMAL_PRECISION);
-                $linkedVacationPrimaryOffsetAmount = $isForcedLeave ? 0.0 : $linkedVacationWithPayAmount;
-                $primaryWithPayAmount = round(
-                    max($withPayAmount - $linkedVacationPrimaryOffsetAmount - $linkedSickWithPayAmount, 0.0),
-                    self::LEDGER_DECIMAL_PRECISION
-                );
+                $primaryWithPayAmount = $isForcedLeave
+                    ? 0.0
+                    : round(
+                        max($withPayAmount - $linkedVacationWithPayAmount - $linkedSickWithPayAmount, 0.0),
+                        self::LEDGER_DECIMAL_PRECISION
+                    );
 
                 $withoutPayAmount = round(
                     max((float) ($payAmounts['without_pay'] ?? 0.0), 0.0),
@@ -1340,6 +1376,7 @@ class EmployeeController extends Controller
                             'category' => 'deduction_with_pay',
                             'amount' => $linkedForcedWithPayAmount,
                             'balance_delta' => -$linkedForcedWithPayAmount,
+                            'suppress_display' => true,
                         ];
                     }
                 }
@@ -1528,6 +1565,7 @@ class EmployeeController extends Controller
                                 'category' => 'earned',
                                 'amount' => $linkedForcedRestoredAmount,
                                 'balance_delta' => $linkedForcedRestoredAmount,
+                                'suppress_display' => true,
                             ];
                         }
                     }
@@ -1617,6 +1655,9 @@ class EmployeeController extends Controller
             $runningBalances[$balanceKey] = $this->roundLedgerValue(
                 $currentBalance - (float) ($transaction['balance_delta'] ?? 0)
             );
+            if ((bool) ($transaction['suppress_display'] ?? false)) {
+                continue;
+            }
 
             $actionDate = (string) ($transaction['transaction_date'] ?? '');
             $particulars = trim((string) ($transaction['particulars'] ?? ''));
@@ -1727,6 +1768,13 @@ class EmployeeController extends Controller
         $firstDayOfService = HrisEmployee::firstDayOfServiceByControlNo(
             (string) ($employee->control_no ?? $controlNo)
         ) ?? $this->normalizeLedgerDateString($employee->from_date ?? null);
+        $ledgerBalanceBadges = $this->buildLedgerBalanceBadges(
+            $currentLedgerBalances,
+            $trackedTypeIdsByKey,
+            $balanceKeyByTypeId,
+            $otherTypeIds,
+            $otherTypeCodeById
+        );
 
         return response()->json([
             'employee' => [
@@ -1744,6 +1792,10 @@ class EmployeeController extends Controller
             'leave_balance_ledger' => $ledgerRows,
             'leave_credits_ledger' => $ledgerRows,
             'leaveCreditsLedger' => $ledgerRows,
+            'balances' => $ledgerBalanceBadges,
+            'leave_balances' => $ledgerBalanceBadges,
+            'ledger_balances' => $ledgerBalanceBadges,
+            'leaveBalanceBadges' => $ledgerBalanceBadges,
         ]);
     }
 
@@ -3410,6 +3462,69 @@ class EmployeeController extends Controller
         return $this->roundLedgerValue($balancesByType[$leaveTypeId]->balance ?? 0);
     }
 
+    /**
+     * @param  array<string, float>  $currentLedgerBalances
+     * @param  array<string, mixed>  $trackedTypeIdsByKey
+     * @param  array<int, string>  $balanceKeyByTypeId
+     * @param  array<int, int>  $otherTypeIds
+     * @param  array<int, string|null>  $otherTypeCodeById
+     * @return array<int, array{code:string, label:string, balance:float, leave_type_id:int|null, balance_key:string}>
+     */
+    private function buildLedgerBalanceBadges(
+        array $currentLedgerBalances,
+        array $trackedTypeIdsByKey,
+        array $balanceKeyByTypeId,
+        array $otherTypeIds,
+        array $otherTypeCodeById
+    ): array {
+        $badges = [];
+        $seenBalanceKeys = [];
+
+        $addBadge = function (string $code, ?int $leaveTypeId, string $balanceKey) use (&$badges, &$seenBalanceKeys, $currentLedgerBalances): void {
+            $normalizedBalanceKey = trim($balanceKey);
+            if ($normalizedBalanceKey === '' || isset($seenBalanceKeys[$normalizedBalanceKey])) {
+                return;
+            }
+
+            $seenBalanceKeys[$normalizedBalanceKey] = true;
+            $normalizedCode = strtoupper(trim($code));
+            $badges[] = [
+                'code' => $normalizedCode,
+                'label' => $normalizedCode,
+                'balance' => $this->roundLedgerValue($currentLedgerBalances[$normalizedBalanceKey] ?? 0.0),
+                'leave_type_id' => $leaveTypeId !== null && $leaveTypeId > 0 ? $leaveTypeId : null,
+                'balance_key' => $normalizedBalanceKey,
+            ];
+        };
+
+        $vacationLeaveTypeId = $trackedTypeIdsByKey['vacation'] ?? null;
+        $sickLeaveTypeId = $trackedTypeIdsByKey['sick'] ?? null;
+        $addBadge('VL', is_int($vacationLeaveTypeId) ? $vacationLeaveTypeId : null, 'vacation');
+        $addBadge('SL', is_int($sickLeaveTypeId) ? $sickLeaveTypeId : null, 'sick');
+
+        foreach ($otherTypeIds as $otherTypeId) {
+            $normalizedTypeId = (int) $otherTypeId;
+            if ($normalizedTypeId <= 0) {
+                continue;
+            }
+
+            $balanceKey = $balanceKeyByTypeId[$normalizedTypeId]
+                ?? $this->resolveLedgerRunningBalanceKey('other', $normalizedTypeId);
+            if (! is_string($balanceKey) || $balanceKey === '') {
+                continue;
+            }
+
+            $otherTypeCode = $otherTypeCodeById[$normalizedTypeId] ?? null;
+            $addBadge(
+                $this->resolveLedgerTypeCode('other', is_string($otherTypeCode) ? $otherTypeCode : null, false) ?? 'OT'.$normalizedTypeId,
+                $normalizedTypeId,
+                $balanceKey
+            );
+        }
+
+        return $badges;
+    }
+
     private function roundLedgerValue(mixed $value): float
     {
         return round((float) $value, self::LEDGER_DECIMAL_PRECISION);
@@ -3688,6 +3803,99 @@ class EmployeeController extends Controller
         return [
             'with_pay' => round(max($withPayAmount, 0.0), self::LEDGER_DECIMAL_PRECISION),
             'without_pay' => round(max($weightedWithoutPay, 0.0), self::LEDGER_DECIMAL_PRECISION),
+        ];
+    }
+
+    /**
+     * Older approved FL rows may not have stored their FL entitlement deduction.
+     * Infer that movement from the linked VL paid days so historical ledgers
+     * still show initial FL credits and the current FL balance correctly.
+     *
+     * @param  Collection<int, LeaveApplication>  $applications
+     * @return array{by_application_id: array<int, float>, total: float}
+     */
+    private function resolveLedgerInferredForcedLeaveDeductions(
+        Collection $applications,
+        int $forcedLeaveTypeId,
+        float $currentForcedLeaveBalance
+    ): array {
+        if ($forcedLeaveTypeId <= 0 || $currentForcedLeaveBalance <= 0.0) {
+            return [
+                'by_application_id' => [],
+                'total' => 0.0,
+            ];
+        }
+
+        $remainingBalance = $this->roundLedgerValue($currentForcedLeaveBalance);
+        $deductionsByApplicationId = [];
+        $totalInferred = 0.0;
+
+        $forcedApplications = $applications
+            ->filter(function ($application) use ($forcedLeaveTypeId): bool {
+                if (! $application instanceof LeaveApplication) {
+                    return false;
+                }
+
+                if ((bool) $application->is_monetization) {
+                    return false;
+                }
+
+                if ((int) $application->leave_type_id !== $forcedLeaveTypeId) {
+                    return false;
+                }
+
+                if (strtoupper(trim((string) ($application->status ?? ''))) !== LeaveApplication::STATUS_APPROVED) {
+                    return false;
+                }
+
+                return $this->roundLedgerValue($application->linked_forced_leave_deducted_days ?? 0.0) <= 0.0;
+            })
+            ->sortBy(function (LeaveApplication $application): string {
+                $timestamp = $application->hr_approved_at?->toIso8601String()
+                    ?? $application->created_at?->toIso8601String()
+                    ?? '';
+
+                return $timestamp.'|'.str_pad((string) (int) $application->id, 12, '0', STR_PAD_LEFT);
+            })
+            ->values();
+
+        foreach ($forcedApplications as $application) {
+            if ($remainingBalance <= 0.0) {
+                break;
+            }
+
+            $totalDays = round((float) ($application->total_days ?? 0.0), 2);
+            $deductibleDays = round((float) ($application->deductible_days ?? $totalDays), self::LEDGER_DECIMAL_PRECISION);
+            $payAmounts = $this->resolveLedgerApplicationPayAmounts(
+                $application,
+                $totalDays,
+                $deductibleDays,
+                LeaveApplication::PAY_MODE_WITH_PAY,
+                false
+            );
+            $withPayAmount = $this->roundLedgerValue($payAmounts['with_pay'] ?? 0.0);
+            $linkedVacationAmount = $this->roundLedgerValue($application->linked_vacation_leave_deducted_days ?? 0.0);
+            $candidateAmount = $linkedVacationAmount > 0.0
+                ? min($linkedVacationAmount, max($withPayAmount, $linkedVacationAmount))
+                : $withPayAmount;
+            $candidateAmount = $this->roundLedgerValue($candidateAmount);
+            if ($candidateAmount <= 0.0) {
+                continue;
+            }
+
+            $inferredAmount = $this->roundLedgerValue(min($candidateAmount, $remainingBalance));
+            if ($inferredAmount <= 0.0) {
+                continue;
+            }
+
+            $deductionsByApplicationId[(int) $application->id] = $inferredAmount;
+            $totalInferred = $this->roundLedgerValue($totalInferred + $inferredAmount);
+            $remainingBalance = $this->roundLedgerValue($remainingBalance - $inferredAmount);
+        }
+
+        return [
+            'by_application_id' => $deductionsByApplicationId,
+            'total' => $totalInferred,
         ];
     }
 

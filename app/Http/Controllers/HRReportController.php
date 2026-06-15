@@ -1339,6 +1339,10 @@ class HRReportController extends Controller
             return [$deductibleDays, 0.0];
         }
 
+        if (LeaveType::isForcedLeaveType($application->leaveType, (int) $application->leave_type_id)) {
+            return [$totalDays, 0.0];
+        }
+
         $payMode = strtoupper(trim((string) ($application->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY)));
         if (! in_array($payMode, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
             $payMode = LeaveApplication::PAY_MODE_WITH_PAY;
@@ -1373,6 +1377,10 @@ class HRReportController extends Controller
 
     private function resolveApplicationWopDateKeys(LeaveApplication $application): array
     {
+        if (LeaveType::isForcedLeaveType($application->leaveType, (int) $application->leave_type_id)) {
+            return [];
+        }
+
         $selectedDatePayStatus = is_array($application->selected_date_pay_status)
             ? $application->selected_date_pay_status
             : [];
