@@ -10844,8 +10844,23 @@ class LeaveApplicationController extends Controller
     ): array {
         $normalizedTotalDays = round(max($totalDays, 0.0), 3);
         $normalizedAvailableCredits = round(max($availableCredits, 0.0), 3);
+        $normalizedCrossDeductionAvailableCredits = round(max((float) ($crossDeductionAvailableCredits ?? 0.0), 0.0), 3);
+        $canUseSlVlCrossDeductionCredits = $allowSlVlCrossDeduction
+            && $normalizedCrossDeductionAvailableCredits > 0.0
+            && $leaveType instanceof LeaveType
+            && $this->resolveSlVlCrossDeductionTargetLeaveTypeId(
+                $leaveType,
+                (int) ($leaveType->id ?? 0),
+                false,
+                true,
+                $this->resolveSickLeaveTypeId(),
+                $this->resolveVacationLeaveTypeId()
+            ) !== null;
 
-        if ($normalizedTotalDays <= 0.0 || $normalizedAvailableCredits <= 0.0) {
+        if (
+            $normalizedTotalDays <= 0.0
+            || ($normalizedAvailableCredits <= 0.0 && ! $canUseSlVlCrossDeductionCredits)
+        ) {
             return [
                 'pay_mode' => LeaveApplication::PAY_MODE_WITHOUT_PAY,
                 'selected_date_pay_status' => null,
@@ -10881,7 +10896,6 @@ class LeaveApplicationController extends Controller
             $preferredPayMode,
             $employeeControlNo
         );
-        $normalizedCrossDeductionAvailableCredits = round(max((float) ($crossDeductionAvailableCredits ?? 0.0), 0.0), 3);
         $combinedAvailableCredits = round($normalizedAvailableCredits + $normalizedCrossDeductionAvailableCredits, 3);
 
         if (
@@ -10889,18 +10903,9 @@ class LeaveApplicationController extends Controller
             || $preferredDeductibleDays <= $normalizedAvailableCredits + 1e-9
             || (
                 $preferredDeductibleDays > 0.0
-                && $allowSlVlCrossDeduction
-                && $leaveType instanceof LeaveType
+                && $canUseSlVlCrossDeductionCredits
                 && $combinedAvailableCredits > $normalizedAvailableCredits + 1e-9
                 && $preferredDeductibleDays <= $combinedAvailableCredits + 1e-9
-                && $this->resolveSlVlCrossDeductionTargetLeaveTypeId(
-                    $leaveType,
-                    (int) ($leaveType->id ?? 0),
-                    false,
-                    true,
-                    $this->resolveSickLeaveTypeId(),
-                    $this->resolveVacationLeaveTypeId()
-                ) !== null
             )
         ) {
             if ($preferredDeductibleDays <= 0.0) {
@@ -10919,10 +10924,22 @@ class LeaveApplicationController extends Controller
         }
 
         if (! is_array($selectedDates) || $selectedDates === []) {
+            $availableCreditCap = $canUseSlVlCrossDeductionCredits
+                ? round(min($normalizedTotalDays, $combinedAvailableCredits), 3)
+                : $normalizedAvailableCredits;
+
+            if ($availableCreditCap <= 0.0) {
+                return [
+                    'pay_mode' => LeaveApplication::PAY_MODE_WITHOUT_PAY,
+                    'selected_date_pay_status' => null,
+                    'deductible_days' => 0.0,
+                ];
+            }
+
             return [
                 'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
                 'selected_date_pay_status' => null,
-                'deductible_days' => $normalizedAvailableCredits,
+                'deductible_days' => $availableCreditCap,
             ];
         }
 
