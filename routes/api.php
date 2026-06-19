@@ -218,10 +218,14 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::middleware('hr.module:applications')->group(function () {
             // Leave application review
             Route::get('/leave-applications', [LeaveApplicationController::class, 'hrIndex']);
+            Route::get('/leave-application-edit-requests', [LeaveApplicationController::class, 'hrApplicationEditRequests']);
             Route::get('/leave-applications/{id}', [LeaveApplicationController::class, 'hrShow']);
             Route::get('/leave-applications/{id}/attachment', [LeaveApplicationController::class, 'hrViewAttachment']);
             Route::post('/leave-applications/{id}/receive', [LeaveApplicationController::class, 'hrReceive']);
             Route::post('/leave-applications/{id}/undo-receive', [LeaveApplicationController::class, 'hrUndoReceive']);
+            Route::post('/leave-applications/{id}/edit', [LeaveApplicationController::class, 'hrSaveApplicationEdit']);
+            Route::post('/leave-application-edit-requests/{id}/approve', [LeaveApplicationController::class, 'hrApproveApplicationEditRequest']);
+            Route::post('/leave-application-edit-requests/{id}/reject', [LeaveApplicationController::class, 'hrRejectApplicationEditRequest']);
             Route::post('/leave-applications/{id}/pay-status/update', [LeaveApplicationController::class, 'hrUpdatePayStatus']);
             Route::post('/leave-applications/{id}/cmo-cbmo-review', [LeaveApplicationController::class, 'hrCmoCbmoReview']);
             Route::post('/leave-applications/{id}/release', [LeaveApplicationController::class, 'hrRelease']);

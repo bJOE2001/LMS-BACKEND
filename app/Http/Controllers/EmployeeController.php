@@ -1071,7 +1071,7 @@ class EmployeeController extends Controller
                         'category' => $entryCategory,
                         'amount' => $displayAmount,
                         'balance_delta' => $creditsAdded,
-                        'suppress_display' => $isForcedLeaveBalanceEntry && $isManualBalanceSource,
+                        'suppress_display' => $isForcedLeaveBalanceEntry,
                     ];
                 }
             }
@@ -1435,9 +1435,9 @@ class EmployeeController extends Controller
                     $transactions[] = [
                         'row_id' => $mergeKey.'-wop',
                         'merge_key' => $mergeKey,
-                        'type_key' => $typeKey,
-                        'balance_key' => $balanceKey,
-                        'leave_type_code' => $leaveTypeCode,
+                        'type_key' => $isForcedLeave ? 'vacation' : $typeKey,
+                        'balance_key' => $isForcedLeave ? 'vacation' : $balanceKey,
+                        'leave_type_code' => $isForcedLeave ? $this->resolveLedgerTypeCode('vacation') : $leaveTypeCode,
                         'transaction_date' => $transactionDate,
                         'sort_date' => $transactionDate,
                         'sort_timestamp' => (string) (
@@ -1538,6 +1538,7 @@ class EmployeeController extends Controller
                             'category' => 'earned',
                             'amount' => $primaryRestoredAmount,
                             'balance_delta' => $isUsageOnlyOtherType ? 0.0 : $primaryRestoredAmount,
+                            'suppress_display' => $isForcedLeave,
                         ];
                     }
 

@@ -59,8 +59,22 @@ class LeaveApplication extends Model
             $isForcedLeave = self::isForcedLeaveApplication($application);
             if ($isForcedLeave) {
                 $application->pay_mode = self::PAY_MODE_WITH_PAY;
-                $application->selected_date_pay_status = null;
-                $application->without_pay_days = 0.0;
+                $hasStoredForcedLeaveOverride = is_array($application->selected_date_pay_status)
+                    || is_array($application->selected_date_deduction)
+                    || is_array($application->selected_date_without_pay)
+                    || round(max((float) ($application->without_pay_days ?? 0.0), 0.0), 3) > 0.0;
+                if (
+                    ! $hasStoredForcedLeaveOverride
+                    && ! $application->isDirty('selected_date_pay_status')
+                    && ! $application->isDirty('without_pay_days')
+                    && ! $application->isDirty('selected_date_deduction')
+                    && ! $application->isDirty('selected_date_without_pay')
+                ) {
+                    $application->selected_date_pay_status = null;
+                    $application->selected_date_deduction = null;
+                    $application->selected_date_without_pay = null;
+                    $application->without_pay_days = 0.0;
+                }
             }
 
             $application->selected_dates = self::resolveSelectedDates(
@@ -72,7 +86,16 @@ class LeaveApplication extends Model
 
             $totalDays = round((float) ($application->total_days ?? 0), 2);
             $fallbackDeductible = $application->pay_mode === self::PAY_MODE_WITHOUT_PAY ? 0.0 : $totalDays;
-            $deductibleDays = $isForcedLeave
+            $hasExplicitForcedLeaveDeduction = $isForcedLeave
+                && (
+                    is_array($application->selected_date_deduction)
+                    || is_array($application->selected_date_without_pay)
+                    || round(max((float) ($application->without_pay_days ?? 0.0), 0.0), 3) > 0.0
+                    || $application->isDirty('deductible_days')
+                    || $application->isDirty('selected_date_deduction')
+                    || $application->isDirty('selected_date_without_pay')
+                );
+            $deductibleDays = $isForcedLeave && ! $hasExplicitForcedLeaveDeduction
                 ? $totalDays
                 : ($application->deductible_days !== null
                     ? round((float) $application->deductible_days, 3)
@@ -146,6 +169,8 @@ class LeaveApplication extends Model
         'selected_date_pay_status',
         'selected_date_coverage',
         'selected_date_half_day_portion',
+        'selected_date_deduction',
+        'selected_date_without_pay',
         'commutation',
         'pay_mode',
         'allow_sl_vl_cross_deduction',
@@ -180,6 +205,8 @@ class LeaveApplication extends Model
             'selected_date_pay_status' => 'array',
             'selected_date_coverage' => 'array',
             'selected_date_half_day_portion' => 'array',
+            'selected_date_deduction' => 'array',
+            'selected_date_without_pay' => 'array',
             'pay_mode' => 'string',
             'allow_sl_vl_cross_deduction' => 'boolean',
             'linked_forced_leave_deducted_days' => 'decimal:3',

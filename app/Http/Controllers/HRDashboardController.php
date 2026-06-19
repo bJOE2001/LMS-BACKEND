@@ -759,7 +759,8 @@ class HRDashboardController extends Controller
                 ->sortByDesc(fn (LeaveApplicationUpdateRequest $item) => (int) $item->id)
                 ->first(function (LeaveApplicationUpdateRequest $item): bool {
                     return strtoupper(trim((string) $item->status)) === LeaveApplicationUpdateRequest::STATUS_PENDING
-                        && strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED;
+                        && strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED
+                        && ! $item->isHrApplicationEditRequest();
                 });
 
             return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
@@ -769,7 +770,8 @@ class HRDashboardController extends Controller
             ->where('leave_application_id', (int) $app->id)
             ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
             ->latest('id')
-            ->first();
+            ->get()
+            ->first(fn (LeaveApplicationUpdateRequest $item): bool => ! $item->isHrApplicationEditRequest());
 
         if (! $record) {
             return null;
@@ -813,7 +815,8 @@ class HRDashboardController extends Controller
                 ->filter(fn ($item) => $item instanceof LeaveApplicationUpdateRequest)
                 ->sortByDesc(fn (LeaveApplicationUpdateRequest $item) => (int) $item->id)
                 ->first(function (LeaveApplicationUpdateRequest $item): bool {
-                    return strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED;
+                    return strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED
+                        && ! $item->isHrApplicationEditRequest();
                 });
 
             return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
@@ -822,7 +825,8 @@ class HRDashboardController extends Controller
         $record = LeaveApplicationUpdateRequest::query()
             ->where('leave_application_id', (int) $app->id)
             ->latest('id')
-            ->first();
+            ->get()
+            ->first(fn (LeaveApplicationUpdateRequest $item): bool => ! $item->isHrApplicationEditRequest());
 
         if (! $record) {
             return null;

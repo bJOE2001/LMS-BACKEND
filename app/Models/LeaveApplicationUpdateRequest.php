@@ -24,6 +24,8 @@ class LeaveApplicationUpdateRequest extends Model
 
     public const ACTION_TYPE_RECALL = 'REQUEST_RECALL';
 
+    public const REQUEST_KIND_HR_EDIT = 'HR_APPLICATION_EDIT';
+
     protected $fillable = [
         'leave_application_id',
         'employee_control_no',
@@ -60,5 +62,22 @@ class LeaveApplicationUpdateRequest extends Model
     public function reviewedByHr(): BelongsTo
     {
         return $this->belongsTo(HRAccount::class, 'reviewed_by_hr_id');
+    }
+
+    public function isHrApplicationEditRequest(): bool
+    {
+        $payload = $this->requested_payload;
+        if (is_string($payload)) {
+            $decoded = json_decode($payload, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $payload = $decoded;
+            }
+        }
+
+        if (! is_array($payload)) {
+            return false;
+        }
+
+        return strtoupper(trim((string) ($payload['request_kind'] ?? ''))) === self::REQUEST_KIND_HR_EDIT;
     }
 }

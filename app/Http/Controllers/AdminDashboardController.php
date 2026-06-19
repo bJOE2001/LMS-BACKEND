@@ -655,10 +655,73 @@ class AdminDashboardController extends Controller
                 $adminEmployeeControlNo
             );
 
+            $forcedLeaveBalance = $this->findAdminEmployeeBalanceByLeaveType($admin, (int) $leaveType->id);
+            $availableForcedLeaveBalance = $forcedLeaveBalance ? (float) $forcedLeaveBalance->balance : 0.0;
+            if ($availableForcedLeaveBalance <= 0.0) {
+                return response()->json([
+                    'message' => 'Insufficient Mandatory / Forced Leave balance.',
+                    'errors' => [
+                        'leave_type_id' => ['Mandatory / Forced Leave has no remaining balance.'],
+                        'forced_leave_balance' => [
+                            'Available Mandatory / Forced Leave is '
+                            .self::formatDays($availableForcedLeaveBalance)
+                            .'.',
+                        ],
+                    ],
+                    'available_forced_leave_days' => $availableForcedLeaveBalance,
+                ], 422);
+            }
+
+            if ($vacationLeaveTypeId === null) {
+                return response()->json([
+                    'message' => 'Mandatory / Forced Leave requires available Vacation Leave balance.',
+                    'errors' => [
+                        'leave_type_id' => ['Mandatory / Forced Leave requires available Vacation Leave balance.'],
+                        'vacation_leave_balance' => ['Available Vacation Leave must be greater than 0.'],
+                    ],
+                    'available_vacation_leave_days' => 0.0,
+                ], 422);
+            }
+
             if ($vacationLeaveTypeId !== null) {
                 $vacationBalance = $this->findAdminEmployeeBalanceByLeaveType($admin, (int) $vacationLeaveTypeId);
                 $availableVacationBalance = $vacationBalance ? (float) $vacationBalance->balance : 0.0;
-                if ($availableVacationBalance + 1e-9 < $requestedTotalDays) {
+                if ($availableVacationBalance <= 0.0) {
+                    return response()->json([
+                        'message' => 'Mandatory / Forced Leave requires available Vacation Leave balance.',
+                        'errors' => [
+                            'leave_type_id' => ['Mandatory / Forced Leave requires available Vacation Leave balance.'],
+                            'vacation_leave_balance' => ['Available Vacation Leave must be greater than 0.'],
+                        ],
+                        'available_vacation_leave_days' => $availableVacationBalance,
+                    ], 422);
+                }
+
+                if ($requestedDeductibleDays > $availableVacationBalance + 1e-9) {
+                    $selectedDatePayStatus = $this->rebalanceSelectedDatePayStatusToDeductibleDays(
+                        $resolvedSelectedDates,
+                        $selectedDateCoverage,
+                        $selectedDatePayStatus,
+                        $availableVacationBalance,
+                        $adminEmployeeControlNo
+                    );
+                    $requestedDeductibleDays = $this->resolveRequestedDeductibleDays(
+                        $resolvedSelectedDates,
+                        $selectedDateCoverage,
+                        $selectedDatePayStatus,
+                        $requestedPayMode,
+                        $requestedTotalDays,
+                        $adminEmployeeControlNo
+                    );
+                    $requestedPayMode = $this->resolvePayModeFromSelectedDatePayStatus(
+                        $resolvedSelectedDates,
+                        $selectedDatePayStatus,
+                        $requestedDeductibleDays
+                    );
+                }
+
+                $requiredVacationLeaveDays = round(max($requestedDeductibleDays, 0.0), 3);
+                if ($availableVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
                     return response()->json([
                         'message' => 'Insufficient Vacation Leave balance to apply Mandatory / Forced Leave.',
                         'errors' => [
@@ -667,14 +730,16 @@ class AdminDashboardController extends Controller
                                 'Available Vacation Leave is '
                                 .self::formatDays($availableVacationBalance)
                                 .', but '
-                                .self::formatDays($requestedTotalDays)
+                                .self::formatDays($requiredVacationLeaveDays)
                                 .' is required.',
                             ],
                         ],
                         'available_vacation_leave_days' => $availableVacationBalance,
-                        'required_vacation_leave_days' => $requestedTotalDays,
+                        'required_vacation_leave_days' => $requiredVacationLeaveDays,
                     ], 422);
                 }
+
+                $linkedVacationLeaveReservedDays = $requiredVacationLeaveDays;
             }
         }
 
@@ -866,10 +931,7 @@ class AdminDashboardController extends Controller
             $deductibleDays
         );
         if ($isForcedLeave) {
-            $requestedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
-            $selectedDatePayStatus = [];
             $deductibleDays = $requestedDeductibleDays;
-            $linkedVacationLeaveReservedDays = $deductibleDays;
         }
         if ($requestedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
             $deductibleDays = 0.0;
@@ -2201,20 +2263,22 @@ class AdminDashboardController extends Controller
         $latestUpdateReviewRemarks = $this->trimNullableString(
             $latestApprovedUpdateRequest?->review_remarks ?? null
         );
-        $statusHistory = $logs->map(function (LeaveApplicationLog $log) use ($actorDirectory, $employeeName) {
-            $actorName = $this->resolvePerformerName($log, $actorDirectory, $employeeName);
+        $statusHistory = $logs
+            ->filter(fn (LeaveApplicationLog $log): bool => ! $this->isHrApplicationEditWorkflowLog($log))
+            ->map(function (LeaveApplicationLog $log) use ($actorDirectory, $employeeName) {
+                $actorName = $this->resolvePerformerName($log, $actorDirectory, $employeeName);
 
-            return [
-                'action' => $log->action,
-                'stage' => $log->action,
-                'actor_name' => $actorName,
-                'action_by_name' => $actorName,
-                'action_by' => $actorName,
-                'performed_by_type' => strtoupper((string) $log->performed_by_type),
-                'remarks' => $log->remarks,
-                'created_at' => $log->created_at?->toIso8601String(),
-            ];
-        })->values();
+                return [
+                    'action' => $log->action,
+                    'stage' => $log->action,
+                    'actor_name' => $actorName,
+                    'action_by_name' => $actorName,
+                    'action_by' => $actorName,
+                    'performed_by_type' => strtoupper((string) $log->performed_by_type),
+                    'remarks' => $log->remarks,
+                    'created_at' => $log->created_at?->toIso8601String(),
+                ];
+            })->values();
 
         return [
             'id' => $app->id,
@@ -2334,6 +2398,16 @@ class AdminDashboardController extends Controller
         ];
     }
 
+    private function isHrApplicationEditWorkflowLog(LeaveApplicationLog $log): bool
+    {
+        return in_array($log->action, [
+            LeaveApplicationLog::ACTION_HR_APPLICATION_EDITED,
+            LeaveApplicationLog::ACTION_HR_APPLICATION_EDIT_REQUESTED,
+            LeaveApplicationLog::ACTION_HR_APPLICATION_EDIT_REQUEST_APPROVED,
+            LeaveApplicationLog::ACTION_HR_APPLICATION_EDIT_REQUEST_REJECTED,
+        ], true);
+    }
+
     private function resolvePendingApprovedUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
     {
         if (! $app->id) {
@@ -2346,7 +2420,8 @@ class AdminDashboardController extends Controller
                 ->sortByDesc(fn (LeaveApplicationUpdateRequest $item) => (int) $item->id)
                 ->first(function (LeaveApplicationUpdateRequest $item): bool {
                     return strtoupper(trim((string) ($item->status ?? ''))) === LeaveApplicationUpdateRequest::STATUS_PENDING
-                        && strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED;
+                        && strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED
+                        && ! $item->isHrApplicationEditRequest();
                 });
 
             return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
@@ -2357,7 +2432,8 @@ class AdminDashboardController extends Controller
             ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
             ->where('previous_status', LeaveApplication::STATUS_APPROVED)
             ->latest('id')
-            ->first();
+            ->get()
+            ->first(fn (LeaveApplicationUpdateRequest $item): bool => ! $item->isHrApplicationEditRequest());
     }
 
     private function resolveLatestApprovedUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
@@ -2371,7 +2447,8 @@ class AdminDashboardController extends Controller
                 ->filter(fn ($item) => $item instanceof LeaveApplicationUpdateRequest)
                 ->sortByDesc(fn (LeaveApplicationUpdateRequest $item) => (int) $item->id)
                 ->first(function (LeaveApplicationUpdateRequest $item): bool {
-                    return strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED;
+                    return strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED
+                        && ! $item->isHrApplicationEditRequest();
                 });
 
             return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
@@ -2380,7 +2457,8 @@ class AdminDashboardController extends Controller
         $record = LeaveApplicationUpdateRequest::query()
             ->where('leave_application_id', (int) $app->id)
             ->latest('id')
-            ->first();
+            ->get()
+            ->first(fn (LeaveApplicationUpdateRequest $item): bool => ! $item->isHrApplicationEditRequest());
 
         if (! $record) {
             return null;

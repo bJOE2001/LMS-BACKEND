@@ -15,6 +15,7 @@ use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveType;
 use App\Models\Notification;
 use App\Services\CocLedgerService;
+use App\Services\HrAccessControlService;
 use App\Services\SmsGatewayService;
 use App\Services\WorkScheduleService;
 use Illuminate\Filesystem\FilesystemAdapter;
@@ -44,6 +45,8 @@ class LeaveApplicationController extends Controller
     private const TERMINAL_LEAVE_AMOUNT_PRECISION = 12;
 
     private const CERTIFICATION_SELECTED_LEAVE_TYPE_BUCKET = 'selected_leave_type';
+
+    private const HR_APPLICATION_EDIT_REQUEST_KIND = LeaveApplicationUpdateRequest::REQUEST_KIND_HR_EDIT;
 
     private const DETAILS_OF_LEAVE_FIELDS = [
         'vacation_detail',
@@ -802,7 +805,9 @@ class LeaveApplicationController extends Controller
             $deductibleDays,
             $forcedLeaveTypeId
         );
-        if (! $appliedAllowSlVlCrossDeduction) {
+        if (LeaveType::isForcedLeaveType($leaveType, (int) $validated['leave_type_id'])) {
+            $linkedVacationLeaveReservedDays = round(max($deductibleDays, 0.0), 3);
+        } elseif (! $appliedAllowSlVlCrossDeduction) {
             $linkedVacationLeaveReservedDays = $this->resolveLeaveTypeVacationLeaveDeductionDays(
                 $leaveType,
                 (int) $validated['leave_type_id'],
@@ -810,7 +815,8 @@ class LeaveApplicationController extends Controller
                 (float) $validated['total_days'],
                 $deductibleDays,
                 $forcedLeaveTypeId,
-                $vacationLeaveTypeId
+                $vacationLeaveTypeId,
+                (float) ($eligibility['available_balance'] ?? 0.0)
             );
         }
 
@@ -1736,7 +1742,9 @@ class LeaveApplicationController extends Controller
             $deductibleDays,
             $forcedLeaveTypeId
         );
-        if (! $appliedAllowSlVlCrossDeduction) {
+        if (LeaveType::isForcedLeaveType($leaveType, (int) $validated['leave_type_id'])) {
+            $linkedVacationLeaveReservedDays = round(max($deductibleDays, 0.0), 3);
+        } elseif (! $appliedAllowSlVlCrossDeduction) {
             $linkedVacationLeaveReservedDays = $this->resolveLeaveTypeVacationLeaveDeductionDays(
                 $leaveType,
                 (int) $validated['leave_type_id'],
@@ -1744,7 +1752,8 @@ class LeaveApplicationController extends Controller
                 (float) $validated['total_days'],
                 $deductibleDays,
                 $forcedLeaveTypeId,
-                $vacationLeaveTypeId
+                $vacationLeaveTypeId,
+                (float) ($eligibility['available_balance'] ?? 0.0)
             );
         }
 
@@ -2772,6 +2781,288 @@ class LeaveApplicationController extends Controller
         return $this->streamApplicationAttachment($application);
     }
 
+    public function hrApplicationEditRequests(Request $request): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can view application edit requests.'], 403);
+        }
+
+        if (! $this->isHrAccessControlOwner($hr)) {
+            return response()->json(['message' => 'Only HR Admin accounts can view application edit requests.'], 403);
+        }
+
+        $status = strtoupper(trim((string) $request->query('status', LeaveApplicationUpdateRequest::STATUS_PENDING)));
+        $allowedStatuses = [
+            LeaveApplicationUpdateRequest::STATUS_PENDING,
+            LeaveApplicationUpdateRequest::STATUS_APPROVED,
+            LeaveApplicationUpdateRequest::STATUS_REJECTED,
+            'ALL',
+        ];
+        if (! in_array($status, $allowedStatuses, true)) {
+            $status = LeaveApplicationUpdateRequest::STATUS_PENDING;
+        }
+
+        $query = LeaveApplicationUpdateRequest::query()
+            ->with(['leaveApplication.leaveType', 'reviewedByHr'])
+            ->latest('id');
+
+        if ($status !== 'ALL') {
+            $query->where('status', $status);
+        }
+
+        $requests = $query
+            ->limit(500)
+            ->get()
+            ->filter(fn (LeaveApplicationUpdateRequest $editRequest): bool => $this->isHrApplicationEditRequestRecord($editRequest))
+            ->values();
+
+        return response()->json([
+            'requests' => $requests
+                ->map(fn (LeaveApplicationUpdateRequest $editRequest): array => $this->formatHrApplicationEditRequest($editRequest))
+                ->all(),
+            'count' => $requests->count(),
+        ]);
+    }
+
+    public function hrSaveApplicationEdit(Request $request, int $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can edit leave applications.'], 403);
+        }
+
+        $validated = $request->validate([
+            'reason' => ['nullable', 'string', 'max:2000'],
+            'remarks' => ['nullable', 'string', 'max:2000'],
+            'pay_status_rows' => ['nullable', 'array', 'min:1'],
+            'payStatusRows' => ['nullable', 'array', 'min:1'],
+            'selected_dates' => ['nullable', 'array', 'min:1'],
+            'selectedDates' => ['nullable', 'array', 'min:1'],
+            'selected_date_pay_status' => ['nullable', 'array'],
+            'selectedDatePayStatus' => ['nullable', 'array'],
+            'selected_date_coverage' => ['nullable', 'array'],
+            'selectedDateCoverage' => ['nullable', 'array'],
+            'selected_date_half_day_portion' => ['nullable', 'array'],
+            'selectedDateHalfDayPortion' => ['nullable', 'array'],
+            'deductible_days_by_date' => ['nullable', 'array'],
+            'without_pay_days_by_date' => ['nullable', 'array'],
+            'allow_sl_vl_cross_deduction' => ['nullable', 'boolean'],
+        ]);
+
+        $app = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        if (! in_array($app->status, [LeaveApplication::STATUS_PENDING_HR, LeaveApplication::STATUS_APPROVED], true)) {
+            return response()->json([
+                'message' => 'Only Pending HR and Approved applications can be edited by HR.',
+            ], 422);
+        }
+
+        if ((bool) $app->is_monetization) {
+            return response()->json([
+                'message' => 'Monetization applications are not supported by this edit form.',
+            ], 422);
+        }
+
+        $normalizedPayload = $this->normalizeHrApplicationEditPayload($request->input(), $app);
+        if ($normalizedPayload instanceof JsonResponse) {
+            return $normalizedPayload;
+        }
+
+        $reason = $this->trimNullableString($validated['reason'] ?? null);
+
+        $existingPendingRequest = LeaveApplicationUpdateRequest::query()
+            ->where('leave_application_id', (int) $app->id)
+            ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
+            ->latest('id')
+            ->get()
+            ->first(fn (LeaveApplicationUpdateRequest $editRequest): bool => $this->isHrApplicationEditRequestRecord($editRequest));
+
+        if ($existingPendingRequest instanceof LeaveApplicationUpdateRequest) {
+            return response()->json([
+                'message' => 'This application already has a pending HR staff edit request. Please approve or reject it first.',
+            ], 422);
+        }
+
+        if ($this->isHrAccessControlOwner($hr)) {
+            $applied = $this->applyHrApplicationEdit(
+                $app,
+                $hr,
+                $normalizedPayload,
+                $reason,
+                null,
+                $this->trimNullableString($validated['remarks'] ?? null)
+            );
+
+            if ($applied instanceof JsonResponse) {
+                return $applied;
+            }
+
+            return response()->json([
+                'message' => 'Application edit applied successfully.',
+                'application' => $this->formatApplication($applied->fresh(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])),
+            ]);
+        }
+
+        $editRequest = DB::transaction(function () use ($app, $hr, $normalizedPayload, $reason): LeaveApplicationUpdateRequest {
+            $payload = $this->withHrApplicationEditRequestMeta($normalizedPayload);
+
+            $editRequest = LeaveApplicationUpdateRequest::create([
+                'leave_application_id' => $app->id,
+                'employee_control_no' => $app->employee_control_no,
+                'employee_name' => $this->resolveEmployeeDisplayName($app),
+                'requested_payload' => $payload,
+                'requested_reason' => $reason,
+                'previous_status' => $app->status,
+                'requested_by_control_no' => $this->formatHrEditRequestActor($hr),
+                'requested_at' => now(),
+                'status' => LeaveApplicationUpdateRequest::STATUS_PENDING,
+            ]);
+
+            LeaveApplicationLog::create([
+                'leave_application_id' => $app->id,
+                'action' => LeaveApplicationLog::ACTION_HR_APPLICATION_EDIT_REQUESTED,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
+                'performed_by_id' => $hr->id,
+                'remarks' => $reason ?? 'HR application override.',
+                'created_at' => now(),
+            ]);
+
+            return $editRequest;
+        });
+
+        $editRequest->load(['leaveApplication.leaveType', 'reviewedByHr']);
+
+        return response()->json([
+            'message' => 'Application edit request submitted for HR Admin approval.',
+            'edit_request' => $this->formatHrApplicationEditRequest($editRequest),
+        ], 201);
+    }
+
+    public function hrApproveApplicationEditRequest(Request $request, int $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can approve application edit requests.'], 403);
+        }
+
+        if (! $this->isHrAccessControlOwner($hr)) {
+            return response()->json(['message' => 'Only HR Admin accounts can approve application edit requests.'], 403);
+        }
+
+        $validated = $request->validate([
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $editRequest = LeaveApplicationUpdateRequest::query()
+            ->with(['leaveApplication.leaveType', 'reviewedByHr'])
+            ->find($id);
+        if (! $editRequest || ! $this->isHrApplicationEditRequestRecord($editRequest)) {
+            return response()->json(['message' => 'Application edit request not found.'], 404);
+        }
+
+        if (strtoupper(trim((string) $editRequest->status)) !== LeaveApplicationUpdateRequest::STATUS_PENDING) {
+            return response()->json(['message' => 'Only pending application edit requests can be approved.'], 422);
+        }
+
+        $app = $editRequest->leaveApplication;
+        if (! $app instanceof LeaveApplication) {
+            return response()->json(['message' => 'Leave application for this edit request no longer exists.'], 404);
+        }
+
+        if (! in_array($app->status, [LeaveApplication::STATUS_PENDING_HR, LeaveApplication::STATUS_APPROVED], true)) {
+            return response()->json([
+                'message' => 'Only Pending HR and Approved applications can receive an approved HR edit.',
+            ], 422);
+        }
+
+        $normalizedPayload = $this->normalizeHrApplicationEditPayload(
+            is_array($editRequest->requested_payload) ? $editRequest->requested_payload : [],
+            $app
+        );
+        if ($normalizedPayload instanceof JsonResponse) {
+            return $normalizedPayload;
+        }
+
+        $applied = $this->applyHrApplicationEdit(
+            $app,
+            $hr,
+            $normalizedPayload,
+            $this->trimNullableString($editRequest->requested_reason) ?? 'Approved HR staff edit request.',
+            $editRequest,
+            $this->trimNullableString($validated['remarks'] ?? null)
+        );
+
+        if ($applied instanceof JsonResponse) {
+            return $applied;
+        }
+
+        $editRequest->refresh()->load(['leaveApplication.leaveType', 'reviewedByHr']);
+
+        return response()->json([
+            'message' => 'Application edit request approved and applied.',
+            'edit_request' => $this->formatHrApplicationEditRequest($editRequest),
+            'application' => $this->formatApplication($applied->fresh(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])),
+        ]);
+    }
+
+    public function hrRejectApplicationEditRequest(Request $request, int $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can reject application edit requests.'], 403);
+        }
+
+        if (! $this->isHrAccessControlOwner($hr)) {
+            return response()->json(['message' => 'Only HR Admin accounts can reject application edit requests.'], 403);
+        }
+
+        $validated = $request->validate([
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $editRequest = LeaveApplicationUpdateRequest::query()
+            ->with(['leaveApplication.leaveType', 'reviewedByHr'])
+            ->find($id);
+        if (! $editRequest || ! $this->isHrApplicationEditRequestRecord($editRequest)) {
+            return response()->json(['message' => 'Application edit request not found.'], 404);
+        }
+
+        if (strtoupper(trim((string) $editRequest->status)) !== LeaveApplicationUpdateRequest::STATUS_PENDING) {
+            return response()->json(['message' => 'Only pending application edit requests can be rejected.'], 422);
+        }
+
+        DB::transaction(function () use ($editRequest, $hr, $validated): void {
+            $editRequest->update([
+                'status' => LeaveApplicationUpdateRequest::STATUS_REJECTED,
+                'reviewed_by_hr_id' => $hr->id,
+                'reviewed_at' => now(),
+                'review_remarks' => $this->trimNullableString($validated['remarks'] ?? null),
+            ]);
+
+            LeaveApplicationLog::create([
+                'leave_application_id' => $editRequest->leave_application_id,
+                'action' => LeaveApplicationLog::ACTION_HR_APPLICATION_EDIT_REQUEST_REJECTED,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
+                'performed_by_id' => $hr->id,
+                'remarks' => $this->trimNullableString($validated['remarks'] ?? null) ?? 'Rejected HR staff edit request.',
+                'created_at' => now(),
+            ]);
+        });
+
+        $editRequest->refresh()->load(['leaveApplication.leaveType', 'reviewedByHr']);
+
+        return response()->json([
+            'message' => 'Application edit request rejected.',
+            'edit_request' => $this->formatHrApplicationEditRequest($editRequest),
+        ]);
+    }
+
     /**
      * HR may override WP/WOP only during the initial CHRMO certification stage.
      */
@@ -3024,7 +3315,9 @@ class LeaveApplicationController extends Controller
             $deductibleDays,
             $forcedLeaveTypeId
         );
-        if (! $resolvedAllowSlVlCrossDeduction) {
+        if (LeaveType::isForcedLeaveType($leaveType, (int) $app->leave_type_id)) {
+            $linkedVacationLeaveReservedDays = round(max($deductibleDays, 0.0), 3);
+        } elseif (! $resolvedAllowSlVlCrossDeduction) {
             $linkedVacationLeaveReservedDays = $this->resolveLeaveTypeVacationLeaveDeductionDays(
                 $leaveType,
                 (int) $app->leave_type_id,
@@ -3032,7 +3325,8 @@ class LeaveApplicationController extends Controller
                 (float) ($app->total_days ?? $deductibleDays),
                 $deductibleDays,
                 $forcedLeaveTypeId,
-                $vacationLeaveTypeId
+                $vacationLeaveTypeId,
+                $effectivePrimaryAvailableBalance
             );
         }
 
@@ -3648,6 +3942,16 @@ class LeaveApplicationController extends Controller
         $resolvedSelectedDatePayStatus = $policyResolution['selected_date_pay_status'];
         $daysToDeduct = (float) ($policyResolution['deductible_days'] ?? 0);
         $ctoDeductedHours = (float) ($policyResolution['cto_deducted_hours'] ?? 0);
+        if (! (bool) $app->is_monetization && $this->applicationHasHrSelectedDateLedgerValues($app)) {
+            $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY, false);
+            $resolvedSelectedDatePayStatus = is_array($app->selected_date_pay_status)
+                ? $app->selected_date_pay_status
+                : null;
+            $daysToDeduct = $this->resolveApplicationDeductibleDays($app);
+            $ctoDeductedHours = $this->isCtoLeaveType($leaveType, (int) $app->leave_type_id)
+                ? $this->resolveCtoDeductedHours($daysToDeduct)
+                : 0.0;
+        }
         $attachmentRequired = (bool) ($policyResolution['attachment_required'] ?? false);
         $attachmentSubmitted = (bool) ($policyResolution['attachment_submitted'] ?? false);
         $attachmentReference = $policyResolution['attachment_reference'] ?? null;
@@ -3665,6 +3969,8 @@ class LeaveApplicationController extends Controller
             $forcedLeaveTypeId,
             $vacationLeaveTypeId
         );
+        $isForcedLeaveApplication = $forcedLeaveTypeId !== null
+            && ($this->resolveCanonicalLeaveTypeId((int) $app->leave_type_id) ?? (int) $app->leave_type_id) === $forcedLeaveTypeId;
         $usesVacationLeaveTopUpForScheduleExcess = $this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
             $leaveType,
             (int) $app->leave_type_id,
@@ -3742,7 +4048,10 @@ class LeaveApplicationController extends Controller
                     $deductTypeId
                 );
                 $currentBalance = $balance ? (float) $balance->balance : 0.0;
-                if ($usesVacationLeaveTopUpForScheduleExcess) {
+                if ($isForcedLeaveApplication) {
+                    $requiredVacationLeaveDays = round(max($daysToDeduct, 0.0), 3);
+                    $requiredPrimaryLeaveDays = 0.0;
+                } elseif ($usesVacationLeaveTopUpForScheduleExcess) {
                     $requiredVacationLeaveDays = round(max($daysToDeduct - max($currentBalance, 0.0), 0.0), 3);
                     $requiredPrimaryLeaveDays = round(max($daysToDeduct - $requiredVacationLeaveDays, 0.0), 3);
                 }
@@ -3772,12 +4081,20 @@ class LeaveApplicationController extends Controller
                     ], 422);
                 }
 
-                if ($requiredVacationLeaveDays > 0.0 && $vacationLeaveTypeId !== null) {
+                if ($isForcedLeaveApplication && $vacationLeaveTypeId === null) {
+                    return $this->buildRequiredForcedLeaveVacationBalanceResponse(0.0);
+                }
+
+                if (($requiredVacationLeaveDays > 0.0 || $isForcedLeaveApplication) && $vacationLeaveTypeId !== null) {
                     $vacationBalance = $this->findPreferredEmployeeLeaveBalanceRecord(
                         (string) $app->employee_control_no,
                         $vacationLeaveTypeId
                     );
                     $currentVacationBalance = $vacationBalance ? (float) $vacationBalance->balance : 0.0;
+                    if ($isForcedLeaveApplication && $currentVacationBalance <= 0.0) {
+                        return $this->buildRequiredForcedLeaveVacationBalanceResponse($currentVacationBalance);
+                    }
+
                     if ($currentVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
                         if ($usesVacationLeaveTopUpForScheduleExcess) {
                             return $this->buildInsufficientVacationLeaveTopUpResponse(
@@ -3818,7 +4135,10 @@ class LeaveApplicationController extends Controller
                     (int) $app->leave_type_id
                 );
                 $currentBalance = $balance ? (float) $balance->balance : 0.0;
-                if ($usesVacationLeaveTopUpForScheduleExcess) {
+                if ($isForcedLeaveApplication) {
+                    $requiredVacationLeaveDays = round(max($daysToDeduct, 0.0), 3);
+                    $requiredPrimaryLeaveDays = 0.0;
+                } elseif ($usesVacationLeaveTopUpForScheduleExcess) {
                     $requiredVacationLeaveDays = round(max($daysToDeduct - max($currentBalance, 0.0), 0.0), 3);
                     $requiredPrimaryLeaveDays = round(max($daysToDeduct - $requiredVacationLeaveDays, 0.0), 3);
                 }
@@ -3846,12 +4166,20 @@ class LeaveApplicationController extends Controller
                     ], 422);
                 }
 
-                if ($requiredVacationLeaveDays > 0.0 && $vacationLeaveTypeId !== null) {
+                if ($isForcedLeaveApplication && $vacationLeaveTypeId === null) {
+                    return $this->buildRequiredForcedLeaveVacationBalanceResponse(0.0);
+                }
+
+                if (($requiredVacationLeaveDays > 0.0 || $isForcedLeaveApplication) && $vacationLeaveTypeId !== null) {
                     $vacationBalance = $this->findAdminEmployeeLeaveBalance(
                         (int) $app->applicant_admin_id,
                         $vacationLeaveTypeId
                     );
                     $currentVacationBalance = $vacationBalance ? (float) $vacationBalance->balance : 0.0;
+                    if ($isForcedLeaveApplication && $currentVacationBalance <= 0.0) {
+                        return $this->buildRequiredForcedLeaveVacationBalanceResponse($currentVacationBalance);
+                    }
+
                     if ($currentVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
                         if ($usesVacationLeaveTopUpForScheduleExcess) {
                             return $this->buildInsufficientVacationLeaveTopUpResponse(
@@ -4005,18 +4333,29 @@ class LeaveApplicationController extends Controller
                         (int) $app->leave_type_id
                     )?->balance ?? 0
                 );
-                if ($usesVacationLeaveTopUpForScheduleExcess) {
+                if ($isForcedLeaveApplication) {
+                    $requiredVacationLeaveDays = round(max($daysToDeduct, 0.0), 3);
+                    $requiredPrimaryLeaveDays = 0.0;
+                } elseif ($usesVacationLeaveTopUpForScheduleExcess) {
                     $requiredVacationLeaveDays = round(max($daysToDeduct - max($currentBalance, 0.0), 0.0), 3);
                     $requiredPrimaryLeaveDays = round(max($daysToDeduct - $requiredVacationLeaveDays, 0.0), 3);
                 }
 
-                if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null && $requiredVacationLeaveDays > 0.0) {
+                if ($isForcedLeaveApplication && $vacationLeaveTypeId === null) {
+                    return $this->buildRequiredForcedLeaveVacationBalanceResponse(0.0);
+                }
+
+                if (($shouldDeductVacationLeave || $isForcedLeaveApplication) && $vacationLeaveTypeId !== null && ($requiredVacationLeaveDays > 0.0 || $isForcedLeaveApplication)) {
                     $currentVacationBalance = (float) (
                         $this->findPreferredEmployeeLeaveBalanceRecord(
                             (string) $app->employee_control_no,
                             $vacationLeaveTypeId
                         )?->balance ?? 0.0
                     );
+                    if ($isForcedLeaveApplication && $currentVacationBalance <= 0.0) {
+                        return $this->buildRequiredForcedLeaveVacationBalanceResponse($currentVacationBalance);
+                    }
+
                     if ($currentVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
                         if ($usesVacationLeaveTopUpForScheduleExcess) {
                             return $this->buildInsufficientVacationLeaveTopUpResponse(
@@ -4070,18 +4409,29 @@ class LeaveApplicationController extends Controller
                     (int) $app->leave_type_id
                 )?->balance ?? 0
             );
-            if ($usesVacationLeaveTopUpForScheduleExcess) {
+            if ($isForcedLeaveApplication) {
+                $requiredVacationLeaveDays = round(max($daysToDeduct, 0.0), 3);
+                $requiredPrimaryLeaveDays = 0.0;
+            } elseif ($usesVacationLeaveTopUpForScheduleExcess) {
                 $requiredVacationLeaveDays = round(max($daysToDeduct - max($currentBalance, 0.0), 0.0), 3);
                 $requiredPrimaryLeaveDays = round(max($daysToDeduct - $requiredVacationLeaveDays, 0.0), 3);
             }
 
-            if ($shouldDeductVacationLeave && $vacationLeaveTypeId !== null && $requiredVacationLeaveDays > 0.0) {
+            if ($isForcedLeaveApplication && $vacationLeaveTypeId === null) {
+                return $this->buildRequiredForcedLeaveVacationBalanceResponse(0.0);
+            }
+
+            if (($shouldDeductVacationLeave || $isForcedLeaveApplication) && $vacationLeaveTypeId !== null && ($requiredVacationLeaveDays > 0.0 || $isForcedLeaveApplication)) {
                 $currentVacationBalance = (float) (
                     $this->findAdminEmployeeLeaveBalance(
                         (int) $app->applicant_admin_id,
                         $vacationLeaveTypeId
                     )?->balance ?? 0.0
                 );
+                if ($isForcedLeaveApplication && $currentVacationBalance <= 0.0) {
+                    return $this->buildRequiredForcedLeaveVacationBalanceResponse($currentVacationBalance);
+                }
+
                 if ($currentVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
                     if ($usesVacationLeaveTopUpForScheduleExcess) {
                         return $this->buildInsufficientVacationLeaveTopUpResponse(
@@ -4764,6 +5114,23 @@ class LeaveApplicationController extends Controller
                 $linkedVacationLeaveReservedDays = (float) ($crossBreakdown['linked_vacation_deduction_days'] ?? 0.0);
                 $linkedSickLeaveReservedDays = (float) ($crossBreakdown['linked_sick_deduction_days'] ?? 0.0);
             }
+        }
+
+        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
+        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+        if (LeaveType::isForcedLeaveType($leaveType, (int) $validated['leave_type_id'])) {
+            $linkedVacationLeaveReservedDays = round(max($deductibleDays, 0.0), 3);
+        } elseif (! $appliedAllowSlVlCrossDeduction) {
+            $linkedVacationLeaveReservedDays = $this->resolveLeaveTypeVacationLeaveDeductionDays(
+                $leaveType,
+                (int) $validated['leave_type_id'],
+                false,
+                (float) $validated['total_days'],
+                $deductibleDays,
+                $forcedLeaveTypeId,
+                $vacationLeaveTypeId,
+                (float) ($eligibility['available_balance'] ?? 0.0)
+            );
         }
 
         $app = DB::transaction(function () use (
@@ -5867,6 +6234,701 @@ class LeaveApplicationController extends Controller
         return $trimmed === '' ? null : $trimmed;
     }
 
+    private function isHrAccessControlOwner(HRAccount $hr): bool
+    {
+        return app(HrAccessControlService::class)->isAccessControlOwner($hr);
+    }
+
+    private function normalizeHrApplicationEditPayload(array $input, LeaveApplication $app): array|JsonResponse
+    {
+        $leaveType = $app->leaveType ?? LeaveType::find((int) $app->leave_type_id);
+        if (! $leaveType instanceof LeaveType) {
+            return response()->json([
+                'message' => 'Selected leave type is no longer available.',
+            ], 422);
+        }
+        $app->setRelation('leaveType', $leaveType);
+
+        $rows = $this->normalizeHrApplicationEditRows($input, $app);
+        if ($rows instanceof JsonResponse) {
+            return $rows;
+        }
+
+        if ($rows === []) {
+            return response()->json([
+                'message' => 'Please add at least one leave date.',
+                'errors' => ['pay_status_rows' => ['Please add at least one leave date.']],
+            ], 422);
+        }
+
+        $selectedDates = array_keys($rows);
+        sort($selectedDates);
+
+        $payStatusByDate = [];
+        $coverageByDate = [];
+        $halfDayPortionByDate = [];
+        $deductibleDaysByDate = [];
+        $withoutPayDaysByDate = [];
+        $totalDays = 0.0;
+        $deductibleDays = 0.0;
+        $withoutPayDays = 0.0;
+
+        foreach ($selectedDates as $dateKey) {
+            $row = $rows[$dateKey];
+            $payStatusByDate[$dateKey] = $row['pay_status'];
+            $coverageByDate[$dateKey] = $row['coverage'];
+            if (($row['half_day_portion'] ?? null) !== null) {
+                $halfDayPortionByDate[$dateKey] = $row['half_day_portion'];
+            }
+
+            $deductibleDaysByDate[$dateKey] = $row['with_pay_days'];
+            $withoutPayDaysByDate[$dateKey] = $row['without_pay_days'];
+            $totalDays += $row['coverage_days'];
+            $deductibleDays += $row['with_pay_days'];
+            $withoutPayDays += $row['without_pay_days'];
+        }
+
+        $isForcedLeave = LeaveType::isForcedLeaveType($leaveType, (int) $app->leave_type_id);
+        $payMode = $isForcedLeave || $deductibleDays > 0.0
+            ? LeaveApplication::PAY_MODE_WITH_PAY
+            : LeaveApplication::PAY_MODE_WITHOUT_PAY;
+        $selectedDatePayStatus = $this->compactSelectedDatePayStatusMap(
+            $payStatusByDate,
+            $selectedDates,
+            $payMode
+        );
+        $coverageMetadata = $this->synchronizeSelectedDateCoverageMetadata(
+            $coverageByDate,
+            $halfDayPortionByDate,
+            $selectedDates
+        );
+
+        return [
+            'request_kind' => self::HR_APPLICATION_EDIT_REQUEST_KIND,
+            'action_type' => LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE,
+            'leave_type_id' => (int) $app->leave_type_id,
+            'leave_type_name' => $leaveType->name,
+            'start_date' => $selectedDates[0] ?? null,
+            'end_date' => $selectedDates[count($selectedDates) - 1] ?? null,
+            'selected_dates' => $selectedDates,
+            'selected_date_pay_status' => $selectedDatePayStatus,
+            'selected_date_coverage' => $coverageMetadata['selectedDateCoverage'],
+            'selected_date_half_day_portion' => $coverageMetadata['selectedDateHalfDayPortion'],
+            'selected_date_deduction' => $this->compactHrEditNumericDateMap($deductibleDaysByDate, $selectedDates),
+            'selected_date_without_pay' => $this->compactHrEditNumericDateMap($withoutPayDaysByDate, $selectedDates),
+            'deductible_days_by_date' => $this->compactHrEditNumericDateMap($deductibleDaysByDate, $selectedDates),
+            'without_pay_days_by_date' => $this->compactHrEditNumericDateMap($withoutPayDaysByDate, $selectedDates),
+            'pay_status_rows' => array_values($rows),
+            'total_days' => round(max($totalDays, 0.0), 2),
+            'deductible_days' => round(max($deductibleDays, 0.0), 3),
+            'without_pay_days' => round(max($withoutPayDays, 0.0), 3),
+            'pay_mode' => $payMode,
+            'allow_sl_vl_cross_deduction' => $this->resolvePayloadSlVlCrossDeductionFlag(
+                $input,
+                (bool) ($app->allow_sl_vl_cross_deduction ?? false)
+            ),
+            'is_monetization' => false,
+        ];
+    }
+
+    private function normalizeHrApplicationEditRows(array $input, LeaveApplication $app): array|JsonResponse
+    {
+        $rawRows = $this->normalizeHrEditRowsInput(
+            $input['pay_status_rows'] ?? $input['payStatusRows'] ?? null
+        );
+
+        if ($rawRows === []) {
+            $rawRows = $this->buildHrApplicationEditRowsFromMaps($input, $app);
+        }
+
+        if ($rawRows === []) {
+            return [];
+        }
+
+        $rowsByDate = [];
+        $employeeControlNo = trim((string) ($app->employee_control_no ?? '')) ?: null;
+        $fallbackPayMode = $this->normalizePayMode($app->pay_mode ?? null, false);
+
+        foreach ($rawRows as $index => $rawRow) {
+            if (! is_array($rawRow)) {
+                continue;
+            }
+
+            $dateKey = $this->normalizeDateKey(
+                $rawRow['date_key']
+                ?? $rawRow['dateKey']
+                ?? $rawRow['date']
+                ?? $rawRow['selected_date']
+                ?? $rawRow['selectedDate']
+                ?? null
+            );
+            if ($dateKey === null) {
+                return response()->json([
+                    'message' => 'Each edit row must include a valid date.',
+                    'errors' => ["pay_status_rows.{$index}.date" => ['Each edit row must include a valid date.']],
+                ], 422);
+            }
+
+            $coverageInput = $rawRow['coverage_code']
+                ?? $rawRow['coverageCode']
+                ?? $rawRow['coverage']
+                ?? $rawRow['coverageLabel']
+                ?? 'whole';
+            $coverage = $this->normalizeSelectedDateCoverageValue($coverageInput) ?? 'whole';
+            $halfDayPortion = $coverage === 'half'
+                ? ($this->normalizeSelectedDateHalfDayPortionValue(
+                    $rawRow['half_day_portion']
+                    ?? $rawRow['halfDayPortion']
+                    ?? $rawRow['portion']
+                    ?? $coverageInput
+                ) ?? 'AM')
+                : null;
+            $coverageDays = round(max(
+                $this->workScheduleService()->resolveCoverageDeductionDays($coverage, $employeeControlNo),
+                0.0
+            ), 3);
+
+            $rawPayStatus = $rawRow['pay_status']
+                ?? $rawRow['payStatus']
+                ?? $rawRow['status']
+                ?? $fallbackPayMode;
+            $payStatus = $this->resolvePayModeFromStatusValue($rawPayStatus) ?? $fallbackPayMode;
+
+            $rawWithPayDays = $rawRow['wp']
+                ?? $rawRow['with_pay_days']
+                ?? $rawRow['withPayDays']
+                ?? $rawRow['deductible_days']
+                ?? $rawRow['deduction_days']
+                ?? $rawRow['deductionDays']
+                ?? null;
+            $rawWithoutPayDays = $rawRow['wop']
+                ?? $rawRow['without_pay_days']
+                ?? $rawRow['withoutPayDays']
+                ?? $rawRow['without_pay']
+                ?? $rawRow['wopDays']
+                ?? null;
+
+            $withPayDays = $payStatus === LeaveApplication::PAY_MODE_WITH_PAY
+                ? $this->normalizeHrEditDayValue($rawWithPayDays, $coverageDays)
+                : 0.0;
+            $withoutPayDays = $payStatus === LeaveApplication::PAY_MODE_WITHOUT_PAY
+                ? $this->normalizeHrEditDayValue($rawWithoutPayDays, $coverageDays)
+                : 0.0;
+
+            $rowsByDate[$dateKey] = [
+                'date_key' => $dateKey,
+                'dateKey' => $dateKey,
+                'coverage' => $coverage,
+                'coverage_code' => $halfDayPortion !== null ? 'half_'.strtolower($halfDayPortion) : 'whole',
+                'coverageCode' => $halfDayPortion !== null ? 'half_'.strtolower($halfDayPortion) : 'whole',
+                'half_day_portion' => $halfDayPortion,
+                'halfDayPortion' => $halfDayPortion,
+                'coverage_days' => $coverageDays,
+                'coverageDays' => $coverageDays,
+                'pay_status' => $payStatus,
+                'payStatus' => $payStatus,
+                'with_pay_days' => $withPayDays,
+                'withPayDays' => $withPayDays,
+                'without_pay_days' => $withoutPayDays,
+                'withoutPayDays' => $withoutPayDays,
+            ];
+        }
+
+        ksort($rowsByDate);
+
+        return $rowsByDate;
+    }
+
+    private function normalizeHrEditRowsInput(mixed $value): array
+    {
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $value = $decoded;
+            }
+        }
+
+        if (! is_array($value) || $value === []) {
+            return [];
+        }
+
+        if (array_is_list($value)) {
+            return $value;
+        }
+
+        $rows = [];
+        foreach ($value as $dateKey => $entry) {
+            if (is_array($entry)) {
+                $entry['date_key'] ??= $dateKey;
+                $rows[] = $entry;
+
+                continue;
+            }
+
+            $rows[] = [
+                'date_key' => $dateKey,
+                'pay_status' => $entry,
+            ];
+        }
+
+        return $rows;
+    }
+
+    private function buildHrApplicationEditRowsFromMaps(array $input, LeaveApplication $app): array
+    {
+        $selectedDates = $this->normalizeHrEditSelectedDates(
+            $input['selected_dates']
+            ?? $input['selectedDates']
+            ?? $app->resolvedSelectedDates()
+        );
+        if ($selectedDates === []) {
+            return [];
+        }
+
+        $payStatusMap = $this->normalizeSelectedDatePayStatusMap(
+            $input['selected_date_pay_status']
+            ?? $input['selectedDatePayStatus']
+            ?? $app->selected_date_pay_status
+        );
+        $coverageMap = $this->normalizeSelectedDateCoverageMap(
+            $input['selected_date_coverage']
+            ?? $input['selectedDateCoverage']
+            ?? $app->selected_date_coverage
+        );
+        $halfDayPortionMap = $this->normalizeSelectedDateHalfDayPortionMap(
+            $input['selected_date_half_day_portion']
+            ?? $input['selectedDateHalfDayPortion']
+            ?? $app->selected_date_half_day_portion
+        );
+        $deductibleDaysByDate = $this->normalizeHrEditNumericDateMap(
+            $input['deductible_days_by_date']
+            ?? $input['selected_date_deduction']
+            ?? $input['selectedDateDeduction']
+            ?? $app->selected_date_deduction
+            ?? null
+        );
+        $withoutPayDaysByDate = $this->normalizeHrEditNumericDateMap(
+            $input['without_pay_days_by_date']
+            ?? $input['selected_date_without_pay']
+            ?? $input['selectedDateWithoutPay']
+            ?? $app->selected_date_without_pay
+            ?? null
+        );
+
+        $rows = [];
+        $fallbackPayMode = $this->normalizePayMode($app->pay_mode ?? null, false);
+        foreach ($selectedDates as $dateKey) {
+            $coverage = $coverageMap[$dateKey] ?? 'whole';
+            $halfDayPortion = ($coverage === 'half')
+                ? ($halfDayPortionMap[$dateKey] ?? 'AM')
+                : null;
+            $payStatus = $payStatusMap[$dateKey] ?? $fallbackPayMode;
+
+            $rows[] = [
+                'date_key' => $dateKey,
+                'coverage' => $coverage,
+                'half_day_portion' => $halfDayPortion,
+                'pay_status' => $payStatus,
+                'with_pay_days' => $deductibleDaysByDate[$dateKey] ?? null,
+                'without_pay_days' => $withoutPayDaysByDate[$dateKey] ?? null,
+            ];
+        }
+
+        return $rows;
+    }
+
+    private function normalizeHrEditSelectedDates(mixed $value): array
+    {
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $value = $decoded;
+            }
+        }
+
+        if (! is_array($value)) {
+            return [];
+        }
+
+        $dates = [];
+        foreach ($value as $rawDate) {
+            $dateKey = $this->normalizeDateKey($rawDate);
+            if ($dateKey !== null) {
+                $dates[] = $dateKey;
+            }
+        }
+
+        $dates = array_values(array_unique($dates));
+        sort($dates);
+
+        return $dates;
+    }
+
+    private function normalizeHrEditNumericDateMap(mixed $value): ?array
+    {
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $value = $decoded;
+            }
+        }
+
+        if (! is_array($value) || $value === []) {
+            return null;
+        }
+
+        $normalized = [];
+        foreach ($value as $rawDate => $rawDays) {
+            $dateKey = $this->normalizeDateKey($rawDate);
+            if ($dateKey === null) {
+                $dateKey = trim((string) $rawDate);
+            }
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $normalized[$dateKey] = $this->normalizeHrEditDayValue($rawDays);
+        }
+
+        if ($normalized === []) {
+            return null;
+        }
+
+        ksort($normalized);
+
+        return $normalized;
+    }
+
+    private function compactHrEditNumericDateMap(?array $value, array $selectedDates): ?array
+    {
+        if (! is_array($value) || $value === []) {
+            return null;
+        }
+
+        $selectedDateSet = array_fill_keys($selectedDates, true);
+        $compacted = [];
+        foreach ($value as $dateKey => $days) {
+            if (! isset($selectedDateSet[$dateKey])) {
+                continue;
+            }
+
+            $compacted[$dateKey] = $this->normalizeHrEditDayValue($days);
+        }
+
+        if ($compacted === []) {
+            return null;
+        }
+
+        ksort($compacted);
+
+        return $compacted;
+    }
+
+    private function normalizeHrEditDayValue(mixed $value, float $fallback = 0.0): float
+    {
+        $numericValue = is_numeric($value) ? (float) $value : $fallback;
+        if (! is_finite($numericValue)) {
+            $numericValue = $fallback;
+        }
+
+        return round(min(max($numericValue, 0.0), 999.0), 3);
+    }
+
+    private function withHrApplicationEditRequestMeta(array $payload): array
+    {
+        $payload['request_kind'] = self::HR_APPLICATION_EDIT_REQUEST_KIND;
+        $payload['action_type'] = LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE;
+
+        return $payload;
+    }
+
+    private function isHrApplicationEditRequestRecord(LeaveApplicationUpdateRequest $editRequest): bool
+    {
+        return $editRequest->isHrApplicationEditRequest();
+    }
+
+    private function isHrApplicationEditWorkflowLog(LeaveApplicationLog $log): bool
+    {
+        return in_array($log->action, [
+            LeaveApplicationLog::ACTION_HR_APPLICATION_EDITED,
+            LeaveApplicationLog::ACTION_HR_APPLICATION_EDIT_REQUESTED,
+            LeaveApplicationLog::ACTION_HR_APPLICATION_EDIT_REQUEST_APPROVED,
+            LeaveApplicationLog::ACTION_HR_APPLICATION_EDIT_REQUEST_REJECTED,
+        ], true);
+    }
+
+    private function formatHrEditRequestActor(HRAccount $hr): string
+    {
+        $username = trim((string) ($hr->username ?? ''));
+
+        return $username !== ''
+            ? "HR:{$hr->id}:{$username}"
+            : "HR:{$hr->id}";
+    }
+
+    private function formatHrApplicationEditRequest(LeaveApplicationUpdateRequest $editRequest): array
+    {
+        $application = $editRequest->leaveApplication;
+        $payload = is_array($editRequest->requested_payload) ? $editRequest->requested_payload : [];
+
+        return [
+            'id' => $editRequest->id,
+            'leave_application_id' => $editRequest->leave_application_id,
+            'status' => strtoupper(trim((string) $editRequest->status)),
+            'previous_status' => strtoupper(trim((string) ($editRequest->previous_status ?? ''))),
+            'employee_control_no' => $editRequest->employee_control_no,
+            'employee_name' => $editRequest->employee_name,
+            'leave_type_name' => $payload['leave_type_name'] ?? $application?->leaveType?->name,
+            'requested_by' => $this->trimNullableString($editRequest->requested_by_control_no),
+            'requested_at' => $editRequest->requested_at?->toIso8601String(),
+            'requested_reason' => $this->trimNullableString($editRequest->requested_reason),
+            'reviewed_by_hr_id' => $editRequest->reviewed_by_hr_id,
+            'reviewed_by' => $editRequest->reviewedByHr?->full_name,
+            'reviewed_at' => $editRequest->reviewed_at?->toIso8601String(),
+            'review_remarks' => $this->trimNullableString($editRequest->review_remarks),
+            'payload' => $payload,
+            'application' => $application instanceof LeaveApplication
+                ? $this->formatApplication($application->loadMissing(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests']))
+                : null,
+        ];
+    }
+
+    private function applyHrApplicationEdit(
+        LeaveApplication $app,
+        HRAccount $hr,
+        array $payload,
+        ?string $reason,
+        ?LeaveApplicationUpdateRequest $editRequest = null,
+        ?string $reviewRemarks = null
+    ): LeaveApplication|JsonResponse {
+        $leaveType = $app->leaveType ?? LeaveType::find((int) $app->leave_type_id);
+        if (! $leaveType instanceof LeaveType) {
+            return response()->json([
+                'message' => 'Selected leave type is no longer available.',
+            ], 422);
+        }
+        $app->setRelation('leaveType', $leaveType);
+
+        $targetTotalDays = round((float) ($payload['total_days'] ?? 0.0), 2);
+        if ($targetTotalDays <= 0.0) {
+            return response()->json([
+                'message' => 'The edited application must include at least one day.',
+            ], 422);
+        }
+
+        $targetSelectedDates = is_array($payload['selected_dates'] ?? null)
+            ? $this->normalizeHrEditSelectedDates($payload['selected_dates'])
+            : [];
+        if ($targetSelectedDates === []) {
+            return response()->json([
+                'message' => 'The edited application must include at least one leave date.',
+            ], 422);
+        }
+
+        $targetStartDate = $targetSelectedDates[0];
+        $targetEndDate = $targetSelectedDates[count($targetSelectedDates) - 1];
+        $duplicateDateValidation = $this->validateNoDuplicateLeaveDates(
+            (string) ($app->employee_control_no ?? ''),
+            $targetStartDate,
+            $targetEndDate,
+            $targetSelectedDates,
+            $targetTotalDays,
+            (int) $app->id,
+            is_array($payload['selected_date_coverage'] ?? null) ? $payload['selected_date_coverage'] : null,
+            is_array($payload['selected_date_half_day_portion'] ?? null) ? $payload['selected_date_half_day_portion'] : null
+        );
+        if ($duplicateDateValidation instanceof JsonResponse) {
+            return $duplicateDateValidation;
+        }
+
+        if ($leaveType->max_days && $targetTotalDays > (float) $leaveType->max_days) {
+            return response()->json([
+                'message' => "This leave type is limited to {$leaveType->max_days} days per application.",
+                'errors' => [
+                    'total_days' => ["Maximum of {$leaveType->max_days} days allowed for {$leaveType->name}."],
+                ],
+            ], 422);
+        }
+
+        $targetPayMode = $this->normalizePayMode($payload['pay_mode'] ?? null, false);
+        $targetDeductibleDays = round(max((float) ($payload['deductible_days'] ?? 0.0), 0.0), 3);
+        $targetWithoutPayDays = round(max((float) ($payload['without_pay_days'] ?? 0.0), 0.0), 3);
+        $isApprovedApplication = $app->status === LeaveApplication::STATUS_APPROVED;
+        $sourceLeaveType = LeaveType::find((int) $app->leave_type_id);
+        $sourceDeductibleDays = $this->resolveApplicationDeductibleDays($app);
+        $sourceDeductsBalance = $isApprovedApplication
+            && $this->applicationDeductsEmployeeBalance(false, $sourceLeaveType, $app->pay_mode);
+        $targetDeductsBalance = $isApprovedApplication
+            && $this->applicationDeductsEmployeeBalance(false, $leaveType, $targetPayMode);
+
+        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
+        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+        $targetShouldDeductForcedLeave = $this->shouldLeaveTypeDeductForcedLeave(
+            $leaveType,
+            (int) $app->leave_type_id,
+            false,
+            $forcedLeaveTypeId
+        );
+        $targetShouldDeductVacationLeave = $this->shouldLeaveTypeDeductVacationLeave(
+            $leaveType,
+            (int) $app->leave_type_id,
+            false,
+            $forcedLeaveTypeId,
+            $vacationLeaveTypeId
+        );
+        $targetIsCtoDeduction = $this->isCtoLeaveType($leaveType, (int) $app->leave_type_id);
+        $balanceConflictError = 'HR_APPLICATION_EDIT_BALANCE_CONFLICT';
+
+        if ($app->employee_control_no) {
+            $this->syncEmployeeCtoBalance((string) $app->employee_control_no);
+        }
+
+        $updateAttributes = [
+            'start_date' => $targetStartDate,
+            'end_date' => $targetEndDate,
+            'total_days' => $targetTotalDays,
+            'deductible_days' => $targetDeductibleDays,
+            'without_pay_days' => $targetWithoutPayDays,
+            'cto_deducted_hours' => $this->hasLeaveApplicationCtoHoursColumn() && $targetIsCtoDeduction
+                ? $this->resolveCtoDeductedHours($targetDeductibleDays)
+                : null,
+            'selected_dates' => $targetSelectedDates,
+            'selected_date_pay_status' => is_array($payload['selected_date_pay_status'] ?? null)
+                ? $payload['selected_date_pay_status']
+                : null,
+            'selected_date_coverage' => is_array($payload['selected_date_coverage'] ?? null)
+                ? $payload['selected_date_coverage']
+                : null,
+            'selected_date_half_day_portion' => is_array($payload['selected_date_half_day_portion'] ?? null)
+                ? $payload['selected_date_half_day_portion']
+                : null,
+            'pay_mode' => $targetPayMode,
+            'allow_sl_vl_cross_deduction' => (bool) ($payload['allow_sl_vl_cross_deduction'] ?? false),
+        ];
+
+        if ($this->hasLeaveApplicationSelectedDateLedgerValueColumns()) {
+            $updateAttributes['selected_date_deduction'] = is_array($payload['selected_date_deduction'] ?? null)
+                ? $payload['selected_date_deduction']
+                : null;
+            $updateAttributes['selected_date_without_pay'] = is_array($payload['selected_date_without_pay'] ?? null)
+                ? $payload['selected_date_without_pay']
+                : null;
+        }
+
+        try {
+            DB::transaction(function () use (
+                $app,
+                $hr,
+                $editRequest,
+                $payload,
+                $reason,
+                $reviewRemarks,
+                $updateAttributes,
+                $sourceLeaveType,
+                $sourceDeductibleDays,
+                $sourceDeductsBalance,
+                $targetDeductsBalance,
+                $targetDeductibleDays,
+                $targetTotalDays,
+                $targetIsCtoDeduction,
+                $targetShouldDeductForcedLeave,
+                $forcedLeaveTypeId,
+                $targetShouldDeductVacationLeave,
+                $vacationLeaveTypeId,
+                $balanceConflictError
+            ): void {
+                if ($sourceDeductsBalance && $sourceDeductibleDays > 0.0) {
+                    $this->refundApplicationTrackedDeductions(
+                        $app,
+                        $sourceLeaveType,
+                        $sourceDeductibleDays,
+                        $balanceConflictError
+                    );
+                }
+
+                $app->fill($updateAttributes);
+
+                $linkedForcedLeaveDeductedDays = 0.0;
+                $linkedVacationLeaveDeductedDays = 0.0;
+                $linkedSickLeaveDeductedDays = 0.0;
+                if ($targetDeductsBalance && $targetDeductibleDays > 0.0) {
+                    $linkedDeductions = $this->deductApplicationTrackedBalances(
+                        $app,
+                        (int) $app->leave_type_id,
+                        $targetDeductibleDays,
+                        $targetTotalDays,
+                        $targetIsCtoDeduction,
+                        $targetShouldDeductForcedLeave,
+                        $forcedLeaveTypeId,
+                        $targetShouldDeductVacationLeave,
+                        $vacationLeaveTypeId,
+                        (bool) ($payload['allow_sl_vl_cross_deduction'] ?? false),
+                        $this->resolveSickLeaveTypeId(),
+                        $balanceConflictError
+                    );
+                    $linkedForcedLeaveDeductedDays = (float) ($linkedDeductions['linked_forced_leave_deducted_days'] ?? 0.0);
+                    $linkedVacationLeaveDeductedDays = (float) ($linkedDeductions['linked_vacation_leave_deducted_days'] ?? 0.0);
+                    $linkedSickLeaveDeductedDays = (float) ($linkedDeductions['linked_sick_leave_deducted_days'] ?? 0.0);
+                }
+
+                $app->linked_forced_leave_deducted_days = $linkedForcedLeaveDeductedDays;
+                $app->linked_vacation_leave_deducted_days = $linkedVacationLeaveDeductedDays;
+                $app->linked_sick_leave_deducted_days = $linkedSickLeaveDeductedDays;
+                $app->save();
+
+                if ($app->employee_control_no) {
+                    $this->syncEmployeeCtoBalance((string) $app->employee_control_no, true);
+                }
+
+                if ($app->status === LeaveApplication::STATUS_APPROVED) {
+                    $this->lockCertificationLeaveCreditsSnapshot($app);
+                }
+
+                if ($editRequest instanceof LeaveApplicationUpdateRequest) {
+                    $editRequest->update([
+                        'status' => LeaveApplicationUpdateRequest::STATUS_APPROVED,
+                        'reviewed_by_hr_id' => $hr->id,
+                        'reviewed_at' => now(),
+                        'review_remarks' => $reviewRemarks,
+                    ]);
+                }
+
+                LeaveApplicationLog::create([
+                    'leave_application_id' => $app->id,
+                    'action' => $editRequest instanceof LeaveApplicationUpdateRequest
+                        ? LeaveApplicationLog::ACTION_HR_APPLICATION_EDIT_REQUEST_APPROVED
+                        : LeaveApplicationLog::ACTION_HR_APPLICATION_EDITED,
+                    'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
+                    'performed_by_id' => $hr->id,
+                    'remarks' => $reviewRemarks ?? $reason ?? 'HR application override.',
+                    'created_at' => now(),
+                ]);
+            });
+        } catch (\RuntimeException $exception) {
+            if ($exception->getMessage() !== $balanceConflictError) {
+                throw $exception;
+            }
+
+            return response()->json([
+                'message' => 'Insufficient leave balance to apply this HR edit.',
+            ], 422);
+        }
+
+        return $app->fresh(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests']);
+    }
+
+    private function hasLeaveApplicationSelectedDateLedgerValueColumns(): bool
+    {
+        return Schema::hasColumn('tblLeaveApplications', 'selected_date_deduction')
+            && Schema::hasColumn('tblLeaveApplications', 'selected_date_without_pay');
+    }
+
+    private function applicationHasHrSelectedDateLedgerValues(LeaveApplication $app): bool
+    {
+        return is_array($app->selected_date_deduction)
+            || is_array($app->selected_date_without_pay);
+    }
+
     private function formatErmsLeaveBalancePayload(
         LeaveType $leaveType,
         ?LeaveBalance $balance,
@@ -6420,6 +7482,10 @@ class LeaveApplicationController extends Controller
             LeaveApplicationLog::ACTION_HR_RECALLED => 'hr recalled',
             LeaveApplicationLog::ACTION_HR_RECEIVED => 'received application',
             LeaveApplicationLog::ACTION_HR_PAY_STATUS_OVERRIDDEN => 'hr updated pay status',
+            LeaveApplicationLog::ACTION_HR_APPLICATION_EDITED => 'hr edited application',
+            LeaveApplicationLog::ACTION_HR_APPLICATION_EDIT_REQUESTED => 'hr requested application edit',
+            LeaveApplicationLog::ACTION_HR_APPLICATION_EDIT_REQUEST_APPROVED => 'hr approved application edit request',
+            LeaveApplicationLog::ACTION_HR_APPLICATION_EDIT_REQUEST_REJECTED => 'hr rejected application edit request',
             LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED => 'cmo/cvmo reviewed',
             LeaveApplicationLog::ACTION_HR_RELEASED => 'released application',
             default => strtolower(str_replace('_', ' ', (string) $log->action)),
@@ -6576,20 +7642,22 @@ class LeaveApplicationController extends Controller
             $reviewedAt = $disapprovedAt ?? $hrActionAt ?? $adminActionAt;
         }
 
-        $statusHistory = $logs->map(function (LeaveApplicationLog $log) use ($actorDirectory, $employeeName) {
-            $actorName = $this->resolveWorkflowPerformerName($log, $actorDirectory, $employeeName);
+        $statusHistory = $logs
+            ->filter(fn (LeaveApplicationLog $log): bool => ! $this->isHrApplicationEditWorkflowLog($log))
+            ->map(function (LeaveApplicationLog $log) use ($actorDirectory, $employeeName) {
+                $actorName = $this->resolveWorkflowPerformerName($log, $actorDirectory, $employeeName);
 
-            return [
-                'action' => $log->action,
-                'stage' => $this->mapWorkflowLogStage($log),
-                'actor_name' => $actorName,
-                'action_by_name' => $actorName,
-                'action_by' => $actorName,
-                'performed_by_type' => strtoupper((string) $log->performed_by_type),
-                'remarks' => $log->remarks,
-                'created_at' => $log->created_at?->toIso8601String(),
-            ];
-        })->values();
+                return [
+                    'action' => $log->action,
+                    'stage' => $this->mapWorkflowLogStage($log),
+                    'actor_name' => $actorName,
+                    'action_by_name' => $actorName,
+                    'action_by' => $actorName,
+                    'performed_by_type' => strtoupper((string) $log->performed_by_type),
+                    'remarks' => $log->remarks,
+                    'created_at' => $log->created_at?->toIso8601String(),
+                ];
+            })->values();
 
         $approverName = $processedBy ?? $hrActionBy ?? $adminActionBy;
 
@@ -7951,7 +9019,8 @@ class LeaveApplicationController extends Controller
                 ->sortByDesc(fn (LeaveApplicationUpdateRequest $item) => (int) $item->id)
                 ->first(function (LeaveApplicationUpdateRequest $item): bool {
                     return strtoupper(trim((string) $item->status)) === LeaveApplicationUpdateRequest::STATUS_PENDING
-                        && strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED;
+                        && strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED
+                        && ! $this->isHrApplicationEditRequestRecord($item);
                 });
 
             return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
@@ -7961,7 +9030,9 @@ class LeaveApplicationController extends Controller
             ->where('leave_application_id', (int) $app->id)
             ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
             ->latest('id')
-            ->first();
+            ->get()
+            ->first(fn (LeaveApplicationUpdateRequest $item): bool => strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED
+                && ! $this->isHrApplicationEditRequestRecord($item));
 
         if (! $record) {
             return null;
@@ -8088,7 +9159,8 @@ class LeaveApplicationController extends Controller
                 ->filter(fn ($item) => $item instanceof LeaveApplicationUpdateRequest)
                 ->sortByDesc(fn (LeaveApplicationUpdateRequest $item) => (int) $item->id)
                 ->first(function (LeaveApplicationUpdateRequest $item): bool {
-                    return strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED;
+                    return strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED
+                        && ! $this->isHrApplicationEditRequestRecord($item);
                 });
 
             return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
@@ -8097,7 +9169,9 @@ class LeaveApplicationController extends Controller
         $record = LeaveApplicationUpdateRequest::query()
             ->where('leave_application_id', (int) $app->id)
             ->latest('id')
-            ->first();
+            ->get()
+            ->first(fn (LeaveApplicationUpdateRequest $item): bool => strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED
+                && ! $this->isHrApplicationEditRequestRecord($item));
 
         if (! $record) {
             return null;
@@ -8639,7 +9713,23 @@ class LeaveApplicationController extends Controller
             $linkedSickLeaveRequiredDays = (float) ($crossDeductionBreakdown['linked_sick_deduction_days'] ?? 0.0);
         }
         if ($isForcedLeaveApplication) {
+            $forcedAvailable = $primaryBalance ? max((float) $primaryBalance->balance, 0.0) : 0.0;
+            if ($forcedAvailable <= 0.0) {
+                throw new \RuntimeException($balanceConflictError);
+            }
+
+            $linkedVacationLeaveRequiredDays = $normalizedDaysToDeduct;
             $primaryDaysToDeduct = 0.0;
+
+            if ($vacationLeaveTypeId === null) {
+                throw new \RuntimeException($balanceConflictError);
+            }
+
+            $vacationBalance ??= $this->lockEmployeeLeaveBalance($employeeControlNo, $vacationLeaveTypeId);
+            $availableVacationBalance = $vacationBalance ? max((float) $vacationBalance->balance, 0.0) : 0.0;
+            if ($availableVacationBalance <= 0.0) {
+                throw new \RuntimeException($balanceConflictError);
+            }
         }
 
         if (
@@ -8671,10 +9761,10 @@ class LeaveApplicationController extends Controller
                 ? $primaryBalance
                 : $this->lockEmployeeLeaveBalance($employeeControlNo, $forcedLeaveTypeId);
             $forcedAvailable = $forcedBalance ? max((float) $forcedBalance->balance, 0.0) : 0.0;
-            $forcedDeductionBaseDays = $isForcedLeaveApplication
+            $forcedLeaveDeductionBaseDays = $isForcedLeaveApplication
                 ? $normalizedDaysToDeduct
                 : $primaryDaysToDeduct;
-            $linkedForcedLeaveDeductedDays = round(min(max($forcedDeductionBaseDays, 0.0), $forcedAvailable), 3);
+            $linkedForcedLeaveDeductedDays = round(min(max($forcedLeaveDeductionBaseDays, 0.0), $forcedAvailable), 3);
 
             if ($forcedBalance && $linkedForcedLeaveDeductedDays > 0.0) {
                 $forcedBalance->decrement('balance', $linkedForcedLeaveDeductedDays);
@@ -9180,23 +10270,45 @@ class LeaveApplicationController extends Controller
 
     private function isWellnessLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
     {
+        return strcasecmp((string) ($this->resolveLeaveTypePolicyName($leaveType, $leaveTypeId) ?? ''), 'Wellness Leave') === 0;
+    }
+
+    private function isSoloParentLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
+    {
+        return strcasecmp((string) ($this->resolveLeaveTypePolicyName($leaveType, $leaveTypeId) ?? ''), 'Solo Parent Leave') === 0;
+    }
+
+    private function isCalamityLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
+    {
+        $normalizedName = LeaveType::normalizeLeaveTypeName(
+            $this->resolveLeaveTypePolicyName($leaveType, $leaveTypeId)
+        );
+
+        return str_contains($normalizedName, 'CALAMITY')
+            || str_contains($normalizedName, 'SPECIAL EMERGENCY');
+    }
+
+    private function resolveLeaveTypePolicyName(?LeaveType $leaveType = null, ?int $leaveTypeId = null): ?string
+    {
         static $leaveTypeNameCache = [];
 
-        $leaveTypeName = null;
         if ($leaveType instanceof LeaveType) {
-            $leaveTypeName = trim((string) ($leaveType->name ?? ''));
-        } elseif ($leaveTypeId !== null && $leaveTypeId > 0) {
-            if (! array_key_exists($leaveTypeId, $leaveTypeNameCache)) {
-                $leaveTypeNameCache[$leaveTypeId] = LeaveType::query()
-                    ->whereKey((int) $leaveTypeId)
-                    ->value('name');
-            }
-
-            $resolvedName = $leaveTypeNameCache[$leaveTypeId];
-            $leaveTypeName = is_string($resolvedName) ? trim($resolvedName) : null;
+            return trim((string) ($leaveType->name ?? '')) ?: null;
         }
 
-        return strcasecmp((string) ($leaveTypeName ?? ''), 'Wellness Leave') === 0;
+        if ($leaveTypeId === null || $leaveTypeId <= 0) {
+            return null;
+        }
+
+        if (! array_key_exists($leaveTypeId, $leaveTypeNameCache)) {
+            $leaveTypeNameCache[$leaveTypeId] = LeaveType::query()
+                ->whereKey((int) $leaveTypeId)
+                ->value('name');
+        }
+
+        $resolvedName = $leaveTypeNameCache[$leaveTypeId];
+
+        return is_string($resolvedName) ? trim($resolvedName) : null;
     }
 
     private function shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
@@ -9212,7 +10324,9 @@ class LeaveApplicationController extends Controller
         $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
 
         return $this->isWellnessLeaveType($leaveType, $canonicalLeaveTypeId)
-            || LeaveType::isSpecialPrivilegeType($leaveType, $canonicalLeaveTypeId);
+            || LeaveType::isSpecialPrivilegeType($leaveType, $canonicalLeaveTypeId)
+            || $this->isSoloParentLeaveType($leaveType, $canonicalLeaveTypeId)
+            || $this->isCalamityLeaveType($leaveType, $canonicalLeaveTypeId);
     }
 
     private function resolveLeaveTypeVacationLeaveDeductionDays(
@@ -9222,7 +10336,8 @@ class LeaveApplicationController extends Controller
         float $requestedTotalDays,
         float $deductibleDays,
         ?int $forcedLeaveTypeId,
-        ?int $vacationLeaveTypeId
+        ?int $vacationLeaveTypeId,
+        ?float $primaryAvailableDays = null
     ): float {
         $normalizedDeductibleDays = round(max($deductibleDays, 0.0), 3);
         if ($normalizedDeductibleDays <= 0.0) {
@@ -9254,8 +10369,14 @@ class LeaveApplicationController extends Controller
         }
 
         $normalizedRequestedTotalDays = round(max($requestedTotalDays, 0.0), 3);
+        $scheduleExcessDays = round(max($normalizedDeductibleDays - $normalizedRequestedTotalDays, 0.0), 3);
+        if ($primaryAvailableDays !== null) {
+            $shortageDays = round(max($normalizedDeductibleDays - max($primaryAvailableDays, 0.0), 0.0), 3);
 
-        return round(max($normalizedDeductibleDays - $normalizedRequestedTotalDays, 0.0), 3);
+            return max($scheduleExcessDays, $shortageDays);
+        }
+
+        return $scheduleExcessDays;
     }
 
     private function resolvePrimaryLeaveTrackedDeductionDays(
@@ -10300,12 +11421,11 @@ class LeaveApplicationController extends Controller
 
         if ($isForcedLeave) {
             $normalizedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
-            $normalizedSelectedDatePayStatus = null;
 
             $deductibleDays = $this->computeDeductibleDays(
                 $normalizedTotalDays,
                 $selectedDates,
-                null,
+                $normalizedSelectedDatePayStatus,
                 $normalizedSelectedDateCoverage,
                 false,
                 $normalizedPayMode,
@@ -11983,7 +13103,7 @@ class LeaveApplicationController extends Controller
             return 0.0;
         }
 
-        if (LeaveType::isForcedLeaveType($app->leaveType, (int) $app->leave_type_id)) {
+        if (LeaveType::isForcedLeaveType($app->leaveType, (int) $app->leave_type_id) && $app->deductible_days === null) {
             return $totalDays;
         }
 
@@ -12397,6 +13517,7 @@ class LeaveApplicationController extends Controller
 
         $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
         $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
+        $isForcedLeaveType = LeaveType::isForcedLeaveType($leaveType, $leaveTypeId);
         $normalizedPayMode = $this->normalizePayMode($payMode);
         $requiredBalanceDays = round(max((float) ($requestedDeductibleDays ?? $requestedDays), 0.0), 3);
         $requiresVacationLeaveTopUp = $this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
@@ -12444,9 +13565,12 @@ class LeaveApplicationController extends Controller
             $vacationLeaveTypeId
         );
         if (
-            ! $leaveType->is_credit_based
-            || ($requiredBalanceDays <= 0 && $requiredVacationLeaveDays <= 0)
-            || $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
+            ! $isForcedLeaveType
+            && (
+                ! $leaveType->is_credit_based
+                || ($requiredBalanceDays <= 0 && $requiredVacationLeaveDays <= 0)
+                || $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
+            )
         ) {
             return [
                 'leave_type' => $leaveType,
@@ -12475,6 +13599,43 @@ class LeaveApplicationController extends Controller
         $currentBalanceHours = (float) ($balanceSnapshot['current_balance_hours'] ?? 0.0);
         $pendingReservedHours = (float) ($balanceSnapshot['pending_reserved_hours'] ?? 0.0);
         $availableBalanceHours = (float) ($balanceSnapshot['available_balance_hours'] ?? 0.0);
+        if ($isForcedLeaveType && $availableBalance <= 0.0) {
+            return [
+                'leave_type' => $leaveType,
+                'balance' => $currentBalance,
+                'available_balance' => $availableBalance,
+                'balance_hours' => $currentBalanceHours,
+                'available_balance_hours' => $availableBalanceHours,
+                'pending_reserved_days' => $pendingReservedDays,
+                'pending_reserved_hours' => $pendingReservedHours,
+                'required_balance_days' => round(max((float) ($requestedDeductibleDays ?? $requestedDays), 0.0), 3),
+                'required_balance_hours' => null,
+                'required_forced_leave_days' => $requiredForcedLeaveDays,
+                'required_vacation_leave_days' => $requiredVacationLeaveDays,
+                'insufficient_balance' => true,
+            ];
+        }
+
+        if ($isForcedLeaveType) {
+            if ($vacationLeaveTypeId === null) {
+                return $this->buildRequiredForcedLeaveVacationBalanceResponse(0.0);
+            }
+
+            $vacationBalanceSnapshot = $this->resolveEmployeeLeaveBalanceSnapshot(
+                $employeeControlNo,
+                $vacationLeaveTypeId
+            );
+            $availableVacationBalance = (float) ($vacationBalanceSnapshot['available_balance'] ?? 0.0);
+            if ($availableVacationBalance <= 0.0) {
+                return $this->buildRequiredForcedLeaveVacationBalanceResponse($availableVacationBalance);
+            }
+
+            $requestedForcedLeaveDays = round(max((float) ($requestedDeductibleDays ?? $requestedDays), 0.0), 3);
+            $requiredBalanceDays = 0.0;
+            $requiredVacationLeaveDays = $requestedForcedLeaveDays;
+            $requiredForcedLeaveDays = 0.0;
+        }
+
         $requiredBalanceHours = $this->isCtoLeaveType($leaveType, $leaveTypeId)
             ? round(max((float) ($requestedCtoHours ?? $this->resolveCtoDeductedHours($requiredBalanceDays)), 0.0), 2)
             : null;
@@ -12663,6 +13824,18 @@ class LeaveApplicationController extends Controller
             ],
             'available_vacation_leave_days' => $availableVacationBalance,
             'required_vacation_leave_days' => $requiredVacationLeaveDays,
+        ], 422);
+    }
+
+    private function buildRequiredForcedLeaveVacationBalanceResponse(float $availableVacationBalance): JsonResponse
+    {
+        return response()->json([
+            'message' => 'Mandatory / Forced Leave requires available Vacation Leave balance.',
+            'errors' => [
+                'leave_type_id' => ['Mandatory / Forced Leave requires available Vacation Leave balance.'],
+                'vacation_leave_balance' => ['Available Vacation Leave must be greater than 0.'],
+            ],
+            'available_vacation_leave_days' => round(max($availableVacationBalance, 0.0), 3),
         ], 422);
     }
 
@@ -12877,16 +14050,22 @@ class LeaveApplicationController extends Controller
         $isForcedLeave = LeaveType::isForcedLeaveType($app->leaveType, (int) $app->leave_type_id);
         $currentLeaveBalance = $this->findLeaveTypeBalanceInSnapshot($leaveBalanceSnapshot, (int) $app->leave_type_id);
         $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
-        if ($isForcedLeave) {
+        $hasForcedLeaveHrLedgerOverride = $isForcedLeave
+            && (
+                is_array($app->selected_date_pay_status)
+                || is_array($app->selected_date_deduction)
+                || is_array($app->selected_date_without_pay)
+                || round(max((float) ($app->without_pay_days ?? 0.0), 0.0), 3) > 0.0
+            );
+        if ($isForcedLeave && ! $hasForcedLeaveHrLedgerOverride) {
             $normalizedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
         }
         $withoutPay = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
-        $selectedDatePayStatus = $isForcedLeave
-            ? null
-            : (is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null);
-        $deductibleDays = $isForcedLeave
+        $selectedDatePayStatus = is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null;
+        $deductibleDays = $isForcedLeave && ! $hasForcedLeaveHrLedgerOverride
             ? round(max((float) ($app->total_days ?? 0.0), 0.0), 3)
             : $this->resolveApplicationDeductibleDays($app);
+        $withoutPayDays = round(max((float) ($app->without_pay_days ?? 0.0), 0.0), 3);
         $ctoDeductedHours = $this->resolveApplicationCtoDeductedHours($app);
         $hasPendingApprovedUpdateRequest = $this->hasPendingApprovedUpdateRequest($app);
         $displayStatus = $this->shouldPresentApprovedWhilePendingUpdate($app, $hasPendingApprovedUpdateRequest)
@@ -12912,6 +14091,7 @@ class LeaveApplicationController extends Controller
                 && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
         );
         $statusHistory = $logs
+            ->filter(fn (LeaveApplicationLog $log): bool => ! $this->isHrApplicationEditWorkflowLog($log))
             ->map(function (LeaveApplicationLog $log): array {
                 $stage = $this->mapWorkflowLogStage($log);
 
@@ -12984,6 +14164,13 @@ class LeaveApplicationController extends Controller
             'selected_date_half_day_period' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
             'selectedDateHalfDayPeriod' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
             'selected_date_halfday_period' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selected_date_deduction' => is_array($app->selected_date_deduction) ? $app->selected_date_deduction : null,
+            'selectedDateDeduction' => is_array($app->selected_date_deduction) ? $app->selected_date_deduction : null,
+            'deductible_days_by_date' => is_array($app->selected_date_deduction) ? $app->selected_date_deduction : null,
+            'selected_date_without_pay' => is_array($app->selected_date_without_pay) ? $app->selected_date_without_pay : null,
+            'selectedDateWithoutPay' => is_array($app->selected_date_without_pay) ? $app->selected_date_without_pay : null,
+            'without_pay_days_by_date' => is_array($app->selected_date_without_pay) ? $app->selected_date_without_pay : null,
+            'wop_days_by_date' => is_array($app->selected_date_without_pay) ? $app->selected_date_without_pay : null,
             'commutation' => $app->commutation ?? 'Not Requested',
             'pay_mode' => $normalizedPayMode,
             'allow_sl_vl_cross_deduction' => (bool) ($app->allow_sl_vl_cross_deduction ?? false),
@@ -13010,6 +14197,10 @@ class LeaveApplicationController extends Controller
             'sl_balance' => $sickLeaveBalance,
             'terminal_leave_estimated_amount' => $terminalLeaveEstimatedAmount,
             'deductible_days' => $deductibleDays,
+            'with_pay_days' => $deductibleDays,
+            'withPayDays' => $deductibleDays,
+            'without_pay_days' => $withoutPayDays,
+            'withoutPayDays' => $withoutPayDays,
             'cto_deducted_hours' => $ctoDeductedHours,
             'leaveBalance' => $currentLeaveBalance,
             'leaveBalances' => $leaveBalanceSnapshot,
