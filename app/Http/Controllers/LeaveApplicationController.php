@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Http\Controllers\Concerns\FiltersEmployeeControlNos;
+use App\Http\Requests\HrLeaveApplicationIndexRequest;
 use App\Models\DepartmentAdmin;
 use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HRAccount;
@@ -2528,14 +2529,41 @@ class LeaveApplicationController extends Controller
     /**
      * List PENDING_HR applications (all departments).
      */
-    public function hrIndex(Request $request): JsonResponse
+    public function hrIndex(HrLeaveApplicationIndexRequest $request): JsonResponse
     {
         $hr = $request->user();
         if (! $hr instanceof HRAccount) {
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
-        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin.department', 'updateRequests', 'logs'])
+        $validated = $request->validated();
+        $perPage = (int) ($validated['per_page'] ?? 10);
+        $requestedPage = (int) ($validated['page'] ?? 1);
+        $searchTokens = $this->tokenizeHrApplicationSearch($validated['search'] ?? null);
+        $employmentType = trim((string) ($validated['employment_type'] ?? ''));
+
+        $applications = LeaveApplication::query()
+            ->select([
+                'id',
+                'applicant_admin_id',
+                'employee_control_no',
+                'employee_name',
+                'leave_type_id',
+                'start_date',
+                'end_date',
+                'selected_dates',
+                'total_days',
+                'status',
+                'remarks',
+                'created_at',
+            ])
+            ->with([
+                'leaveType:id,name',
+                'applicantAdmin:id,department_id,employee_control_no,full_name',
+                'applicantAdmin.department:id,name',
+                'updateRequests:id,leave_application_id,requested_payload,requested_reason,previous_status,requested_by_control_no,requested_at,status,reviewed_at,review_remarks',
+                'logs:id,leave_application_id,action,performed_by_type,performed_by_id,remarks,created_at',
+            ])
             ->whereIn('status', [
                 LeaveApplication::STATUS_PENDING_ADMIN,
                 LeaveApplication::STATUS_PENDING_HR,
@@ -2546,16 +2574,178 @@ class LeaveApplicationController extends Controller
             ->orderBy('created_at')
             ->orderBy('id')
             ->get();
+
         $applications = $this->sortLeaveApplicationsForHrQueue($applications)
-            ->reject(fn (LeaveApplication $application): bool => $this->isCancelledForHrQueue($application))
+            ->reject(fn (LeaveApplication $application): bool => $this->isCancelledForHrQueue($application)
+                || (
+                    $application->status === LeaveApplication::STATUS_PENDING_ADMIN
+                    && ! $this->hasPendingApprovedUpdateRequest($application)
+                ))
             ->values();
-        $formattedApplications = $applications
+
+        if ($searchTokens !== [] || $employmentType !== '') {
+            HrisEmployee::directoryByControlNos(
+                $applications
+                    ->pluck('employee_control_no')
+                    ->filter()
+                    ->unique()
+                    ->values()
+                    ->all()
+            );
+
+            $applications = $applications
+                ->filter(fn (LeaveApplication $application): bool => $this->matchesHrApplicationFilters(
+                    $application,
+                    $searchTokens,
+                    $employmentType
+                ))
+                ->values();
+        }
+
+        $total = $applications->count();
+        $lastPage = max((int) ceil($total / $perPage), 1);
+        $page = min($requestedPage, $lastPage);
+        $pageApplicationIds = $applications
+            ->forPage($page, $perPage)
+            ->pluck('id')
+            ->map(fn (mixed $id): int => (int) $id)
+            ->values();
+
+        $pageApplications = LeaveApplication::with(['leaveType', 'applicantAdmin.department', 'updateRequests', 'logs'])
+            ->whereKey($pageApplicationIds->all())
+            ->get()
+            ->keyBy(fn (LeaveApplication $application): int => (int) $application->id);
+
+        HrisEmployee::directoryByControlNos(
+            $pageApplications
+                ->pluck('employee_control_no')
+                ->filter()
+                ->unique()
+                ->values()
+                ->all()
+        );
+
+        $formattedApplications = $pageApplicationIds
+            ->map(fn (int $id): ?LeaveApplication => $pageApplications->get($id))
+            ->filter(fn (mixed $application): bool => $application instanceof LeaveApplication)
             ->map(fn (LeaveApplication $app): array => $this->formatApplication($app))
             ->values();
 
+        $from = $total > 0 ? (($page - 1) * $perPage) + 1 : null;
+        $to = $total > 0 ? min($page * $perPage, $total) : null;
+
         return response()->json([
             'applications' => $formattedApplications,
+            'pagination' => [
+                'current_page' => $page,
+                'per_page' => $perPage,
+                'total' => $total,
+                'last_page' => $lastPage,
+                'from' => $from,
+                'to' => $to,
+            ],
         ]);
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function tokenizeHrApplicationSearch(mixed $search): array
+    {
+        $normalizedSearch = $this->normalizeHrApplicationSearchValue($search);
+        if ($normalizedSearch === '') {
+            return [];
+        }
+
+        return array_values(array_filter(explode(' ', $normalizedSearch)));
+    }
+
+    /**
+     * @param  array<int, string>  $searchTokens
+     */
+    private function matchesHrApplicationFilters(
+        LeaveApplication $application,
+        array $searchTokens,
+        string $employmentType
+    ): bool {
+        $employee = $this->resolveApplicationEmployee($application);
+
+        if (
+            $employmentType !== ''
+            && LeaveType::normalizeEmploymentStatusKey($employee?->status) !== $employmentType
+        ) {
+            return false;
+        }
+
+        if ($searchTokens === []) {
+            return true;
+        }
+
+        $queueMeta = $this->resolveLeaveHrQueueMeta($application);
+        $selectedDates = collect($application->resolvedSelectedDates() ?? [])
+            ->flatMap(fn (string $date): array => [
+                $date,
+                \Carbon\CarbonImmutable::parse($date)->format('F j Y'),
+            ])
+            ->all();
+        $searchableValues = [
+            'application',
+            $application->id,
+            $application->employee_control_no,
+            $application->employee_name,
+            $application->applicantAdmin?->full_name,
+            $this->formatEmployeeFullName($employee),
+            $employee?->office,
+            $employee?->officeAcronym,
+            $application->applicantAdmin?->department?->name,
+            $application->leaveType?->name,
+            $application->status,
+            $this->statusToFrontend((string) $application->status),
+            $queueMeta['group_status'] ?? null,
+            $queueMeta['stage_key'] ?? null,
+            $this->hrQueueStageSearchLabel((string) ($queueMeta['stage_key'] ?? '')),
+            $application->total_days,
+            self::formatDays($application->total_days),
+            $application->created_at?->toDateString(),
+            $application->created_at?->format('F j Y'),
+            $application->start_date?->toDateString(),
+            $application->start_date?->format('F j Y'),
+            $application->end_date?->toDateString(),
+            $application->end_date?->format('F j Y'),
+            ...$selectedDates,
+        ];
+        $haystack = $this->normalizeHrApplicationSearchValue(implode(' ', array_filter(
+            $searchableValues,
+            static fn (mixed $value): bool => $value !== null && $value !== ''
+        )));
+
+        foreach ($searchTokens as $searchToken) {
+            if (! str_contains($haystack, $searchToken)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private function normalizeHrApplicationSearchValue(mixed $value): string
+    {
+        $normalized = mb_strtolower(trim((string) ($value ?? '')));
+        $normalized = preg_replace('/[^a-z0-9]+/u', ' ', $normalized);
+
+        return is_string($normalized) ? trim($normalized) : '';
+    }
+
+    private function hrQueueStageSearchLabel(string $stageKey): string
+    {
+        return match ($stageKey) {
+            'PENDING_ADMIN', 'PENDING_ADMIN_REVIEW' => 'Department Recommendation',
+            'PENDING_HR_RECEIVE' => 'Pending Receive Pending Update Receive',
+            'PENDING_HR_REVIEW' => 'CHRMO Certification Pending Update Review',
+            'PENDING_CMO_CBMO_REVIEW' => 'CMO CVMO Review',
+            'PENDING_RELEASE' => 'Pending Release Pending Update Release',
+            default => '',
+        };
     }
 
     private function hasHrReceivedForQueue(LeaveApplication $application): bool
