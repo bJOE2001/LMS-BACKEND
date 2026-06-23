@@ -112,8 +112,8 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::post('/employees/{controlNo}/update', [EmployeeController::class, 'update']);
         Route::post('/employees/{controlNo}/delete', [EmployeeController::class, 'destroy']);
         Route::get('/department-head', [EmployeeController::class, 'departmentHead']);
-        Route::post('/department-head', [EmployeeController::class, 'upsertDepartmentHead']);
-        Route::post('/department-head/update', [EmployeeController::class, 'upsertDepartmentHead']);
+        Route::post('/department-head', [EmployeeController::class, 'createDepartmentHead']);
+        Route::post('/department-head/update', [EmployeeController::class, 'updateDepartmentHead']);
         Route::post('/department-head/delete', [EmployeeController::class, 'deleteDepartmentHead']);
 
         // Dashboard

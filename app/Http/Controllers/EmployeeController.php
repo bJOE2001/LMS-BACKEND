@@ -261,11 +261,22 @@ class EmployeeController extends Controller
     }
 
     /**
-     * Create or update the current department head for the authenticated department admin.
-     * POST creates a new head and rejects a second head for the same department.
-     * PUT updates the existing head record.
+     * Create the current department head for the authenticated department admin.
      */
-    public function upsertDepartmentHead(Request $request): JsonResponse
+    public function createDepartmentHead(Request $request): JsonResponse
+    {
+        return $this->persistDepartmentHead($request, false);
+    }
+
+    /**
+     * Update the current department head for the authenticated department admin.
+     */
+    public function updateDepartmentHead(Request $request): JsonResponse
+    {
+        return $this->persistDepartmentHead($request, true);
+    }
+
+    private function persistDepartmentHead(Request $request, bool $isUpdating): JsonResponse
     {
         $admin = $this->resolveDepartmentAdmin($request);
         if ($admin instanceof JsonResponse) {
@@ -300,7 +311,7 @@ class EmployeeController extends Controller
             'position' => $attributes['designation'],
         ]);
 
-        if ($request->isMethod('post')) {
+        if (! $isUpdating) {
             if ($existingDepartmentHead) {
                 return response()->json([
                     'message' => 'A department head already exists for this department. Edit or remove the current record first.',
