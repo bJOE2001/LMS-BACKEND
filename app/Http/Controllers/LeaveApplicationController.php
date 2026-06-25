@@ -41,6 +41,8 @@ class LeaveApplicationController extends Controller
 
     private const CTO_STANDARD_DAY_HOURS = WorkScheduleService::STANDARD_WORKDAY_HOURS;
 
+    private const CTO_MIN_WORKING_DAYS_BEFORE_AVAILMENT = 3;
+
     private const TERMINAL_LEAVE_ESTIMATE_FACTOR = 0.0478087;
 
     private const TERMINAL_LEAVE_AMOUNT_PRECISION = 12;
@@ -11853,12 +11855,16 @@ class LeaveApplicationController extends Controller
         }
 
         $filedDate = $this->resolvePolicyFilingDate($filedAt);
-        $daysBeforeAvailment = $this->countDaysBeforeDate($filedDate, $firstAvailmentDate);
-        if ($daysBeforeAvailment < 5) {
+        $workingDaysBeforeAvailment = $this->countWorkingDaysFromFiledDateBeforeDate($filedDate, $firstAvailmentDate);
+        if ($workingDaysBeforeAvailment < self::CTO_MIN_WORKING_DAYS_BEFORE_AVAILMENT) {
+            $message = 'CTO applications must be submitted at least '
+                .self::CTO_MIN_WORKING_DAYS_BEFORE_AVAILMENT
+                .' working days before the first availment date.';
+
             return response()->json([
-                'message' => 'CTO applications must be submitted at least 5 days before the first availment date.',
+                'message' => $message,
                 'errors' => [
-                    'start_date' => ['CTO applications must be submitted at least 5 days before the first availment date.'],
+                    'start_date' => [$message],
                 ],
             ], 422);
         }
@@ -12010,7 +12016,7 @@ class LeaveApplicationController extends Controller
         return round($total, 2);
     }
 
-    private function countDaysBeforeDate(
+    private function countWorkingDaysFromFiledDateBeforeDate(
         \Carbon\CarbonImmutable $filedDate,
         \Carbon\CarbonImmutable $targetDate
     ): int {
@@ -12020,7 +12026,18 @@ class LeaveApplicationController extends Controller
             return 0;
         }
 
-        return $normalizedFiledDate->addDay()->diffInDays($normalizedTargetDate);
+        $workingDays = 0;
+        $cursor = $normalizedFiledDate;
+
+        while ($cursor->lt($normalizedTargetDate)) {
+            if ($cursor->isWeekday()) {
+                $workingDays++;
+            }
+
+            $cursor = $cursor->addDay();
+        }
+
+        return $workingDays;
     }
 
     private function nextDate(\Carbon\CarbonImmutable $date): \Carbon\CarbonImmutable

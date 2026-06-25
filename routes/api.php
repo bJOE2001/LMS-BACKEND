@@ -131,6 +131,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::get('/leave-applications/{id}/attachment', [LeaveApplicationController::class, 'adminViewAttachment']);
         Route::post('/leave-applications/{id}/approve', [LeaveApplicationController::class, 'adminApprove']);
         Route::post('/leave-applications/{id}/reject', [LeaveApplicationController::class, 'adminReject']);
+        Route::post('/leave-applications/{id}/request-recall', [LeaveApplicationController::class, 'adminRequestRecall']);
         Route::get('/coc-applications', [COCApplicationController::class, 'adminIndex']);
         Route::get('/coc-applications/{id}', [COCApplicationController::class, 'adminShow']);
         Route::post('/coc-applications/{id}/approve', [COCApplicationController::class, 'adminApprove']);
