@@ -13,10 +13,10 @@ use Throwable;
 /**
  * Read-only HRIS employee directory backed by:
  * - xPersonal
- * - vwpartitionforseparated (RN = 1)
+ * - vwpartitionforseparated (current date window preferred, then RN = 1)
  *
  * Active/inactive is derived from HRIS date windows:
- *   GETDATE() BETWEEN fromDate AND toDate
+ *   CAST(GETDATE() AS date) BETWEEN CAST(fromDate AS date) AND CAST(toDate AS date)
  */
 class HrisEmployee
 {
@@ -40,6 +40,8 @@ class HrisEmployee
 
     private const CACHE_VERSION_KEY = 'hris_employees.cache_version';
 
+    private const CACHE_DATA_VERSION = 'v5';
+
     /** @var array<string, object|null> */
     private static array $singleLookupMemo = [];
 
@@ -56,11 +58,14 @@ class HrisEmployee
      */
     public static function query(?bool $activeOnly = null, bool $includeOfficeAcronym = true): Builder
     {
+        $partitionQuery = self::preferredPartitionQuery();
+        $activeWindowSql = self::activeWindowSql('vp');
+
         $query = DB::connection(self::HR_CONNECTION)
             ->table(self::PERSONAL_TABLE.' as xp')
-            ->join(self::PARTITION_VIEW.' as vp', function ($join): void {
+            ->joinSub($partitionQuery, 'vp', function ($join): void {
                 $join->on('xp.ControlNo', '=', 'vp.ControlNo')
-                    ->where('vp.RN', '=', 1);
+                    ->where('vp.preferred_row_number', 1);
             })
             ->selectRaw('LTRIM(RTRIM(CONVERT(VARCHAR(64), xp.ControlNo))) as control_no')
             ->selectRaw('xp.Surname as surname')
@@ -74,10 +79,10 @@ class HrisEmployee
             ->selectRaw('vp.FromDate as from_date')
             ->selectRaw('vp.ToDate as to_date')
             ->selectRaw(
-                'CASE WHEN vp.FromDate IS NOT NULL AND vp.ToDate IS NOT NULL AND GETDATE() BETWEEN vp.FromDate AND vp.ToDate THEN CAST(1 AS bit) ELSE CAST(0 AS bit) END as is_active'
+                "CASE WHEN {$activeWindowSql} THEN CAST(1 AS bit) ELSE CAST(0 AS bit) END as is_active"
             )
             ->selectRaw(
-                "CASE WHEN vp.FromDate IS NOT NULL AND vp.ToDate IS NOT NULL AND GETDATE() BETWEEN vp.FromDate AND vp.ToDate THEN 'ACTIVE' ELSE 'INACTIVE' END as activity_status"
+                "CASE WHEN {$activeWindowSql} THEN 'ACTIVE' ELSE 'INACTIVE' END as activity_status"
             );
 
         if ($includeOfficeAcronym) {
@@ -278,8 +283,9 @@ class HrisEmployee
     private static function partitionQuery(?bool $activeOnly = null): Builder
     {
         $query = DB::connection(self::HR_CONNECTION)
-            ->table(self::PARTITION_VIEW.' as vp')
-            ->where('vp.RN', 1);
+            ->query()
+            ->fromSub(self::preferredPartitionQuery(), 'vp')
+            ->where('vp.preferred_row_number', 1);
 
         self::applyActiveWindowFilter($query, $activeOnly);
 
@@ -294,7 +300,7 @@ class HrisEmployee
             default => 'all',
         };
 
-        return 'hris_employees.'.self::cacheVersion().".{$suffix}.{$activityKey}";
+        return 'hris_employees.'.self::CACHE_DATA_VERSION.'.'.self::cacheVersion().".{$suffix}.{$activityKey}";
     }
 
     public static function flushCache(): void
@@ -326,22 +332,58 @@ class HrisEmployee
 
     private static function applyActiveWindowFilter(Builder $query, ?bool $activeOnly): void
     {
+        $activeWindowSql = self::activeWindowSql('vp');
+
         if ($activeOnly === true) {
-            $query->whereRaw(
-                'vp.FromDate IS NOT NULL AND vp.ToDate IS NOT NULL AND GETDATE() BETWEEN vp.FromDate AND vp.ToDate'
-            );
+            $query->whereRaw($activeWindowSql);
 
             return;
         }
 
         if ($activeOnly === false) {
-            $query->where(function (Builder $nestedQuery): void {
-                $nestedQuery->whereNull('vp.FromDate')
-                    ->orWhereNull('vp.ToDate')
-                    ->orWhereRaw('GETDATE() < vp.FromDate')
-                    ->orWhereRaw('GETDATE() > vp.ToDate');
-            });
+            $query->whereRaw("NOT ({$activeWindowSql})");
         }
+    }
+
+    private static function preferredPartitionQuery(): Builder
+    {
+        $activeWindowSql = self::activeWindowSql('source');
+
+        return DB::connection(self::HR_CONNECTION)
+            ->table(self::PARTITION_VIEW.' as source')
+            ->select([
+                'source.ControlNo',
+                'source.Office',
+                'source.Status',
+                'source.Designation',
+                'source.RateMon',
+                'source.FromDate',
+                'source.ToDate',
+                'source.OffCode',
+                'source.RN',
+            ])
+            ->where(function (Builder $query) use ($activeWindowSql): void {
+                $query->where('source.RN', 1)
+                    ->orWhereRaw($activeWindowSql);
+            })
+            ->selectRaw(
+                "ROW_NUMBER() OVER (
+                    PARTITION BY source.ControlNo
+                    ORDER BY
+                        CASE WHEN {$activeWindowSql} THEN 0 ELSE 1 END,
+                        CASE WHEN source.RN = 1 THEN 0 ELSE 1 END,
+                        source.RN ASC,
+                        source.FromDate DESC,
+                        source.ToDate DESC
+                ) as preferred_row_number"
+            );
+    }
+
+    private static function activeWindowSql(string $tableAlias): string
+    {
+        return "{$tableAlias}.FromDate IS NOT NULL
+            AND {$tableAlias}.ToDate IS NOT NULL
+            AND CAST(GETDATE() AS date) BETWEEN CAST({$tableAlias}.FromDate AS date) AND CAST({$tableAlias}.ToDate AS date)";
     }
 
     private static function applyControlNoFilter(Builder $query, string $controlNo): void
@@ -1049,19 +1091,15 @@ class HrisEmployee
 
     private static function isCurrentlyActive(mixed $fromDate, mixed $toDate): bool
     {
-        try {
-            if ($fromDate === null || $toDate === null) {
-                return false;
-            }
-
-            $now = now();
-            $resolvedFromDate = $fromDate instanceof \DateTimeInterface ? $fromDate : new \DateTimeImmutable((string) $fromDate);
-            $resolvedToDate = $toDate instanceof \DateTimeInterface ? $toDate : new \DateTimeImmutable((string) $toDate);
-
-            return $resolvedFromDate <= $now && $resolvedToDate >= $now;
-        } catch (Throwable) {
+        $fromDateString = self::dateValueToDateString($fromDate);
+        $toDateString = self::dateValueToDateString($toDate);
+        if ($fromDateString === null || $toDateString === null) {
             return false;
         }
+
+        $today = now()->toDateString();
+
+        return $fromDateString <= $today && $toDateString >= $today;
     }
 
     private static function dateValueToDateString(mixed $value): ?string
