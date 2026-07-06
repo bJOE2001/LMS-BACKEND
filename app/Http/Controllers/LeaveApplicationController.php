@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Http\Controllers\Concerns\FiltersEmployeeControlNos;
 use App\Http\Requests\HrLeaveApplicationIndexRequest;
+use App\Http\Requests\HrVerifyLeaveApplicationDocumentRequest;
 use App\Models\DepartmentAdmin;
 use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HRAccount;
@@ -17,6 +18,7 @@ use App\Models\LeaveType;
 use App\Models\Notification;
 use App\Services\CocLedgerService;
 use App\Services\HrAccessControlService;
+use App\Services\LeaveApplicationDocumentVerificationService;
 use App\Services\SmsGatewayService;
 use App\Services\WorkScheduleService;
 use Illuminate\Filesystem\FilesystemAdapter;
@@ -93,7 +95,9 @@ class LeaveApplicationController extends Controller
 
     private const QUEUE_NON_PENDING_STAGE_PRIORITY = 999;
 
-    public function __construct() {}
+    public function __construct(
+        private LeaveApplicationDocumentVerificationService $documentVerificationService
+    ) {}
 
     private function workScheduleService(): WorkScheduleService
     {
@@ -2941,6 +2945,75 @@ class LeaveApplicationController extends Controller
         ]);
     }
 
+    public function hrVerifyDocument(HrVerifyLeaveApplicationDocumentRequest $request): JsonResponse
+    {
+        $decodedToken = $this->documentVerificationService->decode((string) $request->validated('token'));
+        if ($decodedToken === null) {
+            return response()->json([
+                'message' => 'The leave application QR code is invalid or has been altered.',
+                'verification' => [
+                    'status' => 'invalid',
+                    'token_valid' => false,
+                    'document_current' => false,
+                    'can_receive' => false,
+                ],
+            ], 422);
+        }
+
+        $application = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($decodedToken['application_id']);
+
+        if (! $application) {
+            return response()->json([
+                'message' => 'The verified QR code refers to a leave application that no longer exists.',
+                'verification' => [
+                    'status' => 'not_found',
+                    'token_valid' => true,
+                    'document_current' => false,
+                    'can_receive' => false,
+                ],
+            ], 404);
+        }
+
+        $documentCurrent = $this->documentVerificationService->isCurrent(
+            $application,
+            $decodedToken['fingerprint']
+        );
+        $receivedLog = $application->logs->first(
+            fn (LeaveApplicationLog $log): bool => $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
+        $canReceiveByStatus = $application->status !== LeaveApplication::STATUS_PENDING_ADMIN
+            || $this->isPendingApprovedUpdateRequest($application);
+        $isCancelled = $application->logs->contains(
+            fn (LeaveApplicationLog $log): bool => $this->isCancelledRemark($log->remarks)
+        ) || $this->isCancelledRemark($application->remarks);
+        $currentVerification = $this->documentVerificationService->issue($application);
+        $actorDirectory = $this->buildWorkflowActorDirectory([$application]);
+
+        return response()->json([
+            'message' => $documentCurrent
+                ? 'The QR code is valid. Compare the printed form with the official application details before receiving it.'
+                : 'The QR code is authentic, but the printed form is no longer the current application version.',
+            'verification' => [
+                'status' => $documentCurrent ? 'verified' : 'outdated',
+                'token_valid' => true,
+                'document_current' => $documentCurrent,
+                'scanned_reference' => $this->documentVerificationService->reference(
+                    (int) $decodedToken['application_id'],
+                    (string) $decodedToken['fingerprint']
+                ),
+                'current_reference' => $currentVerification['reference'],
+                'format_version' => $decodedToken['format_version'],
+                'already_received' => $receivedLog !== null,
+                'can_receive' => $documentCurrent && $receivedLog === null && $canReceiveByStatus && ! $isCancelled,
+                'checked_at' => now()->toIso8601String(),
+            ],
+            'application' => $this->formatErmsApplication($application, $actorDirectory),
+        ]);
+    }
+
     public function hrViewAttachment(Request $request, int $id)
     {
         $hr = $request->user();
@@ -3591,15 +3664,38 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Only HR accounts can confirm received applications.'], 403);
         }
 
-        $request->validate([
+        $validated = $request->validate([
             'remarks' => ['nullable', 'string', 'max:2000'],
+            'verification_token' => ['required', 'string', 'max:255'],
         ]);
+
+        $decodedToken = $this->documentVerificationService->decode((string) $validated['verification_token']);
+        if ($decodedToken === null || (int) $decodedToken['application_id'] !== $id) {
+            return response()->json([
+                'message' => 'Scan and verify the QR code from this leave application form before receiving it.',
+            ], 422);
+        }
 
         $app = LeaveApplication::query()
             ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
             ->find($id);
         if (! $app) {
             return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        if (! $this->documentVerificationService->isCurrent($app, (string) $decodedToken['fingerprint'])) {
+            return response()->json([
+                'message' => 'This printed form is outdated. Print the current leave application form and scan its QR code.',
+            ], 422);
+        }
+
+        $isCancelled = $app->logs->contains(
+            fn (LeaveApplicationLog $log): bool => $this->isCancelledRemark($log->remarks)
+        ) || $this->isCancelledRemark($app->remarks);
+        if ($isCancelled) {
+            return response()->json([
+                'message' => 'Cannot mark as received: application is cancelled.',
+            ], 422);
         }
 
         $isPendingApprovedUpdateRequest = $this->isPendingApprovedUpdateRequest($app);
@@ -7686,6 +7782,7 @@ class LeaveApplicationController extends Controller
 
     private function formatErmsApplication(LeaveApplication $app, array $actorDirectory): array
     {
+        $documentVerification = $this->documentVerificationService->issue($app);
         $resolvedEmployee = $this->resolveApplicationEmployee($app);
         $employeeName = trim((string) ($app->employee_name ?? ''));
         if ($employeeName === '') {
@@ -7887,6 +7984,8 @@ class LeaveApplicationController extends Controller
 
         return [
             'id' => $app->id,
+            'document_verification' => $documentVerification,
+            'documentVerification' => $documentVerification,
             'employee_control_no' => $app->employee_control_no ? (string) $app->employee_control_no : null,
             'leave_type_id' => $app->leave_type_id,
             'leave_type_name' => $displayLeaveTypeName,
@@ -14224,6 +14323,7 @@ class LeaveApplicationController extends Controller
 
     private function formatApplication(LeaveApplication $app): array
     {
+        $documentVerification = $this->documentVerificationService->issue($app);
         $resolvedEmployee = $this->resolveApplicationEmployee($app);
         $employeeName = trim((string) ($app->employee_name ?? ''));
         if ($employeeName === '') {
@@ -14317,6 +14417,8 @@ class LeaveApplicationController extends Controller
 
         $data = [
             'id' => $app->id,
+            'document_verification' => $documentVerification,
+            'documentVerification' => $documentVerification,
             'employee_control_no' => $app->employee_control_no,
             'applicant_admin_id' => $app->applicant_admin_id,
             'leave_type_id' => $app->leave_type_id,

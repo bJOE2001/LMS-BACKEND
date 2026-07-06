@@ -219,6 +219,8 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::middleware('hr.module:applications')->group(function () {
             // Leave application review
             Route::get('/leave-applications', [LeaveApplicationController::class, 'hrIndex']);
+            Route::post('/leave-applications/verify-document', [LeaveApplicationController::class, 'hrVerifyDocument'])
+                ->middleware('throttle:60,1');
             Route::get('/leave-application-edit-requests', [LeaveApplicationController::class, 'hrApplicationEditRequests']);
             Route::get('/leave-applications/{id}', [LeaveApplicationController::class, 'hrShow']);
             Route::get('/leave-applications/{id}/attachment', [LeaveApplicationController::class, 'hrViewAttachment']);
