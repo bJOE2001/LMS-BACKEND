@@ -61,6 +61,8 @@ class LeaveApplicationController extends Controller
         'women_specify',
         'study_detail',
         'other_purpose',
+        'spl_detail',
+        'spl_specify',
     ];
 
     private const QUEUE_GROUP_PENDING = 'PENDING';
@@ -978,14 +980,13 @@ class LeaveApplicationController extends Controller
 
         DB::transaction(function () use ($app, $remarks, $performedById): void {
             $app->update([
-                'status' => LeaveApplication::STATUS_REJECTED,
+                'status' => LeaveApplication::STATUS_CANCELLED,
                 'remarks' => $remarks,
             ]);
 
-            // Reuse REJECTED action because current log schema has no dedicated CANCELLED enum.
             LeaveApplicationLog::create([
                 'leave_application_id' => $app->id,
-                'action' => LeaveApplicationLog::ACTION_ADMIN_REJECTED,
+                'action' => LeaveApplicationLog::ACTION_EMPLOYEE_CANCELLED,
                 'performed_by_type' => LeaveApplicationLog::PERFORMER_EMPLOYEE,
                 'performed_by_id' => $performedById,
                 'remarks' => $remarks,
@@ -2041,6 +2042,7 @@ class LeaveApplicationController extends Controller
                 LeaveApplication::STATUS_APPROVED,
                 LeaveApplication::STATUS_REJECTED,
                 LeaveApplication::STATUS_RECALLED,
+                LeaveApplication::STATUS_CANCELLED,
             ])
             ->where(function ($query) use ($departmentEmployeeControlNos, $admin, $departmentAdminIds): void {
                 $hasVisibilityConstraint = false;
@@ -2104,6 +2106,10 @@ class LeaveApplicationController extends Controller
 
     private function isCancelledForHrQueue(LeaveApplication $application): bool
     {
+        if ($application->status === LeaveApplication::STATUS_CANCELLED) {
+            return true;
+        }
+
         if ($this->isCancelledRemark($application->remarks)) {
             return true;
         }
@@ -2115,6 +2121,28 @@ class LeaveApplicationController extends Controller
         }
 
         return false;
+    }
+
+    private function isRejectedBeforeHrQueue(LeaveApplication $application): bool
+    {
+        if ($application->status !== LeaveApplication::STATUS_REJECTED) {
+            return false;
+        }
+
+        if ((int) ($application->hr_id ?? 0) > 0) {
+            return false;
+        }
+
+        if ($application->relationLoaded('logs')) {
+            return ! $application->logs
+                ->filter(fn ($log) => $log instanceof LeaveApplicationLog)
+                ->contains(
+                    fn (LeaveApplicationLog $log): bool => $log->action === LeaveApplicationLog::ACTION_HR_REJECTED
+                        && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+                );
+        }
+
+        return true;
     }
 
     public function adminShow(Request $request, int $id): JsonResponse
@@ -2330,19 +2358,23 @@ class LeaveApplicationController extends Controller
             return $this->adminRejectPendingUpdateRequest($request, $app, $admin);
         }
 
-        DB::transaction(function () use ($app, $admin, $request) {
+        $remarks = $request->input('remarks');
+        $status = $this->adminRejectStatusForRemarks($remarks);
+        $action = $this->adminRejectLogActionForRemarks($remarks);
+
+        DB::transaction(function () use ($app, $admin, $remarks, $status, $action): void {
             $app->update([
-                'status' => LeaveApplication::STATUS_REJECTED,
+                'status' => $status,
                 'admin_id' => $admin->id,
-                'remarks' => $request->input('remarks'),
+                'remarks' => $remarks,
             ]);
 
             LeaveApplicationLog::create([
                 'leave_application_id' => $app->id,
-                'action' => LeaveApplicationLog::ACTION_ADMIN_REJECTED,
+                'action' => $action,
                 'performed_by_type' => LeaveApplicationLog::PERFORMER_ADMIN,
                 'performed_by_id' => $admin->id,
-                'remarks' => $request->input('remarks'),
+                'remarks' => $remarks,
                 'created_at' => now(),
             ]);
         });
@@ -2351,7 +2383,9 @@ class LeaveApplicationController extends Controller
         $app->load('leaveType');
 
         return response()->json([
-            'message' => 'Application rejected by admin.',
+            'message' => $status === LeaveApplication::STATUS_CANCELLED
+                ? 'Application cancelled by admin.'
+                : 'Application rejected by admin.',
             'application' => $this->formatApplication($app->fresh('leaveType')),
         ]);
     }
@@ -2561,6 +2595,7 @@ class LeaveApplicationController extends Controller
                 'total_days',
                 'status',
                 'remarks',
+                'hr_id',
                 'created_at',
             ])
             ->with([
@@ -2576,6 +2611,7 @@ class LeaveApplicationController extends Controller
                 LeaveApplication::STATUS_APPROVED,
                 LeaveApplication::STATUS_REJECTED,
                 LeaveApplication::STATUS_RECALLED,
+                LeaveApplication::STATUS_CANCELLED,
             ])
             ->orderBy('created_at')
             ->orderBy('id')
@@ -2583,6 +2619,7 @@ class LeaveApplicationController extends Controller
 
         $applications = $this->sortLeaveApplicationsForHrQueue($applications)
             ->reject(fn (LeaveApplication $application): bool => $this->isCancelledForHrQueue($application)
+                || $this->isRejectedBeforeHrQueue($application)
                 || (
                     $application->status === LeaveApplication::STATUS_PENDING_ADMIN
                     && ! $this->hasPendingApprovedUpdateRequest($application)
@@ -2986,9 +3023,10 @@ class LeaveApplicationController extends Controller
         );
         $canReceiveByStatus = $application->status !== LeaveApplication::STATUS_PENDING_ADMIN
             || $this->isPendingApprovedUpdateRequest($application);
-        $isCancelled = $application->logs->contains(
-            fn (LeaveApplicationLog $log): bool => $this->isCancelledRemark($log->remarks)
-        ) || $this->isCancelledRemark($application->remarks);
+        $isCancelled = $application->status === LeaveApplication::STATUS_CANCELLED
+            || $application->logs->contains(
+                fn (LeaveApplicationLog $log): bool => $this->isCancelledRemark($log->remarks)
+            ) || $this->isCancelledRemark($application->remarks);
         $currentVerification = $this->documentVerificationService->issue($application);
         $actorDirectory = $this->buildWorkflowActorDirectory([$application]);
 
@@ -3666,14 +3704,18 @@ class LeaveApplicationController extends Controller
 
         $validated = $request->validate([
             'remarks' => ['nullable', 'string', 'max:2000'],
-            'verification_token' => ['required', 'string', 'max:255'],
+            'verification_token' => ['nullable', 'string', 'max:255'],
         ]);
 
-        $decodedToken = $this->documentVerificationService->decode((string) $validated['verification_token']);
-        if ($decodedToken === null || (int) $decodedToken['application_id'] !== $id) {
-            return response()->json([
-                'message' => 'Scan and verify the QR code from this leave application form before receiving it.',
-            ], 422);
+        $verificationToken = trim((string) ($validated['verification_token'] ?? ''));
+        $decodedToken = null;
+        if ($verificationToken !== '') {
+            $decodedToken = $this->documentVerificationService->decode($verificationToken);
+            if ($decodedToken === null || (int) $decodedToken['application_id'] !== $id) {
+                return response()->json([
+                    'message' => 'Scan and verify the QR code from this leave application form before receiving it.',
+                ], 422);
+            }
         }
 
         $app = LeaveApplication::query()
@@ -3683,15 +3725,16 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Leave application not found.'], 404);
         }
 
-        if (! $this->documentVerificationService->isCurrent($app, (string) $decodedToken['fingerprint'])) {
+        if ($decodedToken !== null && ! $this->documentVerificationService->isCurrent($app, (string) $decodedToken['fingerprint'])) {
             return response()->json([
                 'message' => 'This printed form is outdated. Print the current leave application form and scan its QR code.',
             ], 422);
         }
 
-        $isCancelled = $app->logs->contains(
-            fn (LeaveApplicationLog $log): bool => $this->isCancelledRemark($log->remarks)
-        ) || $this->isCancelledRemark($app->remarks);
+        $isCancelled = $app->status === LeaveApplication::STATUS_CANCELLED
+            || $app->logs->contains(
+                fn (LeaveApplicationLog $log): bool => $this->isCancelledRemark($log->remarks)
+            ) || $this->isCancelledRemark($app->remarks);
         if ($isCancelled) {
             return response()->json([
                 'message' => 'Cannot mark as received: application is cancelled.',
@@ -7489,6 +7532,7 @@ class LeaveApplicationController extends Controller
             LeaveApplication::STATUS_APPROVED => 'Approved',
             LeaveApplication::STATUS_REJECTED => 'Rejected',
             LeaveApplication::STATUS_RECALLED => 'Recalled',
+            LeaveApplication::STATUS_CANCELLED => 'Cancelled',
             default => 'Pending',
         };
     }
@@ -7720,6 +7764,46 @@ class LeaveApplicationController extends Controller
         return (bool) preg_match('/^cancelled\b/i', trim((string) ($remarks ?? '')));
     }
 
+    private function adminRejectStatusForRemarks(mixed $remarks): string
+    {
+        return $this->isCancelledRemark($remarks)
+            ? LeaveApplication::STATUS_CANCELLED
+            : LeaveApplication::STATUS_REJECTED;
+    }
+
+    private function adminRejectLogActionForRemarks(mixed $remarks): string
+    {
+        return $this->isCancelledRemark($remarks)
+            ? LeaveApplicationLog::ACTION_ADMIN_CANCELLED
+            : LeaveApplicationLog::ACTION_ADMIN_REJECTED;
+    }
+
+    private function isAdminCancellationLog(LeaveApplicationLog $log): bool
+    {
+        $performerType = strtoupper((string) $log->performed_by_type);
+
+        if ($log->action === LeaveApplicationLog::ACTION_ADMIN_CANCELLED) {
+            return true;
+        }
+
+        return $log->action === LeaveApplicationLog::ACTION_ADMIN_REJECTED
+            && $performerType === LeaveApplicationLog::PERFORMER_ADMIN
+            && $this->isCancelledRemark($log->remarks);
+    }
+
+    private function isEmployeeCancellationLog(LeaveApplicationLog $log): bool
+    {
+        $performerType = strtoupper((string) $log->performed_by_type);
+
+        if ($log->action === LeaveApplicationLog::ACTION_EMPLOYEE_CANCELLED) {
+            return true;
+        }
+
+        return $log->action === LeaveApplicationLog::ACTION_ADMIN_REJECTED
+            && $performerType === LeaveApplicationLog::PERFORMER_EMPLOYEE
+            && $this->isCancelledRemark($log->remarks);
+    }
+
     private function extractCancellationReason(mixed $remarks): ?string
     {
         $normalizedRemarks = trim((string) ($remarks ?? ''));
@@ -7749,11 +7833,11 @@ class LeaveApplicationController extends Controller
             return 'employee requested cancellation';
         }
 
-        if (
-            $log->action === LeaveApplicationLog::ACTION_ADMIN_REJECTED
-            && $performerType === LeaveApplicationLog::PERFORMER_EMPLOYEE
-            && $this->isCancelledRemark($remarks)
-        ) {
+        if ($this->isAdminCancellationLog($log)) {
+            return 'department admin cancelled';
+        }
+
+        if ($this->isEmployeeCancellationLog($log)) {
             return 'employee cancelled';
         }
 
@@ -7765,6 +7849,8 @@ class LeaveApplicationController extends Controller
             },
             LeaveApplicationLog::ACTION_ADMIN_APPROVED => 'department admin approved',
             LeaveApplicationLog::ACTION_ADMIN_REJECTED => 'department admin rejected',
+            LeaveApplicationLog::ACTION_ADMIN_CANCELLED => 'department admin cancelled',
+            LeaveApplicationLog::ACTION_EMPLOYEE_CANCELLED => 'employee cancelled',
             LeaveApplicationLog::ACTION_HR_APPROVED => 'hr approved',
             LeaveApplicationLog::ACTION_HR_REJECTED => 'hr rejected',
             LeaveApplicationLog::ACTION_HR_RECALLED => 'hr recalled',
@@ -7835,6 +7921,8 @@ class LeaveApplicationController extends Controller
         );
         $cancelledLog = $logs->last(
             fn (LeaveApplicationLog $log) => $this->isCancelledRemark($log->remarks)
+                || $this->isAdminCancellationLog($log)
+                || $this->isEmployeeCancellationLog($log)
         );
 
         $filedBy = $this->resolveWorkflowPerformerName($submittedLog, $actorDirectory, $employeeName);
@@ -7859,7 +7947,7 @@ class LeaveApplicationController extends Controller
         $cmoCbmoReviewActionBy = $this->resolveWorkflowPerformerName($cmoCbmoReviewedLog, $actorDirectory, $employeeName);
         $releasedActionBy = $this->resolveWorkflowPerformerName($hrReleasedLog, $actorDirectory, $employeeName);
 
-        $isCancelled = $cancelledLog !== null || $this->isCancelledRemark($app->remarks);
+        $isCancelled = $app->status === LeaveApplication::STATUS_CANCELLED || $cancelledLog !== null || $this->isCancelledRemark($app->remarks);
         $hasPendingApprovedUpdateRequest = $this->hasPendingApprovedUpdateRequest($app);
         $displayStatus = $isCancelled
             ? 'Cancelled'
@@ -9110,7 +9198,7 @@ class LeaveApplicationController extends Controller
                 }
 
                 $app->update([
-                    'status' => LeaveApplication::STATUS_REJECTED,
+                    'status' => LeaveApplication::STATUS_CANCELLED,
                     'hr_id' => $hr->id,
                     'hr_approved_at' => now(),
                     'remarks' => $cancelRemarks,

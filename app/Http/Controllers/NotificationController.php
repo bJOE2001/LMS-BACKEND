@@ -3,9 +3,9 @@
 namespace App\Http\Controllers;
 
 use App\Models\COCApplication;
+use App\Models\HrisEmployee;
 use App\Models\LeaveApplication;
 use App\Models\Notification;
-use App\Models\HrisEmployee;
 use App\Services\RecycleBinService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -55,7 +55,7 @@ class NotificationController extends Controller
             ->orderByDesc('created_at')
             ->limit(50)
             ->get()
-            ->map(fn($n) => [
+            ->map(fn ($n) => [
                 'id' => $n->id,
                 'type' => $n->type,
                 'title' => $n->title,
@@ -117,7 +117,7 @@ class NotificationController extends Controller
             ->where('id', $id)
             ->firstOrFail();
 
-        if (!$notification->leave_application_id && !$notification->coc_application_id) {
+        if (! $notification->leave_application_id && ! $notification->coc_application_id) {
             return response()->json([
                 'application' => null,
                 'message' => 'Notification is not linked to an application.',
@@ -189,7 +189,7 @@ class NotificationController extends Controller
 
     private function formatLeaveApplication(?LeaveApplication $application): ?array
     {
-        if (!$application) {
+        if (! $application) {
             return null;
         }
 
@@ -200,7 +200,7 @@ class NotificationController extends Controller
         if ($employeeName === '' || trim((string) ($office ?? '')) === '') {
             $employee = $this->resolveApplicationEmployee($application);
             if ($employeeName === '') {
-                $employeeName = trim(($employee?->firstname ?? '') . ' ' . ($employee?->surname ?? ''));
+                $employeeName = trim(($employee?->firstname ?? '').' '.($employee?->surname ?? ''));
             }
             if (trim((string) ($office ?? '')) === '') {
                 $office = $employee?->office;
@@ -245,7 +245,7 @@ class NotificationController extends Controller
 
     private function formatCocApplication(?COCApplication $application): ?array
     {
-        if (!$application) {
+        if (! $application) {
             return null;
         }
 
@@ -345,6 +345,7 @@ class NotificationController extends Controller
             LeaveApplication::STATUS_APPROVED => 'Approved',
             LeaveApplication::STATUS_REJECTED => 'Rejected',
             LeaveApplication::STATUS_RECALLED => 'Recalled',
+            LeaveApplication::STATUS_CANCELLED => 'Cancelled',
             default => (string) $status,
         };
     }
@@ -377,6 +378,7 @@ class NotificationController extends Controller
     private function formatHours(float $hours): string
     {
         $display = $hours === (float) ((int) $hours) ? (string) ((int) $hours) : (string) $hours;
+
         return "{$display} h";
     }
 }

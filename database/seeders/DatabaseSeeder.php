@@ -22,6 +22,7 @@ class DatabaseSeeder extends Seeder
             HRAccountSeeder::class,
             LeaveTypeSeeder::class,
             IllnessSeeder::class,
+            SpecialPrivilegeReasonSeeder::class,
         ]);
     }
 }

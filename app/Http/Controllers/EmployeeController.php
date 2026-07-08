@@ -1819,6 +1819,7 @@ class EmployeeController extends Controller
             LeaveApplication::STATUS_APPROVED => 'Approved',
             LeaveApplication::STATUS_REJECTED => 'Rejected',
             LeaveApplication::STATUS_RECALLED => 'Recalled',
+            LeaveApplication::STATUS_CANCELLED => 'Cancelled',
             default => (string) $status,
         };
     }

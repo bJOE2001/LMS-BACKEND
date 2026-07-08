@@ -39,6 +39,10 @@ class LeaveApplicationLog extends Model
 
     public const ACTION_ADMIN_REJECTED = 'ADMIN_REJECTED';
 
+    public const ACTION_ADMIN_CANCELLED = 'ADMIN_CANCELLED';
+
+    public const ACTION_EMPLOYEE_CANCELLED = 'EMPLOYEE_CANCELLED';
+
     public const ACTION_HR_APPROVED = 'HR_APPROVED';
 
     public const ACTION_HR_REJECTED = 'HR_REJECTED';

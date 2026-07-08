@@ -17,6 +17,7 @@ use App\Http\Controllers\HRWorkScheduleController;
 use App\Http\Controllers\LeaveApplicationController;
 use App\Http\Controllers\NotificationController;
 use App\Http\Controllers\SettingsController;
+use App\Http\Controllers\SpecialPrivilegeReasonController;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -59,6 +60,7 @@ Route::prefix('erms')->middleware('erms.auth')->group(function () {
     Route::post('/apply-leave/request-cancel', [LeaveApplicationController::class, 'ermsRequestCancel']);
     Route::post('/apply-leave/{id}/request-cancel', [LeaveApplicationController::class, 'ermsRequestCancel']);
     Route::get('/illnesses/options', [HRIllnessLibraryController::class, 'options']);
+    Route::get('/special-privilege-reasons/options', [SpecialPrivilegeReasonController::class, 'options']);
     Route::get('/coc-records', [COCApplicationController::class, 'ermsIndex']);
     Route::get('/apply-coc', [COCApplicationController::class, 'ermsIndex']);
     Route::post('/apply-coc', [COCApplicationController::class, 'ermsStore']);
@@ -103,6 +105,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
     Route::get('/settings/signatories', [SettingsController::class, 'getSignatories']);
     Route::post('/settings/signatories/chrmo-leave-in-charge/update', [SettingsController::class, 'updateChrmoLeaveInCharge']);
     Route::get('/illnesses/options', [HRIllnessLibraryController::class, 'options']);
+    Route::get('/special-privilege-reasons/options', [SpecialPrivilegeReasonController::class, 'options']);
 
     Route::middleware('department_admin')->prefix('admin')->group(function () {
         // Employee management

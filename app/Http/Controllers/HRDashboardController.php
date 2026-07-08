@@ -241,6 +241,10 @@ class HRDashboardController extends Controller
 
     private function isCancelledLeaveApplication(LeaveApplication $application): bool
     {
+        if ($application->status === LeaveApplication::STATUS_CANCELLED) {
+            return true;
+        }
+
         if ((bool) preg_match('/^cancelled\b/i', trim((string) ($application->remarks ?? '')))) {
             return true;
         }
@@ -575,6 +579,7 @@ class HRDashboardController extends Controller
             LeaveApplication::STATUS_APPROVED => 'Approved',
             LeaveApplication::STATUS_REJECTED => 'Rejected',
             LeaveApplication::STATUS_RECALLED => 'Recalled',
+            LeaveApplication::STATUS_CANCELLED => 'Cancelled',
         ];
 
         // Determine applicant name & office

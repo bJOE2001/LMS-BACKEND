@@ -2052,6 +2052,7 @@ class AdminDashboardController extends Controller
             LeaveApplication::STATUS_APPROVED => 'Approved',
             LeaveApplication::STATUS_REJECTED => 'Rejected',
             LeaveApplication::STATUS_RECALLED => 'Recalled',
+            LeaveApplication::STATUS_CANCELLED => 'Cancelled',
         ];
 
         $employee = null;
@@ -2108,10 +2109,8 @@ class AdminDashboardController extends Controller
         );
         $cancelledLog = $logs->first(
             fn (LeaveApplicationLog $log) => $this->isCancelledRemark($log->remarks)
-            || (
-                $log->action === LeaveApplicationLog::ACTION_ADMIN_REJECTED
-                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_EMPLOYEE
-            )
+                || $this->isAdminCancellationLog($log)
+                || $this->isEmployeeCancellationLog($log)
         );
 
         $filedBy = $this->resolvePerformerName($submittedLog, $actorDirectory, $employeeName) ?? $employeeName;
@@ -2127,7 +2126,9 @@ class AdminDashboardController extends Controller
             $recallActionBy = $actorDirectory['hr'][(int) $app->hr_id];
         }
 
-        $isCancelled = $this->isCancelledRemark($app->remarks);
+        $isCancelled = $app->status === LeaveApplication::STATUS_CANCELLED
+            || $cancelledLog !== null
+            || $this->isCancelledRemark($app->remarks);
         $cancelledBy = $cancelledLog
             ? ($this->resolvePerformerName($cancelledLog, $actorDirectory, $employeeName) ?? $employeeName)
             : ($isCancelled ? $employeeName : null);
@@ -2153,7 +2154,7 @@ class AdminDashboardController extends Controller
             ?? $app->hr_approved_at;
         $recallActionAt = $hrRecalledLog?->created_at
             ?? ($app->status === LeaveApplication::STATUS_RECALLED ? $app->updated_at : null);
-        $cancelledAt = $cancelledLog?->created_at;
+        $cancelledAt = $cancelledLog?->created_at ?? ($isCancelled ? $app->updated_at : null);
 
         $disapprovedAt = null;
         if ($app->status === LeaveApplication::STATUS_REJECTED) {
@@ -2752,8 +2753,38 @@ class AdminDashboardController extends Controller
         return (bool) preg_match('/^cancelled\b/i', trim((string) ($remarks ?? '')));
     }
 
+    private function isAdminCancellationLog(LeaveApplicationLog $log): bool
+    {
+        $performerType = strtoupper((string) $log->performed_by_type);
+
+        if ($log->action === LeaveApplicationLog::ACTION_ADMIN_CANCELLED) {
+            return true;
+        }
+
+        return $log->action === LeaveApplicationLog::ACTION_ADMIN_REJECTED
+            && $performerType === LeaveApplicationLog::PERFORMER_ADMIN
+            && $this->isCancelledRemark($log->remarks);
+    }
+
+    private function isEmployeeCancellationLog(LeaveApplicationLog $log): bool
+    {
+        $performerType = strtoupper((string) $log->performed_by_type);
+
+        if ($log->action === LeaveApplicationLog::ACTION_EMPLOYEE_CANCELLED) {
+            return true;
+        }
+
+        return $log->action === LeaveApplicationLog::ACTION_ADMIN_REJECTED
+            && $performerType === LeaveApplicationLog::PERFORMER_EMPLOYEE
+            && $this->isCancelledRemark($log->remarks);
+    }
+
     private function isCancelledDashboardLeaveApplication(LeaveApplication $application): bool
     {
+        if ($application->status === LeaveApplication::STATUS_CANCELLED) {
+            return true;
+        }
+
         if ($this->isCancelledRemark($application->remarks)) {
             return true;
         }

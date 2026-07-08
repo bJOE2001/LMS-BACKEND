@@ -235,6 +235,8 @@ class LeaveApplication extends Model
 
     public const STATUS_RECALLED = 'RECALLED';
 
+    public const STATUS_CANCELLED = 'CANCELLED';
+
     // ─── Relationships ───────────────────────────────────────────────
 
     public function leaveType(): BelongsTo
