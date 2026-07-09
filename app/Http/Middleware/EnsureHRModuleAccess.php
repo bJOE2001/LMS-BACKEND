@@ -15,7 +15,7 @@ class EnsureHRModuleAccess
      *
      * @param  \Closure(\Illuminate\Http\Request): (\Symfony\Component\HttpFoundation\Response)  $next
      */
-    public function handle(Request $request, Closure $next, string $moduleKey): Response
+    public function handle(Request $request, Closure $next, string ...$moduleKeys): Response
     {
         $account = $request->user();
         if (! $account instanceof HRAccount) {
@@ -25,13 +25,27 @@ class EnsureHRModuleAccess
         }
 
         $accessControl = app(HrAccessControlService::class);
-        if (! $accessControl->isValidModuleKey($moduleKey)) {
+
+        $hasAccess = false;
+        $hasValidKey = false;
+
+        foreach ($moduleKeys as $moduleKey) {
+            if ($accessControl->isValidModuleKey($moduleKey)) {
+                $hasValidKey = true;
+                if ($accessControl->hasModuleAccess($account, $moduleKey)) {
+                    $hasAccess = true;
+                    break;
+                }
+            }
+        }
+
+        if (! $hasValidKey) {
             return response()->json([
                 'message' => 'Invalid HR module access key.',
             ], 403);
         }
 
-        if (! $accessControl->hasModuleAccess($account, $moduleKey)) {
+        if (! $hasAccess) {
             return response()->json([
                 'message' => 'You do not have access to this module.',
             ], 403);

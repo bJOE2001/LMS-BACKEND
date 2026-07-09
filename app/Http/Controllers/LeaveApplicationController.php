@@ -2567,20 +2567,24 @@ class LeaveApplicationController extends Controller
     // ═══════════════════════════════════════════════════════════════════
 
     /**
-     * List PENDING_HR applications (all departments).
+     * Export Received Applications for HR module within a specific date range.
      */
-    public function hrIndex(HrLeaveApplicationIndexRequest $request): JsonResponse
+    public function exportReceivedApplications(Request $request): JsonResponse
     {
         $hr = $request->user();
         if (! $hr instanceof HRAccount) {
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
         }
 
-        $validated = $request->validated();
-        $perPage = (int) ($validated['per_page'] ?? 10);
-        $requestedPage = (int) ($validated['page'] ?? 1);
-        $searchTokens = $this->tokenizeHrApplicationSearch($validated['search'] ?? null);
-        $employmentType = trim((string) ($validated['employment_type'] ?? ''));
+        $validated = $request->validate([
+            'from_date' => ['nullable', 'date'],
+            'to_date' => ['nullable', 'date', 'after_or_equal:from_date'],
+        ]);
+
+        $fromDate = $validated['from_date'] ?? now()->toDateString();
+        $toDate = $validated['to_date'] ?? now()->toDateString();
+        $start = $fromDate.' 00:00:00';
+        $end = $toDate.' 23:59:59';
 
         $applications = LeaveApplication::query()
             ->select([
@@ -2605,17 +2609,91 @@ class LeaveApplicationController extends Controller
                 'updateRequests:id,leave_application_id,requested_payload,requested_reason,previous_status,requested_by_control_no,requested_at,status,reviewed_at,review_remarks',
                 'logs:id,leave_application_id,action,performed_by_type,performed_by_id,remarks,created_at',
             ])
-            ->whereIn('status', [
+            ->whereHas('logs', function ($q) use ($start, $end) {
+                $q->where('action', LeaveApplicationLog::ACTION_HR_RECEIVED)
+                    ->whereBetween('created_at', [$start, $end]);
+            })
+            ->orderBy('created_at')
+            ->orderBy('id')
+            ->get();
+
+        return response()->json([
+            'applications' => $applications->map(fn (LeaveApplication $app) => $this->formatApplication($app)),
+        ]);
+    }
+
+    /**
+     * List PENDING_HR applications (all departments).
+     */
+    public function hrIndex(HrLeaveApplicationIndexRequest $request): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $validated = $request->validated();
+        $perPage = (int) ($validated['per_page'] ?? 10);
+        $requestedPage = (int) ($validated['page'] ?? 1);
+        $searchTokens = $this->tokenizeHrApplicationSearch($validated['search'] ?? null);
+        $employmentType = trim((string) ($validated['employment_type'] ?? ''));
+
+        $accessControl = app(\App\Services\HrAccessControlService::class);
+        $hasApplicationsModule = $accessControl->hasModuleAccess($hr, \App\Services\HrAccessControlService::MODULE_APPLICATIONS);
+        $hasReceivingModule = $accessControl->hasModuleAccess($hr, \App\Services\HrAccessControlService::MODULE_RECEIVING);
+
+        if ($hasReceivingModule && ! $hasApplicationsModule) {
+            $pendingReceiveOnly = true;
+        } else {
+            $pendingReceiveOnly = filter_var($validated['pending_receive'] ?? false, FILTER_VALIDATE_BOOLEAN);
+        }
+
+        $query = LeaveApplication::query()
+            ->select([
+                'id',
+                'applicant_admin_id',
+                'employee_control_no',
+                'employee_name',
+                'leave_type_id',
+                'start_date',
+                'end_date',
+                'selected_dates',
+                'total_days',
+                'status',
+                'remarks',
+                'hr_id',
+                'created_at',
+            ])
+            ->with([
+                'leaveType:id,name',
+                'applicantAdmin:id,department_id,employee_control_no,full_name',
+                'applicantAdmin.department:id,name',
+                'updateRequests:id,leave_application_id,requested_payload,requested_reason,previous_status,requested_by_control_no,requested_at,status,reviewed_at,review_remarks',
+                'logs:id,leave_application_id,action,performed_by_type,performed_by_id,remarks,created_at',
+            ]);
+
+        if ($pendingReceiveOnly) {
+            $query->where('status', LeaveApplication::STATUS_PENDING_HR);
+        } else {
+            $query->whereIn('status', [
                 LeaveApplication::STATUS_PENDING_ADMIN,
                 LeaveApplication::STATUS_PENDING_HR,
                 LeaveApplication::STATUS_APPROVED,
                 LeaveApplication::STATUS_REJECTED,
                 LeaveApplication::STATUS_RECALLED,
                 LeaveApplication::STATUS_CANCELLED,
-            ])
-            ->orderBy('created_at')
+            ]);
+        }
+
+        $applications = $query->orderBy('created_at')
             ->orderBy('id')
             ->get();
+
+        if ($pendingReceiveOnly) {
+            $applications = $applications->filter(fn (LeaveApplication $application): bool => $this->isPendingReceive($application))->values();
+        } else {
+            $applications = $applications->reject(fn (LeaveApplication $application): bool => $this->isPendingReceive($application))->values();
+        }
 
         $applications = $this->sortLeaveApplicationsForHrQueue($applications)
             ->reject(fn (LeaveApplication $application): bool => $this->isCancelledForHrQueue($application)
@@ -8736,6 +8814,23 @@ class LeaveApplicationController extends Controller
         }
 
         return $this->hasPendingApprovedUpdateRequest($app);
+    }
+
+    private function isPendingReceive(LeaveApplication $app): bool
+    {
+        if ($app->status !== LeaveApplication::STATUS_PENDING_HR) {
+            return false;
+        }
+
+        $cycleRequestedAt = $this->resolvePendingApprovedUpdateCycleRequestedAt($app);
+
+        $receivedLog = $this->resolveLatestHrActionLogForCycle(
+            $app,
+            LeaveApplicationLog::ACTION_HR_RECEIVED,
+            $cycleRequestedAt
+        );
+
+        return $receivedLog === null;
     }
 
     private function hrApprovePendingUpdateRequest(Request $request, LeaveApplication $app, HRAccount $hr): JsonResponse
