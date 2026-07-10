@@ -230,12 +230,12 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::post('/leave-applications/{id}/receive', [LeaveApplicationController::class, 'hrReceive']);
             Route::post('/leave-applications/{id}/undo-receive', [LeaveApplicationController::class, 'hrUndoReceive']);
             Route::post('/leave-applications/{id}/update-receive', [LeaveApplicationController::class, 'hrReceiveUpdate']);
+            Route::post('/leave-applications/verify-document', [LeaveApplicationController::class, 'hrVerifyDocument'])
+                ->middleware('throttle:60,1');
         });
 
         Route::middleware('hr.module:applications')->group(function () {
             // Leave application review
-            Route::post('/leave-applications/verify-document', [LeaveApplicationController::class, 'hrVerifyDocument'])
-                ->middleware('throttle:60,1');
             Route::get('/leave-application-edit-requests', [LeaveApplicationController::class, 'hrApplicationEditRequests']);
             Route::post('/leave-applications/{id}/edit', [LeaveApplicationController::class, 'hrSaveApplicationEdit']);
             Route::post('/leave-application-edit-requests/{id}/approve', [LeaveApplicationController::class, 'hrApproveApplicationEditRequest']);
