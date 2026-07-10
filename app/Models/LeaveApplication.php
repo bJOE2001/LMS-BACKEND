@@ -585,14 +585,14 @@ class LeaveApplication extends Model
 
     private static function normalizeSelectedDateHalfDayPortionValue(mixed $value): ?string
     {
-        $normalized = strtoupper(str_replace([' ', '-', '_'], '', trim((string) $value)));
+        $normalized = strtoupper(str_replace([' ', '-', '_', '(', ')'], '', trim((string) $value)));
         if ($normalized === '') {
             return null;
         }
 
         return match ($normalized) {
-            'AM', 'MORNING' => 'AM',
-            'PM', 'AFTERNOON' => 'PM',
+            'AM', 'MORNING', 'HALFDAYAM', 'HALFAM' => 'AM',
+            'PM', 'AFTERNOON', 'HALFDAYPM', 'HALFPM' => 'PM',
             default => null,
         };
     }

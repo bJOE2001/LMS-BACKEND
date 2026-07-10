@@ -541,7 +541,7 @@ class AdminDashboardController extends Controller
         }
 
         $isTerminalLeave = $this->isTerminalLeaveTypeId(
-            $this->resolveCanonicalLeaveTypeId((int) $request->input('leave_type_id'))
+            LeaveType::resolveCanonicalLeaveTypeId((int) $request->input('leave_type_id'))
                 ?? (int) $request->input('leave_type_id')
         );
 
@@ -3499,7 +3499,7 @@ class AdminDashboardController extends Controller
             return false;
         }
 
-        $resolvedLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+        $resolvedLeaveTypeId = LeaveType::resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
 
         return $resolvedLeaveTypeId === $terminalLeaveTypeId;
     }
