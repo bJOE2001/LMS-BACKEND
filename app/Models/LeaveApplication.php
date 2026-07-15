@@ -111,11 +111,27 @@ class LeaveApplication extends Model
                 $resolvedEmployeeControlNo = $employeeControlNo !== '' ? $employeeControlNo : null;
                 $workScheduleService = app(WorkScheduleService::class);
 
+                $selectedDatesForWop = $application->selected_dates;
+                if (self::shouldIgnoreAbroadWeekendsForWithoutPay($application) && is_array($selectedDatesForWop)) {
+                    $filteredDates = [];
+                    foreach ($selectedDatesForWop as $dateKey) {
+                        try {
+                            $dayOfWeek = \Carbon\CarbonImmutable::parse($dateKey)->dayOfWeek;
+                            if ($dayOfWeek !== 0 && $dayOfWeek !== 6) {
+                                $filteredDates[] = $dateKey;
+                            }
+                        } catch (\Throwable) {
+                            $filteredDates[] = $dateKey;
+                        }
+                    }
+                    $selectedDatesForWop = $filteredDates;
+                }
+
                 $application->without_pay_days = self::calculateWithoutPayDays(
                     $application->total_days,
                     $application->deductible_days,
                     $application->pay_mode,
-                    $application->selected_dates,
+                    $selectedDatesForWop,
                     $application->selected_date_pay_status,
                     $application->selected_date_coverage,
                     $application->selected_date_half_day_portion,
@@ -129,6 +145,34 @@ class LeaveApplication extends Model
                 ? round(max((float) $application->cto_deducted_hours, 0.0), 2)
                 : null;
         });
+    }
+
+    private static function shouldIgnoreAbroadWeekendsForWithoutPay(self $application): bool
+    {
+        $leaveType = $application->relationLoaded('leaveType') ? $application->leaveType : null;
+        if (! $leaveType && $application->leave_type_id) {
+            $leaveType = LeaveType::find($application->leave_type_id);
+        }
+
+        $isVacation = $leaveType && (stripos($leaveType->name ?? '', 'vacation') !== false);
+        $isSpecialPrivilege = LeaveType::isSpecialPrivilegeType($leaveType, (int) ($application->leave_type_id ?? 0));
+
+        if (! $isVacation && ! $isSpecialPrivilege) {
+            return false;
+        }
+
+        $details = is_string($application->details_of_leave)
+            ? json_decode($application->details_of_leave, true)
+            : $application->details_of_leave;
+
+        if (! is_array($details)) {
+            return false;
+        }
+
+        $vacationDetail = strtolower(trim((string) ($details['vacation_detail'] ?? '')));
+        $vacationDetail = preg_replace('/[^a-z0-9]+/', ' ', $vacationDetail) ?? $vacationDetail;
+
+        return str_contains($vacationDetail, 'abroad');
     }
 
     private static function isForcedLeaveApplication(self $application): bool
@@ -799,5 +843,111 @@ class LeaveApplication extends Model
             'pay_mode',
             'is_monetization',
         ]);
+    }
+
+    public static function calculateLwopDaysForMonth(string $employeeControlNo, \Carbon\CarbonInterface $month, ?int $leaveTypeId = null): float
+    {
+        $startDate = $month->copy()->startOfMonth()->toDateString();
+        $endDate = $month->copy()->endOfMonth()->toDateString();
+
+        $applications = self::query()
+            ->where('employee_control_no', $employeeControlNo)
+            ->where('status', self::STATUS_APPROVED)
+            ->when($leaveTypeId !== null, function ($query) use ($leaveTypeId) {
+                $query->where('leave_type_id', $leaveTypeId);
+            })
+            ->where(function ($query) use ($startDate, $endDate) {
+                // Application starts before the end of the month AND ends after the start of the month
+                $query->where('start_date', '<=', $endDate)
+                    ->where('end_date', '>=', $startDate);
+            })
+            ->where('without_pay_days', '>', 0)
+            ->get();
+
+        if ($applications->isEmpty()) {
+            return 0.0;
+        }
+
+        $lwopDays = 0.0;
+        $workScheduleService = app(\App\Services\WorkScheduleService::class);
+        $wholeDayWeight = $workScheduleService->resolveCoverageDeductionDays('whole', $employeeControlNo);
+        $halfDayWeight = $workScheduleService->resolveCoverageDeductionDays('half', $employeeControlNo);
+
+        foreach ($applications as $application) {
+            $selectedDates = self::normalizeDateList($application->selected_dates);
+            $payStatusMap = self::normalizeSelectedDatePayStatusMap($application->selected_date_pay_status);
+            $coverageMap = self::normalizeSelectedDateCoverageMap($application->selected_date_coverage);
+            $isAbroad = self::isAbroadLeave($application);
+
+            $halfDayPortionMap = self::mergeSelectedDateHalfDayPortionMaps(
+                self::normalizeSelectedDateHalfDayPortionMap($application->selected_date_half_day_portion),
+                self::normalizeSelectedDateHalfDayPortionMap($application->selected_date_coverage)
+            );
+            foreach (array_keys($halfDayPortionMap) as $dateKey) {
+                $coverageMap[$dateKey] = 'half';
+            }
+
+            foreach ($selectedDates as $date) {
+                if ($date < $startDate || $date > $endDate) {
+                    continue;
+                }
+
+                $effectivePayMode = $payStatusMap[$date] ?? $application->pay_mode;
+                if ($effectivePayMode === self::PAY_MODE_WITHOUT_PAY) {
+                    // Skip weekend LWOP dates for abroad leaves — these are
+                    // system-generated penalties and should not reduce accruals.
+                    if ($isAbroad && self::isWeekendDate($date)) {
+                        continue;
+                    }
+
+                    $weight = ($coverageMap[$date] ?? 'whole') === 'half'
+                        ? $halfDayWeight
+                        : $wholeDayWeight;
+
+                    if ($weight > 0) {
+                        $lwopDays += $weight;
+                    }
+                }
+            }
+        }
+
+        return round($lwopDays, 3);
+    }
+
+    /**
+     * Check whether the given leave application is an "Abroad" vacation leave.
+     */
+    private static function isAbroadLeave(self $application): bool
+    {
+        $detailsOfLeave = $application->details_of_leave;
+        if ($detailsOfLeave === null || $detailsOfLeave === '') {
+            return false;
+        }
+
+        $payload = is_string($detailsOfLeave)
+            ? json_decode(trim($detailsOfLeave), true)
+            : (is_array($detailsOfLeave) ? $detailsOfLeave : null);
+
+        if (! is_array($payload)) {
+            return false;
+        }
+
+        $vacationDetail = strtolower(trim((string) ($payload['vacation_detail'] ?? '')));
+
+        return str_contains($vacationDetail, 'abroad');
+    }
+
+    /**
+     * Check whether a date string falls on a weekend (Saturday or Sunday).
+     */
+    private static function isWeekendDate(string $date): bool
+    {
+        try {
+            $dayOfWeek = \Carbon\CarbonImmutable::parse($date)->dayOfWeek;
+        } catch (\Throwable) {
+            return false;
+        }
+
+        return $dayOfWeek === 0 || $dayOfWeek === 6;
     }
 }

@@ -5542,6 +5542,14 @@ class LeaveApplicationController extends Controller
             );
         }
 
+        $linkedForcedLeaveReservedDays = $this->resolveLeaveTypeForcedLeaveDeductionDays(
+            $leaveType,
+            (int) $validated['leave_type_id'],
+            false,
+            $deductibleDays,
+            $forcedLeaveTypeId
+        );
+
         $app = DB::transaction(function () use (
             $validated,
             $employee,
@@ -5559,7 +5567,8 @@ class LeaveApplicationController extends Controller
             $attachmentReference,
             $appliedAllowSlVlCrossDeduction,
             $linkedVacationLeaveReservedDays,
-            $linkedSickLeaveReservedDays
+            $linkedSickLeaveReservedDays,
+            $linkedForcedLeaveReservedDays
         ) {
             $application = LeaveApplication::create([
                 'employee_control_no' => (string) $employee->control_no,
@@ -5580,6 +5589,7 @@ class LeaveApplicationController extends Controller
                 'allow_sl_vl_cross_deduction' => $appliedAllowSlVlCrossDeduction,
                 'linked_vacation_leave_deducted_days' => $linkedVacationLeaveReservedDays > 0.0 ? $linkedVacationLeaveReservedDays : null,
                 'linked_sick_leave_deducted_days' => $linkedSickLeaveReservedDays > 0.0 ? $linkedSickLeaveReservedDays : null,
+                'linked_forced_leave_deducted_days' => $linkedForcedLeaveReservedDays > 0.0 ? $linkedForcedLeaveReservedDays : null,
                 'attachment_required' => $attachmentRequired,
                 'attachment_submitted' => $attachmentSubmitted,
                 'attachment_reference' => $attachmentReference,
@@ -6758,6 +6768,12 @@ class LeaveApplicationController extends Controller
         $employeeControlNo = trim((string) ($app->employee_control_no ?? '')) ?: null;
         $fallbackPayMode = $this->normalizePayMode($app->pay_mode ?? null, false);
 
+        $shouldForceAbroadWeekendWithoutPay = $this->shouldForceAbroadWeekendWithoutPay(
+            $app->leaveType,
+            (int) $app->leave_type_id,
+            $app->details_of_leave
+        );
+
         foreach ($rawRows as $index => $rawRow) {
             if (! is_array($rawRow)) {
                 continue;
@@ -6778,6 +6794,8 @@ class LeaveApplicationController extends Controller
                 ], 422);
             }
 
+            $isAbroadWeekend = $shouldForceAbroadWeekendWithoutPay && $this->isWeekendDateKey($dateKey);
+
             $coverageInput = $rawRow['coverage_code']
                 ?? $rawRow['coverageCode']
                 ?? $rawRow['coverage']
@@ -6792,7 +6810,7 @@ class LeaveApplicationController extends Controller
                     ?? $coverageInput
                 ) ?? 'AM')
                 : null;
-            $coverageDays = round(max(
+            $coverageDays = $isAbroadWeekend ? 0.0 : round(max(
                 $this->workScheduleService()->resolveCoverageDeductionDays($coverage, $employeeControlNo),
                 0.0
             ), 3);
@@ -6817,12 +6835,12 @@ class LeaveApplicationController extends Controller
                 ?? $rawRow['wopDays']
                 ?? null;
 
-            $withPayDays = $payStatus === LeaveApplication::PAY_MODE_WITH_PAY
+            $withPayDays = $isAbroadWeekend ? 0.0 : ($payStatus === LeaveApplication::PAY_MODE_WITH_PAY
                 ? $this->normalizeHrEditDayValue($rawWithPayDays, $coverageDays)
-                : 0.0;
-            $withoutPayDays = $payStatus === LeaveApplication::PAY_MODE_WITHOUT_PAY
+                : 0.0);
+            $withoutPayDays = $isAbroadWeekend ? 0.0 : ($payStatus === LeaveApplication::PAY_MODE_WITHOUT_PAY
                 ? $this->normalizeHrEditDayValue($rawWithoutPayDays, $coverageDays)
-                : 0.0;
+                : 0.0);
 
             $rowsByDate[$dateKey] = [
                 'date_key' => $dateKey,
@@ -11893,12 +11911,19 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
+        $deductibleSelectedDates = $this->filterOutAbroadWeekendDates(
+            $selectedDates,
+            $leaveType,
+            (int) $leaveType->id,
+            $detailsOfLeave
+        );
+
         if ($isForcedLeave) {
             $normalizedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
 
             $deductibleDays = $this->computeDeductibleDays(
                 $normalizedTotalDays,
-                $selectedDates,
+                $deductibleSelectedDates,
                 $normalizedSelectedDatePayStatus,
                 $normalizedSelectedDateCoverage,
                 false,
@@ -11936,7 +11961,7 @@ class LeaveApplicationController extends Controller
             $normalizedSelectedDatePayStatus = null;
             $deductibleDays = $this->computeDeductibleDays(
                 $normalizedTotalDays,
-                $selectedDates,
+                $deductibleSelectedDates,
                 null,
                 $normalizedSelectedDateCoverage,
                 false,
@@ -11956,7 +11981,7 @@ class LeaveApplicationController extends Controller
 
             $deductibleDays = $this->computeDeductibleDays(
                 $normalizedTotalDays,
-                $selectedDates,
+                $deductibleSelectedDates,
                 null,
                 $normalizedSelectedDateCoverage,
                 false,
@@ -11994,7 +12019,7 @@ class LeaveApplicationController extends Controller
 
             $deductibleDays = $this->computeDeductibleDays(
                 $normalizedTotalDays,
-                $selectedDates,
+                $deductibleSelectedDates,
                 $normalizedSelectedDatePayStatus,
                 $normalizedSelectedDateCoverage,
                 false,
@@ -12014,7 +12039,7 @@ class LeaveApplicationController extends Controller
 
             $deductibleDays = $this->computeDeductibleDays(
                 $normalizedTotalDays,
-                $selectedDates,
+                $deductibleSelectedDates,
                 $normalizedSelectedDatePayStatus,
                 $normalizedSelectedDateCoverage,
                 false,
@@ -12496,9 +12521,16 @@ class LeaveApplicationController extends Controller
             $preferredPayMode
         );
 
+        $deductibleSelectedDates = $this->filterOutAbroadWeekendDates(
+            $selectedDates,
+            $leaveType,
+            $leaveType?->id !== null ? (int) $leaveType->id : null,
+            $detailsOfLeave
+        );
+
         $preferredDeductibleDays = $this->computeDeductibleDays(
             $normalizedTotalDays,
-            $selectedDates,
+            $deductibleSelectedDates,
             $preferredCompactedPayStatus,
             $selectedDateCoverage,
             false,
@@ -12580,7 +12612,7 @@ class LeaveApplicationController extends Controller
 
         $deductibleDays = $this->computeDeductibleDays(
             $normalizedTotalDays,
-            $selectedDates,
+            $deductibleSelectedDates,
             $compactedPayStatusOverrides,
             $selectedDateCoverage,
             false,
@@ -12889,35 +12921,37 @@ class LeaveApplicationController extends Controller
         ?int $leaveTypeId = null,
         mixed $detailsOfLeave = null
     ): ?array {
-        $compactedPayStatus = $this->compactSelectedDatePayStatusMap(
+        return $this->compactSelectedDatePayStatusMap(
             $selectedDatePayStatus,
             $selectedDates,
             $payMode
         );
+    }
 
+    private function filterOutAbroadWeekendDates(
+        ?array $selectedDates,
+        ?LeaveType $leaveType = null,
+        ?int $leaveTypeId = null,
+        mixed $detailsOfLeave = null
+    ): ?array {
         if (! $this->shouldForceAbroadWeekendWithoutPay($leaveType, $leaveTypeId, $detailsOfLeave)) {
-            return $compactedPayStatus;
+            return $selectedDates;
         }
 
         if (! is_array($selectedDates) || $selectedDates === []) {
-            return $compactedPayStatus;
+            return $selectedDates;
         }
 
-        $resolvedPayStatus = is_array($compactedPayStatus) ? $compactedPayStatus : [];
+        $filteredDates = [];
         foreach ($selectedDates as $rawDate) {
             $dateKey = $this->normalizeDateKey($rawDate) ?? trim((string) $rawDate);
-            if ($dateKey === '' || ! $this->isWeekendDateKey($dateKey)) {
+            if ($dateKey !== '' && $this->isWeekendDateKey($dateKey)) {
                 continue;
             }
-
-            $resolvedPayStatus[$dateKey] = LeaveApplication::PAY_MODE_WITHOUT_PAY;
+            $filteredDates[] = $rawDate;
         }
 
-        return $this->compactSelectedDatePayStatusMap(
-            $resolvedPayStatus,
-            $selectedDates,
-            LeaveApplication::PAY_MODE_WITH_PAY
-        );
+        return $filteredDates;
     }
 
     private function resolvePayModeFromSelectedDates(

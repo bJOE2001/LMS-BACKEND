@@ -957,6 +957,13 @@ class AdminDashboardController extends Controller
             return $duplicateDateValidation;
         }
 
+        $forcedLeaveTypeId = LeaveType::resolveForcedLeaveTypeId();
+        $isVacationLeave = strcasecmp(trim((string) ($leaveType->name ?? '')), 'Vacation Leave') === 0;
+        $linkedForcedLeaveReservedDays = 0.0;
+        if ($forcedLeaveTypeId !== null && $leaveType->id !== $forcedLeaveTypeId && $isVacationLeave) {
+            $linkedForcedLeaveReservedDays = round(max($deductibleDays, 0.0), 3);
+        }
+
         // 3. Create the application
         $application = DB::transaction(function () use (
             $validated,
@@ -973,7 +980,8 @@ class AdminDashboardController extends Controller
             $attachmentState,
             $appliedAllowSlVlCrossDeduction,
             $linkedVacationLeaveReservedDays,
-            $linkedSickLeaveReservedDays
+            $linkedSickLeaveReservedDays,
+            $linkedForcedLeaveReservedDays
         ) {
             $app = LeaveApplication::create([
                 'applicant_admin_id' => $admin->id,
@@ -994,6 +1002,7 @@ class AdminDashboardController extends Controller
                 'allow_sl_vl_cross_deduction' => $appliedAllowSlVlCrossDeduction,
                 'linked_vacation_leave_deducted_days' => $linkedVacationLeaveReservedDays > 0.0 ? $linkedVacationLeaveReservedDays : null,
                 'linked_sick_leave_deducted_days' => $linkedSickLeaveReservedDays > 0.0 ? $linkedSickLeaveReservedDays : null,
+                'linked_forced_leave_deducted_days' => $linkedForcedLeaveReservedDays > 0.0 ? $linkedForcedLeaveReservedDays : null,
                 'attachment_required' => $attachmentRequired,
                 'attachment_submitted' => (bool) ($attachmentState['attachment_submitted'] ?? false),
                 'attachment_reference' => $attachmentState['attachment_reference'] ?? null,

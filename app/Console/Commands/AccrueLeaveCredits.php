@@ -23,6 +23,7 @@ class AccrueLeaveCredits extends Command
     // SQL Server hard limit is 2100 bound parameters per statement.
     // Keep a safety margin so Laravel upsert() never exceeds the limit.
     private const SQL_SERVER_SAFE_PARAMETER_LIMIT = 2000;
+
     private const EXCLUDED_ACCRUAL_STATUS_KEYWORDS = ['HONORARIUM', 'CONTRACTUAL'];
 
     protected $signature = 'leave:accrue
@@ -47,22 +48,28 @@ class AccrueLeaveCredits extends Command
 
         if ($accruedTypes->isEmpty()) {
             $this->warn('No ACCRUED leave types found.');
+
             return self::SUCCESS;
         }
 
         $employeeDirectory = $this->buildEmployeeDirectory($hrTimeout);
         if ($employeeDirectory['employees'] === []) {
             $this->warn('No employee records found. Nothing to accrue.');
+
             return self::SUCCESS;
         }
 
         $totalAccrued = 0;
         $totalProvisioned = 0;
 
+        $targetMonth = $now->copy()->subMonth();
+        $lwopDaysCache = [];
+
         foreach ($accruedTypes as $type) {
             $eligibleEmployeeControlNos = $this->eligibleEmployeeControlNosForType($type, $employeeDirectory['employees']);
             if ($eligibleEmployeeControlNos === []) {
                 $this->line("  {$type->name}: no eligible employee records found for accrual");
+
                 continue;
             }
 
@@ -91,7 +98,48 @@ class AccrueLeaveCredits extends Command
                     continue;
                 }
 
-                DB::transaction(function () use ($balance, $type, $now, $employeeDirectory): void {
+                $controlNo = trim((string) ($balance->employee_control_no ?? ''));
+                if ($controlNo !== '' && ! isset($lwopDaysCache[$controlNo])) {
+                    $deductions = [];
+                    $accruals = [];
+                    foreach ($accruedTypes as $t) {
+                        $deductions[$t->id] = \App\Models\LeaveApplication::calculateLwopDaysForMonth($controlNo, $targetMonth, $t->id);
+                        $accruals[$t->id] = (float) $t->accrual_rate;
+                    }
+
+                    $excessDeduction = 0.0;
+                    foreach ($accruedTypes as $t) {
+                        $d = $deductions[$t->id];
+                        $a = $accruals[$t->id];
+                        if ($d > $a) {
+                            $excessDeduction += ($d - $a);
+                            $deductions[$t->id] = $a;
+                        }
+                    }
+
+                    if ($excessDeduction > 0) {
+                        foreach ($accruedTypes as $t) {
+                            $remainingAccrual = $accruals[$t->id] - $deductions[$t->id];
+                            if ($remainingAccrual > 0) {
+                                $toDeduct = min($excessDeduction, $remainingAccrual);
+                                $deductions[$t->id] += $toDeduct;
+                                $excessDeduction -= $toDeduct;
+                            }
+                            if ($excessDeduction <= 0) {
+                                break;
+                            }
+                        }
+                    }
+
+                    $lwopDaysCache[$controlNo] = $deductions;
+                }
+
+                $deduction = $lwopDaysCache[$controlNo][$type->id] ?? 0.0;
+                $accrualRate = (float) $type->accrual_rate;
+
+                $finalAccrual = round(max($accrualRate - $deduction, 0.0), 3);
+
+                DB::transaction(function () use ($balance, $type, $now, $employeeDirectory, $finalAccrual): void {
                     $employeeName = $this->resolveEmployeeNameForBalance($balance, $employeeDirectory['lookup']);
                     $leaveTypeName = trim((string) ($balance->leave_type_name ?? $type->name ?? ''));
 
@@ -103,9 +151,9 @@ class AccrueLeaveCredits extends Command
                     }
 
                     // Keep accrual math aligned with the 3-decimal leave balance precision.
-                    $balance->balance = round((float) $balance->balance + (float) $type->accrual_rate, 3);
+                    $balance->balance = round((float) $balance->balance + $finalAccrual, 3);
                     $balance->last_accrual_date = $now->toDateString();
-                    if (!$balance->year) {
+                    if (! $balance->year) {
                         $balance->year = (int) $now->year;
                     }
                     $balance->save();
@@ -120,7 +168,7 @@ class AccrueLeaveCredits extends Command
                             'employee_control_no' => trim((string) ($balance->employee_control_no ?? '')) ?: null,
                             'employee_name' => $employeeName,
                             'leave_type_name' => $leaveTypeName !== '' ? $leaveTypeName : null,
-                            'credits_added' => (float) $type->accrual_rate,
+                            'credits_added' => $finalAccrual,
                         ]
                     );
                 });
@@ -151,7 +199,7 @@ class AccrueLeaveCredits extends Command
         $records = $this->resolveAccrualEmployeeRecords($hrTimeout);
 
         foreach ($records as $employee) {
-            if (!is_object($employee)) {
+            if (! is_object($employee)) {
                 continue;
             }
 
@@ -237,7 +285,7 @@ class AccrueLeaveCredits extends Command
     }
 
     /**
-     * @param array<int, array{control_no: string, status: mixed}> $employees
+     * @param  array<int, array{control_no: string, status: mixed}>  $employees
      * @return array<int, string>
      */
     private function eligibleEmployeeControlNosForType(LeaveType $type, array $employees): array
@@ -257,7 +305,7 @@ class AccrueLeaveCredits extends Command
     }
 
     /**
-     * @param array<string, array{name: string, status: mixed}> $employeeLookup
+     * @param  array<string, array{name: string, status: mixed}>  $employeeLookup
      */
     private function balanceIsEligibleForTypeAccrual(
         LeaveBalance $balance,
@@ -290,15 +338,14 @@ class AccrueLeaveCredits extends Command
     }
 
     /**
-     * @param array<string, array{name: string, status: mixed}> $employeeLookup
+     * @param  array<string, array{name: string, status: mixed}>  $employeeLookup
      */
     private function provisionMissingAccruedBalances(
         array $employeeControlNos,
         LeaveType $type,
         Carbon $now,
         array $employeeLookup
-    ): int
-    {
+    ): int {
         if ($employeeControlNos === []) {
             return 0;
         }
@@ -306,8 +353,8 @@ class AccrueLeaveCredits extends Command
         $existingEmployeeControlNos = LeaveBalance::query()
             ->where('leave_type_id', $type->id)
             ->pluck('employee_control_no')
-            ->map(static fn(mixed $employeeControlNo): string => trim((string) $employeeControlNo))
-            ->filter(static fn(string $employeeControlNo): bool => $employeeControlNo !== '')
+            ->map(static fn (mixed $employeeControlNo): string => trim((string) $employeeControlNo))
+            ->filter(static fn (string $employeeControlNo): bool => $employeeControlNo !== '')
             ->values()
             ->all();
 
@@ -344,7 +391,7 @@ class AccrueLeaveCredits extends Command
     }
 
     /**
-     * @param array<int, array<string, mixed>> $rows
+     * @param  array<int, array<string, mixed>>  $rows
      */
     private function upsertLeaveBalancesInChunks(array $rows): void
     {
@@ -369,7 +416,7 @@ class AccrueLeaveCredits extends Command
     }
 
     /**
-     * @param array<string, array{name: string, status: mixed}> $employeeLookup
+     * @param  array<string, array{name: string, status: mixed}>  $employeeLookup
      */
     private function resolveEmployeeNameForBalance(LeaveBalance $balance, array $employeeLookup): ?string
     {
@@ -403,11 +450,11 @@ class AccrueLeaveCredits extends Command
         }
 
         if ($firstname !== '') {
-            $name .= $name !== '' ? ', ' . $firstname : $firstname;
+            $name .= $name !== '' ? ', '.$firstname : $firstname;
         }
 
         if ($middlename !== '') {
-            $name .= ($name !== '' ? ' ' : '') . $middlename;
+            $name .= ($name !== '' ? ' ' : '').$middlename;
         }
 
         return trim($name);
@@ -416,11 +463,12 @@ class AccrueLeaveCredits extends Command
     private function normalizeControlNo(?string $value): ?string
     {
         $raw = trim((string) ($value ?? ''));
-        if ($raw === '' || !preg_match('/^\d+$/', $raw)) {
+        if ($raw === '' || ! preg_match('/^\d+$/', $raw)) {
             return null;
         }
 
         $normalized = ltrim($raw, '0');
+
         return $normalized !== '' ? $normalized : '0';
     }
 

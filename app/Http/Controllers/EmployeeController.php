@@ -1700,6 +1700,7 @@ class EmployeeController extends Controller
                 $rowIndex = count($ledgerRows);
                 $ledgerRows[] = [
                     'id' => $transaction['row_id'] ?? null,
+                    'accrual_ids' => [],
                     'period' => $period,
                     'particulars' => $particulars,
                     'leave_type_code' => $leaveTypeCode !== '' ? $leaveTypeCode : null,
@@ -1713,6 +1714,14 @@ class EmployeeController extends Controller
 
                 if ($mergeKey !== null) {
                     $rowIndexByMergeKey[$mergeKey] = $rowIndex;
+                }
+            }
+
+            $txRowId = (string) ($transaction['row_id'] ?? '');
+            if (str_starts_with($txRowId, 'accrual-')) {
+                $accrualId = (int) substr($txRowId, 8);
+                if ($accrualId > 0 && ! in_array($accrualId, $ledgerRows[$rowIndex]['accrual_ids'], true)) {
+                    $ledgerRows[$rowIndex]['accrual_ids'][] = $accrualId;
                 }
             }
 

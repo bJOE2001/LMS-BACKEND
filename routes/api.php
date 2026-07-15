@@ -15,6 +15,7 @@ use App\Http\Controllers\HRReportController;
 use App\Http\Controllers\HRUserManagementController;
 use App\Http\Controllers\HRWorkScheduleController;
 use App\Http\Controllers\LeaveApplicationController;
+use App\Http\Controllers\LeaveBalanceAccrualController;
 use App\Http\Controllers\NotificationController;
 use App\Http\Controllers\SettingsController;
 use App\Http\Controllers\SpecialPrivilegeReasonController;
@@ -160,6 +161,10 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::get('/leave-balances/available-types', [HRLeaveBalanceImportController::class, 'availableTypes']);
             Route::post('/leave-balances', [HRLeaveBalanceImportController::class, 'store']);
             Route::post('/leave-balances/update', [HRLeaveBalanceImportController::class, 'update']);
+
+            // Accrual History Management
+            Route::get('/leave-accruals', [LeaveBalanceAccrualController::class, 'getByIds']);
+            Route::post('/leave-accruals/bulk-update', [LeaveBalanceAccrualController::class, 'bulkUpdate']);
         });
 
         Route::middleware('hr.module:dashboard')->group(function () {

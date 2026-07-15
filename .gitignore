@@ -16,10 +16,13 @@
 /.agents
 /.ai
 /.codex
+/.gemini
 /.mcp.json
 /AGENTS.md
+/GEMINI.md
 /CLAUDE.md
 /boost.json
+/settings.json
 /junie
 /auth.json
 /node_modules
