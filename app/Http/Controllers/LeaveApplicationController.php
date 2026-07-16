@@ -46,6 +46,8 @@ class LeaveApplicationController extends Controller
 
     private const CTO_MIN_WORKING_DAYS_BEFORE_AVAILMENT = 3;
 
+    private const VL_MIN_WORKING_DAYS_BEFORE_AVAILMENT = 3;
+
     private const TERMINAL_LEAVE_ESTIMATE_FACTOR = 0.0478087;
 
     private const TERMINAL_LEAVE_AMOUNT_PRECISION = 12;
@@ -11911,6 +11913,7 @@ class LeaveApplicationController extends Controller
             : null;
 
         $isSickLeave = $this->isSickLeaveType($leaveType, (int) $leaveType->id);
+        $isVacationLeave = (int) $leaveType->id === $this->resolveVacationLeaveTypeId();
         $isCtoLeave = $this->isCtoLeaveType($leaveType, (int) $leaveType->id);
         $isForcedLeave = LeaveType::isForcedLeaveType($leaveType, (int) $leaveType->id);
         $isEventLeave = strtoupper(trim((string) ($leaveType->category ?? ''))) === LeaveType::CATEGORY_EVENT;
@@ -12046,6 +12049,42 @@ class LeaveApplicationController extends Controller
                 $normalizedPayMode,
                 $employeeControlNo
             );
+            $ctoDeductedHours = null;
+        } elseif ($isVacationLeave) {
+            $vlValidation = $this->validateVacationLeaveAdvanceFilingPolicy(
+                $selectedDates,
+                $normalizedSelectedDatePayStatus,
+                $normalizedPayMode,
+                $filedAt
+            );
+            if ($vlValidation instanceof JsonResponse) {
+                return $vlValidation;
+            }
+
+            $normalizedSelectedDatePayStatus = $this->enforceAbroadWeekendWithoutPayStatus(
+                $selectedDates,
+                $normalizedSelectedDatePayStatus,
+                $normalizedPayMode,
+                $leaveType,
+                (int) $leaveType->id,
+                $detailsOfLeave
+            );
+
+            $deductibleDays = $this->computeDeductibleDays(
+                $normalizedTotalDays,
+                $deductibleSelectedDates,
+                $normalizedSelectedDatePayStatus,
+                $normalizedSelectedDateCoverage,
+                false,
+                $normalizedPayMode,
+                $employeeControlNo
+            );
+
+            if (! $attachmentRequired) {
+                $attachmentSubmitted = false;
+                $attachmentReference = null;
+            }
+
             $ctoDeductedHours = null;
         } else {
             $normalizedSelectedDatePayStatus = $this->enforceAbroadWeekendWithoutPayStatus(
@@ -12202,6 +12241,81 @@ class LeaveApplicationController extends Controller
                 'message' => 'CTO may only be availed for up to 5 consecutive days per application.',
                 'errors' => [
                     'selected_dates' => ['CTO may only be availed for up to 5 consecutive days per application.'],
+                ],
+            ], 422);
+        }
+
+        return null;
+    }
+
+    private function validateVacationLeaveAdvanceFilingPolicy(
+        ?array $selectedDates,
+        ?array $selectedDatePayStatus,
+        string $payMode,
+        mixed $filedAt = null
+    ): ?JsonResponse {
+        $normalizedDateKeys = $this->normalizeSelectedDateKeys($selectedDates);
+        if ($normalizedDateKeys === []) {
+            return null;
+        }
+
+        $filedDate = $this->resolvePolicyFilingDate($filedAt);
+        $normalizedFiledDate = $filedDate->startOfDay();
+
+        $blockedFutureDates = [];
+        $latePastDates = [];
+
+        foreach ($normalizedDateKeys as $dateKey) {
+            $availmentDate = $this->resolveIsoDate($dateKey);
+            if ($availmentDate === null) {
+                continue;
+            }
+
+            $normalizedAvailmentDate = $availmentDate->startOfDay();
+
+            if ($normalizedAvailmentDate->lt($normalizedFiledDate)) {
+                $isWithPay = false;
+
+                if (is_array($selectedDatePayStatus) && array_key_exists($dateKey, $selectedDatePayStatus)) {
+                    $isWithPay = $selectedDatePayStatus[$dateKey] === true || $selectedDatePayStatus[$dateKey] === LeaveApplication::PAY_MODE_WITH_PAY;
+                } else {
+                    $isWithPay = $this->normalizePayMode($payMode, false) === LeaveApplication::PAY_MODE_WITH_PAY;
+                }
+
+                if ($isWithPay) {
+                    $latePastDates[] = $availmentDate->format('M j, Y');
+                }
+            } else {
+                $workingDaysBeforeAvailment = $this->countWorkingDaysFromFiledDateBeforeDate($filedDate, $availmentDate);
+
+                if ($workingDaysBeforeAvailment < self::VL_MIN_WORKING_DAYS_BEFORE_AVAILMENT) {
+                    $blockedFutureDates[] = $availmentDate->format('M j, Y');
+                }
+            }
+        }
+
+        if (count($blockedFutureDates) > 0) {
+            $formattedDates = implode(', ', $blockedFutureDates);
+            $message = 'Vacation leaves must be applied for at least '
+                .self::VL_MIN_WORKING_DAYS_BEFORE_AVAILMENT
+                ." working days prior to the intended leave date. Your application for {$formattedDates} cannot be processed.";
+
+            return response()->json([
+                'message' => $message,
+                'errors' => [
+                    'selected_dates' => [$message],
+                ],
+            ], 422);
+        }
+
+        if (count($latePastDates) > 0) {
+            $formattedDates = implode(', ', $latePastDates);
+            $message = "Vacation Leave for past dates must be filed as Without Pay (WOP). Please change the pay status for: {$formattedDates}.";
+
+            return response()->json([
+                'message' => $message,
+                'errors' => [
+                    'selected_date_pay_status' => [$message],
                 ],
             ], 422);
         }
