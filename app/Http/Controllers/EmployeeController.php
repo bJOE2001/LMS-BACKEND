@@ -1020,11 +1020,11 @@ class EmployeeController extends Controller
                     }
 
                     $creditsAdded = $this->roundLedgerValue($entry->credits_added);
-                    if ($creditsAdded === 0.0) {
+                    $source = strtoupper(trim((string) ($entry->source ?? '')));
+                    if ($creditsAdded === 0.0 && $source !== 'AUTOMATED') {
                         continue;
                     }
 
-                    $source = strtoupper(trim((string) ($entry->source ?? '')));
                     $isManualAddSource = $source === 'HR_ADD' || str_starts_with($source, 'HR_ADD:');
                     $isManualEditSource = $source === 'HR_EDIT' || str_starts_with($source, 'HR_EDIT:');
                     $isManualBalanceSource = $isManualAddSource || $isManualEditSource;
@@ -1083,6 +1083,7 @@ class EmployeeController extends Controller
                         'amount' => $displayAmount,
                         'balance_delta' => $creditsAdded,
                         'suppress_display' => $isForcedLeaveBalanceEntry,
+                        'allow_zero_display' => ($creditsAdded === 0.0 && $source === 'AUTOMATED'),
                     ];
                 }
             }
@@ -1659,7 +1660,7 @@ class EmployeeController extends Controller
 
             $category = (string) ($transaction['category'] ?? '');
             $amount = $this->roundLedgerValue($transaction['amount'] ?? 0);
-            if ($amount <= 0) {
+            if ($amount <= 0 && ! ($transaction['allow_zero_display'] ?? false)) {
                 continue;
             }
 
