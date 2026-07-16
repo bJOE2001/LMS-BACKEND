@@ -2651,30 +2651,9 @@ class LeaveApplicationController extends Controller
             $pendingReceiveOnly = filter_var($validated['pending_receive'] ?? false, FILTER_VALIDATE_BOOLEAN);
         }
 
-        $query = LeaveApplication::query()
-            ->select([
-                'id',
-                'applicant_admin_id',
-                'employee_control_no',
-                'employee_name',
-                'leave_type_id',
-                'start_date',
-                'end_date',
-                'selected_dates',
-                'total_days',
-                'status',
-                'remarks',
-                'hr_id',
-                'created_at',
-            ])
-            ->with([
-                'leaveType:id,name',
-                'applicantAdmin:id,department_id,employee_control_no,full_name',
-                'applicantAdmin.department:id,name',
-                'updateRequests:id,leave_application_id,requested_payload,requested_reason,previous_status,requested_by_control_no,requested_at,status,reviewed_at,review_remarks',
-                'logs:id,leave_application_id,action,performed_by_type,performed_by_id,remarks,created_at',
-            ]);
+        $query = LeaveApplication::query();
 
+        // 1. Base Status Filtering
         if ($pendingReceiveOnly) {
             $query->where('status', LeaveApplication::STATUS_PENDING_HR);
         } else {
@@ -2688,58 +2667,121 @@ class LeaveApplicationController extends Controller
             ]);
         }
 
-        $applications = $query->orderBy('created_at')
-            ->orderBy('id')
-            ->get();
+        // 2. Subquery Filtering (Replacing PHP memory filtering)
 
+        $logsTable = (new LeaveApplicationLog)->getTable();
+        $updatesTable = (new LeaveApplicationUpdateRequest)->getTable();
+        $appsTable = (new LeaveApplication)->getTable();
+
+        // isPendingReceive Logic
         if ($pendingReceiveOnly) {
-            $applications = $applications->filter(fn (LeaveApplication $application): bool => $this->isPendingReceive($application))->values();
+            $query->whereNotExists(function ($sub) use ($logsTable, $updatesTable, $appsTable) {
+                $sub->select(\Illuminate\Support\Facades\DB::raw(1))
+                    ->from("{$logsTable} as lal")
+                    ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
+                    ->where('lal.action', LeaveApplicationLog::ACTION_HR_RECEIVED)
+                    ->whereRaw("lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status = ?), '1970-01-01')", [LeaveApplicationUpdateRequest::STATUS_PENDING]);
+            });
         } else {
-            $applications = $applications->reject(fn (LeaveApplication $application): bool => $this->isPendingReceive($application))->values();
+            $query->where(function ($q) use ($logsTable, $updatesTable, $appsTable) {
+                $q->where('status', '!=', LeaveApplication::STATUS_PENDING_HR)
+                    ->orWhereExists(function ($sub) use ($logsTable, $updatesTable, $appsTable) {
+                        $sub->select(\Illuminate\Support\Facades\DB::raw(1))
+                            ->from("{$logsTable} as lal")
+                            ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
+                            ->where('lal.action', LeaveApplicationLog::ACTION_HR_RECEIVED)
+                            ->whereRaw("lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status = ?), '1970-01-01')", [LeaveApplicationUpdateRequest::STATUS_PENDING]);
+                    });
+            });
         }
 
-        $applications = $this->sortLeaveApplicationsForHrQueue($applications)
-            ->reject(fn (LeaveApplication $application): bool => $this->isCancelledForHrQueue($application)
-                || $this->isRejectedBeforeHrQueue($application)
-                || (
-                    $application->status === LeaveApplication::STATUS_PENDING_ADMIN
-                    && ! $this->hasPendingApprovedUpdateRequest($application)
-                ))
-            ->values();
+        // isCancelledForHrQueue Logic
+        $query->where(function ($q) use ($logsTable, $appsTable) {
+            $q->where('status', '!=', LeaveApplication::STATUS_CANCELLED)
+                ->where(function ($q2) {
+                    $q2->whereNull('remarks')->orWhere('remarks', 'NOT LIKE', 'cancelled%');
+                })
+                ->whereNotExists(function ($sub) use ($logsTable, $appsTable) {
+                    $sub->select(\Illuminate\Support\Facades\DB::raw(1))
+                        ->from("{$logsTable} as lal")
+                        ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
+                        ->where('lal.remarks', 'LIKE', 'cancelled%');
+                });
+        });
 
-        if ($searchTokens !== [] || $employmentType !== '') {
-            HrisEmployee::directoryByControlNos(
-                $applications
-                    ->pluck('employee_control_no')
-                    ->filter()
-                    ->unique()
-                    ->values()
-                    ->all()
-            );
+        // isRejectedBeforeHrQueue Logic
+        $query->whereNot(function ($q) use ($logsTable, $appsTable) {
+            $q->where('status', LeaveApplication::STATUS_REJECTED)
+                ->where(function ($q2) {
+                    $q2->whereNull('hr_id')->orWhere('hr_id', '<=', 0);
+                })
+                ->whereNotExists(function ($sub) use ($logsTable, $appsTable) {
+                    $sub->select(\Illuminate\Support\Facades\DB::raw(1))
+                        ->from("{$logsTable} as lal")
+                        ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
+                        ->where('lal.action', LeaveApplicationLog::ACTION_HR_REJECTED)
+                        ->whereRaw('UPPER(lal.performed_by_type) = ?', [LeaveApplicationLog::PERFORMER_HR]);
+                });
+        });
 
-            $applications = $applications
-                ->filter(fn (LeaveApplication $application): bool => $this->matchesHrApplicationFilters(
-                    $application,
-                    $searchTokens,
-                    $employmentType
-                ))
-                ->values();
+        // hasPendingApprovedUpdateRequest Logic (for PENDING_ADMIN)
+        $query->whereNot(function ($q) use ($updatesTable, $appsTable) {
+            $q->where('status', LeaveApplication::STATUS_PENDING_ADMIN)
+                ->whereNotExists(function ($sub) use ($updatesTable, $appsTable) {
+                    $sub->select(\Illuminate\Support\Facades\DB::raw(1))
+                        ->from("{$updatesTable} as req")
+                        ->whereColumn('req.leave_application_id', "{$appsTable}.id")
+                        ->where('req.status', LeaveApplicationUpdateRequest::STATUS_PENDING);
+                });
+        });
+
+        // 3. Search Tokens (Replacing matchesHrApplicationFilters)
+        if ($searchTokens !== []) {
+            $query->where(function ($q) use ($searchTokens) {
+                foreach ($searchTokens as $token) {
+                    $q->where(function ($sub) use ($token) {
+                        $likeToken = "%{$token}%";
+                        $sub->where('id', 'like', $likeToken)
+                            ->orWhere('employee_control_no', 'like', $likeToken)
+                            ->orWhere('employee_name', 'like', $likeToken)
+                            ->orWhere('status', 'like', $likeToken)
+                            ->orWhere('total_days', 'like', $likeToken)
+                            ->orWhereHas('applicantAdmin', function ($qAdmin) use ($likeToken) {
+                                $qAdmin->where('full_name', 'like', $likeToken)
+                                    ->orWhereHas('department', function ($qDept) use ($likeToken) {
+                                        $qDept->where('name', 'like', $likeToken);
+                                    });
+                            })
+                            ->orWhereHas('leaveType', function ($qType) use ($likeToken) {
+                                $qType->where('name', 'like', $likeToken);
+                            });
+                    });
+                }
+            });
         }
 
-        $total = $applications->count();
-        $lastPage = max((int) ceil($total / $perPage), 1);
-        $page = min($requestedPage, $lastPage);
-        $pageApplicationIds = $applications
-            ->forPage($page, $perPage)
-            ->pluck('id')
-            ->map(fn (mixed $id): int => (int) $id)
-            ->values();
+        // Note: Employment Type filter involves external HRIS data which is hard to query in SQL without a join.
+        // It's applied after pagination below if needed, though mostly obsolete if search narrows results.
 
-        $pageApplications = LeaveApplication::with(['leaveType', 'applicantAdmin.department', 'updateRequests', 'logs'])
-            ->whereKey($pageApplicationIds->all())
-            ->get()
-            ->keyBy(fn (LeaveApplication $application): int => (int) $application->id);
+        // 4. Database-level Sorting (Approximating sortLeaveApplicationsForHrQueue)
+        $query->orderByRaw("
+            CASE
+                WHEN status IN ('PENDING_HR', 'PENDING_ADMIN') OR status LIKE '%PENDING%' THEN 1
+                WHEN status = 'APPROVED' THEN 2
+                WHEN status = 'REJECTED' THEN 3
+                WHEN status = 'RECALLED' THEN 4
+                ELSE 5
+            END ASC
+        ")->orderBy('created_at', 'ASC')->orderBy('id', 'ASC');
 
+        // 5. Database Pagination
+        $paginator = $query->paginate($perPage, ['*'], 'page', $requestedPage);
+        $pageApplications = $paginator->getCollection();
+
+        // 6. Late Eager Loading
+        $pageApplications->load(['leaveType', 'applicantAdmin.department', 'updateRequests', 'logs']);
+
+        // 7. Process HRIS Directory and Employment Type for the paginated slice
         HrisEmployee::directoryByControlNos(
             $pageApplications
                 ->pluck('employee_control_no')
@@ -2749,24 +2791,27 @@ class LeaveApplicationController extends Controller
                 ->all()
         );
 
-        $formattedApplications = $pageApplicationIds
-            ->map(fn (int $id): ?LeaveApplication => $pageApplications->get($id))
-            ->filter(fn (mixed $application): bool => $application instanceof LeaveApplication)
+        if ($employmentType !== '') {
+            $pageApplications = $pageApplications->filter(function (LeaveApplication $application) use ($employmentType) {
+                $employee = $this->resolveApplicationEmployee($application);
+
+                return LeaveType::normalizeEmploymentStatusKey($employee?->status) === $employmentType;
+            })->values();
+        }
+
+        $formattedApplications = $pageApplications
             ->map(fn (LeaveApplication $app): array => $this->formatApplication($app))
             ->values();
-
-        $from = $total > 0 ? (($page - 1) * $perPage) + 1 : null;
-        $to = $total > 0 ? min($page * $perPage, $total) : null;
 
         return response()->json([
             'applications' => $formattedApplications,
             'pagination' => [
-                'current_page' => $page,
-                'per_page' => $perPage,
-                'total' => $total,
-                'last_page' => $lastPage,
-                'from' => $from,
-                'to' => $to,
+                'current_page' => $paginator->currentPage(),
+                'per_page' => $paginator->perPage(),
+                'total' => $paginator->total(),
+                'last_page' => $paginator->lastPage(),
+                'from' => $paginator->firstItem(),
+                'to' => $paginator->lastItem(),
             ],
         ]);
     }
