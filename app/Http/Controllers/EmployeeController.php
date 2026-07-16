@@ -1021,7 +1021,7 @@ class EmployeeController extends Controller
 
                     $creditsAdded = $this->roundLedgerValue($entry->credits_added);
                     $source = strtoupper(trim((string) ($entry->source ?? '')));
-                    if ($creditsAdded === 0.0 && $source !== 'AUTOMATED') {
+                    if ($creditsAdded === 0.0 && !str_starts_with($source, 'AUTOMATED')) {
                         continue;
                     }
 
@@ -1083,7 +1083,7 @@ class EmployeeController extends Controller
                         'amount' => $displayAmount,
                         'balance_delta' => $creditsAdded,
                         'suppress_display' => $isForcedLeaveBalanceEntry,
-                        'allow_zero_display' => ($creditsAdded === 0.0 && $source === 'AUTOMATED'),
+                        'allow_zero_display' => ($creditsAdded === 0.0 && str_starts_with($source, 'AUTOMATED')),
                     ];
                 }
             }
