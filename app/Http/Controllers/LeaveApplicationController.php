@@ -6,6 +6,7 @@ use App\Http\Controllers\Concerns\FiltersEmployeeControlNos;
 use App\Http\Requests\HrLeaveApplicationIndexRequest;
 use App\Http\Requests\HrVerifyLeaveApplicationDocumentRequest;
 use App\Models\DepartmentAdmin;
+use App\Models\DepartmentHead;
 use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
@@ -7739,6 +7740,24 @@ class LeaveApplicationController extends Controller
         return $normalized;
     }
 
+    private function isDepartmentHeadRecord(?string $controlNo): bool
+    {
+        $normalizedControlNo = $this->normalizeControlNo($controlNo);
+        if ($normalizedControlNo === '') {
+            return false;
+        }
+
+        $departmentHeads = DepartmentHead::query()->get(['control_no']);
+        foreach ($departmentHeads as $head) {
+            $headControlNo = $this->normalizeControlNo((string) $head->control_no);
+            if ($headControlNo !== '' && $headControlNo === $normalizedControlNo) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private function formatEmployeeFullName(?object $employee): string
     {
         if (! is_object($employee)) {
@@ -8304,6 +8323,7 @@ class LeaveApplicationController extends Controller
                 'employment_status_key' => LeaveType::normalizeEmploymentStatusKey($resolvedEmployee->status),
                 'status' => $resolvedEmployee->status,
             ] : null,
+            'is_department_head' => $this->isDepartmentHeadRecord($resolvedEmployee?->control_no ?? $app->employee_control_no),
         ];
     }
 
@@ -14638,6 +14658,7 @@ class LeaveApplicationController extends Controller
             'documentVerification' => $documentVerification,
             'employee_control_no' => $app->employee_control_no,
             'applicant_admin_id' => $app->applicant_admin_id,
+            'is_department_head' => $this->isDepartmentHeadRecord($resolvedEmployee?->control_no ?? $app->employee_control_no),
             'leave_type_id' => $app->leave_type_id,
             'leaveType' => $displayLeaveTypeName,
             'leave_type_name' => $displayLeaveTypeName,
