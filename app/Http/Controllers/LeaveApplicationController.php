@@ -14266,8 +14266,11 @@ class LeaveApplicationController extends Controller
             $forcedLeaveTypeId,
             $vacationLeaveTypeId
         );
+        $isZeroBalanceRestricted = LeaveType::isZeroBalanceRestrictedName($leaveType->name);
+
         if (
             ! $isForcedLeaveType
+            && ! $isZeroBalanceRestricted
             && (
                 ! $leaveType->is_credit_based
                 || ($requiredBalanceDays <= 0 && $requiredVacationLeaveDays <= 0)
@@ -14301,6 +14304,16 @@ class LeaveApplicationController extends Controller
         $currentBalanceHours = (float) ($balanceSnapshot['current_balance_hours'] ?? 0.0);
         $pendingReservedHours = (float) ($balanceSnapshot['pending_reserved_hours'] ?? 0.0);
         $availableBalanceHours = (float) ($balanceSnapshot['available_balance_hours'] ?? 0.0);
+
+        if ($isZeroBalanceRestricted && $availableBalance <= 0.0) {
+            return response()->json([
+                'message' => "You cannot apply for {$leaveType->name} because your balance is 0.",
+                'errors' => [
+                    'leave_type_id' => ["Insufficient balance. {$leaveType->name} requires an available balance greater than 0."],
+                ],
+            ], 422);
+        }
+
         if ($isForcedLeaveType && $availableBalance <= 0.0) {
             return [
                 'leave_type' => $leaveType,

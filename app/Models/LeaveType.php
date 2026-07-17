@@ -14,6 +14,7 @@ class LeaveType extends Model
     public const FORCED_LEAVE_NAME = 'Mandatory / Forced Leave';
 
     public const SPECIAL_PRIVILEGE_LEAVE_NAME = 'Special Privilege Leave';
+
     public const SPECIAL_PRIVILEGE_LEGACY_NAMES = [
         'MCO6 Leave',
         'MC06 Leave',
@@ -38,24 +39,30 @@ class LeaveType extends Model
     protected function casts(): array
     {
         return [
-            'accrual_rate'        => 'decimal:2',
+            'accrual_rate' => 'decimal:2',
             'accrual_day_of_month' => 'integer',
-            'max_days'            => 'integer',
-            'is_credit_based'     => 'boolean',
-            'resets_yearly'       => 'boolean',
-            'requires_documents'  => 'boolean',
-            'allowed_status'    => 'array',
+            'max_days' => 'integer',
+            'is_credit_based' => 'boolean',
+            'resets_yearly' => 'boolean',
+            'requires_documents' => 'boolean',
+            'allowed_status' => 'array',
         ];
     }
 
-    public const CATEGORY_ACCRUED    = 'ACCRUED';
+    public const CATEGORY_ACCRUED = 'ACCRUED';
+
     public const CATEGORY_RESETTABLE = 'RESETTABLE';
-    public const CATEGORY_EVENT      = 'EVENT';
+
+    public const CATEGORY_EVENT = 'EVENT';
 
     public const EMPLOYMENT_STATUS_REGULAR = 'regular';
+
     public const EMPLOYMENT_STATUS_ELECTIVE = 'elective';
+
     public const EMPLOYMENT_STATUS_CO_TERMINOUS = 'co_terminous';
+
     public const EMPLOYMENT_STATUS_CASUAL = 'casual';
+
     public const EMPLOYMENT_STATUS_CONTRACTUAL = 'contractual';
 
     public const EMPLOYMENT_STATUS_LABELS = [
@@ -153,7 +160,7 @@ class LeaveType extends Model
             }
         }
 
-        if (!is_array($allowedStatuses) || $allowedStatuses === []) {
+        if (! is_array($allowedStatuses) || $allowedStatuses === []) {
             return null;
         }
 
@@ -384,14 +391,14 @@ class LeaveType extends Model
         }
 
         static $nameCache = [];
-        if (!array_key_exists($normalizedLeaveTypeId, $nameCache)) {
+        if (! array_key_exists($normalizedLeaveTypeId, $nameCache)) {
             $nameCache[$normalizedLeaveTypeId] = self::query()
                 ->whereKey($normalizedLeaveTypeId)
                 ->value('name');
         }
 
         $leaveTypeName = $nameCache[$normalizedLeaveTypeId];
-        if (!self::isSpecialPrivilegeAliasName($leaveTypeName)) {
+        if (! self::isSpecialPrivilegeAliasName($leaveTypeName)) {
             return $normalizedLeaveTypeId;
         }
 
@@ -415,5 +422,23 @@ class LeaveType extends Model
         return $canonicalLeaveTypeId !== null
             && $specialPrivilegeLeaveTypeId !== null
             && $canonicalLeaveTypeId === $specialPrivilegeLeaveTypeId;
+    }
+
+    public static function isZeroBalanceRestrictedName(mixed $name): bool
+    {
+        $normalizedName = self::normalizeLeaveTypeName($name);
+
+        $restrictedNames = [
+            self::normalizeLeaveTypeName('Wellness Leave'),
+            self::normalizeLeaveTypeName('Solo Parent Leave'),
+            self::normalizeLeaveTypeName('Special Emergency (Calamity) Leave'),
+            self::normalizeLeaveTypeName('Calamity Leave'),
+            self::normalizeLeaveTypeName('Special Privilege Leave'),
+            self::normalizeLeaveTypeName('MC06 Leave'),
+            self::normalizeLeaveTypeName('MCO6 Leave'),
+            self::normalizeLeaveTypeName('MO6 Leave'),
+        ];
+
+        return in_array($normalizedName, $restrictedNames, true);
     }
 }
