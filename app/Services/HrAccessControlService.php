@@ -15,6 +15,8 @@ class HrAccessControlService
 
     public const MODULE_RECEIVING = 'receiving';
 
+    public const MODULE_RELEASING = 'releasing';
+
     public const MODULE_COC_APPLICATIONS = 'coc_applications';
 
     public const MODULE_EMPLOYEE_MANAGEMENT = 'employee_management';
@@ -55,6 +57,11 @@ class HrAccessControlService
                 'key' => self::MODULE_RECEIVING,
                 'label' => 'Receiving Application',
                 'path' => '/hr/receiving',
+            ],
+            [
+                'key' => self::MODULE_RELEASING,
+                'label' => 'Releasing Application',
+                'path' => '/hr/releasing',
             ],
             [
                 'key' => self::MODULE_COC_APPLICATIONS,
@@ -213,6 +220,7 @@ class HrAccessControlService
             self::MODULE_DASHBOARD,
             self::MODULE_APPLICATIONS,
             self::MODULE_RECEIVING,
+            self::MODULE_RELEASING,
             self::MODULE_COC_APPLICATIONS,
             self::MODULE_EMPLOYEE_MANAGEMENT,
             self::MODULE_USER_MANAGEMENT,

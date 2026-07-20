@@ -237,6 +237,7 @@ class HRReportController extends Controller
                 'deductible_days',
                 'without_pay_days',
                 'pay_mode',
+                'details_of_leave',
                 'reason',
                 'remarks',
                 'created_at',
@@ -279,7 +280,7 @@ class HRReportController extends Controller
                 'typeOfLeave' => $application->leaveType?->name ?? 'Leave',
                 'totalDaysLWOP' => $withoutPayDays,
                 'dateReceivedCHRMO' => $this->formatDateForDisplay($receivedAt),
-                'remarks' => $this->resolveLwopReportRemarks($application),
+                'remarks' => $this->resolveLwopReportRemarks($application, $withoutPayDays),
                 'month' => $monthYear['month'],
                 'year' => $monthYear['year'],
                 '_sort_key' => $this->composeSortKey([
@@ -1349,6 +1350,52 @@ class HRReportController extends Controller
         }
 
         $withPayDays = $payMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $deductibleDays;
+
+        if (LeaveApplication::shouldIgnoreAbroadWeekendsForWithoutPay($application)) {
+            $selectedDatesForWop = $application->selected_dates;
+            if (is_array($selectedDatesForWop)) {
+                $filteredDates = [];
+                foreach ($selectedDatesForWop as $dateKey) {
+                    if (! LeaveApplication::isWeekendDate((string) $dateKey)) {
+                        $filteredDates[] = (string) $dateKey;
+                    }
+                }
+                $selectedDatesForWop = $filteredDates;
+            } else {
+                $resolvedDates = LeaveApplication::resolveDateSet(
+                    $application->start_date?->toDateString(),
+                    $application->end_date?->toDateString(),
+                    null,
+                    $application->total_days
+                );
+                $filteredDates = [];
+                foreach ($resolvedDates as $dateKey) {
+                    if (! LeaveApplication::isWeekendDate((string) $dateKey)) {
+                        $filteredDates[] = (string) $dateKey;
+                    }
+                }
+                $selectedDatesForWop = $filteredDates;
+            }
+
+            $workScheduleService = app(\App\Services\WorkScheduleService::class);
+            $employeeControlNo = trim((string) ($application->employee_control_no ?? ''));
+            $resolvedControlNo = $employeeControlNo !== '' ? $employeeControlNo : null;
+
+            $withoutPayDays = LeaveApplication::calculateWithoutPayDays(
+                $application->total_days,
+                $application->deductible_days,
+                $application->pay_mode,
+                $selectedDatesForWop,
+                $application->selected_date_pay_status,
+                $application->selected_date_coverage,
+                $application->selected_date_half_day_portion,
+                $workScheduleService->resolveCoverageDeductionDays('whole', $resolvedControlNo),
+                $workScheduleService->resolveCoverageDeductionDays('half', $resolvedControlNo)
+            );
+
+            return [round(max($withPayDays, 0.0), 3), round(max($withoutPayDays, 0.0), 3)];
+        }
+
         if ($storedWithoutPayDays !== null) {
             return [round(max($withPayDays, 0.0), 3), $storedWithoutPayDays];
         }
@@ -1399,12 +1446,25 @@ class HRReportController extends Controller
 
         $wopDates = $this->normalizeDateKeys($wopDates);
         if ($wopDates !== []) {
+            if (LeaveApplication::shouldIgnoreAbroadWeekendsForWithoutPay($application)) {
+                $wopDates = array_values(array_filter($wopDates, static function (string $dateKey): bool {
+                    return ! LeaveApplication::isWeekendDate($dateKey);
+                }));
+            }
+
             return $wopDates;
         }
 
         [, $withoutPayDays] = $this->resolveApplicationPayBreakdown($application);
 
-        return $withoutPayDays > 0 ? $this->resolveApplicationDateKeys($application) : [];
+        $dateKeys = $withoutPayDays > 0 ? $this->resolveApplicationDateKeys($application) : [];
+        if ($dateKeys !== [] && LeaveApplication::shouldIgnoreAbroadWeekendsForWithoutPay($application)) {
+            $dateKeys = array_values(array_filter($dateKeys, static function (string $dateKey): bool {
+                return ! LeaveApplication::isWeekendDate($dateKey);
+            }));
+        }
+
+        return $dateKeys;
     }
 
     private function resolveApplicationDateKeys(LeaveApplication $application): array
@@ -1584,9 +1644,96 @@ class HRReportController extends Controller
         return $trimmed !== '' ? $trimmed : null;
     }
 
-    private function resolveLwopReportRemarks(LeaveApplication $application): string
+    private function resolveLwopReportRemarks(LeaveApplication $application, float $withoutPayDays = 0.0): string
     {
-        return $this->trimNullableString($application->reason) ?? '';
+        $lwopReason = $this->determineLwopReason($application, $withoutPayDays);
+        $userReason = $this->trimNullableString($application->reason)
+            ?? $this->trimNullableString($application->remarks)
+            ?? '';
+
+        if ($userReason === '') {
+            return $lwopReason;
+        }
+
+        if ($lwopReason === '') {
+            return $userReason;
+        }
+
+        $upperUserReason = strtoupper($userReason);
+        $upperLwopReason = strtoupper($lwopReason);
+
+        if (str_contains($upperUserReason, $upperLwopReason)) {
+            return $userReason;
+        }
+
+        return "{$lwopReason} - {$userReason}";
+    }
+
+    private function determineLwopReason(LeaveApplication $application, float $withoutPayDays = 0.0): string
+    {
+        if ((bool) ($application->is_late_filed ?? false) || trim((string) ($application->late_filing_status ?? '')) !== '') {
+            return 'LATE FILING';
+        }
+
+        $leaveTypeName = strtolower(trim((string) ($application->leaveType?->name ?? '')));
+        $isSickLeave = str_contains($leaveTypeName, 'sick');
+
+        $filedDate = $application->created_at ? Carbon::parse($application->created_at)->startOfDay() : null;
+
+        if ($filedDate !== null) {
+            if ($isSickLeave) {
+                $endDate = $application->end_date ? Carbon::parse($application->end_date)->startOfDay() : null;
+
+                if ($endDate === null && is_array($application->selected_dates) && ! empty($application->selected_dates)) {
+                    $dateKeys = $this->normalizeDateKeys($application->selected_dates);
+                    if (! empty($dateKeys)) {
+                        $lastDateKey = end($dateKeys);
+                        $endDate = Carbon::parse($lastDateKey)->startOfDay();
+                    }
+                }
+
+                if ($endDate !== null && $filedDate->gt($endDate)) {
+                    $workingDaysElapsed = 0;
+                    $cursor = $endDate->copy()->addDay();
+                    while ($cursor->lte($filedDate)) {
+                        if ($cursor->isWeekday()) {
+                            $workingDaysElapsed++;
+                        }
+                        $cursor->addDay();
+                    }
+
+                    if ($workingDaysElapsed > 5) {
+                        return 'LATE FILING';
+                    }
+                }
+            } else {
+                $startDate = $application->start_date ? Carbon::parse($application->start_date)->startOfDay() : null;
+
+                if ($startDate === null && is_array($application->selected_dates) && ! empty($application->selected_dates)) {
+                    $dateKeys = $this->normalizeDateKeys($application->selected_dates);
+                    if (! empty($dateKeys)) {
+                        $startDate = Carbon::parse($dateKeys[0])->startOfDay();
+                    }
+                }
+
+                if ($startDate !== null && $filedDate->gt($startDate)) {
+                    return 'LATE FILING';
+                }
+            }
+        }
+
+        $payMode = strtoupper(trim((string) ($application->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY)));
+        $isCreditBased = (bool) ($application->leaveType?->is_credit_based ?? true);
+
+        if ($payMode === LeaveApplication::PAY_MODE_WITH_PAY || $isCreditBased) {
+            return 'NOT ENOUGH CREDIT';
+        }
+
+        if ($payMode === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
+            return 'WITHOUT PAY';
+        }
+
+        return 'NOT ENOUGH CREDIT';
     }
 
     private function normalizeControlNoKey(mixed $controlNo): string

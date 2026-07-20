@@ -147,7 +147,7 @@ class LeaveApplication extends Model
         });
     }
 
-    private static function shouldIgnoreAbroadWeekendsForWithoutPay(self $application): bool
+    public static function shouldIgnoreAbroadWeekendsForWithoutPay(self $application): bool
     {
         $leaveType = $application->relationLoaded('leaveType') ? $application->leaveType : null;
         if (! $leaveType && $application->leave_type_id) {
@@ -396,6 +396,10 @@ class LeaveApplication extends Model
 
         $resolvedSelectedDates = self::normalizeDateList($selectedDates);
         if ($resolvedSelectedDates === []) {
+            if (is_array($selectedDates)) {
+                return 0.0;
+            }
+
             if ($normalizedPayMode === self::PAY_MODE_WITHOUT_PAY) {
                 return $normalizedTotalDays;
             }
@@ -917,7 +921,7 @@ class LeaveApplication extends Model
     /**
      * Check whether the given leave application is an "Abroad" vacation leave.
      */
-    private static function isAbroadLeave(self $application): bool
+    public static function isAbroadLeave(self $application): bool
     {
         $detailsOfLeave = $application->details_of_leave;
         if ($detailsOfLeave === null || $detailsOfLeave === '') {
@@ -940,7 +944,7 @@ class LeaveApplication extends Model
     /**
      * Check whether a date string falls on a weekend (Saturday or Sunday).
      */
-    private static function isWeekendDate(string $date): bool
+    public static function isWeekendDate(string $date): bool
     {
         try {
             $dayOfWeek = \Carbon\CarbonImmutable::parse($date)->dayOfWeek;

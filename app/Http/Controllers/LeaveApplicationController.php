@@ -2626,6 +2626,62 @@ class LeaveApplicationController extends Controller
     }
 
     /**
+     * Export Released Applications for HR module within a specific date range.
+     */
+    public function exportReleasedApplications(Request $request): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $validated = $request->validate([
+            'from_date' => ['nullable', 'date'],
+            'to_date' => ['nullable', 'date', 'after_or_equal:from_date'],
+        ]);
+
+        $fromDate = $validated['from_date'] ?? now()->toDateString();
+        $toDate = $validated['to_date'] ?? now()->toDateString();
+        $start = $fromDate.' 00:00:00';
+        $end = $toDate.' 23:59:59';
+
+        $applications = LeaveApplication::query()
+            ->select([
+                'id',
+                'applicant_admin_id',
+                'employee_control_no',
+                'employee_name',
+                'leave_type_id',
+                'start_date',
+                'end_date',
+                'selected_dates',
+                'total_days',
+                'status',
+                'remarks',
+                'hr_id',
+                'created_at',
+            ])
+            ->with([
+                'leaveType:id,name',
+                'applicantAdmin:id,department_id,employee_control_no,full_name',
+                'applicantAdmin.department:id,name',
+                'updateRequests:id,leave_application_id,requested_payload,requested_reason,previous_status,requested_by_control_no,requested_at,status,reviewed_at,review_remarks',
+                'logs:id,leave_application_id,action,performed_by_type,performed_by_id,remarks,created_at',
+            ])
+            ->whereHas('logs', function ($q) use ($start, $end) {
+                $q->where('action', LeaveApplicationLog::ACTION_HR_RELEASED)
+                    ->whereBetween('created_at', [$start, $end]);
+            })
+            ->orderBy('created_at')
+            ->orderBy('id')
+            ->get();
+
+        return response()->json([
+            'applications' => $applications->map(fn (LeaveApplication $app) => $this->formatApplication($app)),
+        ]);
+    }
+
+    /**
      * List PENDING_HR applications (all departments).
      */
     public function hrIndex(HrLeaveApplicationIndexRequest $request): JsonResponse
@@ -2644,11 +2700,17 @@ class LeaveApplicationController extends Controller
         $accessControl = app(\App\Services\HrAccessControlService::class);
         $hasApplicationsModule = $accessControl->hasModuleAccess($hr, \App\Services\HrAccessControlService::MODULE_APPLICATIONS);
         $hasReceivingModule = $accessControl->hasModuleAccess($hr, \App\Services\HrAccessControlService::MODULE_RECEIVING);
+        $hasReleasingModule = $accessControl->hasModuleAccess($hr, \App\Services\HrAccessControlService::MODULE_RELEASING);
 
-        if ($hasReceivingModule && ! $hasApplicationsModule) {
+        if ($hasReceivingModule && ! $hasApplicationsModule && ! $hasReleasingModule) {
             $pendingReceiveOnly = true;
+            $pendingReleaseOnly = false;
+        } elseif ($hasReleasingModule && ! $hasApplicationsModule && ! $hasReceivingModule) {
+            $pendingReceiveOnly = false;
+            $pendingReleaseOnly = true;
         } else {
             $pendingReceiveOnly = filter_var($validated['pending_receive'] ?? false, FILTER_VALIDATE_BOOLEAN);
+            $pendingReleaseOnly = filter_var($validated['pending_release'] ?? false, FILTER_VALIDATE_BOOLEAN);
         }
 
         $query = LeaveApplication::query();
@@ -2656,6 +2718,8 @@ class LeaveApplicationController extends Controller
         // 1. Base Status Filtering
         if ($pendingReceiveOnly) {
             $query->where('status', LeaveApplication::STATUS_PENDING_HR);
+        } elseif ($pendingReleaseOnly) {
+            $query->whereIn('status', [LeaveApplication::STATUS_APPROVED, LeaveApplication::STATUS_PENDING_HR]);
         } else {
             $query->whereIn('status', [
                 LeaveApplication::STATUS_PENDING_ADMIN,
@@ -2673,8 +2737,30 @@ class LeaveApplicationController extends Controller
         $updatesTable = (new LeaveApplicationUpdateRequest)->getTable();
         $appsTable = (new LeaveApplication)->getTable();
 
-        // isPendingReceive Logic
-        if ($pendingReceiveOnly) {
+        // isPendingRelease & isPendingReceive Logic
+        if ($pendingReleaseOnly) {
+            $query->whereExists(function ($sub) use ($logsTable, $updatesTable, $appsTable) {
+                $sub->select(\Illuminate\Support\Facades\DB::raw(1))
+                    ->from("{$logsTable} as lal")
+                    ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
+                    ->where('lal.action', LeaveApplicationLog::ACTION_HR_RECEIVED)
+                    ->whereRaw("lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status = ?), '1970-01-01')", [LeaveApplicationUpdateRequest::STATUS_PENDING]);
+            })
+                ->whereExists(function ($sub) use ($logsTable, $updatesTable, $appsTable) {
+                    $sub->select(\Illuminate\Support\Facades\DB::raw(1))
+                        ->from("{$logsTable} as lal")
+                        ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
+                        ->where('lal.action', LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED)
+                        ->whereRaw("lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status = ?), '1970-01-01')", [LeaveApplicationUpdateRequest::STATUS_PENDING]);
+                })
+                ->whereNotExists(function ($sub) use ($logsTable, $updatesTable, $appsTable) {
+                    $sub->select(\Illuminate\Support\Facades\DB::raw(1))
+                        ->from("{$logsTable} as lal")
+                        ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
+                        ->where('lal.action', LeaveApplicationLog::ACTION_HR_RELEASED)
+                        ->whereRaw("lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status = ?), '1970-01-01')", [LeaveApplicationUpdateRequest::STATUS_PENDING]);
+                });
+        } elseif ($pendingReceiveOnly) {
             $query->whereNotExists(function ($sub) use ($logsTable, $updatesTable, $appsTable) {
                 $sub->select(\Illuminate\Support\Facades\DB::raw(1))
                     ->from("{$logsTable} as lal")
@@ -2690,6 +2776,31 @@ class LeaveApplicationController extends Controller
                             ->from("{$logsTable} as lal")
                             ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
                             ->where('lal.action', LeaveApplicationLog::ACTION_HR_RECEIVED)
+                            ->whereRaw("lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status = ?), '1970-01-01')", [LeaveApplicationUpdateRequest::STATUS_PENDING]);
+                    });
+            });
+
+            // Exclude pending release applications (must only display in Releasing module)
+            $query->whereNot(function ($q) use ($logsTable, $updatesTable, $appsTable) {
+                $q->whereExists(function ($sub) use ($logsTable, $updatesTable, $appsTable) {
+                    $sub->select(\Illuminate\Support\Facades\DB::raw(1))
+                        ->from("{$logsTable} as lal")
+                        ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
+                        ->where('lal.action', LeaveApplicationLog::ACTION_HR_RECEIVED)
+                        ->whereRaw("lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status = ?), '1970-01-01')", [LeaveApplicationUpdateRequest::STATUS_PENDING]);
+                })
+                    ->whereExists(function ($sub) use ($logsTable, $updatesTable, $appsTable) {
+                        $sub->select(\Illuminate\Support\Facades\DB::raw(1))
+                            ->from("{$logsTable} as lal")
+                            ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
+                            ->where('lal.action', LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED)
+                            ->whereRaw("lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status = ?), '1970-01-01')", [LeaveApplicationUpdateRequest::STATUS_PENDING]);
+                    })
+                    ->whereNotExists(function ($sub) use ($logsTable, $updatesTable, $appsTable) {
+                        $sub->select(\Illuminate\Support\Facades\DB::raw(1))
+                            ->from("{$logsTable} as lal")
+                            ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
+                            ->where('lal.action', LeaveApplicationLog::ACTION_HR_RELEASED)
                             ->whereRaw("lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status = ?), '1970-01-01')", [LeaveApplicationUpdateRequest::STATUS_PENDING]);
                     });
             });

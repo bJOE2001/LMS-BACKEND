@@ -34,6 +34,7 @@ class HrLeaveApplicationIndexRequest extends FormRequest
                 Rule::in(array_keys(LeaveType::EMPLOYMENT_STATUS_LABELS)),
             ],
             'pending_receive' => ['sometimes', 'nullable', 'boolean'],
+            'pending_release' => ['sometimes', 'nullable', 'boolean'],
         ];
     }
 }
