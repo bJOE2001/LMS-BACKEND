@@ -2738,70 +2738,72 @@ class LeaveApplicationController extends Controller
         $appsTable = (new LeaveApplication)->getTable();
 
         // isPendingRelease & isPendingReceive Logic
+        $cycleStatuses = [LeaveApplicationUpdateRequest::STATUS_PENDING, LeaveApplicationUpdateRequest::STATUS_APPROVED];
+        $cycleSubquerySql = "lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status IN (?, ?)), '1970-01-01')";
+
         if ($pendingReleaseOnly) {
-            $query->whereExists(function ($sub) use ($logsTable, $updatesTable, $appsTable) {
+            $query->whereExists(function ($sub) use ($logsTable, $appsTable, $cycleSubquerySql, $cycleStatuses) {
                 $sub->select(\Illuminate\Support\Facades\DB::raw(1))
                     ->from("{$logsTable} as lal")
                     ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
                     ->where('lal.action', LeaveApplicationLog::ACTION_HR_RECEIVED)
-                    ->whereRaw("lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status = ?), '1970-01-01')", [LeaveApplicationUpdateRequest::STATUS_PENDING]);
+                    ->whereRaw($cycleSubquerySql, $cycleStatuses);
             })
-                ->whereExists(function ($sub) use ($logsTable, $updatesTable, $appsTable) {
+                ->whereExists(function ($sub) use ($logsTable, $appsTable) {
                     $sub->select(\Illuminate\Support\Facades\DB::raw(1))
                         ->from("{$logsTable} as lal")
                         ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
-                        ->where('lal.action', LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED)
-                        ->whereRaw("lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status = ?), '1970-01-01')", [LeaveApplicationUpdateRequest::STATUS_PENDING]);
+                        ->where('lal.action', LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED);
                 })
-                ->whereNotExists(function ($sub) use ($logsTable, $updatesTable, $appsTable) {
+                ->whereNotExists(function ($sub) use ($logsTable, $appsTable, $cycleSubquerySql, $cycleStatuses) {
                     $sub->select(\Illuminate\Support\Facades\DB::raw(1))
                         ->from("{$logsTable} as lal")
                         ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
                         ->where('lal.action', LeaveApplicationLog::ACTION_HR_RELEASED)
-                        ->whereRaw("lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status = ?), '1970-01-01')", [LeaveApplicationUpdateRequest::STATUS_PENDING]);
+                        ->whereRaw($cycleSubquerySql, $cycleStatuses);
                 });
         } elseif ($pendingReceiveOnly) {
-            $query->whereNotExists(function ($sub) use ($logsTable, $updatesTable, $appsTable) {
+            $query->whereNotExists(function ($sub) use ($logsTable, $appsTable, $cycleSubquerySql, $cycleStatuses) {
                 $sub->select(\Illuminate\Support\Facades\DB::raw(1))
                     ->from("{$logsTable} as lal")
                     ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
                     ->where('lal.action', LeaveApplicationLog::ACTION_HR_RECEIVED)
-                    ->whereRaw("lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status = ?), '1970-01-01')", [LeaveApplicationUpdateRequest::STATUS_PENDING]);
+                    ->whereRaw($cycleSubquerySql, $cycleStatuses);
             });
         } else {
-            $query->where(function ($q) use ($logsTable, $updatesTable, $appsTable) {
+            $query->where(function ($q) use ($logsTable, $appsTable, $cycleSubquerySql, $cycleStatuses) {
                 $q->where('status', '!=', LeaveApplication::STATUS_PENDING_HR)
-                    ->orWhereExists(function ($sub) use ($logsTable, $updatesTable, $appsTable) {
+                    ->orWhereExists(function ($sub) use ($logsTable, $appsTable, $cycleSubquerySql, $cycleStatuses) {
                         $sub->select(\Illuminate\Support\Facades\DB::raw(1))
                             ->from("{$logsTable} as lal")
                             ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
                             ->where('lal.action', LeaveApplicationLog::ACTION_HR_RECEIVED)
-                            ->whereRaw("lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status = ?), '1970-01-01')", [LeaveApplicationUpdateRequest::STATUS_PENDING]);
+                            ->whereRaw($cycleSubquerySql, $cycleStatuses);
                     });
             });
 
             // Exclude pending release applications (must only display in Releasing module)
-            $query->whereNot(function ($q) use ($logsTable, $updatesTable, $appsTable) {
-                $q->whereExists(function ($sub) use ($logsTable, $updatesTable, $appsTable) {
-                    $sub->select(\Illuminate\Support\Facades\DB::raw(1))
-                        ->from("{$logsTable} as lal")
-                        ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
-                        ->where('lal.action', LeaveApplicationLog::ACTION_HR_RECEIVED)
-                        ->whereRaw("lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status = ?), '1970-01-01')", [LeaveApplicationUpdateRequest::STATUS_PENDING]);
-                })
-                    ->whereExists(function ($sub) use ($logsTable, $updatesTable, $appsTable) {
+            $query->whereNot(function ($q) use ($logsTable, $appsTable, $cycleSubquerySql, $cycleStatuses) {
+                $q->where('status', LeaveApplication::STATUS_APPROVED)
+                    ->whereExists(function ($sub) use ($logsTable, $appsTable, $cycleSubquerySql, $cycleStatuses) {
                         $sub->select(\Illuminate\Support\Facades\DB::raw(1))
                             ->from("{$logsTable} as lal")
                             ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
-                            ->where('lal.action', LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED)
-                            ->whereRaw("lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status = ?), '1970-01-01')", [LeaveApplicationUpdateRequest::STATUS_PENDING]);
+                            ->where('lal.action', LeaveApplicationLog::ACTION_HR_RECEIVED)
+                            ->whereRaw($cycleSubquerySql, $cycleStatuses);
                     })
-                    ->whereNotExists(function ($sub) use ($logsTable, $updatesTable, $appsTable) {
+                    ->whereExists(function ($sub) use ($logsTable, $appsTable) {
+                        $sub->select(\Illuminate\Support\Facades\DB::raw(1))
+                            ->from("{$logsTable} as lal")
+                            ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
+                            ->where('lal.action', LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED);
+                    })
+                    ->whereNotExists(function ($sub) use ($logsTable, $appsTable, $cycleSubquerySql, $cycleStatuses) {
                         $sub->select(\Illuminate\Support\Facades\DB::raw(1))
                             ->from("{$logsTable} as lal")
                             ->whereColumn('lal.leave_application_id', "{$appsTable}.id")
                             ->where('lal.action', LeaveApplicationLog::ACTION_HR_RELEASED)
-                            ->whereRaw("lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status = ?), '1970-01-01')", [LeaveApplicationUpdateRequest::STATUS_PENDING]);
+                            ->whereRaw($cycleSubquerySql, $cycleStatuses);
                     });
             });
         }
@@ -5562,11 +5564,11 @@ class LeaveApplicationController extends Controller
             (bool) ($attachmentState['attachment_submitted'] ?? false),
             $attachmentState['attachment_reference'] ?? null,
             true,
-            $request->input('date_filed') ?? now(),
+            $request->input('date_filed') ?? $app->created_at ?? now(),
             (string) ($validated['start_date'] ?? ''),
             (string) ($validated['end_date'] ?? ''),
             (string) ($validated['employee_control_no'] ?? ''),
-            false,
+            true,
             $resolvedDetailsOfLeave
         );
         if ($policyResolution instanceof JsonResponse) {
@@ -8684,7 +8686,7 @@ class LeaveApplicationController extends Controller
             (bool) ($attachmentState['attachment_submitted'] ?? false),
             $attachmentState['attachment_reference'] ?? null,
             true,
-            $request->input('date_filed') ?? $request->input('dateOfFiling') ?? now(),
+            $request->input('date_filed') ?? $request->input('dateOfFiling') ?? $app->created_at ?? now(),
             $resolvedStartDate,
             $resolvedEndDate,
             (string) ($app->employee_control_no ?? ''),
@@ -9142,11 +9144,11 @@ class LeaveApplicationController extends Controller
             (bool) ($targetAttachmentState['attachment_submitted'] ?? false),
             $targetAttachmentState['attachment_reference'] ?? null,
             true,
-            $pendingUpdateRequest?->created_at ?? now(),
+            $app->created_at ?? $pendingUpdateRequest?->created_at ?? now(),
             $targetStartDate,
             $targetEndDate,
             (string) ($app->employee_control_no ?? ''),
-            false,
+            true,
             $this->trimNullableString($payload['details_of_leave'] ?? $payload['detailsOfLeave'] ?? null)
         );
         if ($policyResolution instanceof JsonResponse) {
@@ -9360,7 +9362,7 @@ class LeaveApplicationController extends Controller
                     'is_monetization' => $targetIsMonetization,
                     'status' => LeaveApplication::STATUS_APPROVED,
                     'hr_id' => $hr->id,
-                    'hr_approved_at' => now(),
+                    'hr_approved_at' => $app->hr_approved_at ?? now(),
                     'recall_effective_date' => $updatedRecallEffectiveDate,
                     'recall_selected_dates' => $updatedRecallDateKeys !== [] ? $updatedRecallDateKeys : null,
                     'remarks' => $request->input('remarks'),
@@ -9725,12 +9727,10 @@ class LeaveApplicationController extends Controller
     {
         $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
         $latestStatus = strtoupper(trim((string) ($latestUpdateMeta['status'] ?? '')));
-        $previousStatus = strtoupper(trim((string) ($latestUpdateMeta['previous_status'] ?? '')));
         $requestedAt = $latestUpdateMeta['requested_at'] ?? null;
 
         if (
             $latestStatus !== LeaveApplicationUpdateRequest::STATUS_APPROVED
-            || $previousStatus !== LeaveApplication::STATUS_APPROVED
             || ! $requestedAt instanceof \DateTimeInterface
         ) {
             return null;
@@ -9829,7 +9829,7 @@ class LeaveApplicationController extends Controller
                 ->filter(fn ($item) => $item instanceof LeaveApplicationUpdateRequest)
                 ->sortByDesc(fn (LeaveApplicationUpdateRequest $item) => (int) $item->id)
                 ->first(function (LeaveApplicationUpdateRequest $item): bool {
-                    return strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED
+                    return strtoupper(trim((string) ($item->status ?? ''))) === LeaveApplicationUpdateRequest::STATUS_APPROVED
                         && ! $this->isHrApplicationEditRequestRecord($item);
                 });
 
@@ -9838,18 +9838,12 @@ class LeaveApplicationController extends Controller
 
         $record = LeaveApplicationUpdateRequest::query()
             ->where('leave_application_id', (int) $app->id)
+            ->where('status', LeaveApplicationUpdateRequest::STATUS_APPROVED)
             ->latest('id')
             ->get()
-            ->first(fn (LeaveApplicationUpdateRequest $item): bool => strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED
-                && ! $this->isHrApplicationEditRequestRecord($item));
+            ->first(fn (LeaveApplicationUpdateRequest $item): bool => ! $this->isHrApplicationEditRequestRecord($item));
 
-        if (! $record) {
-            return null;
-        }
-
-        $previousStatus = strtoupper(trim((string) ($record->previous_status ?? '')));
-
-        return $previousStatus === LeaveApplication::STATUS_APPROVED ? $record : null;
+        return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
     }
 
     private function resolveLatestUpdateMeta(LeaveApplication $app): array
@@ -14976,6 +14970,11 @@ class LeaveApplicationController extends Controller
             'pending_update_previous_status' => $pendingUpdateMeta['previous_status'],
             'pending_update_requested_by' => $pendingUpdateMeta['requested_by'],
             'pending_update_requested_at' => $pendingUpdateMeta['requested_at']?->toIso8601String(),
+            'pendingUpdateRequestedAt' => $pendingUpdateMeta['requested_at']?->toIso8601String(),
+            'pendingUpdateRequestedBy' => $pendingUpdateMeta['requested_by'],
+            'pendingUpdateReason' => $pendingUpdateMeta['reason'],
+            'pendingUpdateActionType' => $pendingUpdateMeta['action_type'],
+            'pendingUpdatePreviousStatus' => $pendingUpdateMeta['previous_status'],
             'has_pending_update_request' => $hasPendingApprovedUpdateRequest,
             'latest_update_request_status' => $latestUpdateMeta['status'],
             'latest_update_request_payload' => $latestUpdateMeta['payload'],

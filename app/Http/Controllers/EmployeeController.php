@@ -1021,7 +1021,7 @@ class EmployeeController extends Controller
 
                     $creditsAdded = $this->roundLedgerValue($entry->credits_added);
                     $source = strtoupper(trim((string) ($entry->source ?? '')));
-                    if ($creditsAdded === 0.0 && !str_starts_with($source, 'AUTOMATED')) {
+                    if ($creditsAdded === 0.0 && ! str_starts_with($source, 'AUTOMATED')) {
                         continue;
                     }
 
@@ -1123,10 +1123,23 @@ class EmployeeController extends Controller
                         ->orderByDesc('created_at')
                         ->orderByDesc('id');
                 }])
-                ->whereIn('status', [
-                    LeaveApplication::STATUS_APPROVED,
-                    LeaveApplication::STATUS_RECALLED,
-                ])
+                ->where(function ($query) {
+                    $query->whereIn('status', [
+                        LeaveApplication::STATUS_APPROVED,
+                        LeaveApplication::STATUS_RECALLED,
+                    ])->orWhere(function ($subQuery) {
+                        $subQuery->whereIn('status', [
+                            LeaveApplication::STATUS_PENDING_HR,
+                            LeaveApplication::STATUS_PENDING_ADMIN,
+                        ])->whereExists(function ($reqQuery) {
+                            $reqQuery->select(\Illuminate\Support\Facades\DB::raw(1))
+                                ->from('tblLeaveApplicationUpdateRequests as req')
+                                ->whereColumn('req.leave_application_id', 'tblLeaveApplications.id')
+                                ->where('req.status', 'PENDING')
+                                ->whereRaw('UPPER(LTRIM(RTRIM(req.previous_status))) = ?', [LeaveApplication::STATUS_APPROVED]);
+                        });
+                    });
+                })
                 ->whereIn('employee_control_no', $controlNoCandidates)
                 ->whereIn('leave_type_id', $queryTrackedTypeIds)
                 ->orderByDesc('hr_approved_at')
