@@ -7412,6 +7412,8 @@ class LeaveApplicationController extends Controller
                 $reason,
                 $reviewRemarks,
                 $updateAttributes,
+                $leaveType,
+                $targetSelectedDates,
                 $sourceLeaveType,
                 $sourceDeductibleDays,
                 $sourceDeductsBalance,
@@ -7457,6 +7459,73 @@ class LeaveApplicationController extends Controller
                     $linkedForcedLeaveDeductedDays = (float) ($linkedDeductions['linked_forced_leave_deducted_days'] ?? 0.0);
                     $linkedVacationLeaveDeductedDays = (float) ($linkedDeductions['linked_vacation_leave_deducted_days'] ?? 0.0);
                     $linkedSickLeaveDeductedDays = (float) ($linkedDeductions['linked_sick_leave_deducted_days'] ?? 0.0);
+                } elseif ($targetDeductibleDays > 0.0) {
+                    $sickLeaveTypeId = $this->resolveSickLeaveTypeId();
+                    $employeeControlNo = (string) ($app->employee_control_no ?? '');
+                    $allowCross = (bool) ($payload['allow_sl_vl_cross_deduction'] ?? false);
+                    if (! $allowCross) {
+                        $allowCross = $this->shouldLeaveTypeAllowSlVlCrossDeduction(
+                            $leaveType,
+                            (int) $app->leave_type_id,
+                            (bool) $app->is_monetization,
+                            true,
+                            $sickLeaveTypeId,
+                            $vacationLeaveTypeId
+                        );
+                    }
+
+                    if ($allowCross) {
+                        $primaryBalRecord = $this->findPreferredEmployeeLeaveBalanceRecord($employeeControlNo, (int) $app->leave_type_id);
+                        $primaryRaw = $primaryBalRecord ? (float) $primaryBalRecord->balance : 0.0;
+                        $primaryPending = $this->resolvePendingReservedDaysForTrackedLeaveType(
+                            $employeeControlNo,
+                            (int) $app->leave_type_id,
+                            (int) $app->id
+                        );
+                        $linkedPrimaryAvailable = max(round($primaryRaw - $primaryPending, 3), 0.0);
+
+                        $linkedLeaveTypeId = $this->resolveSlVlCrossDeductionTargetLeaveTypeId(
+                            $leaveType,
+                            (int) $app->leave_type_id,
+                            (bool) $app->is_monetization,
+                            true,
+                            $sickLeaveTypeId,
+                            $vacationLeaveTypeId
+                        );
+                        $linkedAvailable = 0.0;
+                        if ($linkedLeaveTypeId !== null) {
+                            $linkedBalRecord = $this->findPreferredEmployeeLeaveBalanceRecord($employeeControlNo, $linkedLeaveTypeId);
+                            $linkedRaw = $linkedBalRecord ? (float) $linkedBalRecord->balance : 0.0;
+                            $linkedPending = $this->resolvePendingReservedDaysForTrackedLeaveType(
+                                $employeeControlNo,
+                                $linkedLeaveTypeId,
+                                (int) $app->id
+                            );
+                            $linkedAvailable = max(round($linkedRaw - $linkedPending, 3), 0.0);
+                        }
+
+                        $crossDeductionBreakdown = $this->resolveSlVlCrossDeductionBreakdown(
+                            $leaveType,
+                            (int) $app->leave_type_id,
+                            (bool) $app->is_monetization,
+                            $targetDeductibleDays,
+                            true,
+                            $sickLeaveTypeId,
+                            $vacationLeaveTypeId,
+                            $linkedPrimaryAvailable,
+                            $linkedAvailable,
+                            $targetSelectedDates,
+                            is_array($payload['selected_date_pay_status'] ?? null) ? $payload['selected_date_pay_status'] : null,
+                            is_array($payload['selected_date_coverage'] ?? null) ? $payload['selected_date_coverage'] : null,
+                            $targetTotalDays,
+                            $employeeControlNo
+                        );
+                        $linkedVacationLeaveDeductedDays = (float) ($crossDeductionBreakdown['linked_vacation_deduction_days'] ?? 0.0);
+                        $linkedSickLeaveDeductedDays = (float) ($crossDeductionBreakdown['linked_sick_deduction_days'] ?? 0.0);
+                        if ($linkedVacationLeaveDeductedDays > 0.0 || $linkedSickLeaveDeductedDays > 0.0) {
+                            $updateAttributes['allow_sl_vl_cross_deduction'] = true;
+                        }
+                    }
                 }
 
                 $app->linked_forced_leave_deducted_days = $linkedForcedLeaveDeductedDays;
@@ -11252,12 +11321,12 @@ class LeaveApplicationController extends Controller
                 continue;
             }
 
-            if ($remainingPrimaryDays + 1e-9 >= $dateWeight) {
-                $primaryDeductionDays = round($primaryDeductionDays + $dateWeight, 3);
-                $remainingPrimaryDays = round(max($remainingPrimaryDays - $dateWeight, 0.0), 3);
-            } else {
-                $linkedDeductionDays = round($linkedDeductionDays + $dateWeight, 3);
-            }
+            $usedFromPrimary = round(min($dateWeight, $remainingPrimaryDays), 3);
+            $usedFromLinked = round(max($dateWeight - $usedFromPrimary, 0.0), 3);
+
+            $primaryDeductionDays = round($primaryDeductionDays + $usedFromPrimary, 3);
+            $remainingPrimaryDays = round(max($remainingPrimaryDays - $usedFromPrimary, 0.0), 3);
+            $linkedDeductionDays = round($linkedDeductionDays + $usedFromLinked, 3);
 
             $remainingDeductibleDays = round(max($remainingDeductibleDays - $dateWeight, 0.0), 3);
         }
@@ -12205,7 +12274,8 @@ class LeaveApplicationController extends Controller
                 $selectedDates,
                 $normalizedSelectedDatePayStatus,
                 $normalizedPayMode,
-                $filedAt
+                $filedAt,
+                $allowPayStatusOverride
             );
             if ($vlValidation instanceof JsonResponse) {
                 return $vlValidation;
@@ -12402,8 +12472,13 @@ class LeaveApplicationController extends Controller
         ?array $selectedDates,
         ?array $selectedDatePayStatus,
         string $payMode,
-        mixed $filedAt = null
+        mixed $filedAt = null,
+        bool $allowPayStatusOverride = false
     ): ?JsonResponse {
+        if ($allowPayStatusOverride) {
+            return null;
+        }
+
         $normalizedDateKeys = $this->normalizeSelectedDateKeys($selectedDates);
         if ($normalizedDateKeys === []) {
             return null;
@@ -14723,8 +14798,11 @@ class LeaveApplicationController extends Controller
         ];
     }
 
-    private function resolvePendingReservedDaysForTrackedLeaveType(string $employeeControlNo, int $leaveTypeId): float
-    {
+    private function resolvePendingReservedDaysForTrackedLeaveType(
+        string $employeeControlNo,
+        int $leaveTypeId,
+        ?int $exceptAppId = null
+    ): float {
         $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
         if ($canonicalLeaveTypeId <= 0) {
             return 0.0;
@@ -14735,12 +14813,18 @@ class LeaveApplicationController extends Controller
             return 0.0;
         }
 
-        $pendingApplications = LeaveApplication::query()
+        $query = LeaveApplication::query()
             ->with('leaveType')
             ->whereIn('status', [
                 LeaveApplication::STATUS_PENDING_ADMIN,
                 LeaveApplication::STATUS_PENDING_HR,
-            ])
+            ]);
+
+        if ($exceptAppId !== null && $exceptAppId > 0) {
+            $query->where('id', '<>', $exceptAppId);
+        }
+
+        $pendingApplications = $query
             ->where(function ($query): void {
                 $query->where('is_monetization', true)
                     ->orWhereRaw(
@@ -15680,13 +15764,27 @@ class LeaveApplicationController extends Controller
             ->get()))
             ->sortBy(fn (LeaveBalance $balance) => strtolower(trim((string) ($balance->leaveType?->name ?? ''))))
             ->values()
-            ->map(fn (LeaveBalance $balance) => [
-                'leave_type_id' => $this->resolveCanonicalLeaveTypeId((int) $balance->leave_type_id) ?? (int) $balance->leave_type_id,
-                'leave_type_name' => LeaveType::canonicalizeLeaveTypeName($balance->leaveType?->name ?? 'Unknown') ?? 'Unknown',
-                'balance' => (float) $balance->balance,
-                'year' => $balance->year !== null ? (int) $balance->year : null,
-                'updated_at' => $balance->updated_at?->toIso8601String(),
-            ])
+            ->map(function (LeaveBalance $balance) use ($lookupControlNo, $app): array {
+                $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId((int) $balance->leave_type_id) ?? (int) $balance->leave_type_id;
+                $rawBalance = (float) $balance->balance;
+                $pendingReservedDays = $this->resolvePendingReservedDaysForTrackedLeaveType(
+                    $lookupControlNo,
+                    $canonicalLeaveTypeId,
+                    (int) $app->id
+                );
+                $availableBalance = max(round($rawBalance - $pendingReservedDays, 3), 0.0);
+
+                return [
+                    'leave_type_id' => $canonicalLeaveTypeId,
+                    'leave_type_name' => LeaveType::canonicalizeLeaveTypeName($balance->leaveType?->name ?? 'Unknown') ?? 'Unknown',
+                    'balance' => $availableBalance,
+                    'current_balance' => $rawBalance,
+                    'available_balance' => $availableBalance,
+                    'pending_reserved_days' => $pendingReservedDays,
+                    'year' => $balance->year !== null ? (int) $balance->year : null,
+                    'updated_at' => $balance->updated_at?->toIso8601String(),
+                ];
+            })
             ->values()
             ->all();
 

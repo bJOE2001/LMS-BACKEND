@@ -4272,11 +4272,11 @@ class AdminDashboardController extends Controller
                 continue;
             }
 
-            if ($remainingPrimaryDays + 1e-9 >= $durationDays) {
-                $remainingPrimaryDays = round(max($remainingPrimaryDays - $durationDays, 0.0), 3);
-            } else {
-                $requiredAlternateDays = round($requiredAlternateDays + $durationDays, 3);
-            }
+            $usedFromPrimary = round(min($durationDays, $remainingPrimaryDays), 3);
+            $usedFromAlternate = round(max($durationDays - $usedFromPrimary, 0.0), 3);
+
+            $remainingPrimaryDays = round(max($remainingPrimaryDays - $usedFromPrimary, 0.0), 3);
+            $requiredAlternateDays = round($requiredAlternateDays + $usedFromAlternate, 3);
 
             $remainingDeductibleDays = round(max($remainingDeductibleDays - $durationDays, 0.0), 3);
         }
