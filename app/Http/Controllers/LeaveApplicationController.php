@@ -2739,7 +2739,7 @@ class LeaveApplicationController extends Controller
 
         // isPendingRelease & isPendingReceive Logic
         $cycleStatuses = [LeaveApplicationUpdateRequest::STATUS_PENDING, LeaveApplicationUpdateRequest::STATUS_APPROVED];
-        $cycleSubquerySql = "lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status IN (?, ?)), '1970-01-01')";
+        $cycleSubquerySql = "lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status IN (?, ?) AND (req.requested_by_control_no IS NULL OR req.requested_by_control_no NOT LIKE 'HR:%')), '1970-01-01')";
 
         if ($pendingReleaseOnly) {
             $query->whereExists(function ($sub) use ($logsTable, $appsTable, $cycleSubquerySql, $cycleStatuses) {
@@ -5568,7 +5568,7 @@ class LeaveApplicationController extends Controller
             (string) ($validated['start_date'] ?? ''),
             (string) ($validated['end_date'] ?? ''),
             (string) ($validated['employee_control_no'] ?? ''),
-            true,
+            false,
             $resolvedDetailsOfLeave
         );
         if ($policyResolution instanceof JsonResponse) {
