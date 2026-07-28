@@ -7466,12 +7466,12 @@ class LeaveApplicationController extends Controller
         $targetPayMode = $this->normalizePayMode($payload['pay_mode'] ?? null, false);
         $targetDeductibleDays = round(max((float) ($payload['deductible_days'] ?? 0.0), 0.0), 3);
         $targetWithoutPayDays = round(max((float) ($payload['without_pay_days'] ?? 0.0), 0.0), 3);
-        $isApprovedApplication = $app->status === LeaveApplication::STATUS_APPROVED;
+        $isApprovedOrPendingHr = in_array($app->status, [LeaveApplication::STATUS_APPROVED, LeaveApplication::STATUS_PENDING_HR], true);
         $sourceLeaveType = LeaveType::find((int) $app->leave_type_id);
         $sourceDeductibleDays = $this->resolveApplicationDeductibleDays($app);
-        $sourceDeductsBalance = $isApprovedApplication
+        $sourceDeductsBalance = $isApprovedOrPendingHr
             && $this->applicationDeductsEmployeeBalance(false, $sourceLeaveType, $app->pay_mode);
-        $targetDeductsBalance = $isApprovedApplication
+        $targetDeductsBalance = $isApprovedOrPendingHr
             && $this->applicationDeductsEmployeeBalance(false, $leaveType, $targetPayMode);
 
         $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
