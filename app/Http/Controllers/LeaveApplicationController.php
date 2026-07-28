@@ -1212,6 +1212,131 @@ class LeaveApplicationController extends Controller
     }
 
     /**
+     * POST /erms/leave-applications/{id}/withdraw-request
+     *
+     * Protected endpoint for ERMS-to-LMS employee withdrawal of a pending
+     * update or cancellation request for an approved application.
+     */
+    public function ermsWithdrawRequest(Request $request, ?int $id = null): JsonResponse
+    {
+        $routeId = $id;
+
+        $request->merge(array_filter([
+            'leave_application_id' => $request->input('leave_application_id')
+                ?? $routeId,
+        ], static fn ($value) => $value !== null && $value !== ''));
+
+        $this->mergeEmployeeControlNoInput($request);
+
+        $validated = $request->validate([
+            'leave_application_id' => ['required', 'integer'],
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
+            'remarks' => ['nullable', 'string', 'max:2000'],
+            'reason' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $applicationId = (int) $validated['leave_application_id'];
+        if ($routeId !== null && $applicationId !== $routeId) {
+            return response()->json([
+                'message' => 'Route ID and payload leave_application_id must match.',
+            ], 422);
+        }
+
+        $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
+        $employee = $this->findEmployeeByControlNo($controlNo);
+        if (! $employee) {
+            return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+        $pulledAccess = $this->assertErmsEmployeeIsPulled((string) $employee->control_no);
+        if ($pulledAccess instanceof JsonResponse) {
+            return $pulledAccess;
+        }
+
+        $app = LeaveApplication::query()
+            ->with('leaveType')
+            ->where('id', $applicationId)
+            ->where(function ($query) use ($controlNo): void {
+                $query->whereIn('employee_control_no', $this->controlNoCandidates($controlNo));
+            })
+            ->first();
+
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found for this employee.'], 404);
+        }
+
+        if (! $this->hasPendingApprovedUpdateRequest($app)) {
+            return response()->json([
+                'message' => 'There is no pending update or cancellation request for this application to withdraw.',
+            ], 422);
+        }
+
+        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
+        $pendingUpdateRequest = $pendingUpdateMeta['request_record'] ?? null;
+        $pendingActionType = $this->resolveUpdateRequestActionTypeFromPayload($pendingUpdateMeta['payload'] ?? null);
+
+        $reason = trim((string) (
+            $validated['remarks']
+            ?? $validated['reason']
+            ?? ''
+        ));
+
+        $performedById = (int) ltrim((string) $employee->control_no, '0');
+        if ($performedById <= 0) {
+            $performedById = (int) ($app->employee_control_no ?: 1);
+        }
+
+        $previousStatus = strtoupper(trim((string) ($pendingUpdateMeta['previous_status'] ?? '')));
+        if (! in_array($previousStatus, [LeaveApplication::STATUS_APPROVED, LeaveApplication::STATUS_PENDING_HR, LeaveApplication::STATUS_PENDING_ADMIN], true)) {
+            $previousStatus = LeaveApplication::STATUS_APPROVED;
+        }
+
+        DB::transaction(function () use ($app, $pendingUpdateRequest, $previousStatus): void {
+            $cleanedRemarks = $this->cleanRequestLinesFromRemarks($app->remarks);
+
+            $app->update([
+                'status' => $previousStatus,
+                'remarks' => $cleanedRemarks,
+            ]);
+
+            // Delete pending update/cancellation request records for this application
+            if ($pendingUpdateRequest instanceof LeaveApplicationUpdateRequest) {
+                $pendingUpdateRequest->delete();
+            }
+
+            LeaveApplicationUpdateRequest::query()
+                ->where('leave_application_id', (int) $app->id)
+                ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
+                ->delete();
+
+            // Delete request submission log entries so status history is completely restored
+            LeaveApplicationLog::query()
+                ->where('leave_application_id', (int) $app->id)
+                ->where(function ($query): void {
+                    $query->where('remarks', 'LIKE', '%Cancellation request submitted%')
+                        ->orWhere('remarks', 'LIKE', '%Edit request submitted%')
+                        ->orWhere('remarks', 'LIKE', '%Update request submitted%')
+                        ->orWhere('remarks', 'LIKE', '%Recall request submitted%');
+                })
+                ->delete();
+        });
+
+        $leaveTypeName = $app->leaveType?->name ?? 'leave';
+        $requestLabel = $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
+            ? 'cancellation request'
+            : ($pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                ? 'recall request'
+                : 'update request');
+
+        $application = $app->fresh(['leaveType', 'applicantAdmin.department', 'logs']);
+        $actorDirectory = $this->buildWorkflowActorDirectory([$application]);
+
+        return response()->json([
+            'message' => "Leave {$requestLabel} cancelled successfully. Application status restored to approved.",
+            'application' => $this->formatErmsApplication($application, $actorDirectory),
+        ]);
+    }
+
+    /**
      * POST /erms/leave-applications/{id}/request-update
      *
      * Protected endpoint for ERMS-to-LMS leave update request.
@@ -9748,6 +9873,30 @@ class LeaveApplicationController extends Controller
         ]);
     }
 
+    private function cleanRequestLinesFromRemarks(?string $remarks): ?string
+    {
+        if ($remarks === null || trim($remarks) === '') {
+            return null;
+        }
+
+        $lines = explode("\n", $remarks);
+        $filtered = array_filter($lines, static function (string $line): bool {
+            $trimmed = trim($line);
+            if ($trimmed === '') {
+                return false;
+            }
+            if (preg_match('/^(?:Cancellation|Edit|Update|Recall)\s+request\s+submitted\b/i', $trimmed)) {
+                return false;
+            }
+
+            return true;
+        });
+
+        $result = implode("\n", array_map('trim', $filtered));
+
+        return $result !== '' ? $result : null;
+    }
+
     private function getPendingApprovedUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
     {
         if (! $app->id) {
@@ -9887,7 +10036,7 @@ class LeaveApplicationController extends Controller
         ];
     }
 
-    private function getLatestApprovedUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
+    private function getLatestUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
     {
         if (! $app->id) {
             return null;
@@ -9898,8 +10047,7 @@ class LeaveApplicationController extends Controller
                 ->filter(fn ($item) => $item instanceof LeaveApplicationUpdateRequest)
                 ->sortByDesc(fn (LeaveApplicationUpdateRequest $item) => (int) $item->id)
                 ->first(function (LeaveApplicationUpdateRequest $item): bool {
-                    return strtoupper(trim((string) ($item->status ?? ''))) === LeaveApplicationUpdateRequest::STATUS_APPROVED
-                        && ! $this->isHrApplicationEditRequestRecord($item);
+                    return ! $this->isHrApplicationEditRequestRecord($item);
                 });
 
             return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
@@ -9907,7 +10055,6 @@ class LeaveApplicationController extends Controller
 
         $record = LeaveApplicationUpdateRequest::query()
             ->where('leave_application_id', (int) $app->id)
-            ->where('status', LeaveApplicationUpdateRequest::STATUS_APPROVED)
             ->latest('id')
             ->get()
             ->first(fn (LeaveApplicationUpdateRequest $item): bool => ! $this->isHrApplicationEditRequestRecord($item));
@@ -9917,7 +10064,7 @@ class LeaveApplicationController extends Controller
 
     private function resolveLatestUpdateMeta(LeaveApplication $app): array
     {
-        $latestRequest = $this->getLatestApprovedUpdateRequestRecord($app);
+        $latestRequest = $this->getLatestUpdateRequestRecord($app);
         if ($latestRequest instanceof LeaveApplicationUpdateRequest) {
             return [
                 'status' => strtoupper(trim((string) ($latestRequest->status ?? ''))),

@@ -70,6 +70,9 @@ Route::prefix('erms')->middleware('erms.auth')->group(function () {
     Route::post('/leave-applications/{id}/request-cancel', [LeaveApplicationController::class, 'ermsRequestCancel']);
     Route::post('/leave-applications/{id}/edit-request', [LeaveApplicationController::class, 'ermsRequestUpdate']);
     Route::post('/leave-applications/{id}/request-edit', [LeaveApplicationController::class, 'ermsRequestEdit']);
+    Route::post('/apply-leave/withdraw-request', [LeaveApplicationController::class, 'ermsWithdrawRequest']);
+    Route::post('/apply-leave/{id}/withdraw-request', [LeaveApplicationController::class, 'ermsWithdrawRequest']);
+    Route::post('/leave-applications/{id}/withdraw-request', [LeaveApplicationController::class, 'ermsWithdrawRequest']);
     Route::get('/admin/department-head', [EmployeeController::class, 'ermsDepartmentHead']);
     Route::get('/city-administrator', [EmployeeController::class, 'ermsCityAdministrator']);
     Route::get('/city-mayor', [EmployeeController::class, 'ermsCityMayor']);
