@@ -3543,18 +3543,24 @@ class LeaveApplicationController extends Controller
 
         $reason = $this->trimNullableString($validated['reason'] ?? null);
 
-        $existingPendingRequest = LeaveApplicationUpdateRequest::query()
+        $existingPendingHrStaffEditRequest = LeaveApplicationUpdateRequest::query()
             ->where('leave_application_id', (int) $app->id)
             ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
             ->latest('id')
             ->get()
             ->first(fn (LeaveApplicationUpdateRequest $editRequest): bool => $this->isHrApplicationEditRequestRecord($editRequest));
 
-        if ($existingPendingRequest instanceof LeaveApplicationUpdateRequest) {
+        if ($existingPendingHrStaffEditRequest instanceof LeaveApplicationUpdateRequest) {
             return response()->json([
                 'message' => 'This application already has a pending HR staff edit request. Please approve or reject it first.',
             ], 422);
         }
+
+        $pendingEmployeeUpdateRequest = LeaveApplicationUpdateRequest::query()
+            ->where('leave_application_id', (int) $app->id)
+            ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
+            ->latest('id')
+            ->first();
 
         if ($this->isHrAccessControlOwner($hr)) {
             $applied = $this->applyHrApplicationEdit(
@@ -3562,7 +3568,7 @@ class LeaveApplicationController extends Controller
                 $hr,
                 $normalizedPayload,
                 $reason,
-                null,
+                $pendingEmployeeUpdateRequest,
                 $this->trimNullableString($validated['remarks'] ?? null)
             );
 
@@ -7538,6 +7544,8 @@ class LeaveApplicationController extends Controller
                 $reviewRemarks,
                 $updateAttributes,
                 $leaveType,
+                $targetStartDate,
+                $targetEndDate,
                 $targetSelectedDates,
                 $sourceLeaveType,
                 $sourceDeductibleDays,
@@ -7545,6 +7553,8 @@ class LeaveApplicationController extends Controller
                 $targetDeductsBalance,
                 $targetDeductibleDays,
                 $targetTotalDays,
+                $targetWithoutPayDays,
+                $targetPayMode,
                 $targetIsCtoDeduction,
                 $targetShouldDeductForcedLeave,
                 $forcedLeaveTypeId,
@@ -7552,6 +7562,44 @@ class LeaveApplicationController extends Controller
                 $vacationLeaveTypeId,
                 $balanceConflictError
             ): void {
+                if ($editRequest instanceof LeaveApplicationUpdateRequest && $editRequest->status === LeaveApplicationUpdateRequest::STATUS_PENDING) {
+                    $existingPayload = $this->normalizePendingUpdatePayload($editRequest->requested_payload) ?? [];
+                    $updatedPayload = array_merge($existingPayload, [
+                        'start_date' => $targetStartDate,
+                        'end_date' => $targetEndDate,
+                        'total_days' => $targetTotalDays,
+                        'deductible_days' => $targetDeductibleDays,
+                        'without_pay_days' => $targetWithoutPayDays,
+                        'selected_dates' => $targetSelectedDates,
+                        'selected_date_pay_status' => is_array($payload['selected_date_pay_status'] ?? null)
+                            ? $payload['selected_date_pay_status']
+                            : null,
+                        'selected_date_coverage' => is_array($payload['selected_date_coverage'] ?? null)
+                            ? $payload['selected_date_coverage']
+                            : null,
+                        'selected_date_half_day_portion' => is_array($payload['selected_date_half_day_portion'] ?? null)
+                            ? $payload['selected_date_half_day_portion']
+                            : null,
+                        'pay_mode' => $targetPayMode,
+                    ]);
+
+                    $editRequest->update([
+                        'requested_payload' => $updatedPayload,
+                        'review_remarks' => $reviewRemarks ?? 'HR updated requested dates.',
+                    ]);
+
+                    LeaveApplicationLog::create([
+                        'leave_application_id' => $app->id,
+                        'action' => LeaveApplicationLog::ACTION_HR_APPLICATION_EDITED,
+                        'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
+                        'performed_by_id' => $hr->id,
+                        'remarks' => $reviewRemarks ?? $reason ?? 'HR updated pending requested dates.',
+                        'created_at' => now(),
+                    ]);
+
+                    return;
+                }
+
                 if ($sourceDeductsBalance && $sourceDeductibleDays > 0.0) {
                     $this->refundApplicationTrackedDeductions(
                         $app,
@@ -7662,24 +7710,36 @@ class LeaveApplicationController extends Controller
                     $this->syncEmployeeCtoBalance((string) $app->employee_control_no, true);
                 }
 
-                if ($app->status === LeaveApplication::STATUS_APPROVED) {
-                    $this->lockCertificationLeaveCreditsSnapshot($app);
-                }
+                if ($editRequest instanceof LeaveApplicationUpdateRequest && $editRequest->status === LeaveApplicationUpdateRequest::STATUS_PENDING) {
+                    $existingPayload = $this->normalizePendingUpdatePayload($editRequest->requested_payload) ?? [];
+                    $updatedPayload = array_merge($existingPayload, [
+                        'start_date' => $targetStartDate,
+                        'end_date' => $targetEndDate,
+                        'total_days' => $targetTotalDays,
+                        'deductible_days' => $targetDeductibleDays,
+                        'without_pay_days' => $targetWithoutPayDays,
+                        'selected_dates' => $targetSelectedDates,
+                        'selected_date_pay_status' => is_array($payload['selected_date_pay_status'] ?? null)
+                            ? $payload['selected_date_pay_status']
+                            : null,
+                        'selected_date_coverage' => is_array($payload['selected_date_coverage'] ?? null)
+                            ? $payload['selected_date_coverage']
+                            : null,
+                        'selected_date_half_day_portion' => is_array($payload['selected_date_half_day_portion'] ?? null)
+                            ? $payload['selected_date_half_day_portion']
+                            : null,
+                        'pay_mode' => $targetPayMode,
+                    ]);
 
-                if ($editRequest instanceof LeaveApplicationUpdateRequest) {
                     $editRequest->update([
-                        'status' => LeaveApplicationUpdateRequest::STATUS_APPROVED,
-                        'reviewed_by_hr_id' => $hr->id,
-                        'reviewed_at' => now(),
-                        'review_remarks' => $reviewRemarks,
+                        'requested_payload' => $updatedPayload,
+                        'review_remarks' => $reviewRemarks ?? 'HR updated requested dates.',
                     ]);
                 }
 
                 LeaveApplicationLog::create([
                     'leave_application_id' => $app->id,
-                    'action' => $editRequest instanceof LeaveApplicationUpdateRequest
-                        ? LeaveApplicationLog::ACTION_HR_APPLICATION_EDIT_REQUEST_APPROVED
-                        : LeaveApplicationLog::ACTION_HR_APPLICATION_EDITED,
+                    'action' => LeaveApplicationLog::ACTION_HR_APPLICATION_EDITED,
                     'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
                     'performed_by_id' => $hr->id,
                     'remarks' => $reviewRemarks ?? $reason ?? 'HR application override.',
