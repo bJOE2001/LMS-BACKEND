@@ -7017,6 +7017,10 @@ class LeaveApplicationController extends Controller
         return [
             'request_kind' => self::HR_APPLICATION_EDIT_REQUEST_KIND,
             'action_type' => LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE,
+            'previous_start_date' => $app->start_date?->toDateString() ?: ($app->resolvedSelectedDates()[0] ?? null),
+            'previous_end_date' => $app->end_date?->toDateString() ?: ($app->resolvedSelectedDates()[count($app->resolvedSelectedDates()) - 1] ?? null),
+            'previous_selected_dates' => $app->resolvedSelectedDates(),
+            'previous_total_days' => (float) ($app->total_days ?? 0.0),
             'leave_type_id' => (int) $app->leave_type_id,
             'leave_type_name' => $leaveType->name,
             'start_date' => $selectedDates[0] ?? null,
@@ -8960,6 +8964,10 @@ class LeaveApplicationController extends Controller
         $attachmentReference = $policyResolution['attachment_reference'] ?? null;
 
         $rawPayload = [
+            'previous_start_date' => $app->start_date?->toDateString() ?: ($app->resolvedSelectedDates()[0] ?? null),
+            'previous_end_date' => $app->end_date?->toDateString() ?: ($app->resolvedSelectedDates()[count($app->resolvedSelectedDates()) - 1] ?? null),
+            'previous_selected_dates' => $app->resolvedSelectedDates(),
+            'previous_total_days' => (float) ($app->total_days ?? 0.0),
             'leave_type_id' => $targetLeaveTypeId,
             'start_date' => $resolvedStartDate,
             'end_date' => $resolvedEndDate,
@@ -10443,6 +10451,14 @@ class LeaveApplicationController extends Controller
             'attachment_required' => $attachmentRequired,
             'attachment_submitted' => $attachmentSubmitted,
             'attachment_reference' => $this->trimNullableString($attachmentReference),
+            'previous_start_date' => $this->trimNullableString($payload['previous_start_date'] ?? $payload['previousStartDate'] ?? null),
+            'previous_end_date' => $this->trimNullableString($payload['previous_end_date'] ?? $payload['previousEndDate'] ?? null),
+            'previous_selected_dates' => is_array($payload['previous_selected_dates'] ?? null)
+                ? $payload['previous_selected_dates']
+                : (is_array($payload['previousSelectedDates'] ?? null) ? $payload['previousSelectedDates'] : null),
+            'previous_total_days' => isset($payload['previous_total_days'])
+                ? (float) $payload['previous_total_days']
+                : (isset($payload['previousTotalDays']) ? (float) $payload['previousTotalDays'] : null),
         ];
     }
 
