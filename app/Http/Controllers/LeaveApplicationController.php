@@ -7568,7 +7568,9 @@ class LeaveApplicationController extends Controller
             ): void {
                 if ($editRequest instanceof LeaveApplicationUpdateRequest && $editRequest->status === LeaveApplicationUpdateRequest::STATUS_PENDING) {
                     $existingPayload = $this->normalizePendingUpdatePayload($editRequest->requested_payload) ?? [];
+                    $isWithoutPay = $targetWithoutPayDays > 0.0 || $targetPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
                     $updatedPayload = array_merge($existingPayload, [
+                        'request_kind' => $existingPayload['request_kind'] ?? LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE,
                         'start_date' => $targetStartDate,
                         'end_date' => $targetEndDate,
                         'total_days' => $targetTotalDays,
@@ -7585,6 +7587,9 @@ class LeaveApplicationController extends Controller
                             ? $payload['selected_date_half_day_portion']
                             : null,
                         'pay_mode' => $targetPayMode,
+                        'pay_status' => $isWithoutPay ? 'Without Pay' : 'With Pay',
+                        'without_pay' => $isWithoutPay,
+                        'with_pay' => ! $isWithoutPay,
                     ]);
 
                     $editRequest->update([
@@ -10382,7 +10387,7 @@ class LeaveApplicationController extends Controller
                 $startDate,
                 $endDate,
                 isset($payload['employee_control_no']) ? (string) $payload['employee_control_no'] : null,
-                false,
+                $payMode === LeaveApplication::PAY_MODE_WITH_PAY || (bool) ($payload['with_pay'] ?? false) || ((float) ($payload['without_pay_days'] ?? 1.0) === 0.0),
                 $this->trimNullableString($payload['details_of_leave'] ?? $payload['detailsOfLeave'] ?? null)
             );
 
