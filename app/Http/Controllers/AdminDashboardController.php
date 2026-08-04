@@ -957,6 +957,14 @@ class AdminDashboardController extends Controller
             return $duplicateDateValidation;
         }
 
+        $pendingLeaveTypeValidation = $this->validateNoPendingApplicationForLeaveType(
+            $adminEmployeeControlNo,
+            (int) $validated['leave_type_id']
+        );
+        if ($pendingLeaveTypeValidation instanceof JsonResponse) {
+            return $pendingLeaveTypeValidation;
+        }
+
         $forcedLeaveTypeId = LeaveType::resolveForcedLeaveTypeId();
         $isVacationLeave = strcasecmp(trim((string) ($leaveType->name ?? '')), 'Vacation Leave') === 0;
         $linkedForcedLeaveReservedDays = 0.0;
@@ -4397,6 +4405,45 @@ class AdminDashboardController extends Controller
                 'selected_dates' => ['Duplicate leave dates are not allowed for the same employee.'],
             ],
             'duplicate_dates' => $duplicateDates,
+        ], 422);
+    }
+
+    private function validateNoPendingApplicationForLeaveType(
+        string $employeeControlNo,
+        int $leaveTypeId,
+        ?int $excludeApplicationId = null
+    ): ?JsonResponse {
+        $controlNoCandidates = $this->buildControlNoCandidates($employeeControlNo);
+
+        $existingPending = LeaveApplication::query()
+            ->with('leaveType')
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->whereIn('status', [
+                LeaveApplication::STATUS_PENDING_ADMIN,
+                LeaveApplication::STATUS_PENDING_HR,
+            ])
+            ->when($excludeApplicationId !== null, function ($query) use ($excludeApplicationId): void {
+                $query->where('id', '<>', $excludeApplicationId);
+            })
+            ->get()
+            ->first(function (LeaveApplication $app) use ($leaveTypeId): bool {
+                return (int) $app->leave_type_id === $leaveTypeId;
+            });
+
+        if (! $existingPending instanceof LeaveApplication) {
+            return null;
+        }
+
+        $leaveTypeName = $existingPending->leaveType?->name
+            ?? LeaveType::query()->whereKey($leaveTypeId)->value('name')
+            ?? 'selected leave type';
+
+        return response()->json([
+            'message' => "You already have a pending {$leaveTypeName} application.",
+            'errors' => [
+                'leave_type_id' => ["You already have a pending {$leaveTypeName} application."],
+            ],
+            'pending_application_id' => $existingPending->id,
         ], 422);
     }
 }

@@ -738,6 +738,14 @@ class LeaveApplicationController extends Controller
             return $duplicateDateValidation;
         }
 
+        $pendingLeaveTypeValidation = $this->validateNoPendingApplicationForLeaveType(
+            (string) $employee->control_no,
+            (int) $validated['leave_type_id']
+        );
+        if ($pendingLeaveTypeValidation instanceof JsonResponse) {
+            return $pendingLeaveTypeValidation;
+        }
+
         $eligibility = $this->validateRegularLeaveEligibility(
             (string) $employee->control_no,
             (int) $validated['leave_type_id'],
@@ -1797,6 +1805,14 @@ class LeaveApplicationController extends Controller
         );
         if ($duplicateDateValidation instanceof JsonResponse) {
             return $duplicateDateValidation;
+        }
+
+        $pendingLeaveTypeValidation = $this->validateNoPendingApplicationForLeaveType(
+            (string) $employee->control_no,
+            (int) $validated['leave_type_id']
+        );
+        if ($pendingLeaveTypeValidation instanceof JsonResponse) {
+            return $pendingLeaveTypeValidation;
         }
 
         $eligibility = $this->validateRegularLeaveEligibility(
@@ -5745,6 +5761,14 @@ class LeaveApplicationController extends Controller
         );
         if ($duplicateDateValidation instanceof JsonResponse) {
             return $duplicateDateValidation;
+        }
+
+        $pendingLeaveTypeValidation = $this->validateNoPendingApplicationForLeaveType(
+            (string) $employee->control_no,
+            (int) $validated['leave_type_id']
+        );
+        if ($pendingLeaveTypeValidation instanceof JsonResponse) {
+            return $pendingLeaveTypeValidation;
         }
 
         $eligibility = $this->validateRegularLeaveEligibility(
@@ -14575,6 +14599,48 @@ class LeaveApplicationController extends Controller
                 'selected_dates' => ['Duplicate leave dates are not allowed for the same employee.'],
             ],
             'duplicate_dates' => $duplicateDates,
+        ], 422);
+    }
+
+    private function validateNoPendingApplicationForLeaveType(
+        string $employeeControlNo,
+        int $leaveTypeId,
+        ?int $excludeApplicationId = null
+    ): ?JsonResponse {
+        $controlNoCandidates = $this->controlNoCandidates($employeeControlNo);
+        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+
+        $existingPending = LeaveApplication::query()
+            ->with('leaveType')
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->whereIn('status', [
+                LeaveApplication::STATUS_PENDING_ADMIN,
+                LeaveApplication::STATUS_PENDING_HR,
+            ])
+            ->when($excludeApplicationId !== null, function ($query) use ($excludeApplicationId): void {
+                $query->where('id', '<>', $excludeApplicationId);
+            })
+            ->get()
+            ->first(function (LeaveApplication $app) use ($canonicalLeaveTypeId): bool {
+                $appLeaveTypeId = $this->resolveCanonicalLeaveTypeId((int) $app->leave_type_id) ?? (int) $app->leave_type_id;
+
+                return $appLeaveTypeId === $canonicalLeaveTypeId;
+            });
+
+        if (! $existingPending instanceof LeaveApplication) {
+            return null;
+        }
+
+        $leaveTypeName = $existingPending->leaveType?->name
+            ?? LeaveType::query()->whereKey($canonicalLeaveTypeId)->value('name')
+            ?? 'selected leave type';
+
+        return response()->json([
+            'message' => "You already have a pending {$leaveTypeName} application.",
+            'errors' => [
+                'leave_type_id' => ["You already have a pending {$leaveTypeName} application."],
+            ],
+            'pending_application_id' => $existingPending->id,
         ], 422);
     }
 
