@@ -764,7 +764,6 @@ class HRDashboardController extends Controller
                 ->sortByDesc(fn (LeaveApplicationUpdateRequest $item) => (int) $item->id)
                 ->first(function (LeaveApplicationUpdateRequest $item): bool {
                     return strtoupper(trim((string) $item->status)) === LeaveApplicationUpdateRequest::STATUS_PENDING
-                        && strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED
                         && ! $item->isHrApplicationEditRequest();
                 });
 
@@ -778,13 +777,7 @@ class HRDashboardController extends Controller
             ->get()
             ->first(fn (LeaveApplicationUpdateRequest $item): bool => ! $item->isHrApplicationEditRequest());
 
-        if (! $record) {
-            return null;
-        }
-
-        $previousStatus = strtoupper(trim((string) ($record->previous_status ?? '')));
-
-        return $previousStatus === LeaveApplication::STATUS_APPROVED ? $record : null;
+        return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
     }
 
     private function resolvePendingUpdateMeta(LeaveApplication $app): array

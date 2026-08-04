@@ -2864,7 +2864,7 @@ class LeaveApplicationController extends Controller
 
         // isPendingRelease & isPendingReceive Logic
         $cycleStatuses = [LeaveApplicationUpdateRequest::STATUS_PENDING, LeaveApplicationUpdateRequest::STATUS_APPROVED];
-        $cycleSubquerySql = "lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status IN (?, ?) AND (req.requested_by_control_no IS NULL OR req.requested_by_control_no NOT LIKE 'HR:%')), '1970-01-01')";
+        $cycleSubquerySql = "lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status IN (?, ?)), '1970-01-01')";
 
         if ($pendingReleaseOnly) {
             $query->whereExists(function ($sub) use ($logsTable, $appsTable, $cycleSubquerySql, $cycleStatuses) {
@@ -9135,8 +9135,7 @@ class LeaveApplicationController extends Controller
     {
         $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
 
-        return ($pendingUpdateMeta['payload'] ?? null) !== null
-            && strtoupper(trim((string) ($pendingUpdateMeta['previous_status'] ?? ''))) === LeaveApplication::STATUS_APPROVED;
+        return ($pendingUpdateMeta['payload'] ?? null) !== null;
     }
 
     private function shouldPresentApprovedWhilePendingUpdate(
@@ -9144,6 +9143,12 @@ class LeaveApplicationController extends Controller
         bool $hasPendingApprovedUpdateRequest
     ): bool {
         if (! $hasPendingApprovedUpdateRequest) {
+            return false;
+        }
+
+        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
+        $previousStatus = strtoupper(trim((string) ($pendingUpdateMeta['previous_status'] ?? '')));
+        if ($previousStatus !== LeaveApplication::STATUS_APPROVED) {
             return false;
         }
 
@@ -9977,7 +9982,6 @@ class LeaveApplicationController extends Controller
                 ->sortByDesc(fn (LeaveApplicationUpdateRequest $item) => (int) $item->id)
                 ->first(function (LeaveApplicationUpdateRequest $item): bool {
                     return strtoupper(trim((string) $item->status)) === LeaveApplicationUpdateRequest::STATUS_PENDING
-                        && strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED
                         && ! $this->isHrApplicationEditRequestRecord($item);
                 });
 
@@ -9989,16 +9993,9 @@ class LeaveApplicationController extends Controller
             ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
             ->latest('id')
             ->get()
-            ->first(fn (LeaveApplicationUpdateRequest $item): bool => strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED
-                && ! $this->isHrApplicationEditRequestRecord($item));
+            ->first(fn (LeaveApplicationUpdateRequest $item): bool => ! $this->isHrApplicationEditRequestRecord($item));
 
-        if (! $record) {
-            return null;
-        }
-
-        $previousStatus = strtoupper(trim((string) ($record->previous_status ?? '')));
-
-        return $previousStatus === LeaveApplication::STATUS_APPROVED ? $record : null;
+        return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
     }
 
     private function resolvePendingApprovedUpdateCycleRequestedAt(LeaveApplication $app): ?\DateTimeInterface
