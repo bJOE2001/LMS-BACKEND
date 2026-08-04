@@ -14636,9 +14636,9 @@ class LeaveApplicationController extends Controller
             ?? 'selected leave type';
 
         return response()->json([
-            'message' => "You already have a pending {$leaveTypeName} application.",
+            'message' => "You already have a pending {$leaveTypeName} application. Please wait for it to be approved first.",
             'errors' => [
-                'leave_type_id' => ["You already have a pending {$leaveTypeName} application."],
+                'leave_type_id' => ["You already have a pending {$leaveTypeName} application. Please wait for it to be approved first."],
             ],
             'pending_application_id' => $existingPending->id,
         ], 422);
