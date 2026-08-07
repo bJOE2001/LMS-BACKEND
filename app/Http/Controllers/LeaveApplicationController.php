@@ -12354,7 +12354,9 @@ class LeaveApplicationController extends Controller
             }
         }
 
-        if (! $submitted) {
+        if ($reference !== null) {
+            $submitted = true;
+        } elseif (! $submitted) {
             $reference = null;
         }
 
