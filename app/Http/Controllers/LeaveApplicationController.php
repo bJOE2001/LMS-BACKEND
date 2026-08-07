@@ -7500,12 +7500,12 @@ class LeaveApplicationController extends Controller
         $targetPayMode = $this->normalizePayMode($payload['pay_mode'] ?? null, false);
         $targetDeductibleDays = round(max((float) ($payload['deductible_days'] ?? 0.0), 0.0), 3);
         $targetWithoutPayDays = round(max((float) ($payload['without_pay_days'] ?? 0.0), 0.0), 3);
-        $isApprovedOrPendingHr = in_array($app->status, [LeaveApplication::STATUS_APPROVED, LeaveApplication::STATUS_PENDING_HR], true);
+        $isApprovedStatus = $app->status === LeaveApplication::STATUS_APPROVED;
         $sourceLeaveType = LeaveType::find((int) $app->leave_type_id);
         $sourceDeductibleDays = $this->resolveApplicationDeductibleDays($app);
-        $sourceDeductsBalance = $isApprovedOrPendingHr
+        $sourceDeductsBalance = $isApprovedStatus
             && $this->applicationDeductsEmployeeBalance(false, $sourceLeaveType, $app->pay_mode);
-        $targetDeductsBalance = $isApprovedOrPendingHr
+        $targetDeductsBalance = $isApprovedStatus
             && $this->applicationDeductsEmployeeBalance(false, $leaveType, $targetPayMode);
 
         $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
@@ -9182,8 +9182,13 @@ class LeaveApplicationController extends Controller
     private function hasPendingApprovedUpdateRequest(LeaveApplication $app): bool
     {
         $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
+        if (($pendingUpdateMeta['payload'] ?? null) === null) {
+            return false;
+        }
 
-        return ($pendingUpdateMeta['payload'] ?? null) !== null;
+        $previousStatus = strtoupper(trim((string) ($pendingUpdateMeta['previous_status'] ?? '')));
+
+        return $previousStatus === LeaveApplication::STATUS_APPROVED;
     }
 
     private function shouldPresentApprovedWhilePendingUpdate(
