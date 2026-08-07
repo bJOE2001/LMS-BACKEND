@@ -12,6 +12,7 @@ use App\Models\LeaveApplication;
 use App\Models\LeaveApplicationLog;
 use App\Models\LeaveBalance;
 use App\Models\LeaveBalanceAccrualHistory;
+use App\Models\LeaveRestoration;
 use App\Models\LeaveType;
 use App\Services\RecycleBinService;
 use App\Services\WorkScheduleService;
@@ -1088,6 +1089,78 @@ class EmployeeController extends Controller
                 }
             }
 
+            // Leave Restorations (e.g. Magna Carta, Rehabilitation, Errata)
+            $restorations = LeaveRestoration::query()
+                ->whereIn('employee_control_no', $controlNoCandidates)
+                ->orderByDesc('start_date')
+                ->orderByDesc('id')
+                ->get();
+
+            foreach ($restorations as $restoration) {
+                $typeId = (int) $restoration->target_leave_type_id;
+                $typeKey = $typeIdToKey[$typeId] ?? null;
+                if ($typeKey === null) {
+                    continue;
+                }
+                $balanceKey = $balanceKeyByTypeId[$typeId]
+                    ?? $this->resolveLedgerRunningBalanceKey($typeKey, $typeId);
+                if (! is_string($balanceKey) || $balanceKey === '') {
+                    continue;
+                }
+
+                $restorationDate = $restoration->start_date?->toDateString()
+                    ?? $restoration->created_at?->toDateString();
+                if ($restorationDate === null) {
+                    continue;
+                }
+
+                $restoredDays = round((float) ($restoration->restored_days ?? 0), 3);
+                if ($restoredDays <= 0.0) {
+                    continue;
+                }
+
+                $restoredDates = $this->resolveLedgerInclusiveDates(
+                    $restoration->selected_dates,
+                    $restoration->start_date?->toDateString(),
+                    $restoration->end_date?->toDateString()
+                );
+
+                $particulars = trim((string) ($restoration->particulars ?: $restoration->restoration_reason_details ?: 'Special Leave Benefit'));
+
+                $actionTaken = sprintf(
+                    'Restore Leave (%s)',
+                    $restoration->created_at?->format('F j, Y') ?? $restorationDate
+                );
+
+                $otherTypeCode = $typeKey === 'other'
+                    ? ($otherTypeCodeById[$typeId] ?? null)
+                    : null;
+                $leaveTypeCode = $this->resolveLedgerTypeCode(
+                    $typeKey,
+                    is_string($otherTypeCode) ? $otherTypeCode : null
+                );
+
+                $transactions[] = [
+                    'row_id' => 'restoration-'.(int) $restoration->id,
+                    'merge_key' => 'restoration-'.(int) $restoration->id,
+                    'type_key' => $typeKey,
+                    'balance_key' => $balanceKey,
+                    'leave_type_code' => $leaveTypeCode,
+                    'transaction_date' => $restorationDate,
+                    'sort_date' => $restorationDate,
+                    'sort_timestamp' => (string) ($restoration->created_at?->toIso8601String() ?? $restorationDate),
+                    'particulars' => $particulars,
+                    'action_taken' => $actionTaken,
+                    'inclusive_start_date' => $restoration->start_date?->toDateString(),
+                    'inclusive_end_date' => $restoration->end_date?->toDateString(),
+                    'inclusive_dates' => $restoredDates,
+                    'selected_dates' => $restoredDates,
+                    'category' => 'earned',
+                    'amount' => $restoredDays,
+                    'balance_delta' => $restoredDays,
+                ];
+            }
+
             $approvedApplicationColumns = [
                 'id',
                 'leave_type_id',
@@ -1724,6 +1797,7 @@ class EmployeeController extends Controller
                     'inclusive_start_date' => $inclusiveStartDate !== '' ? $inclusiveStartDate : null,
                     'inclusive_end_date' => $inclusiveEndDate !== '' ? $inclusiveEndDate : null,
                     'inclusive_dates' => $inclusiveDates,
+                    'selected_dates' => $transaction['selected_dates'] ?? $inclusiveDates,
                 ];
 
                 if ($mergeKey !== null) {
@@ -4341,5 +4415,95 @@ class EmployeeController extends Controller
         }
 
         return $weights;
+    }
+
+    /**
+     * Restore leave credits for an employee (HR only).
+     */
+    public function restoreLeaveCredits(Request $request, string $controlNo): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $employee = HrisEmployee::findByControlNo($controlNo);
+        if (! $employee) {
+            return response()->json(['message' => 'Employee not found.'], 404);
+        }
+
+        $validated = $request->validate([
+            'target_leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
+            'particulars' => ['nullable', 'string', 'max:255'],
+            'restoration_reason_details' => ['nullable', 'string', 'max:255'],
+            'selected_dates' => ['nullable', 'array'],
+            'selected_dates.*' => ['date'],
+            'start_date' => ['nullable', 'date'],
+            'end_date' => ['nullable', 'date'],
+            'restored_days' => ['required', 'numeric', 'min:0.125', 'max:365'],
+            'remarks' => ['nullable', 'string', 'max:1000'],
+        ]);
+
+        $particularsText = trim((string) ($validated['particulars'] ?? $validated['restoration_reason_details'] ?? ''));
+        if ($particularsText === '') {
+            return response()->json(['message' => 'Particulars text is required.'], 422);
+        }
+
+        $selectedDates = array_values(array_unique(array_filter(
+            (array) ($validated['selected_dates'] ?? []),
+            static fn (mixed $d): bool => is_string($d) && trim($d) !== ''
+        )));
+        sort($selectedDates);
+
+        $startDate = $validated['start_date'] ?? ($selectedDates[0] ?? null);
+        $endDate = $validated['end_date'] ?? ($selectedDates[count($selectedDates) - 1] ?? $startDate);
+
+        if (! $startDate) {
+            return response()->json(['message' => 'Please select at least one restoration date.'], 422);
+        }
+
+        $controlNoCandidates = $this->buildLedgerControlNoCandidates($controlNo, $employee);
+
+        $restoration = DB::transaction(function () use ($controlNo, $validated, $hr, $controlNoCandidates, $employee, $startDate, $endDate, $selectedDates, $particularsText): LeaveRestoration {
+            $restorationRecord = LeaveRestoration::create([
+                'employee_control_no' => (string) $controlNo,
+                'target_leave_type_id' => (int) $validated['target_leave_type_id'],
+                'particulars' => $particularsText,
+                'start_date' => $startDate,
+                'end_date' => $endDate,
+                'selected_dates' => $selectedDates !== [] ? $selectedDates : null,
+                'restored_days' => (float) $validated['restored_days'],
+                'restored_by_hr_id' => (int) $hr->id,
+                'remarks' => isset($validated['remarks']) && trim((string) $validated['remarks']) !== '' ? trim((string) $validated['remarks']) : null,
+            ]);
+
+            // Add restored credits to employee's target LeaveBalance
+            $targetTypeId = (int) $validated['target_leave_type_id'];
+            $leaveBalance = LeaveBalance::query()
+                ->whereIn('employee_control_no', $controlNoCandidates)
+                ->where('leave_type_id', $targetTypeId)
+                ->where('year', now()->year)
+                ->first();
+
+            if (! $leaveBalance) {
+                $leaveBalance = LeaveBalance::create([
+                    'employee_control_no' => (string) $controlNo,
+                    'employee_name' => $employee->full_name ?? ($employee->firstname.' '.$employee->surname),
+                    'leave_type_id' => $targetTypeId,
+                    'year' => now()->year,
+                    'balance' => 0,
+                ]);
+            }
+
+            $restoredAmount = (float) $validated['restored_days'];
+            $leaveBalance->increment('balance', $restoredAmount);
+
+            return $restorationRecord;
+        });
+
+        return response()->json([
+            'message' => 'Leave credits restored successfully.',
+            'restoration' => $restoration->load(['leaveType', 'restoredByHr']),
+        ], 201);
     }
 }
