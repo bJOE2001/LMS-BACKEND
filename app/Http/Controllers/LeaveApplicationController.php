@@ -12429,6 +12429,19 @@ class LeaveApplicationController extends Controller
         );
 
         if ($isForcedLeave) {
+            $flValidation = $this->validateVacationLeaveAdvanceFilingPolicy(
+                $selectedDates,
+                $normalizedSelectedDatePayStatus,
+                $normalizedPayMode,
+                $filedAt,
+                $allowPayStatusOverride,
+                $leaveType,
+                false
+            );
+            if ($flValidation instanceof JsonResponse) {
+                return $flValidation;
+            }
+
             $normalizedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
 
             $deductibleDays = $this->computeDeductibleDays(
@@ -12543,7 +12556,9 @@ class LeaveApplicationController extends Controller
                 $normalizedSelectedDatePayStatus,
                 $normalizedPayMode,
                 $filedAt,
-                $allowPayStatusOverride
+                $allowPayStatusOverride,
+                $leaveType,
+                true
             );
             if ($vlValidation instanceof JsonResponse) {
                 return $vlValidation;
@@ -12575,6 +12590,19 @@ class LeaveApplicationController extends Controller
 
             $ctoDeductedHours = null;
         } else {
+            $otherValidation = $this->validateVacationLeaveAdvanceFilingPolicy(
+                $selectedDates,
+                $normalizedSelectedDatePayStatus,
+                $normalizedPayMode,
+                $filedAt,
+                $allowPayStatusOverride,
+                $leaveType,
+                false
+            );
+            if ($otherValidation instanceof JsonResponse) {
+                return $otherValidation;
+            }
+
             $normalizedSelectedDatePayStatus = $this->enforceAbroadWeekendWithoutPayStatus(
                 $selectedDates,
                 $normalizedSelectedDatePayStatus,
@@ -12741,7 +12769,9 @@ class LeaveApplicationController extends Controller
         ?array $selectedDatePayStatus,
         string $payMode,
         mixed $filedAt = null,
-        bool $allowPayStatusOverride = false
+        bool $allowPayStatusOverride = false,
+        ?LeaveType $leaveType = null,
+        bool $isVacationLeave = true
     ): ?JsonResponse {
         if ($allowPayStatusOverride) {
             return null;
@@ -12778,7 +12808,7 @@ class LeaveApplicationController extends Controller
                 if ($isWithPay) {
                     $latePastDates[] = $availmentDate->format('M j, Y');
                 }
-            } else {
+            } elseif ($isVacationLeave) {
                 $workingDaysBeforeAvailment = $this->countWorkingDaysFromFiledDateBeforeDate($filedDate, $availmentDate);
 
                 if ($workingDaysBeforeAvailment < self::VL_MIN_WORKING_DAYS_BEFORE_AVAILMENT) {
@@ -12803,7 +12833,8 @@ class LeaveApplicationController extends Controller
 
         if (count($latePastDates) > 0) {
             $formattedDates = implode(', ', $latePastDates);
-            $message = "Vacation Leave for past dates must be filed as Without Pay (WOP). Please change the pay status for: {$formattedDates}.";
+            $typeName = $leaveType?->name ?? ($isVacationLeave ? 'Vacation Leave' : 'Leave');
+            $message = "{$typeName} for past dates must be filed as Without Pay (WOP). Please change the pay status for: {$formattedDates}.";
 
             return response()->json([
                 'message' => $message,

@@ -4479,10 +4479,11 @@ class EmployeeController extends Controller
 
             // Add restored credits to employee's target LeaveBalance
             $targetTypeId = (int) $validated['target_leave_type_id'];
+            $restorationYear = (int) (Carbon::parse($startDate)->year ?? now()->year);
             $leaveBalance = LeaveBalance::query()
                 ->whereIn('employee_control_no', $controlNoCandidates)
                 ->where('leave_type_id', $targetTypeId)
-                ->where('year', now()->year)
+                ->where('year', $restorationYear)
                 ->first();
 
             if (! $leaveBalance) {
@@ -4490,7 +4491,7 @@ class EmployeeController extends Controller
                     'employee_control_no' => (string) $controlNo,
                     'employee_name' => $employee->full_name ?? ($employee->firstname.' '.$employee->surname),
                     'leave_type_id' => $targetTypeId,
-                    'year' => now()->year,
+                    'year' => $restorationYear,
                     'balance' => 0,
                 ]);
             }
