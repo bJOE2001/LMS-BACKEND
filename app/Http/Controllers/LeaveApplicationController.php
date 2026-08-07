@@ -7593,7 +7593,21 @@ class LeaveApplicationController extends Controller
                 if ($editRequest instanceof LeaveApplicationUpdateRequest && $editRequest->status === LeaveApplicationUpdateRequest::STATUS_PENDING) {
                     $existingPayload = $this->normalizePendingUpdatePayload($editRequest->requested_payload) ?? [];
                     $isWithoutPay = $targetWithoutPayDays > 0.0 || $targetPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
+
+                    $prevPayMode = $existingPayload['previous_pay_mode']
+                        ?? $existingPayload['pay_mode']
+                        ?? $app->pay_mode;
+                    $prevWopDays = $existingPayload['previous_without_pay_days']
+                        ?? $existingPayload['without_pay_days']
+                        ?? $app->without_pay_days;
+                    $prevDatePayStatus = $existingPayload['previous_selected_date_pay_status']
+                        ?? $existingPayload['selected_date_pay_status']
+                        ?? $app->selected_date_pay_status;
+
                     $updatedPayload = array_merge($existingPayload, [
+                        'previous_pay_mode' => $prevPayMode,
+                        'previous_without_pay_days' => $prevWopDays,
+                        'previous_selected_date_pay_status' => $prevDatePayStatus,
                         'request_kind' => $existingPayload['request_kind'] ?? LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE,
                         'start_date' => $targetStartDate,
                         'end_date' => $targetEndDate,
@@ -8997,6 +9011,11 @@ class LeaveApplicationController extends Controller
             'previous_end_date' => $app->end_date?->toDateString() ?: ($app->resolvedSelectedDates()[count($app->resolvedSelectedDates()) - 1] ?? null),
             'previous_selected_dates' => $app->resolvedSelectedDates(),
             'previous_total_days' => (float) ($app->total_days ?? 0.0),
+            'previous_pay_mode' => $app->pay_mode,
+            'previous_selected_date_pay_status' => is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null,
+            'previous_selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
+            'previous_selected_date_half_day_portion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'previous_without_pay_days' => (float) ($app->without_pay_days ?? 0.0),
             'leave_type_id' => $targetLeaveTypeId,
             'start_date' => $resolvedStartDate,
             'end_date' => $resolvedEndDate,

@@ -747,6 +747,205 @@ class HRReportController extends Controller
         return response()->json($this->finalizeRows($rows));
     }
 
+    public function leaveAdjustmentReports(Request $request): JsonResponse
+    {
+        if ($response = $this->ensureHr($request)) {
+            return $response;
+        }
+
+        [$dateFrom, $dateTo] = $this->validateDateRange($request);
+        $employeeDirectory = $this->getEmployeeDirectory();
+
+        $query = \App\Models\LeaveApplicationUpdateRequest::query()
+            ->with(['leaveApplication.leaveType', 'leaveApplication.applicantAdmin.department'])
+            ->orderBy('requested_at', 'asc')
+            ->orderBy('created_at', 'asc');
+
+        if ($dateFrom) {
+            $query->where(function ($q) use ($dateFrom): void {
+                $q->whereDate('requested_at', '>=', $dateFrom)
+                    ->orWhere(function ($q2) use ($dateFrom): void {
+                        $q2->whereNull('requested_at')->whereDate('created_at', '>=', $dateFrom);
+                    });
+            });
+        }
+        if ($dateTo) {
+            $query->where(function ($q) use ($dateTo): void {
+                $q->whereDate('requested_at', '<=', $dateTo)
+                    ->orWhere(function ($q2) use ($dateTo): void {
+                        $q2->whereNull('requested_at')->whereDate('created_at', '<=', $dateTo);
+                    });
+            });
+        }
+
+        $updateRequests = $query->get();
+        $rows = [];
+        $index = 1;
+
+        foreach ($updateRequests as $updateRequest) {
+            $application = $updateRequest->leaveApplication;
+            if (! $application) {
+                continue;
+            }
+
+            $employee = $this->resolveApplicationEmployeeProfile($application, $employeeDirectory);
+            $payload = is_array($updateRequest->requested_payload) ? $updateRequest->requested_payload : [];
+            $requestKind = strtoupper((string) ($payload['request_kind'] ?? 'UPDATE'));
+            $isCancellation = in_array($requestKind, ['CANCEL', 'RECALL', 'LEAVE_RECALL_REQUEST', 'REQUEST_CANCELLATION'], true)
+                || (bool) ($payload['is_cancelled'] ?? false);
+
+            $fromStartDate = $payload['previous_start_date'] ?? $application->start_date?->toDateString();
+            $fromEndDate = $payload['previous_end_date'] ?? $application->end_date?->toDateString();
+            $fromSelectedDates = is_array($payload['previous_selected_dates'] ?? null)
+                ? $payload['previous_selected_dates']
+                : (is_array($application->selected_dates) ? $application->selected_dates : null);
+
+            $payloadPayMode = strtoupper((string) ($payload['pay_mode'] ?? ''));
+            $payloadWopDays = (float) ($payload['without_pay_days'] ?? 0);
+            $payloadIsWop = $payloadPayMode === 'WOP'
+                || $payloadWopDays > 0
+                || (bool) ($payload['without_pay'] ?? false);
+
+            $appPayMode = strtoupper((string) ($application->pay_mode ?? ''));
+            $appWopDays = (float) ($application->without_pay_days ?? 0);
+            $appIsWop = $appPayMode === 'WOP' || $appWopDays > 0;
+
+            if (isset($payload['previous_pay_mode'])) {
+                $fromPayMode = $payload['previous_pay_mode'];
+                $fromPayStatusMap = $payload['previous_selected_date_pay_status'] ?? null;
+                $fromCoverageMap = $payload['previous_selected_date_coverage'] ?? null;
+                $fromPortionMap = $payload['previous_selected_date_half_day_portion'] ?? null;
+                $fromWopDays = $payload['previous_without_pay_days'] ?? 0;
+            } elseif ($payloadIsWop && ! $appIsWop) {
+                // Application was submitted/requested as WOP and HR edited it to WP
+                $fromPayMode = 'WOP';
+                $fromPayStatusMap = null;
+                $fromCoverageMap = $application->selected_date_coverage;
+                $fromPortionMap = $application->selected_date_half_day_portion;
+                $fromWopDays = $payloadWopDays > 0 ? $payloadWopDays : 1;
+            } else {
+                $fromPayMode = $payload['pay_mode'] ?? $application->pay_mode;
+                $fromPayStatusMap = $application->selected_date_pay_status;
+                $fromCoverageMap = $application->selected_date_coverage;
+                $fromPortionMap = $application->selected_date_half_day_portion;
+                $fromWopDays = $application->without_pay_days;
+            }
+
+            $fromDatesFormatted = $this->formatLeaveDatesWithDetails(
+                $fromStartDate,
+                $fromEndDate,
+                $fromSelectedDates,
+                $fromPayMode,
+                $fromPayStatusMap,
+                $fromCoverageMap,
+                $fromPortionMap,
+                $fromWopDays
+            );
+
+            if ($isCancellation) {
+                $toDatesFormatted = 'CANCELLED';
+            } else {
+                $toStartDate = $payload['start_date'] ?? $application->start_date?->toDateString();
+                $toEndDate = $payload['end_date'] ?? $application->end_date?->toDateString();
+                $toSelectedDates = is_array($payload['selected_dates'] ?? null)
+                    ? $payload['selected_dates']
+                    : (is_array($application->selected_dates) ? $application->selected_dates : null);
+
+                $toPayMode = $application->pay_mode ?? $payload['pay_mode'];
+                $toPayStatusMap = $application->selected_date_pay_status ?? $payload['selected_date_pay_status'];
+                $toCoverageMap = $application->selected_date_coverage ?? $payload['selected_date_coverage'];
+                $toPortionMap = $application->selected_date_half_day_portion ?? $payload['selected_date_half_day_portion'];
+                $toWopDays = $application->without_pay_days ?? $payload['without_pay_days'];
+
+                $toDatesFormatted = $this->formatLeaveDatesWithDetails(
+                    $toStartDate,
+                    $toEndDate,
+                    $toSelectedDates,
+                    $toPayMode,
+                    $toPayStatusMap,
+                    $toCoverageMap,
+                    $toPortionMap,
+                    $toWopDays
+                );
+            }
+
+            $requestedAt = $updateRequest->requested_at ?? $updateRequest->created_at;
+            $dateOfRequest = $requestedAt ? Carbon::parse($requestedAt)->format('F j, Y') : 'N/A';
+            $reason = trim((string) ($updateRequest->requested_reason ?? $payload['reason'] ?? $payload['edit_reason'] ?? $application->reason ?? ''));
+
+            $rows[] = [
+                'no' => $index++,
+                'request_id' => $updateRequest->id,
+                'application_id' => $application->id,
+                'date_of_request' => $dateOfRequest,
+                'requested_at_raw' => $requestedAt ? Carbon::parse($requestedAt)->toDateString() : null,
+                'employee_name' => strtoupper((string) ($employee['name'] ?? $application->employee_name)),
+                'status' => strtoupper((string) ($employee['status'] ?: 'PERMANENT')),
+                'office' => strtoupper((string) ($employee['officeAcronym'] ?: $employee['office'] ?: 'OFFICE')),
+                'from' => $fromDatesFormatted,
+                'to' => $toDatesFormatted,
+                'reason' => $reason !== '' ? $reason : 'N/A',
+                'leave_type' => $application->leaveType?->name ?? 'Leave',
+                'request_status' => $updateRequest->status,
+            ];
+        }
+
+        return response()->json($rows);
+    }
+
+    private function formatLeaveDatesWithDetails(
+        ?string $startDate,
+        ?string $endDate,
+        ?array $selectedDates,
+        mixed $payMode,
+        mixed $selectedDatePayStatus,
+        mixed $selectedDateCoverage,
+        mixed $selectedDateHalfDayPortion,
+        mixed $withoutPayDays = 0
+    ): string {
+        $dates = LeaveApplication::resolveDateSet($startDate, $endDate, $selectedDates);
+        if (empty($dates)) {
+            return 'N/A';
+        }
+
+        $datePayStatusMap = is_array($selectedDatePayStatus) ? $selectedDatePayStatus : [];
+        $dateCoverageMap = is_array($selectedDateCoverage) ? $selectedDateCoverage : [];
+        $dateHalfDayPortionMap = is_array($selectedDateHalfDayPortion) ? $selectedDateHalfDayPortion : [];
+
+        $defaultPayTag = (strtoupper((string) $payMode) === 'WOP' || (float) $withoutPayDays > 0) ? 'WOP' : 'WP';
+
+        $formattedParts = [];
+        foreach ($dates as $dateStr) {
+            $carbonDate = \Carbon\CarbonImmutable::parse($dateStr);
+            $formattedDate = $carbonDate->format('M d, Y');
+
+            $payStatus = strtoupper((string) ($datePayStatusMap[$dateStr] ?? $defaultPayTag));
+            $payTag = ($payStatus === 'WOP' || $payStatus === 'WITHOUT_PAY') ? 'WOP' : 'WP';
+
+            $coverage = strtoupper((string) ($dateCoverageMap[$dateStr] ?? 'FULL_DAY'));
+            $portion = strtoupper((string) ($dateHalfDayPortionMap[$dateStr] ?? ''));
+
+            $timeTag = '';
+            if (
+                str_contains($coverage, 'HALF')
+                || str_contains($portion, 'AM')
+                || str_contains($portion, 'PM')
+                || str_contains($coverage, 'AM')
+                || str_contains($coverage, 'PM')
+            ) {
+                if (str_contains($portion, 'PM') || str_contains($coverage, 'PM')) {
+                    $timeTag = ' (PM)';
+                } else {
+                    $timeTag = ' (AM)';
+                }
+            }
+
+            $formattedParts[] = "{$formattedDate} ({$payTag}){$timeTag}";
+        }
+
+        return implode(', ', $formattedParts);
+    }
+
     public function cocBalanceReports(Request $request): JsonResponse
     {
         if ($response = $this->ensureHr($request)) {

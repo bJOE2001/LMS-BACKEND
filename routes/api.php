@@ -286,6 +286,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::get('/cto-availment', [HRReportController::class, 'ctoAvailmentReports']);
             Route::get('/coc-balances', [HRReportController::class, 'cocBalanceReports']);
             Route::get('/leave-availment', [HRReportController::class, 'leaveAvailmentReports']);
+            Route::get('/adjustment-requests', [HRReportController::class, 'leaveAdjustmentReports']);
             Route::get('/summary', [HRReportController::class, 'getSummaryStats']);
             Route::get('/departments', [HRReportController::class, 'getDepartmentStats']);
             Route::get('/leave-types', [HRReportController::class, 'getLeaveTypeStats']);
