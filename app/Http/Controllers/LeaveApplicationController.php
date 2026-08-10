@@ -7413,6 +7413,31 @@ class LeaveApplicationController extends Controller
             : "HR:{$hr->id}";
     }
 
+    /**
+     * Read the request_kind directly from the raw edit request payload.
+     *
+     * normalizePendingUpdatePayload strips request_kind from its output,
+     * so this reads from the model attribute to preserve HR_APPLICATION_EDIT.
+     */
+    private function resolveEditRequestPayloadRequestKind(LeaveApplicationUpdateRequest $editRequest): ?string
+    {
+        $payload = $editRequest->requested_payload;
+        if (is_string($payload)) {
+            $decoded = json_decode($payload, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $payload = $decoded;
+            }
+        }
+
+        if (! is_array($payload)) {
+            return null;
+        }
+
+        $kind = trim((string) ($payload['request_kind'] ?? ''));
+
+        return $kind !== '' ? $kind : null;
+    }
+
     private function formatHrApplicationEditRequest(LeaveApplicationUpdateRequest $editRequest): array
     {
         $application = $editRequest->leaveApplication;
@@ -7719,7 +7744,7 @@ class LeaveApplicationController extends Controller
                         'previous_pay_mode' => $prevPayMode,
                         'previous_without_pay_days' => $prevWopDays,
                         'previous_selected_date_pay_status' => $prevDatePayStatus,
-                        'request_kind' => $existingPayload['request_kind'] ?? LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE,
+                        'request_kind' => $this->resolveEditRequestPayloadRequestKind($editRequest) ?? LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE,
                         'start_date' => $targetStartDate,
                         'end_date' => $targetEndDate,
                         'total_days' => $targetTotalDays,
@@ -10473,6 +10498,7 @@ class LeaveApplicationController extends Controller
             'without_pay' => $withoutPay,
             'with_pay' => ! $withoutPay,
             'action_type' => $actionType,
+            'request_kind' => $this->trimNullableString($payload['request_kind'] ?? null),
             'is_monetization' => $isMonetization,
             'attachment_required' => $attachmentRequired,
             'attachment_submitted' => $attachmentSubmitted,
