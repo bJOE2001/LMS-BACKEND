@@ -1108,8 +1108,8 @@ class EmployeeController extends Controller
                     continue;
                 }
 
-                $restorationDate = $restoration->start_date?->toDateString()
-                    ?? $restoration->created_at?->toDateString();
+                $restorationDate = $restoration->created_at?->toDateString()
+                    ?? $restoration->start_date?->toDateString();
                 if ($restorationDate === null) {
                     continue;
                 }
@@ -4483,7 +4483,6 @@ class EmployeeController extends Controller
             $leaveBalance = LeaveBalance::query()
                 ->whereIn('employee_control_no', $controlNoCandidates)
                 ->where('leave_type_id', $targetTypeId)
-                ->where('year', $restorationYear)
                 ->first();
 
             if (! $leaveBalance) {

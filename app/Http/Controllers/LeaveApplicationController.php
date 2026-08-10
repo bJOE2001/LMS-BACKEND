@@ -2880,7 +2880,7 @@ class LeaveApplicationController extends Controller
 
         // isPendingRelease & isPendingReceive Logic
         $cycleStatuses = [LeaveApplicationUpdateRequest::STATUS_PENDING, LeaveApplicationUpdateRequest::STATUS_APPROVED];
-        $cycleSubquerySql = "lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status IN (?, ?)), '1970-01-01')";
+        $cycleSubquerySql = "lal.created_at > COALESCE((SELECT MAX(requested_at) FROM {$updatesTable} req WHERE req.leave_application_id = {$appsTable}.id AND req.status IN (?, ?) AND req.requested_payload NOT LIKE '%\"request_kind\":\"HR_APPLICATION_EDIT\"%'), '1970-01-01')";
 
         if ($pendingReleaseOnly) {
             $query->whereExists(function ($sub) use ($logsTable, $appsTable, $cycleSubquerySql, $cycleStatuses) {
@@ -7590,62 +7590,6 @@ class LeaveApplicationController extends Controller
                 $vacationLeaveTypeId,
                 $balanceConflictError
             ): void {
-                if ($editRequest instanceof LeaveApplicationUpdateRequest && $editRequest->status === LeaveApplicationUpdateRequest::STATUS_PENDING) {
-                    $existingPayload = $this->normalizePendingUpdatePayload($editRequest->requested_payload) ?? [];
-                    $isWithoutPay = $targetWithoutPayDays > 0.0 || $targetPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
-
-                    $prevPayMode = $existingPayload['previous_pay_mode']
-                        ?? $existingPayload['pay_mode']
-                        ?? $app->pay_mode;
-                    $prevWopDays = $existingPayload['previous_without_pay_days']
-                        ?? $existingPayload['without_pay_days']
-                        ?? $app->without_pay_days;
-                    $prevDatePayStatus = $existingPayload['previous_selected_date_pay_status']
-                        ?? $existingPayload['selected_date_pay_status']
-                        ?? $app->selected_date_pay_status;
-
-                    $updatedPayload = array_merge($existingPayload, [
-                        'previous_pay_mode' => $prevPayMode,
-                        'previous_without_pay_days' => $prevWopDays,
-                        'previous_selected_date_pay_status' => $prevDatePayStatus,
-                        'request_kind' => $existingPayload['request_kind'] ?? LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE,
-                        'start_date' => $targetStartDate,
-                        'end_date' => $targetEndDate,
-                        'total_days' => $targetTotalDays,
-                        'deductible_days' => $targetDeductibleDays,
-                        'without_pay_days' => $targetWithoutPayDays,
-                        'selected_dates' => $targetSelectedDates,
-                        'selected_date_pay_status' => is_array($payload['selected_date_pay_status'] ?? null)
-                            ? $payload['selected_date_pay_status']
-                            : null,
-                        'selected_date_coverage' => is_array($payload['selected_date_coverage'] ?? null)
-                            ? $payload['selected_date_coverage']
-                            : null,
-                        'selected_date_half_day_portion' => is_array($payload['selected_date_half_day_portion'] ?? null)
-                            ? $payload['selected_date_half_day_portion']
-                            : null,
-                        'pay_mode' => $targetPayMode,
-                        'pay_status' => $isWithoutPay ? 'Without Pay' : 'With Pay',
-                        'without_pay' => $isWithoutPay,
-                        'with_pay' => ! $isWithoutPay,
-                    ]);
-
-                    $editRequest->update([
-                        'requested_payload' => $updatedPayload,
-                        'review_remarks' => $reviewRemarks ?? 'HR updated requested dates.',
-                    ]);
-
-                    LeaveApplicationLog::create([
-                        'leave_application_id' => $app->id,
-                        'action' => LeaveApplicationLog::ACTION_HR_APPLICATION_EDITED,
-                        'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
-                        'performed_by_id' => $hr->id,
-                        'remarks' => $reviewRemarks ?? $reason ?? 'HR updated pending requested dates.',
-                        'created_at' => now(),
-                    ]);
-
-                    return;
-                }
 
                 if ($sourceDeductsBalance && $sourceDeductibleDays > 0.0) {
                     $this->refundApplicationTrackedDeductions(
@@ -7759,7 +7703,23 @@ class LeaveApplicationController extends Controller
 
                 if ($editRequest instanceof LeaveApplicationUpdateRequest && $editRequest->status === LeaveApplicationUpdateRequest::STATUS_PENDING) {
                     $existingPayload = $this->normalizePendingUpdatePayload($editRequest->requested_payload) ?? [];
+                    $isWithoutPay = $targetWithoutPayDays > 0.0 || $targetPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
+
+                    $prevPayMode = $existingPayload['previous_pay_mode']
+                        ?? $existingPayload['pay_mode']
+                        ?? $app->pay_mode;
+                    $prevWopDays = $existingPayload['previous_without_pay_days']
+                        ?? $existingPayload['without_pay_days']
+                        ?? $app->without_pay_days;
+                    $prevDatePayStatus = $existingPayload['previous_selected_date_pay_status']
+                        ?? $existingPayload['selected_date_pay_status']
+                        ?? $app->selected_date_pay_status;
+
                     $updatedPayload = array_merge($existingPayload, [
+                        'previous_pay_mode' => $prevPayMode,
+                        'previous_without_pay_days' => $prevWopDays,
+                        'previous_selected_date_pay_status' => $prevDatePayStatus,
+                        'request_kind' => $existingPayload['request_kind'] ?? LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE,
                         'start_date' => $targetStartDate,
                         'end_date' => $targetEndDate,
                         'total_days' => $targetTotalDays,
@@ -7776,11 +7736,17 @@ class LeaveApplicationController extends Controller
                             ? $payload['selected_date_half_day_portion']
                             : null,
                         'pay_mode' => $targetPayMode,
+                        'pay_status' => $isWithoutPay ? 'Without Pay' : 'With Pay',
+                        'without_pay' => $isWithoutPay,
+                        'with_pay' => ! $isWithoutPay,
                     ]);
 
                     $editRequest->update([
                         'requested_payload' => $updatedPayload,
                         'review_remarks' => $reviewRemarks ?? 'HR updated requested dates.',
+                        'status' => LeaveApplicationUpdateRequest::STATUS_APPROVED,
+                        'reviewed_by_hr_id' => $hr->id,
+                        'reviewed_at' => now(),
                     ]);
                 }
 
@@ -9237,6 +9203,16 @@ class LeaveApplicationController extends Controller
             ], true)
         ) {
             return LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL;
+        }
+
+        if (
+            in_array($normalized, [
+                self::HR_APPLICATION_EDIT_REQUEST_KIND,
+                'HR_EDIT',
+                'HR_APPLICATION_EDIT_REQUEST',
+            ], true)
+        ) {
+            return self::HR_APPLICATION_EDIT_REQUEST_KIND;
         }
 
         return LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE;
