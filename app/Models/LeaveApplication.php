@@ -293,6 +293,11 @@ class LeaveApplication extends Model
         return $this->hasMany(LeaveApplicationLog::class);
     }
 
+    public function printLogs(): HasMany
+    {
+        return $this->hasMany(LeaveApplicationPrintLog::class, 'leave_application_id');
+    }
+
     public function updateRequests(): HasMany
     {
         return $this->hasMany(LeaveApplicationUpdateRequest::class, 'leave_application_id');

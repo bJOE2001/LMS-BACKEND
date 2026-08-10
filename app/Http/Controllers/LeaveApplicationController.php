@@ -12,6 +12,7 @@ use App\Models\HRAccount;
 use App\Models\HrisEmployee;
 use App\Models\LeaveApplication;
 use App\Models\LeaveApplicationLog;
+use App\Models\LeaveApplicationPrintLog;
 use App\Models\LeaveApplicationUpdateRequest;
 use App\Models\LeaveBalance;
 use App\Models\LeaveBalanceAccrualHistory;
@@ -16959,5 +16960,106 @@ class LeaveApplicationController extends Controller
         if ($normalizedHalfDayPortion !== null) {
             $request->merge(['selected_date_half_day_portion' => $normalizedHalfDayPortion]);
         }
+    }
+
+    /**
+     * Log a print event for a leave application form (Sanctum auth).
+     */
+    public function logPrint(Request $request, int $id): JsonResponse
+    {
+        $app = LeaveApplication::find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $user = $request->user();
+        $performerType = LeaveApplicationPrintLog::PERFORMER_EMPLOYEE;
+        $performerId = null;
+        $performerName = null;
+
+        if ($user instanceof HRAccount || $user instanceof DepartmentAdmin) {
+            $performerType = LeaveApplicationPrintLog::PERFORMER_ADMIN;
+            $performerId = (string) $user->id;
+            $performerName = $user->name ?? $user->username ?? $user->full_name ?? null;
+        } elseif ($user instanceof HrisEmployee) {
+            $performerType = LeaveApplicationPrintLog::PERFORMER_EMPLOYEE;
+            $performerId = (string) ($user->control_no ?? $user->id);
+            $performerName = $user->full_name ?? trim(($user->first_name ?? '').' '.($user->last_name ?? ''));
+        } elseif ($user) {
+            $performerId = (string) ($user->id ?? '');
+            $performerName = $user->name ?? null;
+        }
+
+        if ($request->filled('printed_by_name') && empty($performerName)) {
+            $performerName = (string) $request->input('printed_by_name');
+        }
+
+        $printLog = LeaveApplicationPrintLog::create([
+            'leave_application_id' => $app->id,
+            'printed_by_type' => $performerType,
+            'printed_by_id' => $performerId,
+            'printed_by_name' => $performerName,
+            'ip_address' => $request->ip(),
+            'user_agent' => $request->userAgent(),
+            'remarks' => $request->input('remarks'),
+            'created_at' => now(),
+        ]);
+
+        return response()->json([
+            'message' => 'Leave application print logged successfully.',
+            'data' => $printLog,
+        ], 201);
+    }
+
+    /**
+     * Log a print event for a leave application form via ERMS.
+     */
+    public function ermsLogPrint(Request $request, int $id): JsonResponse
+    {
+        $this->mergeEmployeeControlNoInput($request);
+
+        $app = LeaveApplication::find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $performerId = (string) ($request->input('printed_by_id') ?? $request->input('employee_control_no') ?? $request->input('control_no') ?? $app->employee_control_no);
+        $performerName = (string) ($request->input('printed_by_name') ?? $app->employee_name);
+
+        $printLog = LeaveApplicationPrintLog::create([
+            'leave_application_id' => $app->id,
+            'printed_by_type' => LeaveApplicationPrintLog::PERFORMER_EMPLOYEE,
+            'printed_by_id' => $performerId,
+            'printed_by_name' => $performerName,
+            'ip_address' => $request->ip(),
+            'user_agent' => $request->userAgent(),
+            'remarks' => $request->input('remarks', 'Printed via ERMS'),
+            'created_at' => now(),
+        ]);
+
+        return response()->json([
+            'message' => 'ERMS leave application print logged successfully.',
+            'data' => $printLog,
+        ], 201);
+    }
+
+    /**
+     * Retrieve print logs for a leave application.
+     */
+    public function hrPrintLogs(Request $request, int $id): JsonResponse
+    {
+        $app = LeaveApplication::find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $printLogs = LeaveApplicationPrintLog::where('leave_application_id', $app->id)
+            ->orderBy('created_at', 'desc')
+            ->get();
+
+        return response()->json([
+            'status' => 'success',
+            'data' => $printLogs,
+        ]);
     }
 }

@@ -73,6 +73,7 @@ Route::prefix('erms')->middleware('erms.auth')->group(function () {
     Route::post('/apply-leave/withdraw-request', [LeaveApplicationController::class, 'ermsWithdrawRequest']);
     Route::post('/apply-leave/{id}/withdraw-request', [LeaveApplicationController::class, 'ermsWithdrawRequest']);
     Route::post('/leave-applications/{id}/withdraw-request', [LeaveApplicationController::class, 'ermsWithdrawRequest']);
+    Route::post('/leave-applications/{id}/log-print', [LeaveApplicationController::class, 'ermsLogPrint']);
     Route::get('/admin/department-head', [EmployeeController::class, 'ermsDepartmentHead']);
     Route::get('/city-administrator', [EmployeeController::class, 'ermsCityAdministrator']);
     Route::get('/city-mayor', [EmployeeController::class, 'ermsCityMayor']);
@@ -108,6 +109,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
     Route::post('/settings/password/update', [SettingsController::class, 'updatePassword']);
     Route::get('/settings/signatories', [SettingsController::class, 'getSignatories']);
     Route::post('/settings/signatories/chrmo-leave-in-charge/update', [SettingsController::class, 'updateChrmoLeaveInCharge']);
+    Route::post('/leave-applications/{id}/log-print', [LeaveApplicationController::class, 'logPrint']);
     Route::get('/illnesses/options', [HRIllnessLibraryController::class, 'options']);
     Route::get('/special-privilege-reasons/options', [SpecialPrivilegeReasonController::class, 'options']);
 
@@ -232,6 +234,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::get('/leave-applications', [LeaveApplicationController::class, 'hrIndex']);
             Route::get('/leave-applications/{id}', [LeaveApplicationController::class, 'hrShow']);
             Route::get('/leave-applications/{id}/attachment', [LeaveApplicationController::class, 'hrViewAttachment']);
+            Route::get('/leave-applications/{id}/print-logs', [LeaveApplicationController::class, 'hrPrintLogs']);
         });
 
         Route::middleware('hr.module:receiving,applications')->group(function () {
