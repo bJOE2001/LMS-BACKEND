@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\Department;
 use App\Models\DepartmentAdmin;
+use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
 use App\Models\LeaveApplication;
@@ -262,6 +263,10 @@ class HRUserManagementController extends Controller
             'department:id,name',
         ]);
 
+        if ($employee) {
+            $this->ensureEmployeeAssignedToDepartment($employee, (int) $department->id, (int) $admin->id);
+        }
+
         return response()->json([
             'message' => $isGuest
                 ? 'Guest department admin account created successfully. Password must be changed on first login.'
@@ -367,6 +372,10 @@ class HRUserManagementController extends Controller
             'department:id,name',
         ]);
 
+        if ($employee) {
+            $this->ensureEmployeeAssignedToDepartment($employee, (int) $department->id, (int) $admin->id);
+        }
+
         return response()->json([
             'message' => $employeeChanged
                 ? 'Department admin reassigned successfully. Default password is employee birthdate (MMDDYY).'
@@ -414,6 +423,10 @@ class HRUserManagementController extends Controller
         $admin->load([
             'department:id,name',
         ]);
+
+        if ($employee && $admin->department_id) {
+            $this->ensureEmployeeAssignedToDepartment($employee, (int) $admin->department_id, (int) $admin->id);
+        }
 
         return response()->json([
             'message' => 'Office admin account reactivated successfully. Default password is employee birthdate (MMDDYY).',
@@ -1056,5 +1069,40 @@ class HRUserManagementController extends Controller
         return LeaveBalance::query()
             ->whereIn('employee_control_no', $candidateEmployeeControlNos)
             ->exists();
+    }
+
+    /**
+     * Automatically create or update EmployeeDepartmentAssignment when an admin is created/updated.
+     */
+    private function ensureEmployeeAssignedToDepartment(?object $employee, int $departmentId, ?int $assignedByAdminId = null): void
+    {
+        if (! $employee || empty($employee->control_no) || $departmentId <= 0) {
+            return;
+        }
+
+        $controlNo = trim((string) $employee->control_no);
+        $existingAssignment = EmployeeDepartmentAssignment::query()
+            ->where('employee_control_no', $controlNo)
+            ->first();
+
+        $assignmentFields = [
+            'department_id' => $departmentId,
+            'assigned_by_department_admin_id' => $assignedByAdminId,
+            'assigned_at' => now(),
+            'surname' => isset($employee->surname) ? trim((string) $employee->surname) : null,
+            'firstname' => isset($employee->firstname) ? trim((string) $employee->firstname) : null,
+            'middlename' => isset($employee->middlename) ? trim((string) $employee->middlename) : null,
+            'department_acronym' => isset($employee->officeAcronym) ? trim((string) $employee->officeAcronym) : (isset($employee->hrisOfficeAcronym) ? trim((string) $employee->hrisOfficeAcronym) : null),
+        ];
+
+        if ($existingAssignment) {
+            $existingAssignment->fill($assignmentFields);
+            $existingAssignment->save();
+        } else {
+            EmployeeDepartmentAssignment::query()->create([
+                'employee_control_no' => $controlNo,
+                ...$assignmentFields,
+            ]);
+        }
     }
 }

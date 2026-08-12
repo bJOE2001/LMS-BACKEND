@@ -8,12 +8,12 @@ use App\Models\DepartmentHead;
 use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
+use App\Models\LateDeduction;
 use App\Models\LeaveApplication;
 use App\Models\LeaveApplicationLog;
 use App\Models\LeaveBalance;
 use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveRestoration;
-use App\Models\LateDeduction;
 use App\Models\LeaveType;
 use App\Services\RecycleBinService;
 use App\Services\WorkScheduleService;
@@ -2507,6 +2507,16 @@ class EmployeeController extends Controller
             ->values()
             ->all();
 
+        $adminControlNos = DepartmentAdmin::query()
+            ->where('department_id', $departmentId)
+            ->whereNotNull('employee_control_no')
+            ->pluck('employee_control_no')
+            ->map(fn (mixed $value): string => trim((string) $value))
+            ->filter(fn (string $value): bool => $value !== '')
+            ->all();
+
+        $controlNos = array_values(array_unique(array_merge($controlNos, $adminControlNos)));
+
         if ($controlNos === []) {
             return collect();
         }
@@ -4579,6 +4589,7 @@ class EmployeeController extends Controller
             'restoration' => $restoration->load(['leaveType', 'restoredByHr']),
         ], 201);
     }
+
     public function deductLateLeave(Request $request, string $controlNo): JsonResponse
     {
         $hr = $request->user();
@@ -4602,35 +4613,37 @@ class EmployeeController extends Controller
 
         $trackedTypeIdsByKey = $this->resolveLedgerTrackedLeaveTypeIds();
         $targetLeave = $validated['target_leave'];
-        $targetLeaveTypeId = $targetLeave === 'SL' 
-            ? ($trackedTypeIdsByKey['sick'] ?? null) 
+        $targetLeaveTypeId = $targetLeave === 'SL'
+            ? ($trackedTypeIdsByKey['sick'] ?? null)
             : ($trackedTypeIdsByKey['vacation'] ?? null);
-        
+
         if (! $targetLeaveTypeId) {
             $leaveName = $targetLeave === 'SL' ? 'Sick Leave' : 'Vacation Leave';
+
             return response()->json(['message' => "{$leaveName} type not configured."], 500);
         }
 
         $minutes = (int) $validated['minutes_late'];
         $deductionAmount = round($minutes / 480, 3);
-        
+
         if ($deductionAmount <= 0) {
             return response()->json(['message' => 'Deduction amount is too small.'], 422);
         }
 
         $controlNoCandidates = $this->buildLedgerControlNoCandidates($controlNo, $employee);
-        
+
         $leaveBalance = LeaveBalance::query()
             ->whereIn('employee_control_no', $controlNoCandidates)
             ->where('leave_type_id', $targetLeaveTypeId)
             ->first();
-            
+
         $currentBalance = $leaveBalance ? (float) $leaveBalance->balance : 0.0;
-        
+
         if ($currentBalance < $deductionAmount) {
             $leaveName = $targetLeave === 'SL' ? 'Sick Leave' : 'Vacation Leave';
+
             return response()->json([
-                'message' => "Cannot proceed. Insufficient {$leaveName} balance. Current balance is {$currentBalance} but deduction requires {$deductionAmount}."
+                'message' => "Cannot proceed. Insufficient {$leaveName} balance. Current balance is {$currentBalance} but deduction requires {$deductionAmount}.",
             ], 422);
         }
 
@@ -4638,13 +4651,13 @@ class EmployeeController extends Controller
         if ($particularsText === '') {
             $particularsText = "Late Deduction ($minutes minutes)";
         }
-        
+
         $selectedDates = $validated['selected_dates'];
         sort($selectedDates);
         $startDate = $selectedDates[0];
         $endDate = $selectedDates[count($selectedDates) - 1];
-        
-        $deductionRecord = DB::transaction(function () use ($controlNo, $validated, $hr, $controlNoCandidates, $employee, $startDate, $endDate, $selectedDates, $particularsText, $deductionAmount, $targetLeaveTypeId, $leaveBalance, $minutes): LateDeduction {
+
+        $deductionRecord = DB::transaction(function () use ($controlNo, $validated, $hr, $startDate, $endDate, $selectedDates, $particularsText, $deductionAmount, $targetLeaveTypeId, $leaveBalance, $minutes): LateDeduction {
             $record = LateDeduction::create([
                 'employee_control_no' => (string) $controlNo,
                 'target_leave_type_id' => (int) $targetLeaveTypeId,

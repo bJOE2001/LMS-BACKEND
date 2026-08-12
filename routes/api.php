@@ -15,6 +15,7 @@ use App\Http\Controllers\HRReportController;
 use App\Http\Controllers\HRUserManagementController;
 use App\Http\Controllers\HRWorkScheduleController;
 use App\Http\Controllers\LeaveApplicationController;
+use App\Http\Controllers\LeaveApplicationPrintLogController;
 use App\Http\Controllers\LeaveBalanceAccrualController;
 use App\Http\Controllers\NotificationController;
 use App\Http\Controllers\SettingsController;
@@ -152,9 +153,14 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         // Apply leave on behalf of employee
         Route::get('/employees-for-leave', [LeaveApplicationController::class, 'adminEmployees']);
         Route::post('/leave-applications', [LeaveApplicationController::class, 'adminStore']);
+
+        // Application Print Logs
+        Route::get('/application-print-logs', [LeaveApplicationPrintLogController::class, 'adminIndex']);
     });
 
     Route::middleware('hr')->prefix('hr')->group(function () {
+        Route::get('/application-print-logs', [LeaveApplicationPrintLogController::class, 'hrIndex']);
+
         Route::middleware('hr.module:employee_management')->group(function () {
             // Employee management
             Route::get('/employee-options', [EmployeeController::class, 'employeeOptions']);
