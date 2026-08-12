@@ -13,6 +13,7 @@ use App\Models\LeaveApplicationLog;
 use App\Models\LeaveBalance;
 use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveRestoration;
+use App\Models\LateDeduction;
 use App\Models\LeaveType;
 use App\Services\RecycleBinService;
 use App\Services\WorkScheduleService;
@@ -1158,6 +1159,78 @@ class EmployeeController extends Controller
                     'category' => 'earned',
                     'amount' => $restoredDays,
                     'balance_delta' => $restoredDays,
+                ];
+            }
+
+            // Late Deductions
+            $lateDeductions = LateDeduction::query()
+                ->whereIn('employee_control_no', $controlNoCandidates)
+                ->orderByDesc('start_date')
+                ->orderByDesc('id')
+                ->get();
+
+            foreach ($lateDeductions as $deduction) {
+                $typeId = (int) $deduction->target_leave_type_id;
+                $typeKey = $typeIdToKey[$typeId] ?? null;
+                if ($typeKey === null) {
+                    continue;
+                }
+                $balanceKey = $balanceKeyByTypeId[$typeId]
+                    ?? $this->resolveLedgerRunningBalanceKey($typeKey, $typeId);
+                if (! is_string($balanceKey) || $balanceKey === '') {
+                    continue;
+                }
+
+                $deductionDate = $deduction->created_at?->toDateString()
+                    ?? $deduction->start_date?->toDateString();
+                if ($deductionDate === null) {
+                    continue;
+                }
+
+                $deductedDays = round((float) ($deduction->deducted_days ?? 0), 3);
+                if ($deductedDays <= 0.0) {
+                    continue;
+                }
+
+                $selectedDates = $this->resolveLedgerInclusiveDates(
+                    $deduction->selected_dates,
+                    $deduction->start_date?->toDateString(),
+                    $deduction->end_date?->toDateString()
+                );
+
+                $particulars = trim((string) ($deduction->particulars ?: 'Late Deduction'));
+
+                $actionTaken = sprintf(
+                    'Late Deduction (%s)',
+                    $deduction->created_at?->format('F j, Y') ?? $deductionDate
+                );
+
+                $otherTypeCode = $typeKey === 'other'
+                    ? ($otherTypeCodeById[$typeId] ?? null)
+                    : null;
+                $leaveTypeCode = $this->resolveLedgerTypeCode(
+                    $typeKey,
+                    is_string($otherTypeCode) ? $otherTypeCode : null
+                );
+
+                $transactions[] = [
+                    'row_id' => 'late-deduction-'.(int) $deduction->id,
+                    'merge_key' => 'late-deduction-'.(int) $deduction->id,
+                    'type_key' => $typeKey,
+                    'balance_key' => $balanceKey,
+                    'leave_type_code' => $leaveTypeCode,
+                    'transaction_date' => $deductionDate,
+                    'sort_date' => $deductionDate,
+                    'sort_timestamp' => (string) ($deduction->created_at?->toIso8601String() ?? $deductionDate),
+                    'particulars' => $particulars,
+                    'action_taken' => $actionTaken,
+                    'inclusive_start_date' => $deduction->start_date?->toDateString(),
+                    'inclusive_end_date' => $deduction->end_date?->toDateString(),
+                    'inclusive_dates' => $selectedDates,
+                    'selected_dates' => $selectedDates,
+                    'category' => 'deduction_without_pay',
+                    'amount' => $deductedDays,
+                    'balance_delta' => -$deductedDays,
                 ];
             }
 
@@ -4504,6 +4577,107 @@ class EmployeeController extends Controller
         return response()->json([
             'message' => 'Leave credits restored successfully.',
             'restoration' => $restoration->load(['leaveType', 'restoredByHr']),
+        ], 201);
+    }
+    public function deductLateLeave(Request $request, string $controlNo): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $employee = HrisEmployee::findByControlNo($controlNo);
+        if (! $employee) {
+            return response()->json(['message' => 'Employee not found.'], 404);
+        }
+
+        $validated = $request->validate([
+            'target_leave' => ['required', 'string', 'in:VL,SL'],
+            'minutes_late' => ['required', 'integer', 'min:1'],
+            'particulars' => ['nullable', 'string', 'max:255'],
+            'selected_dates' => ['required', 'array', 'min:1'],
+            'selected_dates.*' => ['required', 'date'],
+            'remarks' => ['nullable', 'string', 'max:1000'],
+        ]);
+
+        $trackedTypeIdsByKey = $this->resolveLedgerTrackedLeaveTypeIds();
+        $targetLeave = $validated['target_leave'];
+        $targetLeaveTypeId = $targetLeave === 'SL' 
+            ? ($trackedTypeIdsByKey['sick'] ?? null) 
+            : ($trackedTypeIdsByKey['vacation'] ?? null);
+        
+        if (! $targetLeaveTypeId) {
+            $leaveName = $targetLeave === 'SL' ? 'Sick Leave' : 'Vacation Leave';
+            return response()->json(['message' => "{$leaveName} type not configured."], 500);
+        }
+
+        $minutes = (int) $validated['minutes_late'];
+        $deductionAmount = round($minutes / 480, 3);
+        
+        if ($deductionAmount <= 0) {
+            return response()->json(['message' => 'Deduction amount is too small.'], 422);
+        }
+
+        $controlNoCandidates = $this->buildLedgerControlNoCandidates($controlNo, $employee);
+        
+        $leaveBalance = LeaveBalance::query()
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->where('leave_type_id', $targetLeaveTypeId)
+            ->first();
+            
+        $currentBalance = $leaveBalance ? (float) $leaveBalance->balance : 0.0;
+        
+        if ($currentBalance < $deductionAmount) {
+            $leaveName = $targetLeave === 'SL' ? 'Sick Leave' : 'Vacation Leave';
+            return response()->json([
+                'message' => "Cannot proceed. Insufficient {$leaveName} balance. Current balance is {$currentBalance} but deduction requires {$deductionAmount}."
+            ], 422);
+        }
+
+        $particularsText = trim((string) ($validated['particulars'] ?? ''));
+        if ($particularsText === '') {
+            $particularsText = "Late Deduction ($minutes minutes)";
+        }
+        
+        $selectedDates = $validated['selected_dates'];
+        sort($selectedDates);
+        $startDate = $selectedDates[0];
+        $endDate = $selectedDates[count($selectedDates) - 1];
+        
+        $deductionRecord = DB::transaction(function () use ($controlNo, $validated, $hr, $controlNoCandidates, $employee, $startDate, $endDate, $selectedDates, $particularsText, $deductionAmount, $targetLeaveTypeId, $leaveBalance, $minutes): LateDeduction {
+            $record = LateDeduction::create([
+                'employee_control_no' => (string) $controlNo,
+                'target_leave_type_id' => (int) $targetLeaveTypeId,
+                'particulars' => $particularsText,
+                'start_date' => $startDate,
+                'end_date' => $endDate,
+                'selected_dates' => $selectedDates,
+                'minutes_late' => $minutes,
+                'deducted_days' => $deductionAmount,
+                'deducted_by_hr_id' => (int) $hr->id,
+                'remarks' => isset($validated['remarks']) && trim((string) $validated['remarks']) !== '' ? trim((string) $validated['remarks']) : null,
+            ]);
+
+            $restorationYear = (int) (Carbon::parse($startDate)->year ?? now()->year);
+
+            if (! $leaveBalance) {
+                $leaveBalance = LeaveBalance::create([
+                    'employee_control_no' => (string) $controlNo,
+                    'leave_type_id' => $targetLeaveTypeId,
+                    'year' => $restorationYear,
+                    'balance' => -$deductionAmount,
+                ]);
+            } else {
+                $leaveBalance->balance -= $deductionAmount;
+                $leaveBalance->save();
+            }
+
+            return $record;
+        });
+
+        return response()->json([
+            'message' => 'Late deduction successfully applied.',
+            'deduction' => $deductionRecord->load(['leaveType', 'deductedByHr']),
         ], 201);
     }
 }

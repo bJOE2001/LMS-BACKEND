@@ -167,6 +167,99 @@ class HRReportController extends Controller
         return response()->json($stats->values());
     }
 
+    public function applicationProcessingReports(Request $request): JsonResponse
+    {
+        if ($response = $this->ensureHr($request)) {
+            return $response;
+        }
+
+        $validated = $request->validate([
+            'from_date' => ['nullable', 'date'],
+            'to_date' => ['nullable', 'date', 'after_or_equal:from_date'],
+            'action_type' => ['nullable', 'string', 'in:all,received,certified,cmo_reviewed,released'],
+        ]);
+
+        $fromDate = $validated['from_date'] ?? now()->startOfMonth()->toDateString();
+        $toDate = $validated['to_date'] ?? now()->endOfMonth()->toDateString();
+        $start = $fromDate . ' 00:00:00';
+        $end = $toDate . ' 23:59:59';
+        
+        $actionType = $validated['action_type'] ?? 'all';
+
+        $actionMap = [
+            'received' => \App\Models\LeaveApplicationLog::ACTION_HR_RECEIVED,
+            'certified' => \App\Models\LeaveApplicationLog::ACTION_HR_APPROVED,
+            'cmo_reviewed' => \App\Models\LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED,
+            'released' => \App\Models\LeaveApplicationLog::ACTION_HR_RELEASED,
+        ];
+
+        $targetActions = $actionType === 'all'
+            ? array_values($actionMap)
+            : [$actionMap[$actionType]];
+
+        $applications = LeaveApplication::query()
+            ->select([
+                'id',
+                'applicant_admin_id',
+                'employee_control_no',
+                'employee_name',
+                'leave_type_id',
+                'start_date',
+                'end_date',
+                'selected_dates',
+                'total_days',
+                'status',
+                'remarks',
+                'created_at',
+            ])
+            ->with([
+                'leaveType:id,name',
+                'applicantAdmin:id,department_id,employee_control_no,full_name',
+                'applicantAdmin.department:id,name',
+                'logs' => function ($q) use ($start, $end, $targetActions) {
+                    $q->whereIn('action', $targetActions)
+                      ->whereBetween('created_at', [$start, $end]);
+                }
+            ])
+            ->whereHas('logs', function (Builder $q) use ($start, $end, $targetActions) {
+                $q->whereIn('action', $targetActions)
+                  ->whereBetween('created_at', [$start, $end]);
+            })
+            ->orderBy('id', 'desc')
+            ->get();
+
+        // Transform applications into flat rows for the frontend report
+        // If an application has multiple matching logs (e.g. received AND released in the same date range when action_type=all),
+        // we map each log as a separate row in the report.
+        $rows = [];
+        foreach ($applications as $app) {
+            foreach ($app->logs as $log) {
+                $actionLabel = array_search($log->action, $actionMap) ?: 'unknown';
+                if ($actionLabel === 'cmo_reviewed') $actionLabel = 'CMO/CVMO Reviewed';
+                else $actionLabel = ucfirst($actionLabel);
+                
+                $rows[] = [
+                    'id' => $app->id . '-' . $log->id,
+                    'leave_application_id' => $app->id,
+                    'employee_control_no' => $app->employee_control_no,
+                    'employee_name' => $app->employee_name,
+                    'office_acronym' => $app->applicantAdmin?->department?->name ?? '',
+                    'leave_type_name' => $app->leaveType?->name ?? '',
+                    'inclusive_dates' => $app->selected_dates,
+                    'action' => $actionLabel,
+                    'date_action_taken' => $log->created_at->toIso8601String(),
+                ];
+            }
+        }
+
+        // Sort by date_action_taken descending
+        usort($rows, function($a, $b) {
+            return strtotime($b['date_action_taken']) - strtotime($a['date_action_taken']);
+        });
+
+        return response()->json($rows);
+    }
+
     /**
      * Generate report data based on filters.
      */
@@ -851,11 +944,11 @@ class HRReportController extends Controller
                     ? $payload['selected_dates']
                     : (is_array($application->selected_dates) ? $application->selected_dates : null);
 
-                $toPayMode = $application->pay_mode ?? $payload['pay_mode'];
-                $toPayStatusMap = $application->selected_date_pay_status ?? $payload['selected_date_pay_status'];
-                $toCoverageMap = $application->selected_date_coverage ?? $payload['selected_date_coverage'];
-                $toPortionMap = $application->selected_date_half_day_portion ?? $payload['selected_date_half_day_portion'];
-                $toWopDays = $application->without_pay_days ?? $payload['without_pay_days'];
+                $toPayMode = $application->pay_mode ?? ($payload['pay_mode'] ?? null);
+                $toPayStatusMap = $application->selected_date_pay_status ?? ($payload['selected_date_pay_status'] ?? null);
+                $toCoverageMap = $application->selected_date_coverage ?? ($payload['selected_date_coverage'] ?? null);
+                $toPortionMap = $application->selected_date_half_day_portion ?? ($payload['selected_date_half_day_portion'] ?? null);
+                $toWopDays = $application->without_pay_days ?? ($payload['without_pay_days'] ?? 0);
 
                 $toDatesFormatted = $this->formatLeaveDatesWithDetails(
                     $toStartDate,

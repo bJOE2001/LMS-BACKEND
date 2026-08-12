@@ -162,7 +162,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::get('/employees/{controlNo}/leave-balance-ledger', [EmployeeController::class, 'leaveCreditsLedger']);
             Route::get('/employees/{controlNo}/leave-credits-ledger', [EmployeeController::class, 'leaveCreditsLedger']);
             Route::post('/employees/{controlNo}/restore-leave-credits', [EmployeeController::class, 'restoreLeaveCredits']);
-
+            Route::post('/employees/{controlNo}/deduct-late-leave', [EmployeeController::class, 'deductLateLeave']);
             // Leave balance management
             Route::get('/leave-balances/available-types', [HRLeaveBalanceImportController::class, 'availableTypes']);
             Route::post('/leave-balances', [HRLeaveBalanceImportController::class, 'store']);
@@ -291,6 +291,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::get('/coc-balances', [HRReportController::class, 'cocBalanceReports']);
             Route::get('/leave-availment', [HRReportController::class, 'leaveAvailmentReports']);
             Route::get('/adjustment-requests', [HRReportController::class, 'leaveAdjustmentReports']);
+            Route::get('/application-processing', [HRReportController::class, 'applicationProcessingReports']);
             Route::get('/summary', [HRReportController::class, 'getSummaryStats']);
             Route::get('/departments', [HRReportController::class, 'getDepartmentStats']);
             Route::get('/leave-types', [HRReportController::class, 'getLeaveTypeStats']);
