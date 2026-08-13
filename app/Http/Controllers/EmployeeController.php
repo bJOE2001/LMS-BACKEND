@@ -1518,6 +1518,7 @@ class EmployeeController extends Controller
                         'category' => 'deduction_with_pay',
                         'amount' => $primaryWithPayAmount,
                         'balance_delta' => $isUsageOnlyOtherType ? 0.0 : -$primaryWithPayAmount,
+                        'is_usage_only' => $isUsageOnlyOtherType,
                     ];
                 }
 
@@ -1624,6 +1625,7 @@ class EmployeeController extends Controller
                         'category' => 'deduction_without_pay',
                         'amount' => $withoutPayAmount,
                         'balance_delta' => 0.0,
+                        'is_usage_only' => $isUsageOnlyOtherType,
                     ];
                 }
 
@@ -1709,6 +1711,7 @@ class EmployeeController extends Controller
                             'category' => 'earned',
                             'amount' => $primaryRestoredAmount,
                             'balance_delta' => $isUsageOnlyOtherType ? 0.0 : $primaryRestoredAmount,
+                            'is_usage_only' => $isUsageOnlyOtherType,
                             'suppress_display' => $isForcedLeave,
                         ];
                     }
@@ -1928,7 +1931,8 @@ class EmployeeController extends Controller
                     );
                 }
             } elseif ($displayTypeKey === 'other') {
-                if (! array_key_exists('other_balance', $ledgerRows[$rowIndex])) {
+                $isUsageOnly = (bool) ($transaction['is_usage_only'] ?? false);
+                if (! $isUsageOnly && ! array_key_exists('other_balance', $ledgerRows[$rowIndex])) {
                     $ledgerRows[$rowIndex]['other_balance'] = $currentBalance;
                 }
                 if ($category === 'earned') {
@@ -4647,15 +4651,16 @@ class EmployeeController extends Controller
             ], 422);
         }
 
-        $particularsText = trim((string) ($validated['particulars'] ?? ''));
-        if ($particularsText === '') {
-            $particularsText = "Late Deduction ($minutes minutes)";
-        }
-
         $selectedDates = $validated['selected_dates'];
         sort($selectedDates);
-        $startDate = $selectedDates[0];
-        $endDate = $selectedDates[count($selectedDates) - 1];
+        $firstDate = Carbon::parse($selectedDates[0]);
+        $startDate = $firstDate->copy()->startOfMonth()->toDateString();
+        $endDate = $firstDate->copy()->endOfMonth()->toDateString();
+
+        $particularsText = trim((string) ($validated['particulars'] ?? ''));
+        if ($particularsText === '') {
+            $particularsText = "Late Deduction ({$minutes} minutes)";
+        }
 
         $deductionRecord = DB::transaction(function () use ($controlNo, $validated, $hr, $startDate, $endDate, $selectedDates, $particularsText, $deductionAmount, $targetLeaveTypeId, $leaveBalance, $minutes): LateDeduction {
             $record = LateDeduction::create([
