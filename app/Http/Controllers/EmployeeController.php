@@ -1199,7 +1199,14 @@ class EmployeeController extends Controller
                     $deduction->end_date?->toDateString()
                 );
 
-                $particulars = trim((string) ($deduction->particulars ?: 'Late Deduction'));
+                $particulars = trim((string) ($deduction->particulars ?? ''));
+                if ($particulars === '' || $particulars === 'Late Deduction' || preg_match('/^Late Deduction\s*\(\d+\s*minutes?\)$/i', $particulars)) {
+                    $lateMinutes = (int) ($deduction->minutes_late ?? 0);
+                    $formattedLateDuration = $lateMinutes > 0
+                        ? $this->formatLedgerMinutes($lateMinutes)
+                        : $this->formatLedgerDaysHoursMinutes($deductedDays);
+                    $particulars = "LATE {$formattedLateDuration}";
+                }
 
                 $actionTaken = sprintf(
                     'Late Deduction (%s)',
@@ -1229,7 +1236,7 @@ class EmployeeController extends Controller
                     'inclusive_end_date' => $deduction->end_date?->toDateString(),
                     'inclusive_dates' => $selectedDates,
                     'selected_dates' => $selectedDates,
-                    'category' => 'deduction_without_pay',
+                    'category' => 'deduction_with_pay',
                     'amount' => $deductedDays,
                     'balance_delta' => -$deductedDays,
                 ];
@@ -3874,6 +3881,21 @@ class EmployeeController extends Controller
         return null;
     }
 
+    private function formatLedgerMinutes(int $totalMinutes): string
+    {
+        if ($totalMinutes <= 0) {
+            return '0-0-0';
+        }
+
+        $minutesPerDay = self::LEDGER_HOURS_PER_DAY * self::LEDGER_MINUTES_PER_HOUR;
+        $dayCount = intdiv($totalMinutes, $minutesPerDay);
+        $remainingMinutes = $totalMinutes % $minutesPerDay;
+        $hourCount = intdiv($remainingMinutes, self::LEDGER_MINUTES_PER_HOUR);
+        $minuteCount = $remainingMinutes % self::LEDGER_MINUTES_PER_HOUR;
+
+        return "{$dayCount}-{$hourCount}-{$minuteCount}";
+    }
+
     private function formatLedgerDaysHoursMinutes(float $days): string
     {
         $normalizedDays = round(max($days, 0.0), 4);
@@ -3886,17 +3908,8 @@ class EmployeeController extends Controller
             * self::LEDGER_HOURS_PER_DAY
             * self::LEDGER_MINUTES_PER_HOUR
         );
-        if ($totalMinutes <= 0) {
-            return '0-0-0';
-        }
 
-        $minutesPerDay = self::LEDGER_HOURS_PER_DAY * self::LEDGER_MINUTES_PER_HOUR;
-        $dayCount = intdiv($totalMinutes, $minutesPerDay);
-        $remainingMinutes = $totalMinutes % $minutesPerDay;
-        $hourCount = intdiv($remainingMinutes, self::LEDGER_MINUTES_PER_HOUR);
-        $minuteCount = $remainingMinutes % self::LEDGER_MINUTES_PER_HOUR;
-
-        return "{$dayCount}-{$hourCount}-{$minuteCount}";
+        return $this->formatLedgerMinutes($totalMinutes);
     }
 
     private function resolveLedgerInclusiveDates(
@@ -4738,7 +4751,8 @@ class EmployeeController extends Controller
 
         $particularsText = trim((string) ($validated['particulars'] ?? ''));
         if ($particularsText === '') {
-            $particularsText = "Late Deduction ({$minutes} minutes)";
+            $formattedLateDuration = $this->formatLedgerMinutes($minutes);
+            $particularsText = "LATE {$formattedLateDuration}";
         }
 
         $deductionRecord = DB::transaction(function () use ($controlNo, $validated, $hr, $startDate, $endDate, $selectedDates, $particularsText, $deductionAmount, $targetLeaveTypeId, $leaveBalance, $minutes): LateDeduction {
