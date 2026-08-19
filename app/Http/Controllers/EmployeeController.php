@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\COCApplication;
 use App\Models\Department;
 use App\Models\DepartmentAdmin;
 use App\Models\DepartmentHead;
@@ -1231,6 +1232,81 @@ class EmployeeController extends Controller
                     'category' => 'deduction_without_pay',
                     'amount' => $deductedDays,
                     'balance_delta' => -$deductedDays,
+                ];
+            }
+
+            // Approved COC Applications (Earned CTO Credits)
+            $approvedCocApplications = COCApplication::query()
+                ->with('rows')
+                ->whereIn('employee_control_no', $controlNoCandidates)
+                ->where('status', COCApplication::STATUS_APPROVED)
+                ->orderByDesc('cto_credited_at')
+                ->orderByDesc('reviewed_at')
+                ->orderByDesc('created_at')
+                ->orderByDesc('id')
+                ->get();
+
+            foreach ($approvedCocApplications as $cocApp) {
+                $typeId = (int) ($cocApp->cto_leave_type_id ?: ($trackedTypeIdsByKey['cto'] ?? 8));
+                $typeKey = $typeIdToKey[$typeId] ?? 'other';
+                $balanceKey = $balanceKeyByTypeId[$typeId]
+                    ?? $this->resolveLedgerRunningBalanceKey($typeKey, $typeId);
+                if (! is_string($balanceKey) || $balanceKey === '') {
+                    continue;
+                }
+
+                $cocDate = $cocApp->cto_credited_at?->toDateString()
+                    ?? $cocApp->reviewed_at?->toDateString()
+                    ?? $cocApp->created_at?->toDateString();
+                if ($cocDate === null) {
+                    continue;
+                }
+
+                $totalMinutes = (int) ($cocApp->total_minutes ?? 0);
+                $creditedHours = (float) ($cocApp->credited_hours ?? 0.0);
+                if ($totalMinutes > 0) {
+                    $creditedDays = $totalMinutes / 480.0;
+                } elseif ($creditedHours > 0) {
+                    $creditedDays = $creditedHours / 8.0;
+                } else {
+                    $creditedDays = (float) ($cocApp->cto_credited_days ?? 0.0);
+                }
+                if ($creditedDays <= 0.0) {
+                    continue;
+                }
+
+                $overtimeDates = $cocApp->rows
+                    ?->map(fn ($r) => $r->overtime_date?->toDateString())
+                    ->filter()
+                    ->unique()
+                    ->sort()
+                    ->values()
+                    ->all() ?? [];
+
+                $particulars = 'COC 0-0-0';
+                $actionTaken = sprintf(
+                    'Approved COC (%s)',
+                    $cocApp->cto_credited_at?->format('F j, Y') ?? $cocApp->reviewed_at?->format('F j, Y') ?? $cocDate
+                );
+
+                $transactions[] = [
+                    'row_id' => 'coc-'.(int) $cocApp->id,
+                    'merge_key' => 'coc-'.(int) $cocApp->id,
+                    'type_key' => $typeKey,
+                    'balance_key' => $balanceKey,
+                    'leave_type_code' => 'CTO',
+                    'transaction_date' => $cocDate,
+                    'sort_date' => $cocDate,
+                    'sort_timestamp' => (string) ($cocApp->cto_credited_at?->toIso8601String() ?? $cocApp->reviewed_at?->toIso8601String() ?? $cocApp->created_at?->toIso8601String() ?? $cocDate),
+                    'particulars' => $particulars,
+                    'action_taken' => $actionTaken,
+                    'inclusive_start_date' => $overtimeDates[0] ?? null,
+                    'inclusive_end_date' => ! empty($overtimeDates) ? end($overtimeDates) : null,
+                    'inclusive_dates' => $overtimeDates,
+                    'selected_dates' => $overtimeDates,
+                    'category' => 'earned',
+                    'amount' => $creditedDays,
+                    'balance_delta' => $creditedDays,
                 ];
             }
 
@@ -3406,6 +3482,9 @@ class EmployeeController extends Controller
         }
         if (in_array($normalizedName, ['special emergency calamity leave', 'special emergency (calamity) leave', 'calamity leave'], true)) {
             return 'CL';
+        }
+        if (in_array($normalizedName, ['cto leave', 'cto', 'compensatory time off', 'compensatory time-off', 'compensatory overtime credit', 'compensatory leave'], true)) {
+            return 'CTO';
         }
         if (in_array($normalizedName, ['violence against women and children leave', 'vawc leave', 'vawc'], true)) {
             return 'VAWC';

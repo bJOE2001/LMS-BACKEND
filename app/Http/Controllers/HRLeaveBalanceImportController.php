@@ -70,6 +70,41 @@ class HRLeaveBalanceImportController extends Controller
             ->orderBy('tblLeaveBalanceCreditHistories.created_at')
             ->value('accrual_date');
 
+        $cocLedgerService = app(\App\Services\CocLedgerService::class);
+        $leaveTypesPayload = $allowedCreditLeaveTypes
+            ->map(function (LeaveType $leaveType) use ($currentBalancesByType, $editableBalancesByType, $canonicalControlNo, $cocLedgerService): array {
+                $payload = $this->formatManualCreditLeaveTypePayload($leaveType);
+                $typeId = (int) $leaveType->id;
+                $currentBalance = $currentBalancesByType[$typeId] ?? 0.0;
+                $editableBalance = $editableBalancesByType[$typeId] ?? 0.0;
+
+                $payload['current_balance'] = $currentBalance;
+                $payload['editable_balance'] = $editableBalance;
+                $payload['balance'] = $currentBalance;
+
+                if ($this->isManualCreditExcludedLeaveType($leaveType)) {
+                    $ctoSnapshot = $cocLedgerService->syncEmployeeLedger(
+                        $canonicalControlNo,
+                        $typeId,
+                        null,
+                        false
+                    );
+                    $availHours = isset($ctoSnapshot['availableHours']) ? (float) $ctoSnapshot['availableHours'] : null;
+                    $availDays = isset($ctoSnapshot['availableDays']) ? (float) $ctoSnapshot['availableDays'] : null;
+                    if ($availHours !== null) {
+                        $payload['available_balance_hours'] = $availHours;
+                        $payload['balance_hours'] = $availHours;
+                    }
+                    if ($availDays !== null) {
+                        $payload['current_balance'] = $availDays;
+                        $payload['balance'] = $availDays;
+                    }
+                }
+
+                return $payload;
+            })
+            ->values();
+
         return response()->json([
             'employee_control_no' => $canonicalControlNo !== '' ? $canonicalControlNo : $employeeControlNo,
             'employee_name' => $this->formatEmployeeNameForStorage($employee),
@@ -82,17 +117,7 @@ class HRLeaveBalanceImportController extends Controller
             'as_of_date' => $existingAsOfDate !== null
                 ? ($existingAsOfDate instanceof \DateTimeInterface ? $existingAsOfDate->format('Y-m-d') : (string) $existingAsOfDate)
                 : null,
-            'leave_types' => $allowedCreditLeaveTypes
-                ->map(function (LeaveType $leaveType) use ($currentBalancesByType, $editableBalancesByType): array {
-                    $payload = $this->formatManualCreditLeaveTypePayload($leaveType);
-                    $payload['current_balance'] = $currentBalancesByType[(int) $leaveType->id]
-                        ?? 0.0;
-                    $payload['editable_balance'] = $editableBalancesByType[(int) $leaveType->id]
-                        ?? 0.0;
-
-                    return $payload;
-                })
-                ->values(),
+            'leave_types' => $leaveTypesPayload,
         ]);
     }
 
@@ -136,7 +161,7 @@ class HRLeaveBalanceImportController extends Controller
             return response()->json(['message' => 'Employee not found.'], 422);
         }
 
-        [$allCreditLeaveTypes, $creditLeaveTypes] = $this->resolveManualCreditLeaveTypeSetsForEmployee($employee);
+        [$allCreditLeaveTypes, $creditLeaveTypes] = $this->resolveManualCreditLeaveTypeSetsForEmployee($employee, true);
         if ($creditLeaveTypes->isEmpty()) {
             return response()->json([
                 'message' => 'No credit-based leave types are available for this employee.',
@@ -418,7 +443,7 @@ class HRLeaveBalanceImportController extends Controller
             return response()->json(['message' => 'Employee not found.'], 422);
         }
 
-        [$allCreditLeaveTypes, $creditLeaveTypes] = $this->resolveManualCreditLeaveTypeSetsForEmployee($employee);
+        [$allCreditLeaveTypes, $creditLeaveTypes] = $this->resolveManualCreditLeaveTypeSetsForEmployee($employee, true);
         if ($creditLeaveTypes->isEmpty()) {
             return response()->json([
                 'message' => 'No credit-based leave types are available for this employee.',
@@ -755,7 +780,7 @@ class HRLeaveBalanceImportController extends Controller
         return $entries;
     }
 
-    private function resolveManualCreditLeaveTypeSetsForEmployee(object $employee): array
+    private function resolveManualCreditLeaveTypeSetsForEmployee(object $employee, bool $excludeManualRestricted = false): array
     {
         $allCreditLeaveTypes = LeaveType::query()
             ->withoutLegacySpecialPrivilegeAliases()
@@ -764,7 +789,7 @@ class HRLeaveBalanceImportController extends Controller
             ->get(['id', 'name', 'max_days', 'allowed_status']);
 
         $allowedCreditLeaveTypes = $allCreditLeaveTypes
-            ->reject(fn (LeaveType $leaveType) => $this->isManualCreditExcludedLeaveType($leaveType))
+            ->when($excludeManualRestricted, fn ($collection) => $collection->reject(fn (LeaveType $leaveType) => $this->isManualCreditExcludedLeaveType($leaveType)))
             ->filter(fn (LeaveType $leaveType): bool => ! $this->employeeHasResolvedEmploymentStatus($employee)
                 || $leaveType->allowsEmploymentStatus($employee->status ?? null))
             ->values();
