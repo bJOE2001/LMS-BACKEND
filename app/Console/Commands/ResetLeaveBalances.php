@@ -3,6 +3,7 @@
 namespace App\Console\Commands;
 
 use App\Models\LeaveBalance;
+use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveType;
 use Illuminate\Console\Command;
 use Illuminate\Support\Carbon;
@@ -26,6 +27,7 @@ class ResetLeaveBalances extends Command
     public function handle(): int
     {
         $year = (int) ($this->option('year') ?: Carbon::now()->year);
+        $resetDate = Carbon::createFromDate($year, 1, 1)->toDateString();
 
         $this->info("Resetting RESETTABLE leave balances for year: {$year}");
 
@@ -35,11 +37,12 @@ class ResetLeaveBalances extends Command
 
         if ($resettableTypes->isEmpty()) {
             $this->warn('No RESETTABLE leave types found.');
+
             return self::SUCCESS;
         }
 
         $forcedLeaveType = $resettableTypes->first(
-            fn(LeaveType $type): bool => strcasecmp(trim((string) $type->name), self::FORCED_LEAVE_NAME) === 0
+            fn (LeaveType $type): bool => strcasecmp(trim((string) $type->name), self::FORCED_LEAVE_NAME) === 0
         );
         if ($forcedLeaveType instanceof LeaveType) {
             $vacationLeaveTypeId = $this->resolveLeaveTypeIdByName(self::VACATION_LEAVE_NAME);
@@ -67,16 +70,46 @@ class ResetLeaveBalances extends Command
         $totalReset = 0;
 
         foreach ($resettableTypes as $type) {
-            $maxDays = $type->max_days ?? 0;
+            $maxDays = (float) ($type->max_days ?? 0);
+            $typeResetCount = 0;
 
-            $updated = LeaveBalance::where('leave_type_id', $type->id)
-                ->update([
-                    'balance' => $maxDays,
-                    'year'    => $year,
-                ]);
+            LeaveBalance::where('leave_type_id', $type->id)
+                ->orderBy('id')
+                ->chunkById(200, function ($balances) use ($type, $maxDays, $year, $resetDate, &$typeResetCount): void {
+                    foreach ($balances as $balance) {
+                        if (! $balance instanceof LeaveBalance) {
+                            continue;
+                        }
 
-            $totalReset += $updated;
-            $this->line("  {$type->name}: reset {$updated} balance(s) to {$maxDays} days");
+                        $currentBalance = (float) $balance->balance;
+                        $creditsDelta = round($maxDays - $currentBalance, 3);
+
+                        DB::transaction(function () use ($balance, $type, $maxDays, $year, $creditsDelta, $resetDate, &$typeResetCount): void {
+                            $balance->balance = $maxDays;
+                            $balance->year = $year;
+                            $balance->save();
+
+                            LeaveBalanceAccrualHistory::updateOrCreate(
+                                [
+                                    'leave_balance_id' => $balance->id,
+                                    'accrual_date' => $resetDate,
+                                    'source' => 'YEARLY_RESET',
+                                ],
+                                [
+                                    'employee_control_no' => trim((string) ($balance->employee_control_no ?? '')) ?: null,
+                                    'employee_name' => $balance->employee_name,
+                                    'leave_type_name' => $balance->leave_type_name ?? $type->name,
+                                    'credits_added' => $creditsDelta,
+                                ]
+                            );
+
+                            $typeResetCount++;
+                        });
+                    }
+                });
+
+            $totalReset += $typeResetCount;
+            $this->line("  {$type->name}: reset {$typeResetCount} balance(s) to {$maxDays} days");
         }
 
         $this->info("Reset {$totalReset} balance(s) across {$resettableTypes->count()} leave type(s).");
@@ -105,6 +138,8 @@ class ResetLeaveBalances extends Command
             'total_uncovered' => 0.0,
         ];
 
+        $resetDate = Carbon::createFromDate($targetYear, 1, 1)->toDateString();
+
         LeaveBalance::query()
             ->where('leave_type_id', $forcedLeaveTypeId)
             ->where('balance', '>', 0)
@@ -113,9 +148,9 @@ class ResetLeaveBalances extends Command
                     ->orWhere('year', '<', $targetYear);
             })
             ->orderBy('id')
-            ->chunkById(200, function ($forcedBalances) use (&$summary, $vacationLeaveTypeId): void {
+            ->chunkById(200, function ($forcedBalances) use (&$summary, $vacationLeaveTypeId, $resetDate): void {
                 foreach ($forcedBalances as $forcedBalance) {
-                    if (!$forcedBalance instanceof LeaveBalance) {
+                    if (! $forcedBalance instanceof LeaveBalance) {
                         continue;
                     }
 
@@ -132,6 +167,7 @@ class ResetLeaveBalances extends Command
                             (float) $summary['total_uncovered'] + $unusedForcedDays,
                             2
                         );
+
                         continue;
                     }
 
@@ -139,6 +175,7 @@ class ResetLeaveBalances extends Command
                         $employeeControlNo,
                         $vacationLeaveTypeId,
                         $unusedForcedDays,
+                        $resetDate,
                         &$summary
                     ): void {
                         $vacationBalance = LeaveBalance::query()
@@ -161,6 +198,20 @@ class ResetLeaveBalances extends Command
                                 (float) $summary['total_deducted'] + $daysToDeduct,
                                 2
                             );
+
+                            LeaveBalanceAccrualHistory::updateOrCreate(
+                                [
+                                    'leave_balance_id' => $vacationBalance->id,
+                                    'accrual_date' => $resetDate,
+                                    'source' => 'FORCED_LEAVE_FORFEITURE',
+                                ],
+                                [
+                                    'employee_control_no' => $employeeControlNo,
+                                    'employee_name' => $vacationBalance->employee_name,
+                                    'leave_type_name' => $vacationBalance->leave_type_name ?? 'Vacation Leave',
+                                    'credits_added' => -$daysToDeduct,
+                                ]
+                            );
                         }
 
                         if ($uncoveredDays > 0.0) {
@@ -179,6 +230,7 @@ class ResetLeaveBalances extends Command
     private function formatDays(float $value): string
     {
         $normalized = round(max($value, 0.0), 2);
+
         return number_format($normalized, 2, '.', '');
     }
 }

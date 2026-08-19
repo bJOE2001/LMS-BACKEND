@@ -1024,48 +1024,62 @@ class EmployeeController extends Controller
 
                     $creditsAdded = $this->roundLedgerValue($entry->credits_added);
                     $source = strtoupper(trim((string) ($entry->source ?? '')));
-                    if ($creditsAdded === 0.0 && ! str_starts_with($source, 'AUTOMATED')) {
+                    if ($creditsAdded === 0.0 && ! str_starts_with($source, 'AUTOMATED') && ! str_starts_with($source, 'YEARLY_RESET')) {
                         continue;
                     }
 
                     $isManualAddSource = $source === 'HR_ADD' || str_starts_with($source, 'HR_ADD:');
                     $isManualEditSource = $source === 'HR_EDIT' || str_starts_with($source, 'HR_EDIT:');
                     $isManualBalanceSource = $isManualAddSource || $isManualEditSource;
+                    $isYearlyResetSource = $source === 'YEARLY_RESET' || str_starts_with($source, 'YEARLY_RESET');
+                    $isForcedLeaveForfeitureSource = $source === 'FORCED_LEAVE_FORFEITURE' || str_starts_with($source, 'FORCED_LEAVE_FORFEITURE');
                     $isForcedLeaveBalanceEntry = is_int($forcedLeaveTypeId)
                         && $forcedLeaveTypeId > 0
                         && (int) $typeId === $forcedLeaveTypeId;
                     $actionTaken = match (true) {
                         $isManualAddSource => 'Initial leave balance',
                         $isManualEditSource => 'Leave credits adjusted',
+                        $isYearlyResetSource => 'Yearly balance reset',
+                        $isForcedLeaveForfeitureSource => 'Unused forced leave deduction',
                         default => 'Monthly accrual',
                     };
-                    $isNegativeAdjustment = ! $isManualBalanceSource && $creditsAdded < 0;
+                    $isNegativeAdjustment = ! $isManualBalanceSource && ($creditsAdded < 0 || $isForcedLeaveForfeitureSource);
                     $otherTypeCode = $typeKey === 'other'
                         ? ($otherTypeCodeById[(int) $typeId] ?? null)
                         : null;
-                    $entryKind = $isManualBalanceSource || ! $isNegativeAdjustment ? 'earned' : 'deduction';
+                    $entryKind = $isForcedLeaveForfeitureSource
+                        ? 'deduction'
+                        : ($isYearlyResetSource
+                        ? ($creditsAdded < 0 ? 'deduction' : 'earned')
+                        : ($isManualBalanceSource || ! $isNegativeAdjustment ? 'earned' : 'deduction'));
                     $displayAmount = abs($creditsAdded);
-                    $entryCategory = $isManualBalanceSource
-                        ? 'balance_only'
-                        : ($isNegativeAdjustment
-                        ? 'deduction_with_pay'
-                        : 'earned');
+                    $entryCategory = match (true) {
+                        $isManualBalanceSource => 'balance_only',
+                        $isForcedLeaveForfeitureSource => 'deduction_with_pay',
+                        $isYearlyResetSource => $creditsAdded < 0 ? 'deduction_with_pay' : 'earned',
+                        $isNegativeAdjustment => 'deduction_with_pay',
+                        default => 'earned',
+                    };
                     $shouldMergeMonthlyVlSlAccrual = ! $isManualBalanceSource
+                        && ! $isYearlyResetSource
+                        && ! $isForcedLeaveForfeitureSource
                         && $entryCategory === 'earned'
                         && in_array($typeKey, ['vacation', 'sick'], true);
                     $accrualMergeKey = $shouldMergeMonthlyVlSlAccrual
                         ? 'monthly-accrual-vl-sl-'.$accrualDate
                         : null;
-                    $accrualParticulars = $shouldMergeMonthlyVlSlAccrual
-                        ? 'VL/SL 0-0-0'
-                        : $this->buildLedgerParticulars(
+                    $accrualParticulars = match (true) {
+                        $isForcedLeaveForfeitureSource => 'FL Forfeited',
+                        $shouldMergeMonthlyVlSlAccrual => 'VL/SL 0-0-0',
+                        default => $this->buildLedgerParticulars(
                             $entryKind,
                             $typeKey,
                             $displayAmount,
                             false,
                             false,
                             is_string($otherTypeCode) ? $otherTypeCode : null
-                        );
+                        ),
+                    };
                     $leaveTypeCode = $this->resolveLedgerTypeCode(
                         $typeKey,
                         is_string($otherTypeCode) ? $otherTypeCode : null,
@@ -1086,7 +1100,7 @@ class EmployeeController extends Controller
                         'amount' => $displayAmount,
                         'balance_delta' => $creditsAdded,
                         'suppress_display' => $isForcedLeaveBalanceEntry,
-                        'allow_zero_display' => ($creditsAdded === 0.0 && str_starts_with($source, 'AUTOMATED')),
+                        'allow_zero_display' => ($creditsAdded === 0.0 && (str_starts_with($source, 'AUTOMATED') || $isYearlyResetSource)),
                     ];
                 }
             }
