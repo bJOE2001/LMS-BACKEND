@@ -23,8 +23,9 @@ class SyncCocExpiry extends Command
     public function handle(CocLedgerService $cocLedgerService): int
     {
         $asOfDate = $this->resolveAsOfDate((string) ($this->option('date') ?? ''));
-        if (!$asOfDate instanceof CarbonImmutable) {
+        if (! $asOfDate instanceof CarbonImmutable) {
             $this->error('Invalid --date value. Use Y-m-d format.');
+
             return self::FAILURE;
         }
 
@@ -34,6 +35,7 @@ class SyncCocExpiry extends Command
         $ctoLeaveTypeId = $this->resolveCtoLeaveTypeId();
         if ($ctoLeaveTypeId === null) {
             $this->warn('CTO Leave type was not found. Nothing to sync.');
+
             return self::SUCCESS;
         }
 
@@ -43,6 +45,7 @@ class SyncCocExpiry extends Command
 
         if ($controlNos->isEmpty()) {
             $this->info('No CTO/COC control numbers found to sync.');
+
             return self::SUCCESS;
         }
 
@@ -122,4 +125,3 @@ class SyncCocExpiry extends Command
             ->values();
     }
 }
-

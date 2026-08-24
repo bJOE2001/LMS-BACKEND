@@ -12,6 +12,7 @@ use App\Models\HrisEmployee;
 use App\Models\LateDeduction;
 use App\Models\LeaveApplication;
 use App\Models\LeaveApplicationLog;
+use App\Models\LeaveApplicationUpdateRequest;
 use App\Models\LeaveBalance;
 use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveRestoration;
@@ -1214,10 +1215,16 @@ class EmployeeController extends Controller
                 );
 
                 $particulars = trim((string) ($deduction->particulars ?? ''));
-                if ($particulars === '' || $particulars === 'Late Deduction' || preg_match('/^Late Deduction\s*\(\d+\s*minutes?\)$/i', $particulars)) {
-                    $lateMinutes = (int) ($deduction->minutes_late ?? 0);
-                    $formattedLateDuration = $lateMinutes > 0
-                        ? $this->formatLedgerMinutes($lateMinutes)
+                if ($particulars === '' || $particulars === 'Late Deduction' || preg_match('/^Late Deduction\s*(\([^\)]*\))?$/i', $particulars) || preg_match('/^Late Deduction\s*-\s*[A-Za-z]+\s*\d{4}\s*\(\d+\s*minutes?\)$/i', $particulars)) {
+                    $daysLate = (int) ($deduction->days_late ?? 0);
+                    $hoursLate = (int) ($deduction->hours_late ?? 0);
+                    $minutesLate = (int) ($deduction->minutes_late ?? 0);
+                    $totalLateMinutes = ($daysLate * self::LEDGER_HOURS_PER_DAY * self::LEDGER_MINUTES_PER_HOUR)
+                        + ($hoursLate * self::LEDGER_MINUTES_PER_HOUR)
+                        + $minutesLate;
+
+                    $formattedLateDuration = $totalLateMinutes > 0
+                        ? $this->formatLedgerMinutes($totalLateMinutes)
                         : $this->formatLedgerDaysHoursMinutes($deductedDays);
                     $particulars = "LATE {$formattedLateDuration}";
                 }
@@ -1238,9 +1245,16 @@ class EmployeeController extends Controller
                 $transactions[] = [
                     'row_id' => 'late-deduction-'.(int) $deduction->id,
                     'merge_key' => 'late-deduction-'.(int) $deduction->id,
+                    'late_deduction_id' => (int) $deduction->id,
                     'type_key' => $typeKey,
                     'balance_key' => $balanceKey,
                     'leave_type_code' => $leaveTypeCode,
+                    'target_leave' => $typeKey === 'sick' ? 'SL' : 'VL',
+                    'target_leave_type_id' => $typeId,
+                    'days_late' => (int) ($deduction->days_late ?? 0),
+                    'hours_late' => (int) ($deduction->hours_late ?? 0),
+                    'minutes_late' => (int) ($deduction->minutes_late ?? 0),
+                    'deducted_days' => $deductedDays,
                     'transaction_date' => $deductionDate,
                     'sort_date' => $deductionDate,
                     'sort_timestamp' => (string) ($deduction->created_at?->toIso8601String() ?? $deductionDate),
@@ -1253,81 +1267,6 @@ class EmployeeController extends Controller
                     'category' => 'deduction_with_pay',
                     'amount' => $deductedDays,
                     'balance_delta' => -$deductedDays,
-                ];
-            }
-
-            // Approved COC Applications (Earned CTO Credits)
-            $approvedCocApplications = COCApplication::query()
-                ->with('rows')
-                ->whereIn('employee_control_no', $controlNoCandidates)
-                ->where('status', COCApplication::STATUS_APPROVED)
-                ->orderByDesc('cto_credited_at')
-                ->orderByDesc('reviewed_at')
-                ->orderByDesc('created_at')
-                ->orderByDesc('id')
-                ->get();
-
-            foreach ($approvedCocApplications as $cocApp) {
-                $typeId = (int) ($cocApp->cto_leave_type_id ?: ($trackedTypeIdsByKey['cto'] ?? 8));
-                $typeKey = $typeIdToKey[$typeId] ?? 'other';
-                $balanceKey = $balanceKeyByTypeId[$typeId]
-                    ?? $this->resolveLedgerRunningBalanceKey($typeKey, $typeId);
-                if (! is_string($balanceKey) || $balanceKey === '') {
-                    continue;
-                }
-
-                $cocDate = $cocApp->cto_credited_at?->toDateString()
-                    ?? $cocApp->reviewed_at?->toDateString()
-                    ?? $cocApp->created_at?->toDateString();
-                if ($cocDate === null) {
-                    continue;
-                }
-
-                $totalMinutes = (int) ($cocApp->total_minutes ?? 0);
-                $creditedHours = (float) ($cocApp->credited_hours ?? 0.0);
-                if ($totalMinutes > 0) {
-                    $creditedDays = $totalMinutes / 480.0;
-                } elseif ($creditedHours > 0) {
-                    $creditedDays = $creditedHours / 8.0;
-                } else {
-                    $creditedDays = (float) ($cocApp->cto_credited_days ?? 0.0);
-                }
-                if ($creditedDays <= 0.0) {
-                    continue;
-                }
-
-                $overtimeDates = $cocApp->rows
-                    ?->map(fn ($r) => $r->overtime_date?->toDateString())
-                    ->filter()
-                    ->unique()
-                    ->sort()
-                    ->values()
-                    ->all() ?? [];
-
-                $particulars = 'COC 0-0-0';
-                $actionTaken = sprintf(
-                    'Approved COC (%s)',
-                    $cocApp->cto_credited_at?->format('F j, Y') ?? $cocApp->reviewed_at?->format('F j, Y') ?? $cocDate
-                );
-
-                $transactions[] = [
-                    'row_id' => 'coc-'.(int) $cocApp->id,
-                    'merge_key' => 'coc-'.(int) $cocApp->id,
-                    'type_key' => $typeKey,
-                    'balance_key' => $balanceKey,
-                    'leave_type_code' => 'CTO',
-                    'transaction_date' => $cocDate,
-                    'sort_date' => $cocDate,
-                    'sort_timestamp' => (string) ($cocApp->cto_credited_at?->toIso8601String() ?? $cocApp->reviewed_at?->toIso8601String() ?? $cocApp->created_at?->toIso8601String() ?? $cocDate),
-                    'particulars' => $particulars,
-                    'action_taken' => $actionTaken,
-                    'inclusive_start_date' => $overtimeDates[0] ?? null,
-                    'inclusive_end_date' => ! empty($overtimeDates) ? end($overtimeDates) : null,
-                    'inclusive_dates' => $overtimeDates,
-                    'selected_dates' => $overtimeDates,
-                    'category' => 'earned',
-                    'amount' => $creditedDays,
-                    'balance_delta' => $creditedDays,
                 ];
             }
 
@@ -1360,12 +1299,16 @@ class EmployeeController extends Controller
             }
 
             $approvedApplications = LeaveApplication::query()
-                ->with(['logs' => function ($query) {
-                    $query
-                        ->where('action', LeaveApplicationLog::ACTION_HR_RECALLED)
-                        ->orderByDesc('created_at')
-                        ->orderByDesc('id');
-                }])
+                ->with([
+                    'logs' => function ($query) {
+                        $query->orderBy('created_at')->orderBy('id');
+                    },
+                    'updateRequests' => function ($query) {
+                        $query->where('status', LeaveApplicationUpdateRequest::STATUS_APPROVED)
+                            ->orderByDesc('reviewed_at')
+                            ->orderByDesc('id');
+                    },
+                ])
                 ->where(function ($query) {
                     $query->whereIn('status', [
                         LeaveApplication::STATUS_APPROVED,
@@ -1381,6 +1324,31 @@ class EmployeeController extends Controller
                                 ->where('req.status', 'PENDING')
                                 ->whereRaw('UPPER(LTRIM(RTRIM(req.previous_status))) = ?', [LeaveApplication::STATUS_APPROVED]);
                         });
+                    })->orWhere(function ($subQuery) {
+                        $subQuery->where('status', LeaveApplication::STATUS_CANCELLED)
+                            ->where(function ($cancelQ) {
+                                $cancelQ->whereNotNull('hr_approved_at')
+                                    ->orWhere('remarks', 'LIKE', '%approved leave cancellation%')
+                                    ->orWhere('remarks', 'LIKE', '%Cancelled via approved%')
+                                    ->orWhereExists(function ($reqQuery) {
+                                        $reqQuery->select(\Illuminate\Support\Facades\DB::raw(1))
+                                            ->from('tblLeaveApplicationUpdateRequests as req')
+                                            ->whereColumn('req.leave_application_id', 'tblLeaveApplications.id')
+                                            ->where('req.status', LeaveApplicationUpdateRequest::STATUS_APPROVED)
+                                            ->where(function ($sub) {
+                                                $sub->where('req.requested_payload', 'LIKE', '%REQUEST_CANCEL%')
+                                                    ->orWhere('req.requested_payload', 'LIKE', '%REQUEST_CANCELLATION%')
+                                                    ->orWhere('req.requested_payload', 'LIKE', '%"cancel_leave":true%')
+                                                    ->orWhere('req.requested_payload', 'LIKE', '%"request_kind":"cancel"%');
+                                            });
+                                    })
+                                    ->orWhereExists(function ($logQuery) {
+                                        $logQuery->select(\Illuminate\Support\Facades\DB::raw(1))
+                                            ->from('tblLeaveApplicationLogs as log')
+                                            ->whereColumn('log.leave_application_id', 'tblLeaveApplications.id')
+                                            ->where('log.action', LeaveApplicationLog::ACTION_HR_APPROVED);
+                                    });
+                            });
                     });
                 })
                 ->whereIn('employee_control_no', $controlNoCandidates)
@@ -1434,14 +1402,71 @@ class EmployeeController extends Controller
                 $isUsageOnlyOtherType = $typeKey === 'other'
                     && in_array($typeId, $otherUsageOnlyTypeIds, true);
 
-                $transactionDate = $application->hr_approved_at?->toDateString()
-                    ?? $application->created_at?->toDateString();
+                $isCancelledApp = $application->status === LeaveApplication::STATUS_CANCELLED;
+                $cancelUpdateRequest = $isCancelledApp && $application->relationLoaded('updateRequests')
+                    ? $application->updateRequests->first(function (LeaveApplicationUpdateRequest $req): bool {
+                        $payload = is_array($req->requested_payload) ? $req->requested_payload : [];
+                        $actionType = strtoupper((string) ($payload['action_type'] ?? ''));
+                        $requestKind = strtolower((string) ($payload['request_kind'] ?? ''));
+                        $cancelLeave = (bool) ($payload['cancel_leave'] ?? false);
+
+                        return $actionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
+                            || str_contains($actionType, 'CANCEL')
+                            || $requestKind === 'cancel'
+                            || $cancelLeave;
+                    })
+                    : null;
+
+                $firstApprovalLog = $application->relationLoaded('logs')
+                    ? $application->logs->first(function (LeaveApplicationLog $log): bool {
+                        $remarks = strtolower((string) $log->remarks);
+
+                        return $log->action === LeaveApplicationLog::ACTION_HR_APPROVED
+                            && ! str_contains($remarks, 'cancel');
+                    })
+                    : null;
+                if ($firstApprovalLog === null && $application->relationLoaded('logs')) {
+                    $firstApprovalLog = $application->logs->first(function (LeaveApplicationLog $log): bool {
+                        return in_array($log->action, [
+                            LeaveApplicationLog::ACTION_HR_APPROVED,
+                            LeaveApplicationLog::ACTION_ADMIN_APPROVED,
+                        ], true);
+                    });
+                }
+
+                if ($isCancelledApp) {
+                    $transactionDate = $firstApprovalLog?->created_at?->toDateString()
+                        ?? $application->created_at?->toDateString();
+                    $transactionTimestamp = (string) (
+                        $firstApprovalLog?->created_at?->toIso8601String()
+                        ?? $application->created_at?->toIso8601String()
+                        ?? $transactionDate
+                    );
+                } else {
+                    $transactionDate = $application->hr_approved_at?->toDateString()
+                        ?? $firstApprovalLog?->created_at?->toDateString()
+                        ?? $application->created_at?->toDateString();
+                    $transactionTimestamp = (string) (
+                        $application->hr_approved_at?->toIso8601String()
+                        ?? $firstApprovalLog?->created_at?->toIso8601String()
+                        ?? $application->created_at?->toIso8601String()
+                        ?? $transactionDate
+                    );
+                }
                 if ($transactionDate === null) {
                     continue;
                 }
 
                 $totalDays = round((float) ($application->total_days ?? 0), 2);
                 $deductibleDays = round((float) ($application->deductible_days ?? $totalDays), 3);
+                if ($isCancelledApp && $deductibleDays <= 0.0) {
+                    $payload = is_array($cancelUpdateRequest?->requested_payload) ? $cancelUpdateRequest->requested_payload : [];
+                    $deductibleDays = round((float) ($payload['deductible_days'] ?? $payload['total_days'] ?? $application->total_days ?? 0.0), 3);
+                    if ($totalDays <= 0.0) {
+                        $totalDays = round((float) ($payload['total_days'] ?? $deductibleDays), 2);
+                    }
+                }
+
                 $payMode = strtoupper(trim((string) ($application->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY)));
                 if (! in_array($payMode, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
                     $payMode = LeaveApplication::PAY_MODE_WITH_PAY;
@@ -1555,8 +1580,18 @@ class EmployeeController extends Controller
                 );
                 $inclusiveStartDate = $application->start_date?->toDateString();
                 $inclusiveEndDate = $application->end_date?->toDateString();
+                if ($isCancelledApp && $inclusiveStartDate === null && ! empty($cancelUpdateRequest?->requested_payload['start_date'])) {
+                    $inclusiveStartDate = $cancelUpdateRequest->requested_payload['start_date'];
+                }
+                if ($isCancelledApp && $inclusiveEndDate === null && ! empty($cancelUpdateRequest?->requested_payload['end_date'])) {
+                    $inclusiveEndDate = $cancelUpdateRequest->requested_payload['end_date'];
+                }
+                $selectedDatesCandidate = $application->selected_dates;
+                if ($isCancelledApp && empty($selectedDatesCandidate) && ! empty($cancelUpdateRequest?->requested_payload['selected_dates'])) {
+                    $selectedDatesCandidate = $cancelUpdateRequest->requested_payload['selected_dates'];
+                }
                 $inclusiveDates = $this->resolveLedgerInclusiveDates(
-                    $application->selected_dates,
+                    $selectedDatesCandidate,
                     $inclusiveStartDate,
                     $inclusiveEndDate
                 );
@@ -1578,11 +1613,7 @@ class EmployeeController extends Controller
                             'leave_type_code' => $this->resolveLedgerTypeCode($componentTypeKey),
                             'transaction_date' => $transactionDate,
                             'sort_date' => $transactionDate,
-                            'sort_timestamp' => (string) (
-                                $application->hr_approved_at?->toIso8601String()
-                                ?? $application->created_at?->toIso8601String()
-                                ?? $transactionDate
-                            ),
+                            'sort_timestamp' => $transactionTimestamp,
                             'particulars' => $particulars,
                             'action_taken' => $actionTaken,
                             'inclusive_start_date' => $inclusiveStartDate,
@@ -1602,11 +1633,7 @@ class EmployeeController extends Controller
                         'leave_type_code' => $leaveTypeCode,
                         'transaction_date' => $transactionDate,
                         'sort_date' => $transactionDate,
-                        'sort_timestamp' => (string) (
-                            $application->hr_approved_at?->toIso8601String()
-                            ?? $application->created_at?->toIso8601String()
-                            ?? $transactionDate
-                        ),
+                        'sort_timestamp' => $transactionTimestamp,
                         'particulars' => $particulars,
                         'action_taken' => $actionTaken,
                         'inclusive_start_date' => $inclusiveStartDate,
@@ -1632,11 +1659,7 @@ class EmployeeController extends Controller
                             'leave_type_code' => $this->resolveLedgerTypeCode('other', 'FL', true),
                             'transaction_date' => $transactionDate,
                             'sort_date' => $transactionDate,
-                            'sort_timestamp' => (string) (
-                                $application->hr_approved_at?->toIso8601String()
-                                ?? $application->created_at?->toIso8601String()
-                                ?? $transactionDate
-                            ),
+                            'sort_timestamp' => $transactionTimestamp,
                             'particulars' => $particulars,
                             'action_taken' => $actionTaken,
                             'inclusive_start_date' => $inclusiveStartDate,
@@ -1659,11 +1682,7 @@ class EmployeeController extends Controller
                         'leave_type_code' => $this->resolveLedgerTypeCode('vacation'),
                         'transaction_date' => $transactionDate,
                         'sort_date' => $transactionDate,
-                        'sort_timestamp' => (string) (
-                            $application->hr_approved_at?->toIso8601String()
-                            ?? $application->created_at?->toIso8601String()
-                            ?? $transactionDate
-                        ),
+                        'sort_timestamp' => $transactionTimestamp,
                         'particulars' => $particulars,
                         'action_taken' => $actionTaken,
                         'inclusive_start_date' => $inclusiveStartDate,
@@ -1684,11 +1703,7 @@ class EmployeeController extends Controller
                         'leave_type_code' => $this->resolveLedgerTypeCode('sick'),
                         'transaction_date' => $transactionDate,
                         'sort_date' => $transactionDate,
-                        'sort_timestamp' => (string) (
-                            $application->hr_approved_at?->toIso8601String()
-                            ?? $application->created_at?->toIso8601String()
-                            ?? $transactionDate
-                        ),
+                        'sort_timestamp' => $transactionTimestamp,
                         'particulars' => $particulars,
                         'action_taken' => $actionTaken,
                         'inclusive_start_date' => $inclusiveStartDate,
@@ -1709,11 +1724,7 @@ class EmployeeController extends Controller
                         'leave_type_code' => $isForcedLeave ? $this->resolveLedgerTypeCode('vacation') : $leaveTypeCode,
                         'transaction_date' => $transactionDate,
                         'sort_date' => $transactionDate,
-                        'sort_timestamp' => (string) (
-                            $application->hr_approved_at?->toIso8601String()
-                            ?? $application->created_at?->toIso8601String()
-                            ?? $transactionDate
-                        ),
+                        'sort_timestamp' => $transactionTimestamp,
                         'particulars' => $particulars,
                         'action_taken' => $actionTaken,
                         'inclusive_start_date' => $inclusiveStartDate,
@@ -1724,6 +1735,161 @@ class EmployeeController extends Controller
                         'balance_delta' => 0.0,
                         'is_usage_only' => $isUsageOnlyOtherType,
                     ];
+                }
+
+                if ($isCancelledApp) {
+                    $cancelLog = $application->relationLoaded('logs')
+                        ? $application->logs->first(function (LeaveApplicationLog $log): bool {
+                            return str_contains(strtolower((string) $log->remarks), 'cancel');
+                        })
+                        : null;
+                    if ($cancelLog === null && $application->relationLoaded('logs')) {
+                        $cancelLog = $application->logs->sortByDesc('id')->first(function (LeaveApplicationLog $log): bool {
+                            return $log->action === LeaveApplicationLog::ACTION_HR_APPROVED;
+                        });
+                    }
+
+                    $cancellationDate = $cancelUpdateRequest?->reviewed_at?->toDateString()
+                        ?? $cancelLog?->created_at?->toDateString()
+                        ?? $application->hr_approved_at?->toDateString()
+                        ?? $application->updated_at?->toDateString()
+                        ?? $transactionDate;
+                    $cancellationTimestamp = (string) (
+                        $cancelUpdateRequest?->reviewed_at?->toIso8601String()
+                        ?? $cancelLog?->created_at?->toIso8601String()
+                        ?? $application->hr_approved_at?->toIso8601String()
+                        ?? $application->updated_at?->toIso8601String()
+                        ?? $cancellationDate.'T23:59:59Z'
+                    );
+                    $cancellationDateFormatted = $cancellationDate ? Carbon::parse($cancellationDate)->format('F j, Y') : '';
+
+                    $cancelParticulars = 'Cancelled';
+                    $cancelActionTaken = $cancellationDateFormatted !== ''
+                        ? sprintf('Cancelled Application #%d (%s)', $applicationId, $cancellationDateFormatted)
+                        : sprintf('Cancelled Application #%d', $applicationId);
+
+                    if ($isMonetization) {
+                        foreach ($monetizationComponents as $component) {
+                            $componentTypeKey = (string) $component['type_key'];
+                            $componentAmount = round(max((float) $component['days'], 0.0), self::LEDGER_DECIMAL_PRECISION);
+                            if ($componentAmount <= 0.0) {
+                                continue;
+                            }
+
+                            $transactions[] = [
+                                'row_id' => 'cancelled-'.$mergeKey.'-monetization-'.$componentTypeKey,
+                                'merge_key' => 'cancelled-'.$mergeKey,
+                                'type_key' => $componentTypeKey,
+                                'balance_key' => $this->resolveLedgerRunningBalanceKey($componentTypeKey),
+                                'leave_type_code' => $this->resolveLedgerTypeCode($componentTypeKey),
+                                'transaction_date' => $cancellationDate,
+                                'sort_date' => $cancellationDate,
+                                'sort_timestamp' => $cancellationTimestamp,
+                                'particulars' => $cancelParticulars,
+                                'action_taken' => $cancelActionTaken,
+                                'inclusive_start_date' => $inclusiveStartDate,
+                                'inclusive_end_date' => $inclusiveEndDate,
+                                'inclusive_dates' => $inclusiveDates,
+                                'selected_dates' => $inclusiveDates,
+                                'category' => 'earned',
+                                'amount' => $componentAmount,
+                                'balance_delta' => $componentAmount,
+                            ];
+                        }
+                    } elseif ($primaryWithPayAmount > 0) {
+                        $transactions[] = [
+                            'row_id' => 'cancelled-'.$mergeKey.'-wp',
+                            'merge_key' => 'cancelled-'.$mergeKey,
+                            'type_key' => $typeKey,
+                            'balance_key' => $balanceKey,
+                            'leave_type_code' => $leaveTypeCode,
+                            'transaction_date' => $cancellationDate,
+                            'sort_date' => $cancellationDate,
+                            'sort_timestamp' => $cancellationTimestamp,
+                            'particulars' => $cancelParticulars,
+                            'action_taken' => $cancelActionTaken,
+                            'inclusive_start_date' => $inclusiveStartDate,
+                            'inclusive_end_date' => $inclusiveEndDate,
+                            'inclusive_dates' => $inclusiveDates,
+                            'selected_dates' => $inclusiveDates,
+                            'category' => 'earned',
+                            'amount' => $primaryWithPayAmount,
+                            'balance_delta' => $isUsageOnlyOtherType ? 0.0 : $primaryWithPayAmount,
+                            'is_usage_only' => $isUsageOnlyOtherType,
+                        ];
+                    }
+
+                    if (! $isMonetization && $linkedForcedWithPayAmount > 0 && is_int($forcedLeaveTypeId)) {
+                        $forcedBalanceKey = $balanceKeyByTypeId[$forcedLeaveTypeId]
+                            ?? $this->resolveLedgerRunningBalanceKey('other', $forcedLeaveTypeId, true);
+
+                        if (is_string($forcedBalanceKey) && $forcedBalanceKey !== '') {
+                            $transactions[] = [
+                                'row_id' => 'cancelled-'.$mergeKey.'-fl-linked',
+                                'merge_key' => 'cancelled-'.$mergeKey,
+                                'type_key' => 'other',
+                                'balance_key' => $forcedBalanceKey,
+                                'leave_type_code' => $this->resolveLedgerTypeCode('other', 'FL', true),
+                                'transaction_date' => $cancellationDate,
+                                'sort_date' => $cancellationDate,
+                                'sort_timestamp' => $cancellationTimestamp,
+                                'particulars' => $cancelParticulars,
+                                'action_taken' => $cancelActionTaken,
+                                'inclusive_start_date' => $inclusiveStartDate,
+                                'inclusive_end_date' => $inclusiveEndDate,
+                                'inclusive_dates' => $inclusiveDates,
+                                'selected_dates' => $inclusiveDates,
+                                'category' => 'earned',
+                                'amount' => $linkedForcedWithPayAmount,
+                                'balance_delta' => $linkedForcedWithPayAmount,
+                                'suppress_display' => true,
+                            ];
+                        }
+                    }
+
+                    if (! $isMonetization && $linkedVacationWithPayAmount > 0) {
+                        $transactions[] = [
+                            'row_id' => 'cancelled-'.$mergeKey.'-vl-topup',
+                            'merge_key' => 'cancelled-'.$mergeKey,
+                            'type_key' => 'vacation',
+                            'balance_key' => 'vacation',
+                            'leave_type_code' => $this->resolveLedgerTypeCode('vacation'),
+                            'transaction_date' => $cancellationDate,
+                            'sort_date' => $cancellationDate,
+                            'sort_timestamp' => $cancellationTimestamp,
+                            'particulars' => $cancelParticulars,
+                            'action_taken' => $cancelActionTaken,
+                            'inclusive_start_date' => $inclusiveStartDate,
+                            'inclusive_end_date' => $inclusiveEndDate,
+                            'inclusive_dates' => $inclusiveDates,
+                            'selected_dates' => $inclusiveDates,
+                            'category' => 'earned',
+                            'amount' => $linkedVacationWithPayAmount,
+                            'balance_delta' => $linkedVacationWithPayAmount,
+                        ];
+                    }
+
+                    if (! $isMonetization && $linkedSickWithPayAmount > 0) {
+                        $transactions[] = [
+                            'row_id' => 'cancelled-'.$mergeKey.'-sl-topup',
+                            'merge_key' => 'cancelled-'.$mergeKey,
+                            'type_key' => 'sick',
+                            'balance_key' => 'sick',
+                            'leave_type_code' => $this->resolveLedgerTypeCode('sick'),
+                            'transaction_date' => $cancellationDate,
+                            'sort_date' => $cancellationDate,
+                            'sort_timestamp' => $cancellationTimestamp,
+                            'particulars' => $cancelParticulars,
+                            'action_taken' => $cancelActionTaken,
+                            'inclusive_start_date' => $inclusiveStartDate,
+                            'inclusive_end_date' => $inclusiveEndDate,
+                            'inclusive_dates' => $inclusiveDates,
+                            'selected_dates' => $inclusiveDates,
+                            'category' => 'earned',
+                            'amount' => $linkedSickWithPayAmount,
+                            'balance_delta' => $linkedSickWithPayAmount,
+                        ];
+                    }
                 }
 
                 $storedRecallDateKeys = $this->resolveLedgerStoredRecallDateKeys($application);
@@ -1941,6 +2107,24 @@ class EmployeeController extends Controller
                 $inclusiveDates = [];
             }
             $period = $this->formatLedgerPeriodLabel($actionDate);
+            if (! empty($transaction['row_id']) && str_starts_with((string) $transaction['row_id'], 'late-deduction-')) {
+                $datesForLate = ! empty($transaction['selected_dates']) && is_array($transaction['selected_dates'])
+                    ? $transaction['selected_dates']
+                    : $inclusiveDates;
+                if (count($datesForLate) > 1) {
+                    $parsedDates = collect($datesForLate)->map(fn ($d) => Carbon::parse($d))->sortBy(fn ($c) => $c->timestamp)->values();
+                    $sameYear = $parsedDates->every(fn ($c) => $c->year === $parsedDates->first()->year);
+                    if ($sameYear) {
+                        $monthFormat = $parsedDates->count() <= 2 ? 'F' : 'M';
+                        $period = $parsedDates->map(fn ($c) => $c->format($monthFormat))->join(', ').' '.$parsedDates->first()->year;
+                    } else {
+                        $period = $parsedDates->map(fn ($c) => $c->format('M Y'))->join(', ');
+                    }
+                } elseif (count($datesForLate) === 1) {
+                    $parsedDate = Carbon::parse($datesForLate[0]);
+                    $period = $parsedDate->format('F Y');
+                }
+            }
             $leaveTypeCode = strtoupper(trim((string) ($transaction['leave_type_code'] ?? '')));
             $displayTypeKey = $this->resolveLedgerDisplayTypeKey($typeKey, $leaveTypeCode);
 
@@ -1961,6 +2145,13 @@ class EmployeeController extends Controller
                 $ledgerRows[] = [
                     'id' => $transaction['row_id'] ?? null,
                     'accrual_ids' => [],
+                    'late_deduction_id' => $transaction['late_deduction_id'] ?? null,
+                    'target_leave' => $transaction['target_leave'] ?? null,
+                    'target_leave_type_id' => $transaction['target_leave_type_id'] ?? null,
+                    'days_late' => $transaction['days_late'] ?? null,
+                    'hours_late' => $transaction['hours_late'] ?? null,
+                    'minutes_late' => $transaction['minutes_late'] ?? null,
+                    'deducted_days' => $transaction['deducted_days'] ?? null,
                     'period' => $period,
                     'particulars' => $particulars,
                     'leave_type_code' => $leaveTypeCode !== '' ? $leaveTypeCode : null,
@@ -2051,6 +2242,7 @@ class EmployeeController extends Controller
         $firstDayOfService = HrisEmployee::firstDayOfServiceByControlNo(
             (string) ($employee->control_no ?? $controlNo)
         ) ?? $this->normalizeLedgerDateString($employee->from_date ?? null);
+        $officeAcronym = HrisEmployee::officeAcronymByName($employee->office ?? null) ?? $employee->office;
         $ledgerBalanceBadges = $this->buildLedgerBalanceBadges(
             $currentLedgerBalances,
             $trackedTypeIdsByKey,
@@ -2067,7 +2259,10 @@ class EmployeeController extends Controller
                 'middlename' => $employee->middlename,
                 'first_day_of_service' => $firstDayOfService,
                 'firstDayOfService' => $firstDayOfService,
-                'office' => $employee->office,
+                'office' => $officeAcronym,
+                'office_acronym' => $officeAcronym,
+                'officeAcronym' => $officeAcronym,
+                'hrisOfficeAcronym' => $officeAcronym,
                 'designation' => $employee->designation,
                 'status' => $employee->status,
             ],
@@ -3383,7 +3578,8 @@ class EmployeeController extends Controller
             $isCreditBased = (bool) ($leaveType->is_credit_based ?? false);
             $normalizedCategory = strtoupper(trim((string) ($leaveType->category ?? '')));
             $isCoreType = in_array($normalizedName, ['vacation leave', 'vacation', 'sick leave', 'sick'], true);
-            $isOtherEligibleType = ! $isCoreType && ! in_array($normalizedName, $forcedLeaveNames, true);
+            $isCtoType = str_contains($normalizedName, 'compensatory') || str_contains($normalizedName, 'cto');
+            $isOtherEligibleType = ! $isCoreType && ! in_array($normalizedName, $forcedLeaveNames, true) && ! $isCtoType;
             if ($isOtherEligibleType && $isCreditBased) {
                 $typeIds['other'][] = $typeId;
                 $typeIds['other_code_by_id'][$typeId] = $this->resolveLedgerOtherTypeCode(
@@ -3805,15 +4001,24 @@ class EmployeeController extends Controller
                 continue;
             }
 
+            if (isset($trackedTypeIdsByKey['cto']) && $normalizedTypeId === (int) $trackedTypeIdsByKey['cto']) {
+                continue;
+            }
+
+            $otherTypeCode = $otherTypeCodeById[$normalizedTypeId] ?? null;
+            $code = $this->resolveLedgerTypeCode('other', is_string($otherTypeCode) ? $otherTypeCode : null, false) ?? 'OT'.$normalizedTypeId;
+            if (in_array(strtoupper(trim($code)), ['CTO', 'COC'], true)) {
+                continue;
+            }
+
             $balanceKey = $balanceKeyByTypeId[$normalizedTypeId]
                 ?? $this->resolveLedgerRunningBalanceKey('other', $normalizedTypeId);
             if (! is_string($balanceKey) || $balanceKey === '') {
                 continue;
             }
 
-            $otherTypeCode = $otherTypeCodeById[$normalizedTypeId] ?? null;
             $addBadge(
-                $this->resolveLedgerTypeCode('other', is_string($otherTypeCode) ? $otherTypeCode : null, false) ?? 'OT'.$normalizedTypeId,
+                $code,
                 $normalizedTypeId,
                 $balanceKey
             );
@@ -4714,12 +4919,26 @@ class EmployeeController extends Controller
 
         $validated = $request->validate([
             'target_leave' => ['required', 'string', 'in:VL,SL'],
-            'minutes_late' => ['required', 'integer', 'min:1'],
+            'days_late' => ['nullable', 'integer', 'min:0'],
+            'hours_late' => ['nullable', 'integer', 'min:0'],
+            'minutes_late' => ['nullable', 'integer', 'min:0'],
             'particulars' => ['nullable', 'string', 'max:255'],
             'selected_dates' => ['required', 'array', 'min:1'],
             'selected_dates.*' => ['required', 'date'],
             'remarks' => ['nullable', 'string', 'max:1000'],
         ]);
+
+        $days = max(0, (int) ($validated['days_late'] ?? 0));
+        $hours = max(0, (int) ($validated['hours_late'] ?? 0));
+        $minutes = max(0, (int) ($validated['minutes_late'] ?? 0));
+
+        $totalMinutes = ($days * self::LEDGER_HOURS_PER_DAY * self::LEDGER_MINUTES_PER_HOUR)
+            + ($hours * self::LEDGER_MINUTES_PER_HOUR)
+            + $minutes;
+
+        if ($totalMinutes <= 0) {
+            return response()->json(['message' => 'Total late duration must be greater than 0.'], 422);
+        }
 
         $trackedTypeIdsByKey = $this->resolveLedgerTrackedLeaveTypeIds();
         $targetLeave = $validated['target_leave'];
@@ -4733,8 +4952,7 @@ class EmployeeController extends Controller
             return response()->json(['message' => "{$leaveName} type not configured."], 500);
         }
 
-        $minutes = (int) $validated['minutes_late'];
-        $deductionAmount = round($minutes / 480, 3);
+        $deductionAmount = round($totalMinutes / 480, 3);
 
         if ($deductionAmount <= 0) {
             return response()->json(['message' => 'Deduction amount is too small.'], 422);
@@ -4760,16 +4978,17 @@ class EmployeeController extends Controller
         $selectedDates = $validated['selected_dates'];
         sort($selectedDates);
         $firstDate = Carbon::parse($selectedDates[0]);
+        $lastDate = Carbon::parse($selectedDates[count($selectedDates) - 1]);
         $startDate = $firstDate->copy()->startOfMonth()->toDateString();
-        $endDate = $firstDate->copy()->endOfMonth()->toDateString();
+        $endDate = $lastDate->copy()->endOfMonth()->toDateString();
 
         $particularsText = trim((string) ($validated['particulars'] ?? ''));
-        if ($particularsText === '') {
-            $formattedLateDuration = $this->formatLedgerMinutes($minutes);
+        if ($particularsText === '' || preg_match('/^LATE \d+-\d+-\d+$/i', $particularsText)) {
+            $formattedLateDuration = $this->formatLedgerMinutes($totalMinutes);
             $particularsText = "LATE {$formattedLateDuration}";
         }
 
-        $deductionRecord = DB::transaction(function () use ($controlNo, $validated, $hr, $startDate, $endDate, $selectedDates, $particularsText, $deductionAmount, $targetLeaveTypeId, $leaveBalance, $minutes): LateDeduction {
+        $deductionRecord = DB::transaction(function () use ($controlNo, $validated, $hr, $startDate, $endDate, $selectedDates, $particularsText, $deductionAmount, $targetLeaveTypeId, $leaveBalance, $days, $hours, $minutes): LateDeduction {
             $record = LateDeduction::create([
                 'employee_control_no' => (string) $controlNo,
                 'target_leave_type_id' => (int) $targetLeaveTypeId,
@@ -4777,6 +4996,8 @@ class EmployeeController extends Controller
                 'start_date' => $startDate,
                 'end_date' => $endDate,
                 'selected_dates' => $selectedDates,
+                'days_late' => $days,
+                'hours_late' => $hours,
                 'minutes_late' => $minutes,
                 'deducted_days' => $deductionAmount,
                 'deducted_by_hr_id' => (int) $hr->id,
@@ -4804,5 +5025,592 @@ class EmployeeController extends Controller
             'message' => 'Late deduction successfully applied.',
             'deduction' => $deductionRecord->load(['leaveType', 'deductedByHr']),
         ], 201);
+    }
+
+    public function updateLateDeduction(Request $request, string $controlNo, int|string $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $employee = HrisEmployee::findByControlNo($controlNo);
+        if (! $employee) {
+            return response()->json(['message' => 'Employee not found.'], 404);
+        }
+
+        $controlNoCandidates = $this->buildLedgerControlNoCandidates($controlNo, $employee);
+        $lateDeduction = LateDeduction::query()
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->where('id', (int) $id)
+            ->first();
+
+        if (! $lateDeduction) {
+            return response()->json(['message' => 'Late deduction record not found.'], 404);
+        }
+
+        $validated = $request->validate([
+            'target_leave' => ['required', 'string', 'in:VL,SL'],
+            'days_late' => ['nullable', 'integer', 'min:0'],
+            'hours_late' => ['nullable', 'integer', 'min:0'],
+            'minutes_late' => ['nullable', 'integer', 'min:0'],
+            'particulars' => ['nullable', 'string', 'max:255'],
+            'selected_dates' => ['required', 'array', 'min:1'],
+            'selected_dates.*' => ['required', 'date'],
+            'remarks' => ['nullable', 'string', 'max:1000'],
+        ]);
+
+        $days = max(0, (int) ($validated['days_late'] ?? 0));
+        $hours = max(0, (int) ($validated['hours_late'] ?? 0));
+        $minutes = max(0, (int) ($validated['minutes_late'] ?? 0));
+
+        $totalMinutes = ($days * self::LEDGER_HOURS_PER_DAY * self::LEDGER_MINUTES_PER_HOUR)
+            + ($hours * self::LEDGER_MINUTES_PER_HOUR)
+            + $minutes;
+
+        if ($totalMinutes <= 0) {
+            return response()->json(['message' => 'Total late duration must be greater than 0.'], 422);
+        }
+
+        $trackedTypeIdsByKey = $this->resolveLedgerTrackedLeaveTypeIds();
+        $targetLeave = $validated['target_leave'];
+        $newTargetTypeId = $targetLeave === 'SL'
+            ? ($trackedTypeIdsByKey['sick'] ?? null)
+            : ($trackedTypeIdsByKey['vacation'] ?? null);
+
+        if (! $newTargetTypeId) {
+            $leaveName = $targetLeave === 'SL' ? 'Sick Leave' : 'Vacation Leave';
+
+            return response()->json(['message' => "{$leaveName} type not configured."], 500);
+        }
+
+        $newDeductionAmount = round($totalMinutes / 480, 3);
+        if ($newDeductionAmount <= 0) {
+            return response()->json(['message' => 'Deduction amount is too small.'], 422);
+        }
+
+        $oldTargetTypeId = (int) $lateDeduction->target_leave_type_id;
+        $oldDeductionAmount = round((float) ($lateDeduction->deducted_days ?? 0), 3);
+
+        $selectedDates = $validated['selected_dates'];
+        sort($selectedDates);
+        $firstDate = Carbon::parse($selectedDates[0]);
+        $lastDate = Carbon::parse($selectedDates[count($selectedDates) - 1]);
+        $startDate = $firstDate->copy()->startOfMonth()->toDateString();
+        $endDate = $lastDate->copy()->endOfMonth()->toDateString();
+
+        $particularsText = trim((string) ($validated['particulars'] ?? ''));
+        if ($particularsText === '' || preg_match('/^LATE \d+-\d+-\d+$/i', $particularsText)) {
+            $formattedLateDuration = $this->formatLedgerMinutes($totalMinutes);
+            $particularsText = "LATE {$formattedLateDuration}";
+        }
+
+        $updatedRecord = DB::transaction(function () use (
+            $controlNo,
+            $controlNoCandidates,
+            $lateDeduction,
+            $validated,
+            $hr,
+            $startDate,
+            $endDate,
+            $selectedDates,
+            $particularsText,
+            $newDeductionAmount,
+            $newTargetTypeId,
+            $oldTargetTypeId,
+            $oldDeductionAmount,
+            $days,
+            $hours,
+            $minutes
+        ): LateDeduction {
+            $year = (int) (Carbon::parse($startDate)->year ?? now()->year);
+
+            if ($newTargetTypeId === $oldTargetTypeId) {
+                $netDelta = $newDeductionAmount - $oldDeductionAmount;
+                $leaveBalance = LeaveBalance::query()
+                    ->whereIn('employee_control_no', $controlNoCandidates)
+                    ->where('leave_type_id', $newTargetTypeId)
+                    ->first();
+
+                if (! $leaveBalance) {
+                    $leaveBalance = LeaveBalance::create([
+                        'employee_control_no' => (string) $controlNo,
+                        'leave_type_id' => $newTargetTypeId,
+                        'year' => $year,
+                        'balance' => -$newDeductionAmount,
+                    ]);
+                } else {
+                    $leaveBalance->balance -= $netDelta;
+                    $leaveBalance->save();
+                }
+            } else {
+                // Refund old leave type
+                $oldBalance = LeaveBalance::query()
+                    ->whereIn('employee_control_no', $controlNoCandidates)
+                    ->where('leave_type_id', $oldTargetTypeId)
+                    ->first();
+                if ($oldBalance) {
+                    $oldBalance->balance += $oldDeductionAmount;
+                    $oldBalance->save();
+                }
+
+                // Deduct from new leave type
+                $newBalance = LeaveBalance::query()
+                    ->whereIn('employee_control_no', $controlNoCandidates)
+                    ->where('leave_type_id', $newTargetTypeId)
+                    ->first();
+                if (! $newBalance) {
+                    $newBalance = LeaveBalance::create([
+                        'employee_control_no' => (string) $controlNo,
+                        'leave_type_id' => $newTargetTypeId,
+                        'year' => $year,
+                        'balance' => -$newDeductionAmount,
+                    ]);
+                } else {
+                    $newBalance->balance -= $newDeductionAmount;
+                    $newBalance->save();
+                }
+            }
+
+            $lateDeduction->update([
+                'target_leave_type_id' => (int) $newTargetTypeId,
+                'particulars' => $particularsText,
+                'start_date' => $startDate,
+                'end_date' => $endDate,
+                'selected_dates' => $selectedDates,
+                'days_late' => $days,
+                'hours_late' => $hours,
+                'minutes_late' => $minutes,
+                'deducted_days' => $newDeductionAmount,
+                'deducted_by_hr_id' => (int) $hr->id,
+                'remarks' => isset($validated['remarks']) && trim((string) $validated['remarks']) !== '' ? trim((string) $validated['remarks']) : null,
+            ]);
+
+            return $lateDeduction;
+        });
+
+        return response()->json([
+            'message' => 'Late deduction successfully updated.',
+            'deduction' => $updatedRecord->load(['leaveType', 'deductedByHr']),
+        ], 200);
+    }
+
+    /**
+     * Get the dedicated COC (Compensatory Overtime Credits) & CTO (Compensatory Time-Off) ledger for an employee.
+     */
+    public function cocCtoLedger(Request $request, string $controlNo): JsonResponse
+    {
+        $account = $request->user();
+        if (! $account instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $employee = HrisEmployee::findByControlNo($controlNo);
+        if (! $employee) {
+            return response()->json(['message' => 'Employee not found.'], 404);
+        }
+
+        $controlNoCandidates = $this->buildLedgerControlNoCandidates($controlNo, $employee);
+
+        // Find CTO leave type
+        $ctoLeaveType = LeaveType::query()
+            ->where(function ($q) {
+                $q->where('name', 'like', '%Compensatory%')
+                    ->orWhere('name', 'like', '%CTO%');
+            })
+            ->first();
+        $ctoLeaveTypeId = $ctoLeaveType ? (int) $ctoLeaveType->id : 8;
+
+        // Current CTO balance
+        $ctoBalanceRecord = LeaveBalance::query()
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->where('leave_type_id', $ctoLeaveTypeId)
+            ->orderByDesc('year')
+            ->orderByDesc('updated_at')
+            ->first();
+
+        $currentDays = round((float) ($ctoBalanceRecord->balance ?? 0.0), 3);
+        $currentHours = round($currentDays * self::LEDGER_HOURS_PER_DAY, 2);
+
+        $transactions = [];
+
+        // 1. Accrual History on CTO balance (e.g. manual adjustments)
+        if ($ctoBalanceRecord) {
+            $accrualEntries = LeaveBalanceAccrualHistory::query()
+                ->where('leave_balance_id', $ctoBalanceRecord->id)
+                ->orderByDesc('accrual_date')
+                ->orderByDesc('id')
+                ->get();
+
+            foreach ($accrualEntries as $entry) {
+                $creditsAdded = round((float) ($entry->credits_added ?? 0.0), 3);
+                if ($creditsAdded === 0.0) {
+                    continue;
+                }
+
+                $accrualDate = $entry->accrual_date?->toDateString();
+                if ($accrualDate === null) {
+                    continue;
+                }
+
+                $hoursAdded = round($creditsAdded * self::LEDGER_HOURS_PER_DAY, 2);
+                $isPositive = $creditsAdded > 0;
+                $source = strtoupper(trim((string) ($entry->source ?? '')));
+                $actionTaken = match (true) {
+                    $source === 'MANUAL_ENTRY' => 'Manual Adjustment',
+                    $source === 'YEARLY_RESET' => 'Yearly Balance Reset',
+                    default => 'Accrual Adjustment',
+                };
+
+                $transactions[] = [
+                    'row_id' => 'accrual-'.(int) $entry->id,
+                    'transaction_date' => $accrualDate,
+                    'sort_date' => $accrualDate,
+                    'sort_timestamp' => (string) ($entry->created_at?->toIso8601String() ?? $accrualDate),
+                    'particulars' => $isPositive ? 'CTO Credit Adjustment' : 'CTO Debit Adjustment',
+                    'action_taken' => $actionTaken,
+                    'category' => $isPositive ? 'earned' : 'deduction',
+                    'amount_hours' => abs($hoursAdded),
+                    'amount_days' => abs($creditsAdded),
+                    'balance_delta' => $hoursAdded,
+                    'inclusive_dates' => [],
+                    'inclusive_start_date' => null,
+                    'inclusive_end_date' => null,
+                ];
+            }
+        }
+
+        // 2. Approved COC Applications (Earned Compensatory Overtime Credits)
+        $approvedCocApplications = COCApplication::query()
+            ->with('rows')
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->where('status', COCApplication::STATUS_APPROVED)
+            ->orderByDesc('cto_credited_at')
+            ->orderByDesc('reviewed_at')
+            ->orderByDesc('created_at')
+            ->orderByDesc('id')
+            ->get();
+
+        foreach ($approvedCocApplications as $cocApp) {
+            $cocDate = $cocApp->cto_credited_at?->toDateString()
+                ?? $cocApp->reviewed_at?->toDateString()
+                ?? $cocApp->created_at?->toDateString();
+            if ($cocDate === null) {
+                continue;
+            }
+
+            $totalMinutes = (int) ($cocApp->total_minutes ?? 0);
+            $creditedHours = (float) ($cocApp->credited_hours ?? 0.0);
+            if ($totalMinutes > 0) {
+                $earnedHours = round($totalMinutes / 60.0, 2);
+                $earnedDays = round($totalMinutes / 480.0, 3);
+            } elseif ($creditedHours > 0) {
+                $earnedHours = round($creditedHours, 2);
+                $earnedDays = round($creditedHours / 8.0, 3);
+            } else {
+                $earnedDays = round((float) ($cocApp->cto_credited_days ?? 0.0), 3);
+                $earnedHours = round($earnedDays * 8.0, 2);
+            }
+
+            if ($earnedHours <= 0.0) {
+                continue;
+            }
+
+            $overtimeDates = $cocApp->rows
+                ?->map(fn ($r) => $r->overtime_date?->toDateString())
+                ->filter()
+                ->unique()
+                ->sort()
+                ->values()
+                ->all() ?? [];
+
+            $creditedDateFormatted = $cocDate ? Carbon::parse($cocDate)->format('F j, Y') : '';
+            $particulars = 'COC 0-0-0';
+            $actionTaken = $creditedDateFormatted !== '' ? $creditedDateFormatted : ($cocDate ? Carbon::parse($cocDate)->format('F j, Y') : '');
+
+            $transactions[] = [
+                'row_id' => 'coc-'.(int) $cocApp->id,
+                'transaction_date' => $cocDate,
+                'sort_date' => $cocDate,
+                'sort_timestamp' => (string) ($cocApp->cto_credited_at?->toIso8601String() ?? $cocApp->reviewed_at?->toIso8601String() ?? $cocApp->created_at?->toIso8601String() ?? $cocDate),
+                'particulars' => $particulars,
+                'action_taken' => $actionTaken,
+                'category' => 'earned',
+                'amount_hours' => $earnedHours,
+                'amount_days' => $earnedDays,
+                'balance_delta' => $earnedHours,
+                'inclusive_dates' => $overtimeDates,
+                'inclusive_start_date' => $overtimeDates[0] ?? null,
+                'inclusive_end_date' => ! empty($overtimeDates) ? end($overtimeDates) : null,
+            ];
+        }
+
+        // 3. Approved & Approved-Cancelled CTO Leave Applications (Compensatory Time-Off Taken)
+        $ctoApplications = LeaveApplication::query()
+            ->with(['logs', 'updateRequests', 'leaveType'])
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->where(function ($q) use ($ctoLeaveTypeId) {
+                if ($ctoLeaveTypeId) {
+                    $q->where('leave_type_id', $ctoLeaveTypeId);
+                }
+                $q->orWhereHas('leaveType', function ($tq) {
+                    $tq->where('name', 'like', '%Compensatory%')
+                        ->orWhere('name', 'like', '%CTO%');
+                });
+            })
+            ->where(function ($q) {
+                $q->where('status', LeaveApplication::STATUS_APPROVED)
+                    ->orWhere(function ($sq) {
+                        $sq->where('status', LeaveApplication::STATUS_CANCELLED)
+                            ->where(function ($ssq) {
+                                $ssq->whereNotNull('hr_approved_at')
+                                    ->orWhereHas('logs', fn ($l) => $l->where('action', LeaveApplicationLog::ACTION_HR_APPROVED))
+                                    ->orWhereHas('updateRequests', fn ($u) => $u->where('status', LeaveApplicationUpdateRequest::STATUS_APPROVED));
+                            });
+                    });
+            })
+            ->orderByDesc('hr_approved_at')
+            ->orderByDesc('created_at')
+            ->orderByDesc('id')
+            ->get();
+
+        foreach ($ctoApplications as $app) {
+            $isCancelled = $app->status === LeaveApplication::STATUS_CANCELLED;
+            $cancelUpdateRequest = $isCancelled && $app->relationLoaded('updateRequests')
+                ? $app->updateRequests->first(function (LeaveApplicationUpdateRequest $req): bool {
+                    $payload = is_array($req->requested_payload) ? $req->requested_payload : [];
+                    $actionType = strtoupper((string) ($payload['action_type'] ?? ''));
+                    $requestKind = strtolower((string) ($payload['request_kind'] ?? ''));
+
+                    return $actionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
+                        || str_contains($actionType, 'CANCEL')
+                        || $requestKind === 'cancel';
+                })
+                : null;
+
+            $firstApprovalLog = $app->relationLoaded('logs')
+                ? $app->logs->first(function (LeaveApplicationLog $log): bool {
+                    $remarks = strtolower((string) $log->remarks);
+
+                    return $log->action === LeaveApplicationLog::ACTION_HR_APPROVED
+                        && ! str_contains($remarks, 'cancel');
+                })
+                : null;
+            if ($firstApprovalLog === null && $app->relationLoaded('logs')) {
+                $firstApprovalLog = $app->logs->first(function (LeaveApplicationLog $log): bool {
+                    return in_array($log->action, [
+                        LeaveApplicationLog::ACTION_HR_APPROVED,
+                        LeaveApplicationLog::ACTION_ADMIN_APPROVED,
+                    ], true);
+                });
+            }
+
+            if ($isCancelled) {
+                $appDate = $firstApprovalLog?->created_at?->toDateString()
+                    ?? $app->created_at?->toDateString();
+                $appTimestamp = (string) (
+                    $firstApprovalLog?->created_at?->toIso8601String()
+                    ?? $app->created_at?->toIso8601String()
+                    ?? $appDate
+                );
+            } else {
+                $appDate = $app->hr_approved_at?->toDateString()
+                    ?? $firstApprovalLog?->created_at?->toDateString()
+                    ?? $app->created_at?->toDateString();
+                $appTimestamp = (string) (
+                    $app->hr_approved_at?->toIso8601String()
+                    ?? $firstApprovalLog?->created_at?->toIso8601String()
+                    ?? $app->created_at?->toIso8601String()
+                    ?? $appDate
+                );
+            }
+            if ($appDate === null) {
+                continue;
+            }
+
+            $totalDays = (float) ($app->total_days ?? 0.0);
+            $deductibleDays = (float) ($app->deductible_days ?? 0.0);
+            if ($isCancelled && $deductibleDays <= 0.0) {
+                $payload = is_array($cancelUpdateRequest?->requested_payload) ? $cancelUpdateRequest->requested_payload : [];
+                $deductibleDays = (float) ($payload['deductible_days'] ?? $payload['total_days'] ?? $totalDays);
+            }
+            if ($deductibleDays <= 0.0 && $totalDays > 0.0) {
+                $deductibleDays = $totalDays;
+            }
+
+            $ctoHours = (float) ($app->cto_deducted_hours ?? 0.0);
+            if ($ctoHours <= 0.0) {
+                $ctoHours = $deductibleDays * self::LEDGER_HOURS_PER_DAY;
+            }
+
+            $usedHours = round($ctoHours, 2);
+            $usedDays = round($ctoHours / self::LEDGER_HOURS_PER_DAY, 3);
+            if ($usedHours <= 0.0) {
+                continue;
+            }
+
+            $inclusiveStartDate = $app->start_date?->toDateString();
+            $inclusiveEndDate = $app->end_date?->toDateString();
+            $inclusiveDates = $this->resolveLedgerInclusiveDates(
+                $app->selected_dates,
+                $inclusiveStartDate,
+                $inclusiveEndDate
+            );
+
+            $particulars = $this->buildLedgerParticulars('deduction', 'other', $totalDays, false, false, 'CTO');
+            $actionTaken = $appDate ? Carbon::parse($appDate)->format('F j, Y') : '';
+
+            // Original Deduction
+            $transactions[] = [
+                'row_id' => 'cto-app-'.(int) $app->id,
+                'transaction_date' => $appDate,
+                'sort_date' => $appDate,
+                'sort_timestamp' => $appTimestamp,
+                'particulars' => $particulars,
+                'action_taken' => $actionTaken,
+                'category' => 'deduction',
+                'amount_hours' => $usedHours,
+                'amount_days' => $usedDays,
+                'balance_delta' => -$usedHours,
+                'inclusive_dates' => $inclusiveDates,
+                'inclusive_start_date' => $inclusiveStartDate,
+                'inclusive_end_date' => $inclusiveEndDate,
+            ];
+
+            // If Cancelled, Restoration Row
+            if ($isCancelled) {
+                $cancelLog = $app->relationLoaded('logs')
+                    ? $app->logs->first(function (LeaveApplicationLog $log): bool {
+                        return str_contains(strtolower((string) $log->remarks), 'cancel');
+                    })
+                    : null;
+                if ($cancelLog === null && $app->relationLoaded('logs')) {
+                    $cancelLog = $app->logs->sortByDesc('id')->first(function (LeaveApplicationLog $log): bool {
+                        return $log->action === LeaveApplicationLog::ACTION_HR_APPROVED;
+                    });
+                }
+
+                $cancellationDate = $cancelUpdateRequest?->reviewed_at?->toDateString()
+                    ?? $cancelLog?->created_at?->toDateString()
+                    ?? $app->hr_approved_at?->toDateString()
+                    ?? $app->updated_at?->toDateString()
+                    ?? $appDate;
+                $cancellationTimestamp = (string) (
+                    $cancelUpdateRequest?->reviewed_at?->toIso8601String()
+                    ?? $cancelLog?->created_at?->toIso8601String()
+                    ?? $app->hr_approved_at?->toIso8601String()
+                    ?? $app->updated_at?->toIso8601String()
+                    ?? $cancellationDate.'T23:59:59Z'
+                );
+                $cancellationDateFormatted = $cancellationDate ? Carbon::parse($cancellationDate)->format('F j, Y') : '';
+
+                $cancelActionTaken = $cancellationDateFormatted !== ''
+                    ? $cancellationDateFormatted
+                    : ($cancellationDate ? Carbon::parse($cancellationDate)->format('F j, Y') : '');
+
+                $transactions[] = [
+                    'row_id' => 'cancelled-cto-app-'.(int) $app->id,
+                    'transaction_date' => $cancellationDate,
+                    'sort_date' => $cancellationDate,
+                    'sort_timestamp' => $cancellationTimestamp,
+                    'particulars' => 'Cancelled',
+                    'action_taken' => $cancelActionTaken,
+                    'category' => 'earned',
+                    'amount_hours' => $usedHours,
+                    'amount_days' => $usedDays,
+                    'balance_delta' => $usedHours,
+                    'inclusive_dates' => $inclusiveDates,
+                    'inclusive_start_date' => $inclusiveStartDate,
+                    'inclusive_end_date' => $inclusiveEndDate,
+                ];
+            }
+        }
+
+        // Sort descending
+        usort($transactions, function (array $left, array $right): int {
+            $leftTimestamp = (string) ($left['sort_timestamp'] ?? '');
+            $rightTimestamp = (string) ($right['sort_timestamp'] ?? '');
+            if ($leftTimestamp !== $rightTimestamp) {
+                return $leftTimestamp < $rightTimestamp ? 1 : -1;
+            }
+
+            $leftDate = (string) ($left['sort_date'] ?? '');
+            $rightDate = (string) ($right['sort_date'] ?? '');
+            if ($leftDate !== $rightDate) {
+                return $leftDate < $rightDate ? 1 : -1;
+            }
+
+            $leftId = (string) ($left['row_id'] ?? '');
+            $rightId = (string) ($right['row_id'] ?? '');
+
+            return $rightId <=> $leftId;
+        });
+
+        // Compute running balances
+        $runningHours = $currentHours;
+        $ledgerRows = [];
+        foreach ($transactions as $tx) {
+            $currentHoursAtStep = $runningHours;
+            $currentDaysAtStep = round($currentHoursAtStep / self::LEDGER_HOURS_PER_DAY, 3);
+
+            $runningHours = round($runningHours - (float) ($tx['balance_delta'] ?? 0.0), 2);
+
+            $earnedHours = $tx['category'] === 'earned' ? $tx['amount_hours'] : null;
+            $earnedDays = $tx['category'] === 'earned' ? $tx['amount_days'] : null;
+            $usedHours = $tx['category'] === 'deduction' ? $tx['amount_hours'] : null;
+            $usedDays = $tx['category'] === 'deduction' ? $tx['amount_days'] : null;
+
+            $earnedMinutes = $tx['category'] === 'earned' ? (int) round(((float) $tx['amount_hours']) * 60) : null;
+            $usedMinutes = $tx['category'] === 'deduction' ? (int) round(((float) $tx['amount_hours']) * 60) : null;
+            $balanceMinutes = (int) round($currentHoursAtStep * 60);
+
+            $ledgerRows[] = [
+                'id' => $tx['row_id'],
+                'action_date' => $tx['transaction_date'],
+                'period' => $this->formatLedgerPeriodLabel($tx['transaction_date']),
+                'inclusive_dates' => $tx['inclusive_dates'] ?? [],
+                'inclusive_start_date' => $tx['inclusive_start_date'] ?? null,
+                'inclusive_end_date' => $tx['inclusive_end_date'] ?? null,
+                'particulars' => $tx['particulars'],
+                'earned_hours' => $earnedHours,
+                'earned_days' => $earnedDays,
+                'earned_minutes' => $earnedMinutes,
+                'used_hours' => $usedHours,
+                'used_days' => $usedDays,
+                'used_minutes' => $usedMinutes,
+                'balance_hours' => $currentHoursAtStep,
+                'balance_days' => $currentDaysAtStep,
+                'balance_minutes' => $balanceMinutes,
+                'action_taken' => $tx['action_taken'],
+            ];
+        }
+
+        $firstDayOfService = HrisEmployee::firstDayOfServiceByControlNo(
+            (string) ($employee->control_no ?? $controlNo)
+        ) ?? $this->normalizeLedgerDateString($employee->from_date ?? null);
+
+        $officeAcronym = HrisEmployee::officeAcronymByName($employee->office ?? null) ?? $employee->office;
+
+        return response()->json([
+            'employee' => [
+                'control_no' => $employee->control_no,
+                'firstname' => $employee->firstname,
+                'surname' => $employee->surname,
+                'middlename' => $employee->middlename,
+                'first_day_of_service' => $firstDayOfService,
+                'firstDayOfService' => $firstDayOfService,
+                'office' => $officeAcronym,
+                'office_acronym' => $officeAcronym,
+                'officeAcronym' => $officeAcronym,
+                'hrisOfficeAcronym' => $officeAcronym,
+                'designation' => $employee->designation,
+                'status' => $employee->status,
+            ],
+            'current_balance' => [
+                'hours' => $currentHours,
+                'days' => $currentDays,
+            ],
+            'ledger' => $ledgerRows,
+        ]);
     }
 }

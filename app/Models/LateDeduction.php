@@ -19,6 +19,8 @@ class LateDeduction extends Model
         'start_date',
         'end_date',
         'selected_dates',
+        'days_late',
+        'hours_late',
         'minutes_late',
         'deducted_days',
         'deducted_by_hr_id',
@@ -28,9 +30,11 @@ class LateDeduction extends Model
     protected function casts(): array
     {
         return [
-            'start_date' => 'date',
-            'end_date' => 'date',
+            'start_date' => 'date:Y-m-d',
+            'end_date' => 'date:Y-m-d',
             'selected_dates' => 'array',
+            'days_late' => 'integer',
+            'hours_late' => 'integer',
             'minutes_late' => 'integer',
             'deducted_days' => 'float',
             'deducted_by_hr_id' => 'integer',

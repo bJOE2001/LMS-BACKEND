@@ -30,6 +30,7 @@ class ResetHrPassword extends Command
         $username = trim((string) $this->argument('username'));
         if ($username === '') {
             $this->error('Username is required.');
+
             return self::FAILURE;
         }
 
@@ -39,6 +40,7 @@ class ResetHrPassword extends Command
 
         if (! $account) {
             $this->error("HR account '{$username}' was not found.");
+
             return self::FAILURE;
         }
 
@@ -59,6 +61,7 @@ class ResetHrPassword extends Command
             });
         } catch (Throwable $e) {
             $this->error('Failed to reset HR password: '.$e->getMessage());
+
             return self::FAILURE;
         }
 
