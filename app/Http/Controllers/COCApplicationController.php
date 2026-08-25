@@ -140,12 +140,6 @@ class COCApplicationController extends Controller
         $applications = COCApplication::query()
             ->with(self::COC_RELATIONS)
             ->matchingControlNo($controlNo)
-            ->where(function ($query): void {
-                $prefix = strtolower(self::HR_IMPORT_REMARK_PREFIX).'%';
-                $query
-                    ->whereNull('remarks')
-                    ->orWhereRaw('LOWER(remarks) NOT LIKE ?', [$prefix]);
-            })
             ->orderByDesc('created_at')
             ->get();
 
@@ -284,7 +278,7 @@ class COCApplicationController extends Controller
             ->when($controlNo !== '', function ($q) use ($controlNo): void {
                 $q->matchingControlNo($controlNo);
             })
-            ->when(! $includeImported, function ($q): void {
+            ->when($request->has('include_imported') && ! $includeImported, function ($q): void {
                 $prefix = strtolower(self::HR_IMPORT_REMARK_PREFIX).'%';
                 $q->where(function ($nestedQuery) use ($prefix): void {
                     $nestedQuery
@@ -561,7 +555,7 @@ class COCApplicationController extends Controller
             ->when($controlNo !== '', function ($q) use ($controlNo): void {
                 $q->matchingControlNo($controlNo);
             })
-            ->when(! $includeImported, function ($q): void {
+            ->when($request->has('include_imported') && ! $includeImported, function ($q): void {
                 $prefix = strtolower(self::HR_IMPORT_REMARK_PREFIX).'%';
                 $q->where(function ($nestedQuery) use ($prefix): void {
                     $nestedQuery
@@ -1777,18 +1771,38 @@ class COCApplicationController extends Controller
     {
         $admin->loadMissing('department');
         $departmentName = trim((string) ($admin->department?->name ?? ''));
+        $departmentId = $admin->department_id !== null ? (int) $admin->department_id : null;
 
         $query = COCApplication::query();
-        if ($departmentName === '') {
+        if ($departmentName === '' && ! $departmentId) {
             return $query->whereRaw('1 = 0');
         }
 
-        $departmentControlNos = HrisEmployee::controlNosByOffice($departmentName);
-        if ($departmentControlNos === []) {
+        $hrisControlNos = $departmentName !== '' ? HrisEmployee::controlNosByOffice($departmentName) : [];
+
+        $assignedControlNos = $departmentId !== null
+            ? EmployeeDepartmentAssignment::query()
+                ->where('department_id', $departmentId)
+                ->pluck('employee_control_no')
+                ->map(fn (mixed $value): string => trim((string) $value))
+                ->filter(fn (string $controlNo): bool => $controlNo !== '')
+                ->values()
+                ->all()
+            : [];
+
+        $adminControlNo = trim((string) ($admin->employee_control_no ?? ''));
+
+        $combinedControlNos = array_values(array_unique([
+            ...$hrisControlNos,
+            ...$assignedControlNos,
+            ...($adminControlNo !== '' ? [$adminControlNo] : []),
+        ]));
+
+        if ($combinedControlNos === []) {
             return $query->whereRaw('1 = 0');
         }
 
-        $candidateControlNos = collect($departmentControlNos)
+        $candidateControlNos = collect($combinedControlNos)
             ->flatMap(fn (string $controlNo): array => $this->controlNoCandidates($controlNo))
             ->unique()
             ->values()
@@ -2272,7 +2286,8 @@ class COCApplicationController extends Controller
     {
         $admin->loadMissing('department');
         $departmentName = trim((string) ($admin->department?->name ?? ''));
-        if ($departmentName === '') {
+        $departmentId = $admin->department_id !== null ? (int) $admin->department_id : null;
+        if ($departmentName === '' && ! $departmentId) {
             return false;
         }
 
@@ -2286,7 +2301,18 @@ class COCApplicationController extends Controller
             }
         }
 
-        return strcasecmp(trim($employeeOffice), $departmentName) === 0;
+        if ($departmentName !== '' && strcasecmp(trim($employeeOffice), $departmentName) === 0) {
+            return true;
+        }
+
+        if ($departmentId !== null && $controlNoCandidates !== []) {
+            return EmployeeDepartmentAssignment::query()
+                ->where('department_id', $departmentId)
+                ->whereIn('employee_control_no', $controlNoCandidates)
+                ->exists();
+        }
+
+        return false;
     }
 
     private function formatApplication(COCApplication $app, array $leaveBalanceDirectory = []): array

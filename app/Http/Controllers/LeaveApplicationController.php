@@ -3910,12 +3910,6 @@ class LeaveApplicationController extends Controller
                 }
             } elseif ($deductibleDays <= $effectivePrimaryAvailableBalance + 1e-9) {
                 // This override is reusing credits already reserved by the same pending application.
-            } elseif (! $requestedAllowSlVlCrossDeduction) {
-                return $this->buildInsufficientPrimaryLeaveBalanceResponse(
-                    $leaveType,
-                    $effectivePrimaryAvailableBalance,
-                    $deductibleDays
-                );
             } else {
                 $sickLeaveTypeId = $this->resolveSickLeaveTypeId();
                 $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
@@ -3927,6 +3921,21 @@ class LeaveApplicationController extends Controller
                     $sickLeaveTypeId,
                     $vacationLeaveTypeId
                 );
+
+                $canCrossDeduct = $linkedLeaveTypeId !== null && (
+                    $requestedAllowSlVlCrossDeduction
+                    || ! $request->has('allow_sl_vl_cross_deduction')
+                    || (bool) ($app->allow_sl_vl_cross_deduction ?? false)
+                );
+
+                if (! $canCrossDeduct) {
+                    return $this->buildInsufficientPrimaryLeaveBalanceResponse(
+                        $leaveType,
+                        $effectivePrimaryAvailableBalance,
+                        $deductibleDays
+                    );
+                }
+
                 $crossDeductionAvailableCredits = $linkedLeaveTypeId === $vacationLeaveTypeId
                     ? $this->resolvePendingTrackedLeaveBalanceAvailableToApplication(
                         $app,
@@ -3951,7 +3960,7 @@ class LeaveApplicationController extends Controller
                     (string) ($app->employee_control_no ?? ''),
                     $leaveType,
                     $this->trimNullableString($app->details_of_leave ?? null),
-                    $requestedAllowSlVlCrossDeduction,
+                    $canCrossDeduct,
                     $crossDeductionAvailableCredits
                 );
 
@@ -3970,7 +3979,7 @@ class LeaveApplicationController extends Controller
                 $requestedPayMode = $allocation['pay_mode'];
                 $requestedPayStatus = $allocation['selected_date_pay_status'];
                 $deductibleDays = (float) ($allocation['deductible_days'] ?? 0.0);
-                $resolvedAllowSlVlCrossDeduction = $requestedAllowSlVlCrossDeduction
+                $resolvedAllowSlVlCrossDeduction = $canCrossDeduct
                     && $deductibleDays > $effectivePrimaryAvailableBalance + 1e-9;
 
                 if ($resolvedAllowSlVlCrossDeduction) {
