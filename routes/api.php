@@ -243,6 +243,8 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::get('/leave-applications/{id}', [LeaveApplicationController::class, 'hrShow']);
             Route::get('/leave-applications/{id}/attachment', [LeaveApplicationController::class, 'hrViewAttachment']);
             Route::get('/leave-applications/{id}/print-logs', [LeaveApplicationController::class, 'hrPrintLogs']);
+            Route::post('/leave-applications/verify-document', [LeaveApplicationController::class, 'hrVerifyDocument'])
+                ->middleware('throttle:60,1');
         });
 
         Route::middleware('hr.module:receiving,applications')->group(function () {
@@ -250,8 +252,6 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::post('/leave-applications/{id}/receive', [LeaveApplicationController::class, 'hrReceive']);
             Route::post('/leave-applications/{id}/undo-receive', [LeaveApplicationController::class, 'hrUndoReceive']);
             Route::post('/leave-applications/{id}/update-receive', [LeaveApplicationController::class, 'hrReceiveUpdate']);
-            Route::post('/leave-applications/verify-document', [LeaveApplicationController::class, 'hrVerifyDocument'])
-                ->middleware('throttle:60,1');
         });
 
         Route::middleware('hr.module:releasing,applications')->group(function () {

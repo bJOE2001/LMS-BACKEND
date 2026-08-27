@@ -3402,6 +3402,14 @@ class LeaveApplicationController extends Controller
             fn (LeaveApplicationLog $log): bool => $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
                 && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
         );
+        $releasedLog = $application->logs->first(
+            fn (LeaveApplicationLog $log): bool => $log->action === LeaveApplicationLog::ACTION_HR_RELEASED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
+        $cmoCbmoReviewedLog = $application->logs->first(
+            fn (LeaveApplicationLog $log): bool => $log->action === LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
         $canReceiveByStatus = $application->status !== LeaveApplication::STATUS_PENDING_ADMIN
             || $this->isPendingApprovedUpdateRequest($application);
         $isCancelled = $application->status === LeaveApplication::STATUS_CANCELLED
@@ -3411,9 +3419,16 @@ class LeaveApplicationController extends Controller
         $currentVerification = $this->documentVerificationService->issue($application);
         $actorDirectory = $this->buildWorkflowActorDirectory([$application]);
 
+        $canRelease = $documentCurrent
+            && $releasedLog === null
+            && $receivedLog !== null
+            && $cmoCbmoReviewedLog !== null
+            && $canReceiveByStatus
+            && ! $isCancelled;
+
         return response()->json([
             'message' => $documentCurrent
-                ? 'The QR code is valid. Compare the printed form with the official application details before receiving it.'
+                ? 'The QR code is valid. Compare the printed form with the official application details before receiving or releasing it.'
                 : 'The QR code is authentic, but the printed form is no longer the current application version.',
             'verification' => [
                 'status' => $documentCurrent ? 'verified' : 'outdated',
@@ -3426,7 +3441,10 @@ class LeaveApplicationController extends Controller
                 'current_reference' => $currentVerification['reference'],
                 'format_version' => $decodedToken['format_version'],
                 'already_received' => $receivedLog !== null,
+                'already_released' => $releasedLog !== null,
+                'has_cmo_cbmo_review' => $cmoCbmoReviewedLog !== null,
                 'can_receive' => $documentCurrent && $receivedLog === null && $canReceiveByStatus && ! $isCancelled,
+                'can_release' => $canRelease,
                 'checked_at' => now()->toIso8601String(),
             ],
             'application' => $this->formatErmsApplication($application, $actorDirectory),
@@ -4182,15 +4200,43 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Only HR accounts can confirm released applications.'], 403);
         }
 
-        $request->validate([
+        $validated = $request->validate([
             'remarks' => ['nullable', 'string', 'max:2000'],
+            'verification_token' => ['nullable', 'string', 'max:255'],
         ]);
+
+        $verificationToken = trim((string) ($validated['verification_token'] ?? ''));
+        $decodedToken = null;
+        if ($verificationToken !== '') {
+            $decodedToken = $this->documentVerificationService->decode($verificationToken);
+            if ($decodedToken === null || (int) $decodedToken['application_id'] !== $id) {
+                return response()->json([
+                    'message' => 'Scan and verify the QR code from this leave application form before releasing it.',
+                ], 422);
+            }
+        }
 
         $app = LeaveApplication::query()
             ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
             ->find($id);
         if (! $app) {
             return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        if ($decodedToken !== null && ! $this->documentVerificationService->isCurrent($app, (string) $decodedToken['fingerprint'])) {
+            return response()->json([
+                'message' => 'This printed form is outdated. Print the current leave application form and scan its QR code.',
+            ], 422);
+        }
+
+        $isCancelled = $app->status === LeaveApplication::STATUS_CANCELLED
+            || $app->logs->contains(
+                fn (LeaveApplicationLog $log): bool => $this->isCancelledRemark($log->remarks)
+            ) || $this->isCancelledRemark($app->remarks);
+        if ($isCancelled) {
+            return response()->json([
+                'message' => 'Cannot mark as released: application is cancelled.',
+            ], 422);
         }
 
         $isPendingApprovedUpdateRequest = $this->isPendingApprovedUpdateRequest($app);
@@ -16990,13 +17036,10 @@ class LeaveApplicationController extends Controller
             $performerType = LeaveApplicationPrintLog::PERFORMER_ADMIN;
             $performerId = (string) $user->id;
             $performerName = $user->name ?? $user->username ?? $user->full_name ?? null;
-        } elseif ($user instanceof HrisEmployee) {
-            $performerType = LeaveApplicationPrintLog::PERFORMER_EMPLOYEE;
-            $performerId = (string) ($user->control_no ?? $user->id);
-            $performerName = $user->full_name ?? trim(($user->first_name ?? '').' '.($user->last_name ?? ''));
         } elseif ($user) {
-            $performerId = (string) ($user->id ?? '');
-            $performerName = $user->name ?? null;
+            $performerType = LeaveApplicationPrintLog::PERFORMER_EMPLOYEE;
+            $performerId = (string) (data_get($user, 'control_no') ?? data_get($user, 'id') ?? '');
+            $performerName = data_get($user, 'full_name') ?? data_get($user, 'name') ?? null;
         }
 
         if ($request->filled('printed_by_name') && empty($performerName)) {
