@@ -4455,6 +4455,258 @@ class LeaveApplicationController extends Controller
     }
 
     /**
+     * HR records batch/bulk CMO/CVMO review for multiple leave applications.
+     */
+    public function hrBulkCmoCbmoReview(Request $request): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can confirm CMO/CVMO review.'], 403);
+        }
+
+        $validated = $request->validate([
+            'ids' => ['required', 'array', 'min:1', 'max:500'],
+            'ids.*' => ['required', 'integer', 'min:1'],
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $ids = array_values(array_unique(array_filter(array_map('intval', $validated['ids']))));
+        if (empty($ids)) {
+            return response()->json(['message' => 'No valid application IDs provided.'], 422);
+        }
+
+        $remarks = trim((string) ($validated['remarks'] ?? '')) ?: 'CMO/CVMO review completed.';
+
+        $applications = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->whereIn('id', $ids)
+            ->get();
+
+        $processedIds = [];
+        $skippedCount = 0;
+        $now = now();
+
+        foreach ($applications as $app) {
+            if ($app->status !== LeaveApplication::STATUS_APPROVED) {
+                $skippedCount++;
+
+                continue;
+            }
+
+            $receivedLog = $app->logs->first(
+                fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
+                    && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+            );
+
+            if (! $receivedLog) {
+                $skippedCount++;
+
+                continue;
+            }
+
+            $reviewedLog = $app->logs->first(
+                fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED
+                    && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+            );
+
+            if ($reviewedLog) {
+                $processedIds[] = (int) $app->id;
+
+                continue;
+            }
+
+            LeaveApplicationLog::create([
+                'leave_application_id' => $app->id,
+                'action' => LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
+                'performed_by_id' => $hr->id,
+                'remarks' => $remarks,
+                'created_at' => $now,
+            ]);
+
+            $app->load('logs');
+            $this->smsGatewayService()->sendLeaveReadyForReleaseMessage($app);
+            $processedIds[] = (int) $app->id;
+        }
+
+        $processedCount = count($processedIds);
+        $actorDirectory = $this->buildWorkflowActorDirectory($applications);
+        $formattedApplications = $applications->map(fn (LeaveApplication $application) => $this->formatErmsApplication($application, $actorDirectory))->values();
+
+        return response()->json([
+            'message' => "Successfully processed {$processedCount} leave application(s) for CMO/CVMO review.",
+            'processed_count' => $processedCount,
+            'skipped_count' => $skippedCount,
+            'processed_ids' => $processedIds,
+            'applications' => $formattedApplications,
+        ]);
+    }
+
+    /**
+     * HR confirms batch/bulk release of multiple leave applications.
+     */
+    public function hrBulkRelease(Request $request): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can confirm released applications.'], 403);
+        }
+
+        $validated = $request->validate([
+            'ids' => ['required', 'array', 'min:1', 'max:500'],
+            'ids.*' => ['required', 'integer', 'min:1'],
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $ids = array_values(array_unique(array_filter(array_map('intval', $validated['ids']))));
+        if (empty($ids)) {
+            return response()->json(['message' => 'No valid application IDs provided.'], 422);
+        }
+
+        $remarks = trim((string) ($validated['remarks'] ?? '')) ?: 'Released hard copy leave application form.';
+
+        $applications = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->whereIn('id', $ids)
+            ->get();
+
+        $processedIds = [];
+        $skippedCount = 0;
+        $now = now();
+
+        foreach ($applications as $app) {
+            $isCancelled = $app->status === LeaveApplication::STATUS_CANCELLED
+                || $app->logs->contains(
+                    fn (LeaveApplicationLog $log): bool => $this->isCancelledRemark($log->remarks)
+                ) || $this->isCancelledRemark($app->remarks);
+            if ($isCancelled) {
+                $skippedCount++;
+
+                continue;
+            }
+
+            $isPendingApprovedUpdateRequest = $this->isPendingApprovedUpdateRequest($app);
+            if ($app->status === LeaveApplication::STATUS_PENDING_ADMIN && ! $isPendingApprovedUpdateRequest) {
+                $skippedCount++;
+
+                continue;
+            }
+
+            if ($this->hasPendingApprovedUpdateRequest($app)) {
+                $cycleRequestedAt = $this->resolveLatestApprovedUpdateCycleRequestedAt($app);
+                if (! $cycleRequestedAt) {
+                    $skippedCount++;
+
+                    continue;
+                }
+
+                $releasedLog = $this->resolveLatestHrActionLogForCycle(
+                    $app,
+                    LeaveApplicationLog::ACTION_HR_RELEASED,
+                    $cycleRequestedAt
+                );
+
+                if ($releasedLog) {
+                    $processedIds[] = (int) $app->id;
+
+                    continue;
+                }
+
+                $receivedLog = $this->resolveLatestHrActionLogForCycle(
+                    $app,
+                    LeaveApplicationLog::ACTION_HR_RECEIVED,
+                    $cycleRequestedAt
+                );
+
+                if (! $receivedLog) {
+                    $skippedCount++;
+
+                    continue;
+                }
+
+                $pendingActionType = $this->resolveLatestApprovedUpdateActionType($app);
+
+                LeaveApplicationLog::create([
+                    'leave_application_id' => $app->id,
+                    'action' => LeaveApplicationLog::ACTION_HR_RELEASED,
+                    'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
+                    'performed_by_id' => $hr->id,
+                    'remarks' => $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
+                        ? 'Released leave cancellation request form.'
+                        : (
+                            $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                                ? 'Released leave recall request form.'
+                                : 'Released updated hard copy leave application form.'
+                        ),
+                    'created_at' => $now,
+                ]);
+
+                $app->load('logs');
+                $processedIds[] = (int) $app->id;
+
+                continue;
+            }
+
+            $releasedLog = $app->logs->first(
+                fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_RELEASED
+                    && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+            );
+
+            if ($releasedLog) {
+                $processedIds[] = (int) $app->id;
+
+                continue;
+            }
+
+            $receivedLog = $app->logs->first(
+                fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
+                    && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+            );
+
+            if (! $receivedLog) {
+                $skippedCount++;
+
+                continue;
+            }
+
+            $cmoCbmoReviewedLog = $app->logs->first(
+                fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED
+                    && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+            );
+
+            if (! $cmoCbmoReviewedLog) {
+                $skippedCount++;
+
+                continue;
+            }
+
+            LeaveApplicationLog::create([
+                'leave_application_id' => $app->id,
+                'action' => LeaveApplicationLog::ACTION_HR_RELEASED,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
+                'performed_by_id' => $hr->id,
+                'remarks' => $remarks,
+                'created_at' => $now,
+            ]);
+
+            $app->load('logs');
+            $processedIds[] = (int) $app->id;
+        }
+
+        $processedCount = count($processedIds);
+        $actorDirectory = $this->buildWorkflowActorDirectory($applications);
+        $formattedApplications = $applications->map(fn (LeaveApplication $application) => $this->formatErmsApplication($application, $actorDirectory))->values();
+
+        return response()->json([
+            'message' => "Successfully released {$processedCount} leave application(s).",
+            'processed_count' => $processedCount,
+            'skipped_count' => $skippedCount,
+            'processed_ids' => $processedIds,
+            'applications' => $formattedApplications,
+        ]);
+    }
+
+    /**
      * HR confirms receipt of the updated hard-copy leave application form
      * for the active approved-update request cycle.
      */

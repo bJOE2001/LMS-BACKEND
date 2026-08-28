@@ -5301,12 +5301,12 @@ class EmployeeController extends Controller
 
             $totalMinutes = (int) ($cocApp->total_minutes ?? 0);
             $creditedHours = (float) ($cocApp->credited_hours ?? 0.0);
-            if ($totalMinutes > 0) {
-                $earnedHours = round($totalMinutes / 60.0, 2);
-                $earnedDays = round($totalMinutes / 480.0, 3);
-            } elseif ($creditedHours > 0) {
+            if ($creditedHours > 0) {
                 $earnedHours = round($creditedHours, 2);
                 $earnedDays = round($creditedHours / 8.0, 3);
+            } elseif ($totalMinutes > 0) {
+                $earnedHours = round($totalMinutes / 60.0, 2);
+                $earnedDays = round($totalMinutes / 480.0, 3);
             } else {
                 $earnedDays = round((float) ($cocApp->cto_credited_days ?? 0.0), 3);
                 $earnedHours = round($earnedDays * 8.0, 2);
