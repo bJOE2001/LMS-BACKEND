@@ -13,7 +13,7 @@ use Throwable;
 
 class SyncCocExpiry extends Command
 {
-    protected $signature = 'coc:sync-expiry
+    protected $signature = 'coc:expire
         {--date= : Override as-of date (Y-m-d) for testing}
         {--control-no= : Sync only one employee control number}
         {--chunk=200 : Number of employees to process per batch}';
