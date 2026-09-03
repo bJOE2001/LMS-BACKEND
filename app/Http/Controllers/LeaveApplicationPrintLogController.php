@@ -23,7 +23,7 @@ class LeaveApplicationPrintLogController extends Controller
         $deptName = $admin->department?->name;
         $departmentEmployeeControlNos = \App\Models\HrisEmployee::controlNosByOffice($deptName);
 
-        $query = LeaveApplicationPrintLog::with(['leaveApplication']);
+        $query = LeaveApplicationPrintLog::with(['leaveApplication.leaveType']);
 
         // Restrict to applications from this admin's department
         if ($departmentEmployeeControlNos !== []) {
@@ -42,7 +42,10 @@ class LeaveApplicationPrintLogController extends Controller
                 $q->whereHas('leaveApplication', function ($qApp) use ($search) {
                     $qApp->where('id', 'like', "%{$search}%")
                         ->orWhere('employee_name', 'like', "%{$search}%")
-                        ->orWhere('employee_control_no', 'like', "%{$search}%");
+                        ->orWhere('employee_control_no', 'like', "%{$search}%")
+                        ->orWhereHas('leaveType', function ($qType) use ($search) {
+                            $qType->where('name', 'like', "%{$search}%");
+                        });
                 })
                 // Or search by printed by name
                     ->orWhere('printed_by_name', 'like', "%{$search}%");
@@ -78,7 +81,7 @@ class LeaveApplicationPrintLogController extends Controller
      */
     public function hrIndex(Request $request)
     {
-        $query = LeaveApplicationPrintLog::with(['leaveApplication']);
+        $query = LeaveApplicationPrintLog::with(['leaveApplication.leaveType']);
 
         // Search filter
         if ($request->filled('search')) {
@@ -87,7 +90,10 @@ class LeaveApplicationPrintLogController extends Controller
                 $q->whereHas('leaveApplication', function ($qApp) use ($search) {
                     $qApp->where('id', 'like', "%{$search}%")
                         ->orWhere('employee_name', 'like', "%{$search}%")
-                        ->orWhere('employee_control_no', 'like', "%{$search}%");
+                        ->orWhere('employee_control_no', 'like', "%{$search}%")
+                        ->orWhereHas('leaveType', function ($qType) use ($search) {
+                            $qType->where('name', 'like', "%{$search}%");
+                        });
                 })
                 // Or search by printed by name
                     ->orWhere('printed_by_name', 'like', "%{$search}%");
