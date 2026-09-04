@@ -1116,12 +1116,17 @@ class EmployeeController extends Controller
             foreach ($restorations as $restoration) {
                 $typeId = (int) $restoration->target_leave_type_id;
                 $typeKey = $typeIdToKey[$typeId] ?? null;
-                if ($typeKey === null) {
+                $isForcedLeaveRestoration = is_int($forcedLeaveTypeId) && $forcedLeaveTypeId > 0 && $typeId === $forcedLeaveTypeId;
+
+                $displayTypeKey = $isForcedLeaveRestoration ? 'vacation' : $typeKey;
+                $displayBalanceKey = $isForcedLeaveRestoration
+                    ? 'vacation'
+                    : ($balanceKeyByTypeId[$typeId] ?? $this->resolveLedgerRunningBalanceKey($typeKey, $typeId));
+
+                if ($displayTypeKey === null) {
                     continue;
                 }
-                $balanceKey = $balanceKeyByTypeId[$typeId]
-                    ?? $this->resolveLedgerRunningBalanceKey($typeKey, $typeId);
-                if (! is_string($balanceKey) || $balanceKey === '') {
+                if (! is_string($displayBalanceKey) || $displayBalanceKey === '') {
                     continue;
                 }
 
@@ -1149,19 +1154,19 @@ class EmployeeController extends Controller
                     $restoration->created_at?->format('F j, Y') ?? $restorationDate
                 );
 
-                $otherTypeCode = $typeKey === 'other'
+                $otherTypeCode = $displayTypeKey === 'other'
                     ? ($otherTypeCodeById[$typeId] ?? null)
                     : null;
                 $leaveTypeCode = $this->resolveLedgerTypeCode(
-                    $typeKey,
+                    $displayTypeKey,
                     is_string($otherTypeCode) ? $otherTypeCode : null
                 );
 
                 $transactions[] = [
                     'row_id' => 'restoration-'.(int) $restoration->id,
                     'merge_key' => 'restoration-'.(int) $restoration->id,
-                    'type_key' => $typeKey,
-                    'balance_key' => $balanceKey,
+                    'type_key' => $displayTypeKey,
+                    'balance_key' => $displayBalanceKey,
                     'leave_type_code' => $leaveTypeCode,
                     'transaction_date' => $restorationDate,
                     'sort_date' => $restorationDate,
@@ -1176,6 +1181,32 @@ class EmployeeController extends Controller
                     'amount' => $restoredDays,
                     'balance_delta' => $restoredDays,
                 ];
+
+                if ($isForcedLeaveRestoration) {
+                    $forcedBalanceKey = $balanceKeyByTypeId[$typeId] ?? $this->resolveLedgerRunningBalanceKey('other', $typeId, true);
+                    if (is_string($forcedBalanceKey) && $forcedBalanceKey !== '') {
+                        $transactions[] = [
+                            'row_id' => 'restoration-fl-linked-'.(int) $restoration->id,
+                            'merge_key' => 'restoration-'.(int) $restoration->id,
+                            'type_key' => 'other',
+                            'balance_key' => $forcedBalanceKey,
+                            'leave_type_code' => $this->resolveLedgerTypeCode('other', 'FL', true),
+                            'transaction_date' => $restorationDate,
+                            'sort_date' => $restorationDate,
+                            'sort_timestamp' => (string) ($restoration->created_at?->toIso8601String() ?? $restorationDate),
+                            'particulars' => $particulars,
+                            'action_taken' => $actionTaken,
+                            'inclusive_start_date' => $restoration->start_date?->toDateString(),
+                            'inclusive_end_date' => $restoration->end_date?->toDateString(),
+                            'inclusive_dates' => $restoredDates,
+                            'selected_dates' => $restoredDates,
+                            'category' => 'earned',
+                            'amount' => $restoredDays,
+                            'balance_delta' => $restoredDays,
+                            'suppress_display' => true,
+                        ];
+                    }
+                }
             }
 
             // Late Deductions
