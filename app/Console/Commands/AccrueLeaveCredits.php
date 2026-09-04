@@ -3,9 +3,11 @@
 namespace App\Console\Commands;
 
 use App\Models\HrisEmployee;
+use App\Models\LeaveApplication;
 use App\Models\LeaveBalance;
 use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveType;
+use App\Services\CscLeaveCreditService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
@@ -62,8 +64,9 @@ class AccrueLeaveCredits extends Command
         $totalAccrued = 0;
         $totalProvisioned = 0;
 
+        $cscLeaveCreditService = app(CscLeaveCreditService::class);
         $targetMonth = $now->copy()->subMonth();
-        $lwopDaysCache = [];
+        $employeeLwopDaysCache = [];
 
         foreach ($accruedTypes as $type) {
             $eligibleEmployeeControlNos = $this->eligibleEmployeeControlNosForType($type, $employeeDirectory['employees']);
@@ -99,45 +102,13 @@ class AccrueLeaveCredits extends Command
                 }
 
                 $controlNo = trim((string) ($balance->employee_control_no ?? ''));
-                if ($controlNo !== '' && ! isset($lwopDaysCache[$controlNo])) {
-                    $deductions = [];
-                    $accruals = [];
-                    foreach ($accruedTypes as $t) {
-                        $deductions[$t->id] = \App\Models\LeaveApplication::calculateLwopDaysForMonth($controlNo, $targetMonth, $t->id);
-                        $accruals[$t->id] = (float) $t->accrual_rate;
-                    }
-
-                    $excessDeduction = 0.0;
-                    foreach ($accruedTypes as $t) {
-                        $d = $deductions[$t->id];
-                        $a = $accruals[$t->id];
-                        if ($d > $a) {
-                            $excessDeduction += ($d - $a);
-                            $deductions[$t->id] = $a;
-                        }
-                    }
-
-                    if ($excessDeduction > 0) {
-                        foreach ($accruedTypes as $t) {
-                            $remainingAccrual = $accruals[$t->id] - $deductions[$t->id];
-                            if ($remainingAccrual > 0) {
-                                $toDeduct = min($excessDeduction, $remainingAccrual);
-                                $deductions[$t->id] += $toDeduct;
-                                $excessDeduction -= $toDeduct;
-                            }
-                            if ($excessDeduction <= 0) {
-                                break;
-                            }
-                        }
-                    }
-
-                    $lwopDaysCache[$controlNo] = $deductions;
+                if ($controlNo !== '' && ! isset($employeeLwopDaysCache[$controlNo])) {
+                    $employeeLwopDaysCache[$controlNo] = LeaveApplication::calculateLwopDaysForMonth($controlNo, $targetMonth);
                 }
 
-                $deduction = $lwopDaysCache[$controlNo][$type->id] ?? 0.0;
+                $lwopDays = $employeeLwopDaysCache[$controlNo] ?? 0.0;
                 $accrualRate = (float) $type->accrual_rate;
-
-                $finalAccrual = round(max($accrualRate - $deduction, 0.0), 3);
+                $finalAccrual = $cscLeaveCreditService->computeMonthlyAccrual($lwopDays, $accrualRate);
 
                 DB::transaction(function () use ($balance, $type, $now, $employeeDirectory, $finalAccrual): void {
                     $employeeName = $this->resolveEmployeeNameForBalance($balance, $employeeDirectory['lookup']);

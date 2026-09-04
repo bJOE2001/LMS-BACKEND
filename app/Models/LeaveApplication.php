@@ -877,7 +877,7 @@ class LeaveApplication extends Model
             return 0.0;
         }
 
-        $lwopDays = 0.0;
+        $dateLwopWeights = [];
         $workScheduleService = app(\App\Services\WorkScheduleService::class);
         $wholeDayWeight = $workScheduleService->resolveCoverageDeductionDays('whole', $employeeControlNo);
         $halfDayWeight = $workScheduleService->resolveCoverageDeductionDays('half', $employeeControlNo);
@@ -914,11 +914,13 @@ class LeaveApplication extends Model
                         : $wholeDayWeight;
 
                     if ($weight > 0) {
-                        $lwopDays += $weight;
+                        $dateLwopWeights[$date] = min($wholeDayWeight, ($dateLwopWeights[$date] ?? 0.0) + $weight);
                     }
                 }
             }
         }
+
+        $lwopDays = array_sum($dateLwopWeights);
 
         return round($lwopDays, 3);
     }
