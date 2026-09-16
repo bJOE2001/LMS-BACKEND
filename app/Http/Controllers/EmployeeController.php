@@ -17,6 +17,7 @@ use App\Models\LeaveBalance;
 use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveRestoration;
 use App\Models\LeaveType;
+use App\Services\HrAccessControlService;
 use App\Services\RecycleBinService;
 use App\Services\WorkScheduleService;
 use Carbon\Carbon;
@@ -1165,6 +1166,8 @@ class EmployeeController extends Controller
                 $transactions[] = [
                     'row_id' => 'restoration-'.(int) $restoration->id,
                     'merge_key' => 'restoration-'.(int) $restoration->id,
+                    'restoration_id' => (int) $restoration->id,
+                    'target_leave_type_id' => $typeId,
                     'type_key' => $displayTypeKey,
                     'balance_key' => $displayBalanceKey,
                     'leave_type_code' => $leaveTypeCode,
@@ -1188,6 +1191,8 @@ class EmployeeController extends Controller
                         $transactions[] = [
                             'row_id' => 'restoration-fl-linked-'.(int) $restoration->id,
                             'merge_key' => 'restoration-'.(int) $restoration->id,
+                            'restoration_id' => (int) $restoration->id,
+                            'target_leave_type_id' => $typeId,
                             'type_key' => 'other',
                             'balance_key' => $forcedBalanceKey,
                             'leave_type_code' => $this->resolveLedgerTypeCode('other', 'FL', true),
@@ -2177,6 +2182,7 @@ class EmployeeController extends Controller
                     'id' => $transaction['row_id'] ?? null,
                     'accrual_ids' => [],
                     'late_deduction_id' => $transaction['late_deduction_id'] ?? null,
+                    'restoration_id' => $transaction['restoration_id'] ?? null,
                     'target_leave' => $transaction['target_leave'] ?? null,
                     'target_leave_type_id' => $transaction['target_leave_type_id'] ?? null,
                     'days_late' => $transaction['days_late'] ?? null,
@@ -2206,6 +2212,13 @@ class EmployeeController extends Controller
                 if ($accrualId > 0 && ! in_array($accrualId, $ledgerRows[$rowIndex]['accrual_ids'], true)) {
                     $ledgerRows[$rowIndex]['accrual_ids'][] = $accrualId;
                 }
+            }
+
+            if (! empty($transaction['restoration_id']) && empty($ledgerRows[$rowIndex]['restoration_id'])) {
+                $ledgerRows[$rowIndex]['restoration_id'] = $transaction['restoration_id'];
+            }
+            if (! empty($transaction['target_leave_type_id']) && empty($ledgerRows[$rowIndex]['target_leave_type_id'])) {
+                $ledgerRows[$rowIndex]['target_leave_type_id'] = $transaction['target_leave_type_id'];
             }
 
             if (
@@ -4934,6 +4947,61 @@ class EmployeeController extends Controller
             'message' => 'Leave credits restored successfully.',
             'restoration' => $restoration->load(['leaveType', 'restoredByHr']),
         ], 201);
+    }
+
+    /**
+     * Delete a leave credit restoration record and deduct the credits back from the employee's balance (HR Admin only).
+     */
+    public function deleteRestoration(Request $request, string $controlNo, int|string $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $accessControl = app(HrAccessControlService::class);
+        if (! $accessControl->isAccessControlOwner($hr)) {
+            return response()->json(['message' => 'Only HR Admin accounts can delete restoration records.'], 403);
+        }
+
+        $employee = HrisEmployee::findByControlNo($controlNo);
+        if (! $employee) {
+            return response()->json(['message' => 'Employee not found.'], 404);
+        }
+
+        $controlNoCandidates = $this->buildLedgerControlNoCandidates($controlNo, $employee);
+        $restoration = LeaveRestoration::query()
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->where('id', (int) $id)
+            ->first();
+
+        if (! $restoration) {
+            return response()->json(['message' => 'Restoration record not found.'], 404);
+        }
+
+        $targetTypeId = (int) $restoration->target_leave_type_id;
+        $restoredDays = round((float) ($restoration->restored_days ?? 0), 3);
+
+        DB::transaction(function () use ($restoration, $controlNoCandidates, $targetTypeId, $restoredDays): void {
+            if ($restoredDays > 0) {
+                $leaveBalance = LeaveBalance::query()
+                    ->whereIn('employee_control_no', $controlNoCandidates)
+                    ->where('leave_type_id', $targetTypeId)
+                    ->first();
+
+                if ($leaveBalance) {
+                    $newBalance = max(0.0, round((float) $leaveBalance->balance - $restoredDays, 3));
+                    $leaveBalance->balance = $newBalance;
+                    $leaveBalance->save();
+                }
+            }
+
+            $restoration->delete();
+        });
+
+        return response()->json([
+            'message' => 'Restoration record deleted and leave balance updated successfully.',
+        ]);
     }
 
     public function deductLateLeave(Request $request, string $controlNo): JsonResponse

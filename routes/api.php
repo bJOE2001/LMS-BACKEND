@@ -169,6 +169,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::get('/employees/{controlNo}/leave-credits-ledger', [EmployeeController::class, 'leaveCreditsLedger']);
             Route::get('/employees/{controlNo}/coc-cto-ledger', [EmployeeController::class, 'cocCtoLedger']);
             Route::post('/employees/{controlNo}/restore-leave-credits', [EmployeeController::class, 'restoreLeaveCredits']);
+            Route::post('/employees/{controlNo}/restore-leave-credits/{id}/delete', [EmployeeController::class, 'deleteRestoration']);
             Route::post('/employees/{controlNo}/deduct-late-leave', [EmployeeController::class, 'deductLateLeave']);
             Route::post('/employees/{controlNo}/late-deductions/{id}/update', [EmployeeController::class, 'updateLateDeduction']);
             // Leave balance management
