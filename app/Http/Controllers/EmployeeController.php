@@ -4960,8 +4960,11 @@ class EmployeeController extends Controller
         }
 
         $accessControl = app(HrAccessControlService::class);
-        if (! $accessControl->isAccessControlOwner($hr)) {
-            return response()->json(['message' => 'Only HR Admin accounts can delete restoration records.'], 403);
+        $canDelete = $accessControl->isAccessControlOwner($hr)
+            || $accessControl->hasModuleAccess($hr, HrAccessControlService::PERMISSION_LEDGER_RESTORE_DELETE);
+
+        if (! $canDelete) {
+            return response()->json(['message' => 'You do not have permission to delete restoration records.'], 403);
         }
 
         $employee = HrisEmployee::findByControlNo($controlNo);
@@ -5131,6 +5134,14 @@ class EmployeeController extends Controller
         $hr = $request->user();
         if (! $hr instanceof HRAccount) {
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $accessControl = app(HrAccessControlService::class);
+        $canEdit = $accessControl->isAccessControlOwner($hr)
+            || $accessControl->hasModuleAccess($hr, HrAccessControlService::PERMISSION_LEDGER_LATE_DEDUCTION_EDIT);
+
+        if (! $canEdit) {
+            return response()->json(['message' => 'You do not have permission to edit late deduction records.'], 403);
         }
 
         $employee = HrisEmployee::findByControlNo($controlNo);

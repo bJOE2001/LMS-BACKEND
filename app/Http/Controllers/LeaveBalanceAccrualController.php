@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\HRAccount;
 use App\Models\LeaveBalance;
 use App\Models\LeaveBalanceAccrualHistory;
+use App\Services\HrAccessControlService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -19,6 +20,14 @@ class LeaveBalanceAccrualController extends Controller
         $account = $request->user();
         if (! $account instanceof HRAccount) {
             return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $accessControl = app(HrAccessControlService::class);
+        $canEdit = $accessControl->isAccessControlOwner($account)
+            || $accessControl->hasModuleAccess($account, HrAccessControlService::PERMISSION_LEDGER_ACCRUAL_EDIT);
+
+        if (! $canEdit) {
+            return response()->json(['message' => 'You do not have permission to edit accrual records.'], 403);
         }
 
         $request->validate([

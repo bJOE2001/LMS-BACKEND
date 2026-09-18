@@ -37,6 +37,12 @@ class HrAccessControlService
 
     public const MODULE_ACCESS_CONTROL = 'access_control';
 
+    public const PERMISSION_LEDGER_RESTORE_DELETE = 'ledger_restore_delete';
+
+    public const PERMISSION_LEDGER_LATE_DEDUCTION_EDIT = 'ledger_late_deduction_edit';
+
+    public const PERMISSION_LEDGER_ACCRUAL_EDIT = 'ledger_accrual_edit';
+
     /**
      * @return array<int, array{key:string,label:string,path:string}>
      */
@@ -71,6 +77,21 @@ class HrAccessControlService
             [
                 'key' => self::MODULE_EMPLOYEE_MANAGEMENT,
                 'label' => 'Employee Management',
+                'path' => '/hr/employees',
+            ],
+            [
+                'key' => self::PERMISSION_LEDGER_RESTORE_DELETE,
+                'label' => 'Ledger: Delete Restored Leave',
+                'path' => '/hr/employees',
+            ],
+            [
+                'key' => self::PERMISSION_LEDGER_LATE_DEDUCTION_EDIT,
+                'label' => 'Ledger: Edit Late Deduction',
+                'path' => '/hr/employees',
+            ],
+            [
+                'key' => self::PERMISSION_LEDGER_ACCRUAL_EDIT,
+                'label' => 'Ledger: Edit Accrual',
                 'path' => '/hr/employees',
             ],
             [
@@ -258,6 +279,24 @@ class HrAccessControlService
             static fn (string $value): string => trim($value),
             $moduleKeys
         )));
+
+        $ledgerSubPermissions = [
+            self::PERMISSION_LEDGER_RESTORE_DELETE,
+            self::PERMISSION_LEDGER_LATE_DEDUCTION_EDIT,
+            self::PERMISSION_LEDGER_ACCRUAL_EDIT,
+        ];
+
+        $hasAnyLedgerSubPermission = false;
+        foreach ($ledgerSubPermissions as $perm) {
+            if (in_array($perm, $normalizedModuleKeys, true)) {
+                $hasAnyLedgerSubPermission = true;
+                break;
+            }
+        }
+
+        if ($hasAnyLedgerSubPermission && ! in_array(self::MODULE_EMPLOYEE_MANAGEMENT, $normalizedModuleKeys, true)) {
+            $normalizedModuleKeys[] = self::MODULE_EMPLOYEE_MANAGEMENT;
+        }
 
         return array_values(array_filter(
             $this->moduleKeys(),
