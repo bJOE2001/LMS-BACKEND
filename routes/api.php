@@ -43,6 +43,11 @@ Route::post('/login', [AuthController::class, 'login']);
 Route::post('/forgot-password', [PasswordResetController::class, 'forgotPassword']);
 Route::post('/reset-password', [PasswordResetController::class, 'resetPassword']);
 
+// ZKTeco MB360 ADMS Push Protocol Endpoints
+Route::match(['GET', 'POST'], '/iclock/cdata', [\App\Http\Controllers\Attendance\ZkAdmsController::class, 'cdata']);
+Route::get('/iclock/getrequest', [\App\Http\Controllers\Attendance\ZkAdmsController::class, 'getrequest']);
+Route::post('/iclock/devicecmd', [\App\Http\Controllers\Attendance\ZkAdmsController::class, 'devicecmd']);
+
 /*
 |--------------------------------------------------------------------------
 | ERMS Integration Routes (trusted frontend origins or API key protected)
@@ -113,6 +118,26 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
     Route::post('/leave-applications/{id}/log-print', [LeaveApplicationController::class, 'logPrint']);
     Route::get('/illnesses/options', [HRIllnessLibraryController::class, 'options']);
     Route::get('/special-privilege-reasons/options', [SpecialPrivilegeReasonController::class, 'options']);
+
+    // Attendance & Daily Time Records (DTR)
+    Route::prefix('attendance')->group(function () {
+        Route::get('/dtr', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'departmentOverview']);
+        Route::get('/dtr/employee/{controlNo}', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'employeeMonthlyDtr']);
+        Route::post('/dtr/{id}/adjust', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'adjust']);
+        Route::post('/dtr/override', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'overrideTime']);
+        Route::post('/dtr/recalculate', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'recalculate']);
+        Route::get('/devices', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'listDevices']);
+        Route::post('/devices', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'storeDevice'])->middleware('hr');
+        Route::post('/devices/{id}/update', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'updateDevice'])->middleware('hr');
+        Route::post('/devices/{id}/toggle', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'toggleDeviceStatus'])->middleware('hr');
+        Route::post('/devices/{id}/delete', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'deleteDevice'])->middleware('hr');
+        Route::post('/import-usb', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'importUsb']);
+
+        // Biometric Registration & Device Syncing
+        Route::get('/biometric/employee-status/{controlNo}', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'employeeStatus']);
+        Route::post('/biometric/pull-to-office', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'adminPullToOffice']);
+        Route::post('/biometric/pull-department-roster', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'adminPullDepartmentRoster']);
+    });
 
     Route::middleware('department_admin')->prefix('admin')->group(function () {
         // Employee management
@@ -210,6 +235,14 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::post('/user-management/hr-accounts/{id}/reset-password', [HRUserManagementController::class, 'resetHrAccountPassword']);
             Route::post('/user-management/department-admins/{id}/delete', [HRUserManagementController::class, 'destroy']);
             Route::post('/user-management/hr-accounts/{id}/delete', [HRUserManagementController::class, 'destroyHrAccount']);
+        });
+
+        // HR Biometric Registration
+        Route::prefix('biometric-registration')->group(function () {
+            Route::get('/', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'hrIndex']);
+            Route::post('/register', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'hrRegister']);
+            Route::post('/mark-enrolled', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'hrMarkEnrolled']);
+            Route::post('/sync-from-logs', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'syncFromLogs']);
         });
 
         Route::middleware('hr.module:access_control')->prefix('access-control')->group(function () {

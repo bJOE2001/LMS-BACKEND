@@ -16,12 +16,17 @@ return Application::configure(basePath: dirname(__DIR__))
     ->withMiddleware(function (Middleware $middleware): void {
         $middleware->throttleApi();
 
+        $middleware->validateCsrfTokens(except: [
+            'iclock/*',
+        ]);
+
         $middleware->alias([
             'hr' => \App\Http\Middleware\EnsureHR::class,
             'hr.module' => \App\Http\Middleware\EnsureHRModuleAccess::class,
             'department_admin' => \App\Http\Middleware\EnsureDepartmentAdmin::class,
             'password.changed' => \App\Http\Middleware\EnsurePasswordChanged::class,
             'erms.auth' => \App\Http\Middleware\VerifyERMSApiKey::class,
+            'bio.security' => \App\Http\Middleware\ValidateBiometricSecurity::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
