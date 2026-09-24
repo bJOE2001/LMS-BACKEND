@@ -17,6 +17,8 @@ class HrAccessControlService
 
     public const MODULE_RELEASING = 'releasing';
 
+    public const MODULE_CANCELLED_APPLICATIONS = 'cancelled_applications';
+
     public const MODULE_COC_APPLICATIONS = 'coc_applications';
 
     public const MODULE_EMPLOYEE_MANAGEMENT = 'employee_management';
@@ -68,6 +70,11 @@ class HrAccessControlService
                 'key' => self::MODULE_RELEASING,
                 'label' => 'Releasing Application',
                 'path' => '/hr/releasing',
+            ],
+            [
+                'key' => self::MODULE_CANCELLED_APPLICATIONS,
+                'label' => 'Cancelled Applications',
+                'path' => '/hr/cancelled-applications',
             ],
             [
                 'key' => self::MODULE_COC_APPLICATIONS,
@@ -242,6 +249,7 @@ class HrAccessControlService
             self::MODULE_APPLICATIONS,
             self::MODULE_RECEIVING,
             self::MODULE_RELEASING,
+            self::MODULE_CANCELLED_APPLICATIONS,
             self::MODULE_COC_APPLICATIONS,
             self::MODULE_EMPLOYEE_MANAGEMENT,
             self::MODULE_USER_MANAGEMENT,

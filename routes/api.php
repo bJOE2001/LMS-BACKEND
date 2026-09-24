@@ -277,6 +277,11 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::post('/leave-applications/{id}/recall', [LeaveApplicationController::class, 'hrRecall']);
         });
 
+        Route::middleware('hr.module:cancelled_applications')->group(function () {
+            Route::get('/cancelled-applications', [LeaveApplicationController::class, 'hrCancelledApplications']);
+            Route::get('/cancelled-applications/export', [LeaveApplicationController::class, 'exportCancelledApplications']);
+        });
+
         Route::middleware('hr.module:coc_applications')->group(function () {
             Route::get('/coc-applications', [COCApplicationController::class, 'hrIndex']);
             Route::get('/coc-applications/late-filings', [COCApplicationController::class, 'hrLateFilingIndex']);
