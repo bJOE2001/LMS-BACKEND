@@ -2824,6 +2824,406 @@ class LeaveApplicationController extends Controller
     }
 
     /**
+     * List cancelled applications for HR module.
+     * Supports tabs: 'ALL', 'APPROVED_CANCELLATION', 'EMPLOYEE_CANCELLED'.
+     */
+    public function hrCancelledApplications(Request $request): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $validated = $request->validate([
+            'tab' => ['nullable', 'string', 'in:ALL,APPROVED_CANCELLATION,EMPLOYEE_CANCELLED'],
+            'search' => ['nullable', 'string', 'max:255'],
+            'department' => ['nullable', 'string', 'max:255'],
+            'from_date' => ['nullable', 'date'],
+            'to_date' => ['nullable', 'date'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+            'page' => ['nullable', 'integer', 'min:1'],
+        ]);
+
+        $tab = strtoupper(trim((string) ($validated['tab'] ?? 'ALL')));
+        $perPage = (int) ($validated['per_page'] ?? 10);
+        $requestedPage = (int) ($validated['page'] ?? 1);
+        $searchTokens = $this->tokenizeHrApplicationSearch($validated['search'] ?? null);
+        $department = trim((string) ($validated['department'] ?? ''));
+        $fromDate = $validated['from_date'] ?? null;
+        $toDate = $validated['to_date'] ?? null;
+
+        $updatesTable = (new LeaveApplicationUpdateRequest)->getTable();
+        $appsTable = (new LeaveApplication)->getTable();
+        $logsTable = (new LeaveApplicationLog)->getTable();
+
+        $approvedCancelCondition = function ($q) use ($updatesTable, $appsTable, $logsTable): void {
+            $q->where(function ($sub): void {
+                $sub->where('remarks', 'LIKE', '%approved leave cancellation%')
+                    ->orWhere('remarks', 'LIKE', '%Cancelled via approved%');
+            })->orWhereExists(function ($reqQuery) use ($updatesTable, $appsTable): void {
+                $reqQuery->select(\Illuminate\Support\Facades\DB::raw(1))
+                    ->from("{$updatesTable} as req")
+                    ->whereColumn('req.leave_application_id', "{$appsTable}.id")
+                    ->where('req.status', LeaveApplicationUpdateRequest::STATUS_APPROVED)
+                    ->where(function ($sub): void {
+                        $sub->where('req.requested_payload', 'LIKE', '%REQUEST_CANCEL%')
+                            ->orWhere('req.requested_payload', 'LIKE', '%REQUEST_CANCELLATION%')
+                            ->orWhere('req.requested_payload', 'LIKE', '%"cancel_leave":true%')
+                            ->orWhere('req.requested_payload', 'LIKE', '%"request_kind":"cancel"%');
+                    });
+            })->orWhereExists(function ($logQuery) use ($logsTable, $appsTable): void {
+                $logQuery->select(\Illuminate\Support\Facades\DB::raw(1))
+                    ->from("{$logsTable} as log")
+                    ->whereColumn('log.leave_application_id', "{$appsTable}.id")
+                    ->where('log.action', LeaveApplicationLog::ACTION_HR_APPROVED)
+                    ->where('log.remarks', 'LIKE', '%cancel%');
+            });
+        };
+
+        $baseQuery = LeaveApplication::query()
+            ->where('status', LeaveApplication::STATUS_CANCELLED);
+
+        if ($searchTokens !== []) {
+            $baseQuery->where(function ($q) use ($searchTokens): void {
+                foreach ($searchTokens as $token) {
+                    $likeToken = "%{$token}%";
+                    $q->where(function ($sub) use ($likeToken): void {
+                        $sub->where('id', 'like', $likeToken)
+                            ->orWhere('employee_control_no', 'like', $likeToken)
+                            ->orWhere('employee_name', 'like', $likeToken)
+                            ->orWhere('total_days', 'like', $likeToken)
+                            ->orWhere('remarks', 'like', $likeToken)
+                            ->orWhereHas('applicantAdmin', function ($qAdmin) use ($likeToken): void {
+                                $qAdmin->where('full_name', 'like', $likeToken)
+                                    ->orWhereHas('department', function ($qDept) use ($likeToken): void {
+                                        $qDept->where('name', 'like', $likeToken);
+                                    });
+                            })
+                            ->orWhereHas('leaveType', function ($qType) use ($likeToken): void {
+                                $qType->where('name', 'like', $likeToken);
+                            });
+                    });
+                }
+            });
+        }
+
+        if ($department !== '') {
+            $baseQuery->whereHas('applicantAdmin.department', function ($q) use ($department): void {
+                $q->where('name', $department);
+            });
+        }
+
+        if ($fromDate && $toDate) {
+            $baseQuery->where(function ($q) use ($fromDate, $toDate): void {
+                $q->whereBetween('updated_at', [$fromDate.' 00:00:00', $toDate.' 23:59:59'])
+                    ->orWhereBetween('created_at', [$fromDate.' 00:00:00', $toDate.' 23:59:59']);
+            });
+        }
+
+        $totalAll = (clone $baseQuery)->count();
+        $totalApproved = (clone $baseQuery)->where($approvedCancelCondition)->count();
+        $totalPendingCancelled = (clone $baseQuery)->whereNot($approvedCancelCondition)->count();
+
+        $listQuery = clone $baseQuery;
+        if ($tab === 'APPROVED_CANCELLATION') {
+            $listQuery->where($approvedCancelCondition);
+        } elseif ($tab === 'EMPLOYEE_CANCELLED') {
+            $listQuery->whereNot($approvedCancelCondition);
+        }
+
+        $listQuery->orderByDesc('updated_at')->orderByDesc('id');
+
+        $paginator = $listQuery->paginate($perPage, ['*'], 'page', $requestedPage);
+        $pageApplications = $paginator->getCollection();
+
+        $pageApplications->load([
+            'leaveType',
+            'applicantAdmin.department',
+            'updateRequests',
+            'logs',
+        ]);
+
+        $actorDirectory = $this->buildWorkflowActorDirectory($pageApplications);
+
+        $formatted = $pageApplications->map(function (LeaveApplication $app) use ($actorDirectory): array {
+            $formattedApp = $this->formatApplication($app, $actorDirectory);
+            $cancellationType = $this->resolveApplicationCancellationType($app);
+            $cancellationDetails = $this->resolveApplicationCancellationDetails($app, $cancellationType);
+
+            return array_merge($formattedApp, [
+                'cancellation_type' => $cancellationType,
+                'cancellation_type_label' => $cancellationType === 'APPROVED_CANCELLATION'
+                    ? 'Approved Cancellation'
+                    : 'Cancelled While Pending',
+                'cancellation_date' => $cancellationDetails['date'],
+                'cancellation_actor' => $cancellationDetails['actor'],
+                'cancellation_reason' => $cancellationDetails['reason'],
+            ]);
+        });
+
+        return response()->json([
+            'applications' => $formatted->all(),
+            'counts' => [
+                'all' => $totalAll,
+                'approved_cancellations' => $totalApproved,
+                'employee_cancelled' => $totalPendingCancelled,
+            ],
+            'pagination' => [
+                'total' => $paginator->total(),
+                'per_page' => $paginator->perPage(),
+                'current_page' => $paginator->currentPage(),
+                'last_page' => $paginator->lastPage(),
+            ],
+        ]);
+    }
+
+    /**
+     * Export Cancelled Applications for HR module within a specific date range / filter.
+     */
+    public function exportCancelledApplications(Request $request): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $validated = $request->validate([
+            'tab' => ['nullable', 'string', 'in:ALL,APPROVED_CANCELLATION,EMPLOYEE_CANCELLED'],
+            'search' => ['nullable', 'string', 'max:255'],
+            'department' => ['nullable', 'string', 'max:255'],
+            'from_date' => ['nullable', 'date'],
+            'to_date' => ['nullable', 'date'],
+        ]);
+
+        $tab = strtoupper(trim((string) ($validated['tab'] ?? 'ALL')));
+        $searchTokens = $this->tokenizeHrApplicationSearch($validated['search'] ?? null);
+        $department = trim((string) ($validated['department'] ?? ''));
+        $fromDate = $validated['from_date'] ?? null;
+        $toDate = $validated['to_date'] ?? null;
+
+        $updatesTable = (new LeaveApplicationUpdateRequest)->getTable();
+        $appsTable = (new LeaveApplication)->getTable();
+        $logsTable = (new LeaveApplicationLog)->getTable();
+
+        $approvedCancelCondition = function ($q) use ($updatesTable, $appsTable, $logsTable): void {
+            $q->where(function ($sub): void {
+                $sub->where('remarks', 'LIKE', '%approved leave cancellation%')
+                    ->orWhere('remarks', 'LIKE', '%Cancelled via approved%');
+            })->orWhereExists(function ($reqQuery) use ($updatesTable, $appsTable): void {
+                $reqQuery->select(\Illuminate\Support\Facades\DB::raw(1))
+                    ->from("{$updatesTable} as req")
+                    ->whereColumn('req.leave_application_id', "{$appsTable}.id")
+                    ->where('req.status', LeaveApplicationUpdateRequest::STATUS_APPROVED)
+                    ->where(function ($sub): void {
+                        $sub->where('req.requested_payload', 'LIKE', '%REQUEST_CANCEL%')
+                            ->orWhere('req.requested_payload', 'LIKE', '%REQUEST_CANCELLATION%')
+                            ->orWhere('req.requested_payload', 'LIKE', '%"cancel_leave":true%')
+                            ->orWhere('req.requested_payload', 'LIKE', '%"request_kind":"cancel"%');
+                    });
+            })->orWhereExists(function ($logQuery) use ($logsTable, $appsTable): void {
+                $logQuery->select(\Illuminate\Support\Facades\DB::raw(1))
+                    ->from("{$logsTable} as log")
+                    ->whereColumn('log.leave_application_id', "{$appsTable}.id")
+                    ->where('log.action', LeaveApplicationLog::ACTION_HR_APPROVED)
+                    ->where('log.remarks', 'LIKE', '%cancel%');
+            });
+        };
+
+        $query = LeaveApplication::query()
+            ->where('status', LeaveApplication::STATUS_CANCELLED);
+
+        if ($searchTokens !== []) {
+            $query->where(function ($q) use ($searchTokens): void {
+                foreach ($searchTokens as $token) {
+                    $likeToken = "%{$token}%";
+                    $q->where(function ($sub) use ($likeToken): void {
+                        $sub->where('id', 'like', $likeToken)
+                            ->orWhere('employee_control_no', 'like', $likeToken)
+                            ->orWhere('employee_name', 'like', $likeToken)
+                            ->orWhere('total_days', 'like', $likeToken)
+                            ->orWhere('remarks', 'like', $likeToken)
+                            ->orWhereHas('applicantAdmin', function ($qAdmin) use ($likeToken): void {
+                                $qAdmin->where('full_name', 'like', $likeToken)
+                                    ->orWhereHas('department', function ($qDept) use ($likeToken): void {
+                                        $qDept->where('name', 'like', $likeToken);
+                                    });
+                            })
+                            ->orWhereHas('leaveType', function ($qType) use ($likeToken): void {
+                                $qType->where('name', 'like', $likeToken);
+                            });
+                    });
+                }
+            });
+        }
+
+        if ($department !== '') {
+            $query->whereHas('applicantAdmin.department', function ($q) use ($department): void {
+                $q->where('name', $department);
+            });
+        }
+
+        if ($fromDate && $toDate) {
+            $query->where(function ($q) use ($fromDate, $toDate): void {
+                $q->whereBetween('updated_at', [$fromDate.' 00:00:00', $toDate.' 23:59:59'])
+                    ->orWhereBetween('created_at', [$fromDate.' 00:00:00', $toDate.' 23:59:59']);
+            });
+        }
+
+        if ($tab === 'APPROVED_CANCELLATION') {
+            $query->where($approvedCancelCondition);
+        } elseif ($tab === 'EMPLOYEE_CANCELLED') {
+            $query->whereNot($approvedCancelCondition);
+        }
+
+        $applications = $query
+            ->with([
+                'leaveType',
+                'applicantAdmin.department',
+                'updateRequests',
+                'logs',
+            ])
+            ->orderByDesc('updated_at')
+            ->orderByDesc('id')
+            ->limit(1000)
+            ->get();
+
+        $actorDirectory = $this->buildWorkflowActorDirectory($applications);
+
+        $formatted = $applications->map(function (LeaveApplication $app) use ($actorDirectory): array {
+            $formattedApp = $this->formatApplication($app, $actorDirectory);
+            $cancellationType = $this->resolveApplicationCancellationType($app);
+            $cancellationDetails = $this->resolveApplicationCancellationDetails($app, $cancellationType);
+
+            return array_merge($formattedApp, [
+                'cancellation_type' => $cancellationType,
+                'cancellation_type_label' => $cancellationType === 'APPROVED_CANCELLATION'
+                    ? 'Approved Cancellation'
+                    : 'Cancelled While Pending',
+                'cancellation_date' => $cancellationDetails['date'],
+                'cancellation_actor' => $cancellationDetails['actor'],
+                'cancellation_reason' => $cancellationDetails['reason'],
+            ]);
+        });
+
+        return response()->json([
+            'applications' => $formatted->all(),
+        ]);
+    }
+
+    /**
+     * Resolve the cancellation category for a cancelled application.
+     * Returns 'APPROVED_CANCELLATION' or 'EMPLOYEE_CANCELLED'.
+     */
+    private function resolveApplicationCancellationType(LeaveApplication $app): string
+    {
+        if ($app->relationLoaded('updateRequests')) {
+            $approvedCancelRequest = $app->updateRequests->first(function (LeaveApplicationUpdateRequest $req): bool {
+                if ($req->status !== LeaveApplicationUpdateRequest::STATUS_APPROVED) {
+                    return false;
+                }
+                $payload = $req->requested_payload;
+                $actionType = is_array($payload) ? ($payload['action_type'] ?? '') : '';
+                $cancelLeave = is_array($payload) ? (bool) ($payload['cancel_leave'] ?? false) : false;
+                $requestKind = is_array($payload) ? ($payload['request_kind'] ?? '') : '';
+
+                return $actionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
+                    || $cancelLeave
+                    || $requestKind === 'cancel';
+            });
+            if ($approvedCancelRequest !== null) {
+                return 'APPROVED_CANCELLATION';
+            }
+        }
+
+        $remarks = trim((string) ($app->remarks ?? ''));
+        if (preg_match('/(?:approved\s+leave\s+cancellation|cancelled\s+via\s+approved)/i', $remarks)) {
+            return 'APPROVED_CANCELLATION';
+        }
+
+        if ($app->relationLoaded('logs')) {
+            $hasHrApprovedCancel = $app->logs->contains(function (LeaveApplicationLog $log): bool {
+                return $log->action === LeaveApplicationLog::ACTION_HR_APPROVED
+                    && preg_match('/cancel/i', (string) ($log->remarks ?? ''));
+            });
+            if ($hasHrApprovedCancel) {
+                return 'APPROVED_CANCELLATION';
+            }
+        }
+
+        return 'EMPLOYEE_CANCELLED';
+    }
+
+    /**
+     * Resolve cancellation timestamp, actor, and reason.
+     *
+     * @return array{date: ?string, actor: string, reason: string}
+     */
+    private function resolveApplicationCancellationDetails(LeaveApplication $app, string $type): array
+    {
+        $date = null;
+        $actor = '';
+        $reason = '';
+
+        if ($type === 'APPROVED_CANCELLATION') {
+            if ($app->relationLoaded('updateRequests')) {
+                $approvedReq = $app->updateRequests->first(function (LeaveApplicationUpdateRequest $req): bool {
+                    return $req->status === LeaveApplicationUpdateRequest::STATUS_APPROVED;
+                });
+                if ($approvedReq) {
+                    $date = $approvedReq->reviewed_at?->toIso8601String() ?? $approvedReq->updated_at?->toIso8601String();
+                    $reason = (string) ($approvedReq->requested_reason ?? '');
+                    if ($approvedReq->relationLoaded('reviewedByHr') && $approvedReq->reviewedByHr) {
+                        $actor = (string) ($approvedReq->reviewedByHr->name ?? $approvedReq->reviewedByHr->username ?? 'HR Admin');
+                    } else {
+                        $actor = 'HR Admin';
+                    }
+                }
+            }
+            if (! $date && $app->relationLoaded('logs')) {
+                $hrLog = $app->logs->first(function (LeaveApplicationLog $log): bool {
+                    return $log->action === LeaveApplicationLog::ACTION_HR_APPROVED;
+                });
+                if ($hrLog) {
+                    $date = $hrLog->created_at?->toIso8601String();
+                }
+            }
+        } else {
+            if ($app->relationLoaded('logs')) {
+                $empLog = $app->logs->first(function (LeaveApplicationLog $log): bool {
+                    return $log->action === LeaveApplicationLog::ACTION_EMPLOYEE_CANCELLED;
+                });
+                if ($empLog) {
+                    $date = $empLog->created_at?->toIso8601String();
+                    $actor = 'Employee';
+                }
+            }
+        }
+
+        if (! $date) {
+            $date = $app->updated_at?->toIso8601String() ?? $app->created_at?->toIso8601String();
+        }
+
+        if ($reason === '') {
+            $remarks = (string) ($app->remarks ?? '');
+            if (preg_match('/(?:Reason:\s*|Cancelled by employee:\s*|Cancellation request submitted by employee\.\s*Reason:\s*)(.+)$/i', $remarks, $matches)) {
+                $reason = trim($matches[1]);
+            } elseif ($remarks !== '') {
+                $reason = $remarks;
+            }
+        }
+
+        if ($actor === '') {
+            $actor = $type === 'APPROVED_CANCELLATION' ? 'HR / Department Admin' : 'Employee';
+        }
+
+        return [
+            'date' => $date,
+            'actor' => $actor,
+            'reason' => $reason,
+        ];
+    }
+
+    /**
      * List PENDING_HR applications (all departments).
      */
     public function hrIndex(HrLeaveApplicationIndexRequest $request): JsonResponse
@@ -3356,7 +3756,7 @@ class LeaveApplicationController extends Controller
 
         $actorDirectory = $this->buildWorkflowActorDirectory([$application]);
         $workflowPayload = $this->formatErmsApplication($application, $actorDirectory);
-        $detailPayload = $this->formatApplication($application);
+        $detailPayload = $this->formatApplication($application, $actorDirectory);
 
         return response()->json([
             'application' => array_replace($workflowPayload, $detailPayload),
@@ -3595,7 +3995,14 @@ class LeaveApplicationController extends Controller
             ->where('leave_application_id', (int) $app->id)
             ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
             ->latest('id')
-            ->first();
+            ->get()
+            ->first(fn (LeaveApplicationUpdateRequest $editRequest): bool => ! $this->isHrApplicationEditRequestRecord($editRequest));
+
+        if ($pendingEmployeeUpdateRequest instanceof LeaveApplicationUpdateRequest) {
+            return response()->json([
+                'message' => 'This application has a pending employee update request. Please review the update request first.',
+            ], 422);
+        }
 
         if ($this->isHrAccessControlOwner($hr)) {
             $applied = $this->applyHrApplicationEdit(
@@ -3603,7 +4010,7 @@ class LeaveApplicationController extends Controller
                 $hr,
                 $normalizedPayload,
                 $reason,
-                $pendingEmployeeUpdateRequest,
+                null,
                 $this->trimNullableString($validated['remarks'] ?? null)
             );
 
@@ -8034,7 +8441,11 @@ class LeaveApplicationController extends Controller
                     $this->syncEmployeeCtoBalance((string) $app->employee_control_no, true);
                 }
 
-                if ($editRequest instanceof LeaveApplicationUpdateRequest && $editRequest->status === LeaveApplicationUpdateRequest::STATUS_PENDING) {
+                if (
+                    $editRequest instanceof LeaveApplicationUpdateRequest
+                    && $editRequest->status === LeaveApplicationUpdateRequest::STATUS_PENDING
+                    && $this->isHrApplicationEditRequestRecord($editRequest)
+                ) {
                     $existingPayload = $this->normalizePendingUpdatePayload($editRequest->requested_payload) ?? [];
                     $isWithoutPay = $targetWithoutPayDays > 0.0 || $targetPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
 
@@ -8900,12 +9311,15 @@ class LeaveApplicationController extends Controller
                 $actorName = $this->resolveWorkflowPerformerName($log, $actorDirectory, $employeeName);
 
                 return [
+                    'id' => (int) $log->id,
+                    'leave_application_id' => (int) $log->leave_application_id,
                     'action' => $log->action,
                     'stage' => $this->mapWorkflowLogStage($log),
                     'actor_name' => $actorName,
                     'action_by_name' => $actorName,
                     'action_by' => $actorName,
                     'performed_by_type' => strtoupper((string) $log->performed_by_type),
+                    'performed_by_id' => $log->performed_by_id !== null ? (int) $log->performed_by_id : null,
                     'remarks' => $log->remarks,
                     'created_at' => $log->created_at?->toIso8601String(),
                 ];
@@ -9067,6 +9481,7 @@ class LeaveApplicationController extends Controller
             'has_hr_released' => $hrReleasedLog !== null,
             'hasHrReleased' => $hrReleasedLog !== null,
             'status_history' => $statusHistory,
+            'logs' => $statusHistory,
             'employee' => $resolvedEmployee ? [
                 'control_no' => $resolvedEmployee->control_no,
                 'firstname' => $resolvedEmployee->firstname,
@@ -9305,7 +9720,18 @@ class LeaveApplicationController extends Controller
         $attachmentSubmitted = (bool) ($policyResolution['attachment_submitted'] ?? false);
         $attachmentReference = $policyResolution['attachment_reference'] ?? null;
 
+        $previousLeaveTypeId = (int) $app->leave_type_id;
+        $previousLeaveTypeName = (string) (
+            $app->leaveType?->name
+            ?? ($previousLeaveTypeId > 0 ? LeaveType::whereKey($previousLeaveTypeId)->value('name') : '')
+            ?? ''
+        );
+
         $rawPayload = [
+            'previous_leave_type_id' => $previousLeaveTypeId > 0 ? $previousLeaveTypeId : null,
+            'previous_leave_type_name' => $previousLeaveTypeName !== '' ? $previousLeaveTypeName : null,
+            'previous_details_of_leave' => $app->details_of_leave,
+            'previous_reason' => $app->reason,
             'previous_start_date' => $app->start_date?->toDateString() ?: ($app->resolvedSelectedDates()[0] ?? null),
             'previous_end_date' => $app->end_date?->toDateString() ?: ($app->resolvedSelectedDates()[count($app->resolvedSelectedDates()) - 1] ?? null),
             'previous_selected_dates' => $app->resolvedSelectedDates(),
@@ -10785,6 +11211,19 @@ class LeaveApplicationController extends Controller
 
         $withoutPay = $payMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
 
+        $previousLeaveTypeId = isset($payload['previous_leave_type_id'])
+            ? (int) $payload['previous_leave_type_id']
+            : (isset($payload['previousLeaveTypeId']) ? (int) $payload['previousLeaveTypeId'] : null);
+        $previousLeaveTypeName = $this->trimNullableString($payload['previous_leave_type_name'] ?? $payload['previousLeaveTypeName'] ?? null);
+        if ($previousLeaveTypeName === null && $previousLeaveTypeId > 0) {
+            if (! array_key_exists($previousLeaveTypeId, $leaveTypeNameCache)) {
+                $leaveTypeNameCache[$previousLeaveTypeId] = LeaveType::query()
+                    ->whereKey($previousLeaveTypeId)
+                    ->value('name');
+            }
+            $previousLeaveTypeName = $this->trimNullableString($leaveTypeNameCache[$previousLeaveTypeId] ?? null);
+        }
+
         return [
             'leave_type_id' => $leaveTypeId,
             'leave_type_name' => $leaveTypeName,
@@ -10811,6 +11250,10 @@ class LeaveApplicationController extends Controller
             'attachment_required' => $attachmentRequired,
             'attachment_submitted' => $attachmentSubmitted,
             'attachment_reference' => $this->trimNullableString($attachmentReference),
+            'previous_leave_type_id' => $previousLeaveTypeId > 0 ? $previousLeaveTypeId : null,
+            'previous_leave_type_name' => $previousLeaveTypeName,
+            'previous_details_of_leave' => $this->trimNullableString($payload['previous_details_of_leave'] ?? $payload['previousDetailsOfLeave'] ?? null),
+            'previous_reason' => $this->trimNullableString($payload['previous_reason'] ?? $payload['previousReason'] ?? null),
             'previous_start_date' => $this->trimNullableString($payload['previous_start_date'] ?? $payload['previousStartDate'] ?? null),
             'previous_end_date' => $this->trimNullableString($payload['previous_end_date'] ?? $payload['previousEndDate'] ?? null),
             'previous_selected_dates' => is_array($payload['previous_selected_dates'] ?? null)
@@ -15577,7 +16020,7 @@ class LeaveApplicationController extends Controller
         return 0.0;
     }
 
-    private function formatApplication(LeaveApplication $app): array
+    private function formatApplication(LeaveApplication $app, ?array $actorDirectory = null): array
     {
         $documentVerification = $this->documentVerificationService->issue($app);
         $resolvedEmployee = $this->resolveApplicationEmployee($app);
@@ -15638,9 +16081,22 @@ class LeaveApplicationController extends Controller
         $logs = $app->relationLoaded('logs')
             ? $app->logs
                 ->filter(fn ($log) => $log instanceof LeaveApplicationLog)
-                ->sortBy(fn (LeaveApplicationLog $log) => $log->created_at?->timestamp ?? 0)
+                ->sort(function (LeaveApplicationLog $a, LeaveApplicationLog $b) {
+                    $timeA = $a->created_at?->timestamp ?? 0;
+                    $timeB = $b->created_at?->timestamp ?? 0;
+                    if ($timeA === $timeB) {
+                        return ($a->id ?? 0) <=> ($b->id ?? 0);
+                    }
+
+                    return $timeA <=> $timeB;
+                })
                 ->values()
             : collect();
+
+        if ($actorDirectory === null && $logs->isNotEmpty()) {
+            $actorDirectory = $this->buildWorkflowActorDirectory([$app]);
+        }
+
         $hrReceivedLog = $logs->last(
             fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
                 && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
@@ -15654,14 +16110,29 @@ class LeaveApplicationController extends Controller
                 && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
         );
         $statusHistory = $logs
-            ->filter(fn (LeaveApplicationLog $log): bool => ! $this->isHrApplicationEditWorkflowLog($log))
-            ->map(function (LeaveApplicationLog $log): array {
-                $stage = $this->mapWorkflowLogStage($log);
+            ->map(function (LeaveApplicationLog $log) use ($actorDirectory, $applicantName): array {
+                $actorName = $actorDirectory ? $this->resolveWorkflowPerformerName($log, $actorDirectory, $applicantName) : null;
+                if (! $actorName) {
+                    $performerType = strtoupper((string) $log->performed_by_type);
+                    if ($performerType === LeaveApplicationLog::PERFORMER_EMPLOYEE) {
+                        $actorName = $applicantName ?: 'Employee';
+                    } elseif ($performerType === LeaveApplicationLog::PERFORMER_ADMIN) {
+                        $actorName = 'Department Admin';
+                    } elseif ($performerType === LeaveApplicationLog::PERFORMER_HR) {
+                        $actorName = 'HR Admin';
+                    }
+                }
 
                 return [
+                    'id' => (int) $log->id,
+                    'leave_application_id' => (int) $log->leave_application_id,
                     'action' => $log->action,
-                    'stage' => $stage,
+                    'stage' => $this->mapWorkflowLogStage($log),
                     'performed_by_type' => strtoupper((string) $log->performed_by_type),
+                    'performed_by_id' => $log->performed_by_id !== null ? (int) $log->performed_by_id : null,
+                    'actor_name' => $actorName,
+                    'action_by_name' => $actorName,
+                    'action_by' => $actorName,
                     'remarks' => $log->remarks,
                     'created_at' => $log->created_at?->toIso8601String(),
                 ];
@@ -15797,6 +16268,7 @@ class LeaveApplicationController extends Controller
             'has_hr_released' => $hrReleasedLog !== null,
             'hasHrReleased' => $hrReleasedLog !== null,
             'status_history' => $statusHistory,
+            'logs' => $statusHistory,
             'recallEffectiveDate' => $app->recall_effective_date?->toDateString(),
             'recall_effective_date' => $app->recall_effective_date?->toDateString(),
             'recallSelectedDates' => $effectiveRecallDateKeys !== [] ? $effectiveRecallDateKeys : null,
