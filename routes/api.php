@@ -47,6 +47,8 @@ Route::post('/reset-password', [PasswordResetController::class, 'resetPassword']
 Route::match(['GET', 'POST'], '/iclock/cdata', [\App\Http\Controllers\Attendance\ZkAdmsController::class, 'cdata']);
 Route::get('/iclock/getrequest', [\App\Http\Controllers\Attendance\ZkAdmsController::class, 'getrequest']);
 Route::post('/iclock/devicecmd', [\App\Http\Controllers\Attendance\ZkAdmsController::class, 'devicecmd']);
+Route::match(['GET', 'POST'], '/iclock/querydata', [\App\Http\Controllers\Attendance\ZkAdmsController::class, 'querydata']);
+Route::match(['GET', 'POST'], '/iclock/fdata', [\App\Http\Controllers\Attendance\ZkAdmsController::class, 'fdata']);
 
 /*
 |--------------------------------------------------------------------------
@@ -243,6 +245,8 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::post('/register', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'hrRegister']);
             Route::post('/mark-enrolled', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'hrMarkEnrolled']);
             Route::post('/sync-from-logs', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'syncFromLogs']);
+            Route::post('/broadcast-all', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'broadcastAll']);
+            Route::post('/pull-device-templates', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'pullDeviceTemplates']);
         });
 
         Route::middleware('hr.module:access_control')->prefix('access-control')->group(function () {

@@ -79,6 +79,12 @@ class DailyTimeRecordController extends Controller
             'days_absent' => $records->where('status', DailyTimeRecord::STATUS_ABSENT)->count(),
         ];
 
+        $devices = BiometricDevice::query()->get()->keyBy('serial_number')->map(fn ($d) => [
+            'serial_number' => $d->serial_number,
+            'device_name' => $d->device_name ?: 'Biometric Device',
+            'location' => $d->location ?: 'Office',
+        ]);
+
         return response()->json([
             'employee' => [
                 'control_no' => $canonicalControlNo,
@@ -96,6 +102,7 @@ class DailyTimeRecordController extends Controller
             ],
             'records' => $records,
             'summary' => $summary,
+            'devices' => $devices,
         ]);
     }
 
@@ -228,6 +235,12 @@ class DailyTimeRecordController extends Controller
             }));
         }
 
+        $devices = BiometricDevice::query()->get()->keyBy('serial_number')->map(fn ($d) => [
+            'serial_number' => $d->serial_number,
+            'device_name' => $d->device_name ?: 'Biometric Device',
+            'location' => $d->location ?: 'Office',
+        ]);
+
         return response()->json([
             'date' => $targetDate,
             'department_id' => $targetDepartmentId,
@@ -239,6 +252,7 @@ class DailyTimeRecordController extends Controller
                 'on_leave' => $onLeaveCount,
                 'absent' => $absentCount,
             ],
+            'devices' => $devices,
         ]);
     }
 
