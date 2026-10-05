@@ -10551,9 +10551,6 @@ class LeaveApplicationController extends Controller
                     'hr_approved_at' => now(),
                     'remarks' => $cancelRemarks,
                     'deductible_days' => 0,
-                    'linked_forced_leave_deducted_days' => 0,
-                    'linked_vacation_leave_deducted_days' => 0,
-                    'linked_sick_leave_deducted_days' => 0,
                 ]);
 
                 if ($app->employee_control_no) {

@@ -1340,7 +1340,10 @@ class EmployeeController extends Controller
                         $query->orderBy('created_at')->orderBy('id');
                     },
                     'updateRequests' => function ($query) {
-                        $query->where('status', LeaveApplicationUpdateRequest::STATUS_APPROVED)
+                        $query->whereIn('status', [
+                            LeaveApplicationUpdateRequest::STATUS_APPROVED,
+                            LeaveApplicationUpdateRequest::STATUS_PENDING,
+                        ])
                             ->orderByDesc('reviewed_at')
                             ->orderByDesc('id');
                     },
@@ -1525,16 +1528,33 @@ class EmployeeController extends Controller
                     max((float) ($application->linked_forced_leave_deducted_days ?? 0), 0.0),
                     3
                 );
-                if ($isForcedLeave && $linkedForcedWithPayAmount <= 0.0) {
-                    $linkedForcedWithPayAmount = round(
-                        max((float) ($inferredForcedLeaveDeductions['by_application_id'][(int) $application->id] ?? 0.0), 0.0),
-                        3
-                    );
-                }
                 $linkedSickWithPayAmount = round(
                     max((float) ($application->linked_sick_leave_deducted_days ?? 0), 0.0),
                     3
                 );
+                if ($isForcedLeave) {
+                    if ($linkedVacationWithPayAmount <= 0.0) {
+                        $snapshotVl = (float) ($application->certification_leave_credits_snapshot['vacation']['less_this_application'] ?? 0.0);
+                        $linkedVacationWithPayAmount = $snapshotVl > 0.0 ? round(min($snapshotVl, $withPayAmount), 3) : $withPayAmount;
+                    }
+                    if ($linkedForcedWithPayAmount <= 0.0) {
+                        $inferredAmount = (float) ($inferredForcedLeaveDeductions['by_application_id'][(int) $application->id] ?? 0.0);
+                        $linkedForcedWithPayAmount = $inferredAmount > 0.0 ? round($inferredAmount, 3) : $withPayAmount;
+                    }
+                } elseif ($isCancelledApp) {
+                    if ($linkedVacationWithPayAmount <= 0.0 && $typeKey !== 'vacation') {
+                        $snapshotVl = (float) ($application->certification_leave_credits_snapshot['vacation']['less_this_application'] ?? 0.0);
+                        if ($snapshotVl > 0.0) {
+                            $linkedVacationWithPayAmount = round(min($snapshotVl, $withPayAmount), 3);
+                        }
+                    }
+                    if ($linkedSickWithPayAmount <= 0.0 && $typeKey !== 'sick') {
+                        $snapshotSl = (float) ($application->certification_leave_credits_snapshot['sick']['less_this_application'] ?? 0.0);
+                        if ($snapshotSl > 0.0) {
+                            $linkedSickWithPayAmount = round(min($snapshotSl, $withPayAmount), 3);
+                        }
+                    }
+                }
                 if ($typeKey !== 'vacation' && ! $isForcedLeave) {
                     $linkedForcedWithPayAmount = 0.0;
                 }
@@ -4396,7 +4416,16 @@ class EmployeeController extends Controller
                     return false;
                 }
 
-                if (strtoupper(trim((string) ($application->status ?? ''))) !== LeaveApplication::STATUS_APPROVED) {
+                $status = strtoupper(trim((string) ($application->status ?? '')));
+                $hasPendingApprovedUpdateRequest = in_array($status, [
+                    LeaveApplication::STATUS_PENDING_ADMIN,
+                    LeaveApplication::STATUS_PENDING_HR,
+                ], true) && $application->relationLoaded('updateRequests') && $application->updateRequests->contains(function (LeaveApplicationUpdateRequest $req): bool {
+                    return strtoupper(trim((string) $req->status)) === LeaveApplicationUpdateRequest::STATUS_PENDING
+                        && strtoupper(trim((string) $req->previous_status)) === LeaveApplication::STATUS_APPROVED;
+                });
+
+                if ($status !== LeaveApplication::STATUS_APPROVED && ! $hasPendingApprovedUpdateRequest) {
                     return false;
                 }
 
@@ -4427,6 +4456,12 @@ class EmployeeController extends Controller
             );
             $withPayAmount = $this->roundLedgerValue($payAmounts['with_pay'] ?? 0.0);
             $linkedVacationAmount = $this->roundLedgerValue($application->linked_vacation_leave_deducted_days ?? 0.0);
+            if ($linkedVacationAmount <= 0.0) {
+                $snapshotVl = (float) ($application->certification_leave_credits_snapshot['vacation']['less_this_application'] ?? 0.0);
+                if ($snapshotVl > 0.0) {
+                    $linkedVacationAmount = $this->roundLedgerValue($snapshotVl);
+                }
+            }
             $candidateAmount = $linkedVacationAmount > 0.0
                 ? min($linkedVacationAmount, max($withPayAmount, $linkedVacationAmount))
                 : $withPayAmount;
