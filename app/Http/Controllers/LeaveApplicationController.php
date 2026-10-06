@@ -2933,8 +2933,13 @@ class LeaveApplicationController extends Controller
 
         $listQuery->orderByDesc('updated_at')->orderByDesc('id');
 
-        $paginator = $listQuery->paginate($perPage, ['*'], 'page', $requestedPage);
-        $pageApplications = $paginator->getCollection();
+        \Illuminate\Support\Facades\DB::unprepared('SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED');
+        try {
+            $paginator = $listQuery->paginate($perPage, ['*'], 'page', $requestedPage);
+            $pageApplications = $paginator->getCollection();
+        } finally {
+            \Illuminate\Support\Facades\DB::unprepared('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+        }
 
         $pageApplications->load([
             'leaveType',
@@ -3075,17 +3080,22 @@ class LeaveApplicationController extends Controller
             $query->whereNot($approvedCancelCondition);
         }
 
-        $applications = $query
-            ->with([
-                'leaveType',
-                'applicantAdmin.department',
-                'updateRequests',
-                'logs',
-            ])
-            ->orderByDesc('updated_at')
-            ->orderByDesc('id')
-            ->limit(1000)
-            ->get();
+        \Illuminate\Support\Facades\DB::unprepared('SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED');
+        try {
+            $applications = $query
+                ->with([
+                    'leaveType',
+                    'applicantAdmin.department',
+                    'updateRequests',
+                    'logs',
+                ])
+                ->orderByDesc('updated_at')
+                ->orderByDesc('id')
+                ->limit(1000)
+                ->get();
+        } finally {
+            \Illuminate\Support\Facades\DB::unprepared('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+        }
 
         $actorDirectory = $this->buildWorkflowActorDirectory($applications);
 
@@ -3430,8 +3440,13 @@ class LeaveApplicationController extends Controller
         ")->orderBy('created_at', 'ASC')->orderBy('id', 'ASC');
 
         // 5. Database Pagination
-        $paginator = $query->paginate($perPage, ['*'], 'page', $requestedPage);
-        $pageApplications = $paginator->getCollection();
+        \Illuminate\Support\Facades\DB::unprepared('SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED');
+        try {
+            $paginator = $query->paginate($perPage, ['*'], 'page', $requestedPage);
+            $pageApplications = $paginator->getCollection();
+        } finally {
+            \Illuminate\Support\Facades\DB::unprepared('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+        }
 
         // 6. Late Eager Loading
         $pageApplications->load(['leaveType', 'applicantAdmin.department', 'updateRequests', 'logs']);
