@@ -17,6 +17,7 @@ use App\Models\LeaveBalance;
 use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveRestoration;
 use App\Models\LeaveType;
+use App\Services\Attendance\BiometricTransferService;
 use App\Services\HrAccessControlService;
 use App\Services\RecycleBinService;
 use App\Services\WorkScheduleService;
@@ -728,8 +729,17 @@ class EmployeeController extends Controller
 
         $assignment->delete();
 
+        $biometricResult = app(BiometricTransferService::class)
+            ->removeOnDepartmentDeassignment($controlNo, (int) $admin->department_id, (int) $admin->id);
+
+        $responseMessage = 'Employee removed from your pulled LMS employee list successfully.';
+        if (! empty($biometricResult['removed'])) {
+            $responseMessage .= ' Biometric terminal profile cleared.';
+        }
+
         return response()->json([
-            'message' => 'Employee removed from your pulled LMS employee list successfully.',
+            'message' => $responseMessage,
+            'biometric_removal' => $biometricResult,
         ]);
     }
 
@@ -3089,9 +3099,18 @@ class EmployeeController extends Controller
             ]);
             $existingAssignment->save();
 
+            $transferResult = app(BiometricTransferService::class)
+                ->transferOnDepartmentAssignment($storedControlNo, (int) $admin->department_id, (int) $admin->id);
+
+            $responseMessage = 'Employee pulled to your office successfully.';
+            if (! empty($transferResult['transferred']) && ! empty($transferResult['message'])) {
+                $responseMessage .= ' '.$transferResult['message'];
+            }
+
             return response()->json([
-                'message' => 'Employee pulled to your office successfully.',
+                'message' => $responseMessage,
                 'employee' => $this->serializeEmployee($updatedEmployee),
+                'biometric_transfer' => $transferResult,
             ]);
         }
 
@@ -3103,9 +3122,18 @@ class EmployeeController extends Controller
             ...$assignmentIdentityFields,
         ]);
 
+        $transferResult = app(BiometricTransferService::class)
+            ->transferOnDepartmentAssignment($storedControlNo, (int) $admin->department_id, (int) $admin->id);
+
+        $responseMessage = 'Employee pulled to your office successfully.';
+        if (! empty($transferResult['transferred']) && ! empty($transferResult['message'])) {
+            $responseMessage .= ' '.$transferResult['message'];
+        }
+
         return response()->json([
-            'message' => 'Employee pulled to your office successfully.',
+            'message' => $responseMessage,
             'employee' => $this->serializeEmployee($updatedEmployee),
+            'biometric_transfer' => $transferResult,
         ], 201);
     }
 

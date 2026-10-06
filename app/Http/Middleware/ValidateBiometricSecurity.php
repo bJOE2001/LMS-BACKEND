@@ -40,7 +40,7 @@ class ValidateBiometricSecurity
         }
 
         // 2. Extract Device Serial Number
-        $serialNumber = trim((string) $request->query('SN', $request->query('sn', '')));
+        $serialNumber = trim((string) $request->query('SN', $request->query('sn', $request->header('X-Serial-Number', ''))));
         if ($serialNumber === '') {
             // Check body for SN if POST devicecmd or cdata
             $body = (string) $request->getContent();
@@ -50,12 +50,20 @@ class ValidateBiometricSecurity
         }
 
         if ($serialNumber === '') {
+            Log::warning('ZkAdmsSecurity: Request missing Device Serial Number', [
+                'method' => $request->method(),
+                'path' => $request->path(),
+                'ip' => $clientIp,
+                'query' => $request->query(),
+                'headers' => $request->headers->all(),
+            ]);
+
             return response("ERROR: Missing Device Serial Number\n", 400, [
                 'Content-Type' => 'text/plain',
             ]);
         }
 
-        // 3. Strict Device Whitelist & Auto-Detection
+        // 3. Auto-Connect Device (Plug-and-Play)
         $device = BiometricDevice::query()
             ->where('serial_number', $serialNumber)
             ->first();
@@ -64,23 +72,29 @@ class ValidateBiometricSecurity
             $pushVer = $request->query('pushver');
             $device = BiometricDevice::query()->create([
                 'serial_number' => $serialNumber,
-                'device_name' => 'New Biometric Device',
+                'device_name' => 'Biometric Terminal - '.$serialNumber,
                 'model_name' => 'MB360',
                 'firmware_version' => $pushVer !== null && is_string($pushVer) ? trim($pushVer) : null,
                 'ip_address' => $clientIp,
                 'communication_mode' => 'ADMS',
-                'is_active' => false,
-                'status' => 'PENDING_APPROVAL',
+                'is_active' => true,
+                'status' => 'ONLINE',
                 'last_heartbeat_at' => now(),
             ]);
 
-            Log::info("ZkAdmsSecurity: Auto-detected new biometric terminal [{$serialNumber}] from IP [{$clientIp}]. Queued for HR authorization.");
-
-            return response("ERROR: Device Pending Approval\n", 403, [
-                'Content-Type' => 'text/plain',
-            ]);
+            Log::info("ZkAdmsSecurity: Auto-connected and activated new biometric terminal [{$serialNumber}] from IP [{$clientIp}].");
+        } elseif ($device->status === 'PENDING_APPROVAL') {
+            // Auto-promote any previously pending device to active
+            $device->is_active = true;
+            $device->status = 'ONLINE';
+            $device->last_heartbeat_at = now();
+            if ($clientIp !== '') {
+                $device->ip_address = $clientIp;
+            }
+            $device->save();
         }
 
+        // If explicitly disabled by HR administrator, block it
         if (! $device->is_active) {
             $device->last_heartbeat_at = now();
             if ($clientIp !== '') {
@@ -91,12 +105,6 @@ class ValidateBiometricSecurity
                 $device->firmware_version = trim($pushVer);
             }
             $device->save();
-
-            if ($device->status === 'PENDING_APPROVAL') {
-                return response("ERROR: Device Pending Approval\n", 403, [
-                    'Content-Type' => 'text/plain',
-                ]);
-            }
 
             Log::warning('ZkAdmsSecurity: Blocked disabled biometric device', [
                 'sn' => $serialNumber,

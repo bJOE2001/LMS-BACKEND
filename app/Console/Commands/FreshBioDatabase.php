@@ -40,6 +40,7 @@ class FreshBioDatabase extends Command
         'tblDailyTimeRecords',
         'tblAttendanceRawLogs',
         'tblBiometricDeviceCommands',
+        'tblBiometricTemplates',
         'tblBiometricEnrollments',
         'tblBiometricDevices',
     ];

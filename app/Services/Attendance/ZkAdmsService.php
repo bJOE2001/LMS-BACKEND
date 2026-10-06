@@ -6,6 +6,7 @@ use App\Models\AttendanceRawLog;
 use App\Models\BiometricDevice;
 use App\Models\BiometricDeviceCommand;
 use App\Models\BiometricEnrollment;
+use App\Models\BiometricTemplate;
 use App\Models\HrisEmployee;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -63,8 +64,12 @@ class ZkAdmsService
             return ['response' => "OK\n", 'count' => 0];
         }
 
-        if (in_array($table, ['user', 'userinfo'], true) || (stripos($body, 'Name=') !== false && stripos($body, 'Pri=') !== false)) {
+        if (in_array($table, ['user', 'userinfo'], true)) {
             return $this->handleUserPush($request, $serialNumber, $body);
+        }
+
+        if (in_array($table, ['templatev10', 'template', 'fingerprint', 'biodata', 'biophoto'], true)) {
+            return $this->handleTemplatePush($request, $serialNumber, $body, $table);
         }
 
         $lines = preg_split('/\r\n|\r|\n/', trim($body));
@@ -78,6 +83,37 @@ class ZkAdmsService
         foreach ($lines as $line) {
             $line = trim($line);
             if ($line === '') {
+                continue;
+            }
+
+            // 1. Ignore device operational/audit logs (e.g. OPLOG 4, OPLOG 36, etc.)
+            if (preg_match('/^OPLOG\s+/i', $line)) {
+                continue;
+            }
+
+            // 2. Native MB360 Fingerprint push (e.g. FP PIN=022936\tFID=6\tSize=1744\tValid=1\tTMP=...)
+            if (preg_match('/^FP\s+/i', $line) || (stripos($line, 'PIN=') !== false && stripos($line, 'TMP=') !== false && (stripos($line, 'FID=') !== false || stripos($line, 'Size=') !== false))) {
+                $savedTpl = $this->handleFingerprintPush($request, $serialNumber, $line);
+                if ($savedTpl !== null) {
+                    $importedCount++;
+                }
+
+                continue;
+            }
+
+            // 3. Native User profile push (e.g. USER PIN=022936\tName=...\tPri=0...)
+            if (preg_match('/^USER\s+/i', $line) || (stripos($line, 'Name=') !== false && stripos($line, 'Pri=') !== false)) {
+                $this->handleUserPush($request, $serialNumber, $line);
+                $importedCount++;
+
+                continue;
+            }
+
+            // 4. Legacy/generic template push (e.g. size=1808\tuid=1\tpin=...\tfingerid=0\ttemplate=...)
+            if (stripos($line, 'Template=') !== false || (stripos($line, 'Tmp=') !== false && stripos($line, 'Type=') !== false)) {
+                $this->handleTemplatePush($request, $serialNumber, $line, $table);
+                $importedCount++;
+
                 continue;
             }
 
@@ -309,6 +345,8 @@ class ZkAdmsService
                         $command->executed_at = now();
                         $command->save();
 
+                        Log::info("ZkAdmsService: Device [{$serialNumber}] executed command [ID={$id}, Type={$command->command_type}, Return={$returnCode}] -> Status: {$command->status}");
+
                         if ($isSuccess && $command->employee_control_no) {
                             $enrollment = BiometricEnrollment::query()
                                 ->where('employee_control_no', $command->employee_control_no)
@@ -440,7 +478,12 @@ class ZkAdmsService
                 continue;
             }
 
-            $parts = preg_split('/\t+|\s{2,}/', $line);
+            $cleanLine = $line;
+            if (preg_match('/^USER\s+/i', $cleanLine)) {
+                $cleanLine = (string) preg_replace('/^USER\s+/i', '', $cleanLine);
+            }
+
+            $parts = preg_split('/\t+|\s{2,}/', $cleanLine);
             if (! $parts) {
                 continue;
             }
@@ -453,7 +496,7 @@ class ZkAdmsService
                 }
             }
 
-            $pin = $kvMap['PIN'] ?? null;
+            $pin = $kvMap['PIN'] ?? $kvMap['USER PIN'] ?? null;
             if (! $pin) {
                 continue;
             }
@@ -479,6 +522,8 @@ class ZkAdmsService
                 $enrollment->save();
             }
 
+            Log::info("ZkAdmsService: Successfully ingested user profile for [{$canonicalControlNo}] ({$name}) from device [{$serialNumber}]");
+
             $imported++;
         }
 
@@ -486,5 +531,290 @@ class ZkAdmsService
             'response' => "OK: {$imported}\n",
             'count' => $imported,
         ];
+    }
+
+    /**
+     * Handle a native FP line from ZKTeco MB360:
+     * Format: FP PIN={pin}\tFID={fid}\tSize={size}\tValid={valid}\tTMP={tmp}
+     */
+    public function handleFingerprintPush(Request $request, string $serialNumber, string $line): ?BiometricTemplate
+    {
+        $cleanLine = trim($line);
+        if (preg_match('/^FP\s+/i', $cleanLine)) {
+            $cleanLine = (string) preg_replace('/^FP\s+/i', '', $cleanLine);
+        }
+
+        $parts = preg_split('/\t+|\s{2,}/', $cleanLine);
+        if (! $parts) {
+            return null;
+        }
+
+        $kvMap = [];
+        foreach ($parts as $part) {
+            $kv = explode('=', trim($part), 2);
+            if (count($kv) === 2) {
+                $kvMap[strtolower(trim($kv[0]))] = trim($kv[1]);
+            }
+        }
+
+        $pin = $kvMap['pin'] ?? $kvMap['fp pin'] ?? null;
+        $tmp = $kvMap['tmp'] ?? $kvMap['template'] ?? null;
+
+        if (! $pin || ! $tmp) {
+            Log::warning("ZkAdmsService: Discarded invalid FP line (missing PIN or TMP): {$line}");
+
+            return null;
+        }
+
+        $emp = HrisEmployee::findByControlNo($pin, true);
+        $canonicalControlNo = $emp?->control_no ? (string) $emp->control_no : $pin;
+
+        $fingerId = isset($kvMap['fid'])
+            ? (int) $kvMap['fid']
+            : (isset($kvMap['fingerid']) ? (int) $kvMap['fingerid'] : (isset($kvMap['index']) ? (int) $kvMap['index'] : 0));
+
+        $size = isset($kvMap['size']) ? (int) $kvMap['size'] : null;
+        $valid = isset($kvMap['valid']) ? (int) $kvMap['valid'] : null;
+
+        $attributes = [
+            'template_size' => $size,
+            'template_version' => '10',
+            'template_data' => $tmp,
+            'raw_payload' => $line,
+            'source_device_sn' => $serialNumber ?: null,
+        ];
+
+        if ($valid !== null) {
+            $attributes['valid'] = $valid;
+        }
+
+        $template = BiometricTemplate::query()->updateOrCreate(
+            [
+                'employee_control_no' => $canonicalControlNo,
+                'biometric_type' => BiometricTemplate::TYPE_FINGERPRINT,
+                'finger_id' => $fingerId,
+            ],
+            $attributes
+        );
+
+        $enrollment = BiometricEnrollment::query()->firstOrNew([
+            'employee_control_no' => $canonicalControlNo,
+        ]);
+
+        $fullName = $emp
+            ? trim(($emp->firstname ?? '').' '.($emp->middlename ? $emp->middlename[0].'. ' : '').($emp->surname ?? ''))
+            : 'EMP '.$pin;
+
+        if (! $enrollment->exists || ! $enrollment->isRegistered()) {
+            $enrollment->employee_name = $fullName;
+            $enrollment->status = BiometricEnrollment::STATUS_REGISTERED;
+            $enrollment->enrolled_at = $enrollment->enrolled_at ?? now();
+            $enrollment->enrollment_device_sn = $enrollment->enrollment_device_sn ?: ($serialNumber ?: null);
+            $enrollment->save();
+        }
+
+        if ($serialNumber !== '') {
+            $synced = $enrollment->synced_devices ?? [];
+            if (! in_array($serialNumber, $synced, true)) {
+                $synced[] = $serialNumber;
+                $enrollment->synced_devices = $synced;
+                $enrollment->save();
+            }
+        }
+
+        Log::info("ZkAdmsService: Successfully stored native MB360 fingerprint template for employee [{$canonicalControlNo}], FID [{$fingerId}], Size [{$size}] from device [{$serialNumber}]");
+
+        return $template;
+    }
+
+    /**
+     * Handle incoming biometric template push (POST /iclock/cdata?table=templatev10 or biodata).
+     *
+     * @return array{response: string, count: int}
+     */
+    public function handleTemplatePush(Request $request, string $serialNumber, string $body, string $table = 'templatev10'): array
+    {
+        $lines = preg_split('/\r\n|\r|\n/', trim($body));
+        if ($lines === false || count($lines) === 0) {
+            return ['response' => "OK\n", 'count' => 0];
+        }
+
+        $imported = 0;
+
+        foreach ($lines as $line) {
+            $line = trim($line);
+            if ($line === '') {
+                continue;
+            }
+
+            if (preg_match('/^FP\s+/i', $line)) {
+                $saved = $this->handleFingerprintPush($request, $serialNumber, $line);
+                if ($saved !== null) {
+                    $imported++;
+                }
+
+                continue;
+            }
+
+            $cleanLine = $line;
+            $parts = preg_split('/\t+|\s{2,}/', $cleanLine);
+            if (! $parts) {
+                continue;
+            }
+
+            $kvMap = [];
+            foreach ($parts as $part) {
+                $kv = explode('=', trim($part), 2);
+                if (count($kv) === 2) {
+                    $kvMap[strtolower(trim($kv[0]))] = trim($kv[1]);
+                }
+            }
+
+            $pin = $kvMap['pin'] ?? $kvMap['fp pin'] ?? null;
+            if (! $pin) {
+                continue;
+            }
+
+            $emp = HrisEmployee::findByControlNo($pin, true);
+            $canonicalControlNo = $emp?->control_no ? (string) $emp->control_no : $pin;
+
+            $templateData = $kvMap['template'] ?? $kvMap['tmp'] ?? null;
+            if (! $templateData) {
+                continue;
+            }
+
+            $fingerId = isset($kvMap['fid'])
+                ? (int) $kvMap['fid']
+                : (isset($kvMap['fingerid']) ? (int) $kvMap['fingerid'] : (isset($kvMap['index']) ? (int) $kvMap['index'] : 0));
+
+            $typeCode = isset($kvMap['type']) ? (int) $kvMap['type'] : 1;
+            $biometricType = ($typeCode === 9 || strtolower($table) === 'biodata' && $typeCode === 9)
+                ? BiometricTemplate::TYPE_FACE
+                : BiometricTemplate::TYPE_FINGERPRINT;
+
+            $size = isset($kvMap['size']) ? (int) $kvMap['size'] : strlen($templateData);
+            $valid = isset($kvMap['valid']) ? (int) $kvMap['valid'] : 1;
+
+            BiometricTemplate::query()->updateOrCreate(
+                [
+                    'employee_control_no' => $canonicalControlNo,
+                    'biometric_type' => $biometricType,
+                    'finger_id' => $fingerId,
+                ],
+                [
+                    'template_size' => $size,
+                    'valid' => $valid,
+                    'template_version' => '10',
+                    'template_data' => $templateData,
+                    'raw_payload' => $line,
+                    'source_device_sn' => $serialNumber ?: null,
+                ]
+            );
+
+            // Ensure employee enrollment status is marked REGISTERED
+            $enrollment = BiometricEnrollment::query()->firstOrNew([
+                'employee_control_no' => $canonicalControlNo,
+            ]);
+
+            $fullName = $emp
+                ? trim(($emp->firstname ?? '').' '.($emp->middlename ? $emp->middlename[0].'. ' : '').($emp->surname ?? ''))
+                : 'EMP '.$pin;
+
+            if (! $enrollment->exists || ! $enrollment->isRegistered()) {
+                $enrollment->employee_name = $fullName;
+                $enrollment->status = BiometricEnrollment::STATUS_REGISTERED;
+                $enrollment->enrolled_at = $enrollment->enrolled_at ?? now();
+                $enrollment->enrollment_device_sn = $enrollment->enrollment_device_sn ?: ($serialNumber ?: null);
+                $enrollment->save();
+            }
+
+            if ($serialNumber !== '') {
+                $synced = $enrollment->synced_devices ?? [];
+                if (! in_array($serialNumber, $synced, true)) {
+                    $synced[] = $serialNumber;
+                    $enrollment->synced_devices = $synced;
+                    $enrollment->save();
+                }
+            }
+
+            // Auto-forward template to assigned office terminal if different from enrollment terminal
+            $assignment = \App\Models\EmployeeDepartmentAssignment::query()
+                ->where('employee_control_no', $canonicalControlNo)
+                ->first();
+
+            if ($assignment && $assignment->department_id) {
+                $officeDevices = BiometricDevice::query()
+                    ->where('department_id', $assignment->department_id)
+                    ->where('is_active', true)
+                    ->where('serial_number', '!=', $serialNumber)
+                    ->get();
+
+                foreach ($officeDevices as $targetDev) {
+                    $payload = strtolower($table) === 'biodata'
+                        ? BiometricDeviceCommand::buildDataBiodataCommand($canonicalControlNo, $typeCode, $fingerId, $templateData, $valid)
+                        : BiometricDeviceCommand::buildDataFpCommand($canonicalControlNo, $fingerId, $size, $valid, $templateData);
+
+                    BiometricDeviceCommand::query()->firstOrCreate(
+                        [
+                            'device_serial_number' => $targetDev->serial_number,
+                            'command_type' => BiometricDeviceCommand::CMD_UPDATE_TEMPLATE,
+                            'employee_control_no' => $canonicalControlNo,
+                            'command_payload' => $payload,
+                            'status' => BiometricDeviceCommand::STATUS_PENDING,
+                        ],
+                        [
+                            'employee_name' => $fullName,
+                        ]
+                    );
+                }
+            }
+
+            $imported++;
+        }
+
+        return [
+            'response' => "OK: {$imported}\n",
+            'count' => $imported,
+        ];
+    }
+
+    /**
+     * Handle incoming data from device in response to DATA QUERY commands.
+     */
+    public function handleQueryData(Request $request): string
+    {
+        $serialNumber = trim((string) $request->query('SN', $request->query('sn', '')));
+        if ($serialNumber !== '') {
+            $this->registerOrUpdateDevice($serialNumber, $request, true);
+        }
+
+        $body = (string) $request->getContent();
+        $table = strtolower(trim((string) $request->query('tablename', $request->query('table', ''))));
+
+        if (trim($body) === '') {
+            return "OK\n";
+        }
+
+        if (in_array($table, ['templatev10', 'template', 'fingerprint', 'biodata'], true)
+            || stripos($body, 'Template=') !== false || stripos($body, 'Tmp=') !== false) {
+            $this->handleTemplatePush($request, $serialNumber, $body, $table);
+        } elseif (in_array($table, ['user', 'userinfo'], true) || stripos($body, 'Name=') !== false) {
+            $this->handleUserPush($request, $serialNumber, $body);
+        }
+
+        return "OK\n";
+    }
+
+    /**
+     * Handle incoming face/photo binary push from device (POST /iclock/fdata).
+     */
+    public function handleFdata(Request $request): string
+    {
+        $serialNumber = trim((string) $request->query('SN', $request->query('sn', '')));
+        if ($serialNumber !== '') {
+            $this->registerOrUpdateDevice($serialNumber, $request, true);
+        }
+
+        return "OK\n";
     }
 }
