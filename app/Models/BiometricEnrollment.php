@@ -3,7 +3,6 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Database\Eloquent\Relations\HasMany;
 
 /**
  * Model representing employee biometric enrollment status in BIO_DB.
@@ -26,8 +25,6 @@ class BiometricEnrollment extends Model
         'employee_name',
         'status',
         'enrollment_device_sn',
-        'biometric_template',
-        'template_type',
         'enrolled_at',
         'enrolled_by_user_id',
         'synced_devices',
@@ -62,13 +59,5 @@ class BiometricEnrollment extends Model
             $this->synced_devices = $devices;
             $this->save();
         }
-    }
-
-    /**
-     * Relationship to Biometric Templates (Fingerprints & Faces).
-     */
-    public function templates(): HasMany
-    {
-        return $this->hasMany(BiometricTemplate::class, 'employee_control_no', 'employee_control_no');
     }
 }

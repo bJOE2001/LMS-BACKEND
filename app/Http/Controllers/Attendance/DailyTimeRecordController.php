@@ -455,11 +455,13 @@ class DailyTimeRecordController extends Controller
     public function listDevices(): JsonResponse
     {
         $devices = BiometricDevice::query()
+            ->orderByRaw("CASE WHEN status = 'PENDING_APPROVAL' THEN 0 ELSE 1 END")
             ->orderBy('device_name')
             ->get();
 
         return response()->json([
             'devices' => $devices,
+            'pending_count' => $devices->where('status', 'PENDING_APPROVAL')->count(),
         ]);
     }
 
@@ -489,8 +491,37 @@ class DailyTimeRecordController extends Controller
 
         $existing = BiometricDevice::query()->where('serial_number', $serialNumber)->first();
         if ($existing) {
+            if ($existing->status === 'PENDING_APPROVAL' || ! $existing->is_active) {
+                $deptId = ! empty($validated['department_id']) ? (int) $validated['department_id'] : null;
+                $deptName = trim((string) ($validated['department_name'] ?? ''));
+                if ($deptId && empty($deptName)) {
+                    $dept = Department::query()->find($deptId);
+                    $deptName = $dept?->name ?? '';
+                } elseif (! $deptId && $deptName !== '') {
+                    $dept = Department::query()->where('name', $deptName)->first();
+                    $deptId = $dept?->id;
+                }
+
+                $existing->update([
+                    'device_name' => trim($validated['device_name']),
+                    'model_name' => trim($validated['model_name'] ?? '') ?: ($existing->model_name ?: 'MB360'),
+                    'department_id' => $deptId ?: $existing->department_id,
+                    'department_name' => $deptName ?: ($existing->department_name ?: 'Tagum City Hall'),
+                    'comm_key' => trim($validated['comm_key'] ?? '') ?: ($existing->comm_key ?: '0'),
+                    'ip_address' => trim($validated['ip_address'] ?? '') ?: $existing->ip_address,
+                    'is_active' => true,
+                    'status' => 'ONLINE',
+                    'last_heartbeat_at' => now(),
+                ]);
+
+                return response()->json([
+                    'message' => "Detected biometric terminal '{$existing->device_name}' has been successfully authorized and activated.",
+                    'device' => $existing,
+                ], 200);
+            }
+
             return response()->json([
-                'message' => "Device with Serial Number '{$serialNumber}' is already registered.",
+                'message' => "Device with Serial Number '{$serialNumber}' is already registered and active.",
             ], 422);
         }
 
@@ -514,13 +545,65 @@ class DailyTimeRecordController extends Controller
             'ip_address' => trim($validated['ip_address'] ?? '') ?: null,
             'communication_mode' => 'ADMS',
             'is_active' => true,
-            'status' => 'OFFLINE',
+            'status' => 'ONLINE',
+            'last_heartbeat_at' => now(),
         ]);
 
         return response()->json([
             'message' => "Biometric device '{$device->device_name}' successfully authorized.",
             'device' => $device,
         ], 201);
+    }
+
+    /**
+     * Authorize an auto-detected biometric device awaiting HR approval.
+     * Accessible only to HR accounts.
+     */
+    public function authorizeDevice(Request $request, int $id): JsonResponse
+    {
+        if (! $request->user() instanceof HRAccount) {
+            return response()->json([
+                'message' => 'Unauthorized. Only HR administrators can authorize biometric devices.',
+            ], 403);
+        }
+
+        $device = BiometricDevice::query()->findOrFail($id);
+
+        $validated = $request->validate([
+            'device_name' => ['required', 'string', 'max:150'],
+            'model_name' => ['nullable', 'string', 'max:100'],
+            'department_id' => ['nullable', 'integer'],
+            'department_name' => ['nullable', 'string', 'max:150'],
+            'comm_key' => ['nullable', 'string', 'max:50'],
+            'ip_address' => ['nullable', 'string', 'max:45'],
+        ]);
+
+        $deptId = ! empty($validated['department_id']) ? (int) $validated['department_id'] : null;
+        $deptName = trim((string) ($validated['department_name'] ?? ''));
+        if ($deptId && empty($deptName)) {
+            $dept = Department::query()->find($deptId);
+            $deptName = $dept?->name ?? '';
+        } elseif (! $deptId && $deptName !== '') {
+            $dept = Department::query()->where('name', $deptName)->first();
+            $deptId = $dept?->id;
+        }
+
+        $device->update([
+            'device_name' => trim($validated['device_name']),
+            'model_name' => trim($validated['model_name'] ?? '') ?: ($device->model_name ?: 'MB360'),
+            'department_id' => $deptId ?: $device->department_id,
+            'department_name' => $deptName ?: ($device->department_name ?: 'Tagum City Hall'),
+            'comm_key' => trim($validated['comm_key'] ?? '') ?: ($device->comm_key ?: '0'),
+            'ip_address' => trim($validated['ip_address'] ?? '') ?: $device->ip_address,
+            'is_active' => true,
+            'status' => 'ONLINE',
+            'last_heartbeat_at' => now(),
+        ]);
+
+        return response()->json([
+            'message' => "Biometric terminal '{$device->device_name}' has been successfully authorized and activated.",
+            'device' => $device,
+        ]);
     }
 
     /**

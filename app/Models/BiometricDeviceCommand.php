@@ -24,14 +24,6 @@ class BiometricDeviceCommand extends Model
 
     public const CMD_DATA_USER = 'DATA_USER';
 
-    public const CMD_DATA_FP = 'DATA_FP';
-
-    public const CMD_DATA_BIODATA = 'DATA_BIODATA';
-
-    public const CMD_DATA_QUERY = 'DATA_QUERY';
-
-    public const CMD_QUERY_FP = 'QUERY_FP';
-
     public const CMD_CHECK = 'CHECK';
 
     public const CMD_DELETE_USER = 'DELETE_USER';

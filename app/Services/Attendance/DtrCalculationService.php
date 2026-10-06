@@ -140,17 +140,11 @@ class DtrCalculationService
             'record_date' => $dateStr,
             'day_of_week' => $dayOfWeek,
             'am_arrival' => $slotted['am_arrival'],
-            'am_arrival_device_sn' => $slotted['am_arrival_device_sn'] ?? null,
             'am_departure' => $slotted['am_departure'],
-            'am_departure_device_sn' => $slotted['am_departure_device_sn'] ?? null,
             'pm_arrival' => $slotted['pm_arrival'],
-            'pm_arrival_device_sn' => $slotted['pm_arrival_device_sn'] ?? null,
             'pm_departure' => $slotted['pm_departure'],
-            'pm_departure_device_sn' => $slotted['pm_departure_device_sn'] ?? null,
             'ot_arrival' => $slotted['ot_arrival'],
-            'ot_arrival_device_sn' => $slotted['ot_arrival_device_sn'] ?? null,
             'ot_departure' => $slotted['ot_departure'],
-            'ot_departure_device_sn' => $slotted['ot_departure_device_sn'] ?? null,
             'late_minutes' => $lateAndUndertime['late_minutes'],
             'undertime_minutes' => $lateAndUndertime['undertime_minutes'],
             'overtime_minutes' => $lateAndUndertime['overtime_minutes'],
@@ -311,28 +305,19 @@ class DtrCalculationService
     {
         $result = [
             'am_arrival' => null,
-            'am_arrival_device_sn' => null,
             'am_departure' => null,
-            'am_departure_device_sn' => null,
             'pm_arrival' => null,
-            'pm_arrival_device_sn' => null,
             'pm_departure' => null,
-            'pm_departure_device_sn' => null,
             'ot_arrival' => null,
-            'ot_arrival_device_sn' => null,
             'ot_departure' => null,
-            'ot_departure_device_sn' => null,
         ];
 
         if ($punches->isEmpty()) {
             return $result;
         }
 
-        $punchItems = $punches->map(fn ($p) => [
-            'time' => Carbon::parse($p->punch_time)->format('H:i:s'),
-            'device_sn' => $p->device_serial_number ?: null,
-        ])->values();
-        $count = $punchItems->count();
+        $times = $punches->map(fn ($p) => Carbon::parse($p->punch_time)->format('H:i:s'))->values();
+        $count = $times->count();
 
         // Standard time window thresholds
         $lunchThreshold = '12:00:00';
@@ -340,66 +325,49 @@ class DtrCalculationService
         $departureThreshold = '16:00:00';
 
         if ($count === 1) {
-            $item = $punchItems[0];
-            $time = $item['time'];
+            $time = $times[0];
             if ($time < $lunchThreshold) {
                 $result['am_arrival'] = $time;
-                $result['am_arrival_device_sn'] = $item['device_sn'];
             } elseif ($time >= $departureThreshold) {
                 $result['pm_departure'] = $time;
-                $result['pm_departure_device_sn'] = $item['device_sn'];
             } elseif ($time >= $afternoonThreshold) {
                 $result['pm_arrival'] = $time;
-                $result['pm_arrival_device_sn'] = $item['device_sn'];
             } else {
                 $result['am_departure'] = $time;
-                $result['am_departure_device_sn'] = $item['device_sn'];
             }
 
             return $result;
         }
 
         if ($count === 2) {
-            $p1 = $punchItems[0];
-            $p2 = $punchItems[1];
-            $t1 = $p1['time'];
-            $t2 = $p2['time'];
+            $t1 = $times[0];
+            $t2 = $times[1];
 
             if ($t1 < $lunchThreshold && $t2 >= $departureThreshold) {
                 // Classic 2-punch day (morning in, afternoon out)
                 $result['am_arrival'] = $t1;
-                $result['am_arrival_device_sn'] = $p1['device_sn'];
                 $result['pm_departure'] = $t2;
-                $result['pm_departure_device_sn'] = $p2['device_sn'];
             } elseif ($t1 < $lunchThreshold && $t2 <= $afternoonThreshold) {
                 // Morning in, lunch out
                 $result['am_arrival'] = $t1;
-                $result['am_arrival_device_sn'] = $p1['device_sn'];
                 $result['am_departure'] = $t2;
-                $result['am_departure_device_sn'] = $p2['device_sn'];
             } elseif ($t1 >= $lunchThreshold && $t2 >= $departureThreshold) {
                 // Lunch in, afternoon out
                 $result['pm_arrival'] = $t1;
-                $result['pm_arrival_device_sn'] = $p1['device_sn'];
                 $result['pm_departure'] = $t2;
-                $result['pm_departure_device_sn'] = $p2['device_sn'];
             } else {
                 $result['am_arrival'] = $t1;
-                $result['am_arrival_device_sn'] = $p1['device_sn'];
                 $result['pm_departure'] = $t2;
-                $result['pm_departure_device_sn'] = $p2['device_sn'];
             }
 
             return $result;
         }
 
         // For 3 or more punches: Assign to closest logical slots
-        foreach ($punchItems as $item) {
-            $time = $item['time'];
+        foreach ($times as $time) {
             // Slot 1: AM Arrival (between 05:00 and 10:30)
             if ($result['am_arrival'] === null && $time <= '10:30:00') {
                 $result['am_arrival'] = $time;
-                $result['am_arrival_device_sn'] = $item['device_sn'];
 
                 continue;
             }
@@ -407,7 +375,6 @@ class DtrCalculationService
             // Slot 2: AM Departure / Lunch Out (between 11:00 and 12:45)
             if ($result['am_departure'] === null && $time >= '11:00:00' && $time <= '12:45:00') {
                 $result['am_departure'] = $time;
-                $result['am_departure_device_sn'] = $item['device_sn'];
 
                 continue;
             }
@@ -416,7 +383,6 @@ class DtrCalculationService
             if ($result['pm_arrival'] === null && $time >= '12:15:00' && $time <= '14:00:00') {
                 if ($result['am_departure'] === null || $time > $result['am_departure']) {
                     $result['pm_arrival'] = $time;
-                    $result['pm_arrival_device_sn'] = $item['device_sn'];
 
                     continue;
                 }
@@ -425,15 +391,12 @@ class DtrCalculationService
             // Slot 4: PM Departure (after 16:00)
             if ($time >= '16:00:00') {
                 $result['pm_departure'] = $time;
-                $result['pm_departure_device_sn'] = $item['device_sn'];
             }
         }
 
         // If departure was not captured in window, pick the latest punch of the day
-        if ($result['pm_departure'] === null && $count >= 3 && $punchItems->last()['time'] > '13:30:00') {
-            $lastItem = $punchItems->last();
-            $result['pm_departure'] = $lastItem['time'];
-            $result['pm_departure_device_sn'] = $lastItem['device_sn'];
+        if ($result['pm_departure'] === null && $count >= 3 && $times->last() > '13:30:00') {
+            $result['pm_departure'] = $times->last();
         }
 
         return $result;

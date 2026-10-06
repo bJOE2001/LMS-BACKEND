@@ -131,6 +131,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::get('/devices', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'listDevices']);
         Route::post('/devices', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'storeDevice'])->middleware('hr');
         Route::post('/devices/{id}/update', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'updateDevice'])->middleware('hr');
+        Route::post('/devices/{id}/authorize', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'authorizeDevice'])->middleware('hr');
         Route::post('/devices/{id}/toggle', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'toggleDeviceStatus'])->middleware('hr');
         Route::post('/devices/{id}/delete', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'deleteDevice'])->middleware('hr');
         Route::post('/import-usb', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'importUsb']);
@@ -245,8 +246,6 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::post('/register', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'hrRegister']);
             Route::post('/mark-enrolled', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'hrMarkEnrolled']);
             Route::post('/sync-from-logs', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'syncFromLogs']);
-            Route::post('/broadcast-all', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'broadcastAll']);
-            Route::post('/pull-device-templates', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'pullDeviceTemplates']);
         });
 
         Route::middleware('hr.module:access_control')->prefix('access-control')->group(function () {

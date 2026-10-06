@@ -16,6 +16,14 @@ class BiometricDevice extends Model
 
     protected $table = 'tblBiometricDevices';
 
+    public const STATUS_PENDING_APPROVAL = 'PENDING_APPROVAL';
+
+    public const STATUS_ONLINE = 'ONLINE';
+
+    public const STATUS_OFFLINE = 'OFFLINE';
+
+    public const STATUS_BLOCKED = 'BLOCKED';
+
     protected $fillable = [
         'device_name',
         'serial_number',
@@ -68,7 +76,7 @@ class BiometricDevice extends Model
 
     public function getIsOnlineAttribute(): bool
     {
-        if (! $this->is_active) {
+        if (! $this->is_active || $this->status === self::STATUS_PENDING_APPROVAL) {
             return false;
         }
 

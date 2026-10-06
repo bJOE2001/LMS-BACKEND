@@ -5,7 +5,6 @@ namespace App\Http\Controllers\Attendance;
 use App\Http\Controllers\Controller;
 use App\Models\BiometricDeviceCommand;
 use App\Models\BiometricEnrollment;
-use App\Models\BiometricTemplate;
 use App\Models\DepartmentAdmin;
 use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HrisEmployee;
@@ -41,21 +40,6 @@ class BiometricRegistrationController extends Controller
             $cNo = (string) $enr->employee_control_no;
             $enrollmentsMap[$cNo] = $enr;
             $enrollmentsMap[ltrim($cNo, '0')] = $enr;
-        }
-
-        // Fetch biometric template stats in BIO_DB
-        $templates = BiometricTemplate::query()
-            ->selectRaw('employee_control_no, template_type, count(*) as count')
-            ->groupBy('employee_control_no', 'template_type')
-            ->get();
-        $templatesMap = [];
-        foreach ($templates as $t) {
-            $cNo = (string) $t->employee_control_no;
-            $type = (string) $t->template_type;
-            $cnt = (int) $t->count;
-
-            $templatesMap[$cNo][$type] = ($templatesMap[$cNo][$type] ?? 0) + $cnt;
-            $templatesMap[ltrim($cNo, '0')][$type] = ($templatesMap[ltrim($cNo, '0')][$type] ?? 0) + $cnt;
         }
 
         $rows = [];
@@ -119,13 +103,6 @@ class BiometricRegistrationController extends Controller
                 'enrolled_at' => $enrollment?->enrolled_at?->format('Y-m-d H:i:s'),
                 'enrollment_device_sn' => $enrollment?->enrollment_device_sn,
                 'synced_devices' => $enrollment?->synced_devices ?? [],
-                'fp_count' => $templatesMap[$controlNo]['FP'] ?? $templatesMap[ltrim($controlNo, '0')]['FP'] ?? 0,
-                'face_count' => ($templatesMap[$controlNo]['BIODATA'] ?? 0)
-                    + ($templatesMap[ltrim($controlNo, '0')]['BIODATA'] ?? 0)
-                    + ($templatesMap[$controlNo]['FACE'] ?? 0)
-                    + ($templatesMap[ltrim($controlNo, '0')]['FACE'] ?? 0),
-                'has_templates' => (($templatesMap[$controlNo]['FP'] ?? $templatesMap[ltrim($controlNo, '0')]['FP'] ?? 0) > 0)
-                    || ((($templatesMap[$controlNo]['BIODATA'] ?? 0) + ($templatesMap[ltrim($controlNo, '0')]['BIODATA'] ?? 0) + ($templatesMap[$controlNo]['FACE'] ?? 0) + ($templatesMap[ltrim($controlNo, '0')]['FACE'] ?? 0)) > 0),
             ];
         }
 
@@ -190,14 +167,10 @@ class BiometricRegistrationController extends Controller
             'status' => BiometricDeviceCommand::STATUS_PENDING,
         ]);
 
-        // 3. Automatically broadcast to all other active authorized office biometric devices
-        $broadcasted = $this->admsService->broadcastEmployeeToAllDevices($controlNo, $fullName, $deviceSn);
-
         return response()->json([
-            'message' => "Employee {$fullName} pushed to enrollment terminal ({$deviceSn}) and queued to {$broadcasted} other office biometric devices.",
+            'message' => "Employee {$fullName} pushed to enrollment terminal ({$deviceSn}).",
             'enrollment' => $enrollment,
             'command_id' => $command->id,
-            'broadcasted_devices_count' => $broadcasted,
         ]);
     }
 
@@ -231,26 +204,9 @@ class BiometricRegistrationController extends Controller
         }
         $enrollment->save();
 
-        // Broadcast to all active office biometric devices
-        $broadcasted = $this->admsService->broadcastEmployeeToAllDevices($controlNo, $fullName);
-
         return response()->json([
-            'message' => "Employee {$fullName} marked as biometrically registered and queued to {$broadcasted} active office biometric devices.",
+            'message' => "Employee {$fullName} marked as biometrically registered.",
             'enrollment' => $enrollment,
-            'broadcasted_devices_count' => $broadcasted,
-        ]);
-    }
-
-    /**
-     * Broadcast all biometrically registered employees to all active, authorized office devices.
-     */
-    public function broadcastAll(): JsonResponse
-    {
-        $result = $this->admsService->broadcastAllRegisteredEmployees();
-
-        return response()->json([
-            'message' => "Universal Roaming Sync queued: {$result['commands_queued']} sync commands created for {$result['employees_count']} employee(s) across {$result['devices_count']} active biometric device(s).",
-            'result' => $result,
         ]);
     }
 
@@ -455,34 +411,5 @@ class BiometricRegistrationController extends Controller
             'synced_count' => $syncedCount,
             'total_punched_employees' => count($byPin),
         ]);
-    }
-
-    /**
-     * Request/Pull biometric templates from a specific terminal into the server.
-     */
-    public function pullDeviceTemplates(Request $request): JsonResponse
-    {
-        $validated = $request->validate([
-            'device_serial_number' => ['required', 'string'],
-            'employee_control_no' => ['nullable', 'string'],
-        ]);
-
-        $deviceSn = $validated['device_serial_number'];
-        $controlNo = $validated['employee_control_no'] ?? null;
-
-        try {
-            $result = $this->admsService->requestTemplatesFromDevice($deviceSn, $controlNo);
-
-            return response()->json([
-                'success' => true,
-                'message' => "Successfully queued template query command for terminal [{$deviceSn}]. Stored templates will upload on the next device check-in.",
-                'data' => $result,
-            ]);
-        } catch (\Throwable $e) {
-            return response()->json([
-                'success' => false,
-                'message' => $e->getMessage(),
-            ], 400);
-        }
     }
 }

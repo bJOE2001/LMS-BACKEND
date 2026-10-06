@@ -55,24 +55,49 @@ class ValidateBiometricSecurity
             ]);
         }
 
-        // 3. Strict Device Whitelist Check
+        // 3. Strict Device Whitelist & Auto-Detection
         $device = BiometricDevice::query()
             ->where('serial_number', $serialNumber)
             ->first();
 
         if (! $device) {
-            Log::warning('ZkAdmsSecurity: Blocked unregistered rogue biometric device', [
-                'sn' => $serialNumber,
-                'ip' => $clientIp,
-                'user_agent' => $request->userAgent(),
+            $pushVer = $request->query('pushver');
+            $device = BiometricDevice::query()->create([
+                'serial_number' => $serialNumber,
+                'device_name' => 'New Biometric Device',
+                'model_name' => 'MB360',
+                'firmware_version' => $pushVer !== null && is_string($pushVer) ? trim($pushVer) : null,
+                'ip_address' => $clientIp,
+                'communication_mode' => 'ADMS',
+                'is_active' => false,
+                'status' => 'PENDING_APPROVAL',
+                'last_heartbeat_at' => now(),
             ]);
 
-            return response("ERROR: Unauthorized Device\n", 403, [
+            Log::info("ZkAdmsSecurity: Auto-detected new biometric terminal [{$serialNumber}] from IP [{$clientIp}]. Queued for HR authorization.");
+
+            return response("ERROR: Device Pending Approval\n", 403, [
                 'Content-Type' => 'text/plain',
             ]);
         }
 
         if (! $device->is_active) {
+            $device->last_heartbeat_at = now();
+            if ($clientIp !== '') {
+                $device->ip_address = $clientIp;
+            }
+            $pushVer = $request->query('pushver');
+            if ($pushVer !== null && is_string($pushVer) && trim($pushVer) !== '') {
+                $device->firmware_version = trim($pushVer);
+            }
+            $device->save();
+
+            if ($device->status === 'PENDING_APPROVAL') {
+                return response("ERROR: Device Pending Approval\n", 403, [
+                    'Content-Type' => 'text/plain',
+                ]);
+            }
+
             Log::warning('ZkAdmsSecurity: Blocked disabled biometric device', [
                 'sn' => $serialNumber,
                 'ip' => $clientIp,

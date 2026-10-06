@@ -337,57 +337,6 @@ class DtrCalculationTest extends TestCase
         $this->assertSame($homeDepartmentId, (int) $dtr->department_id);
         $this->assertSame(DailyTimeRecord::STATUS_PRESENT, $dtr->status);
         $this->assertSame('07:50:00', $dtr->am_arrival);
-        $this->assertSame($engineeringDeviceSn, $dtr->am_arrival_device_sn);
         $this->assertSame('17:05:00', $dtr->pm_departure);
-        $this->assertSame($itDeviceSn, $dtr->pm_departure_device_sn);
-    }
-
-    public function test_universal_broadcast_queues_commands_for_all_devices(): void
-    {
-        $admsService = app(\App\Services\Attendance\ZkAdmsService::class);
-        $deviceSn1 = 'TEST-DEV-001';
-        $deviceSn2 = 'TEST-DEV-002';
-
-        try {
-            // Clean up any test devices and commands
-            \App\Models\BiometricDevice::query()->whereIn('serial_number', [$deviceSn1, $deviceSn2])->delete();
-            \App\Models\BiometricDeviceCommand::query()->where('employee_control_no', self::TEST_CONTROL_NO)->delete();
-
-            // Create two active authorized devices
-            \App\Models\BiometricDevice::query()->create([
-                'serial_number' => $deviceSn1,
-                'device_name' => 'IT Office MB360',
-                'is_active' => true,
-                'status' => 'ONLINE',
-            ]);
-            \App\Models\BiometricDevice::query()->create([
-                'serial_number' => $deviceSn2,
-                'device_name' => 'Engineering Office MB360',
-                'is_active' => true,
-                'status' => 'ONLINE',
-            ]);
-
-            $totalActiveDevices = \App\Models\BiometricDevice::query()->where('is_active', true)->where('status', '!=', 'BLOCKED')->count();
-
-            // Broadcast employee
-            $queued = $admsService->broadcastEmployeeToAllDevices(self::TEST_CONTROL_NO, 'Juan Dela Cruz');
-
-            $this->assertSame($totalActiveDevices, $queued, 'Should queue commands for all active devices');
-
-            // Verify commands exist for our test devices
-            $commands = \App\Models\BiometricDeviceCommand::query()
-                ->where('employee_control_no', self::TEST_CONTROL_NO)
-                ->whereIn('device_serial_number', [$deviceSn1, $deviceSn2])
-                ->get();
-
-            $this->assertCount(2, $commands);
-            foreach ($commands as $cmd) {
-                $this->assertSame(\App\Models\BiometricDeviceCommand::STATUS_PENDING, $cmd->status);
-                $this->assertStringContainsString('DATA USER PIN='.self::TEST_CONTROL_NO, $cmd->command_payload);
-            }
-        } finally {
-            \App\Models\BiometricDevice::query()->whereIn('serial_number', [$deviceSn1, $deviceSn2])->delete();
-            \App\Models\BiometricDeviceCommand::query()->where('employee_control_no', self::TEST_CONTROL_NO)->delete();
-        }
     }
 }

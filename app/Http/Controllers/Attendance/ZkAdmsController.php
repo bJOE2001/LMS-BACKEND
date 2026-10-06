@@ -61,26 +61,4 @@ class ZkAdmsController extends Controller
             'Content-Type' => 'text/plain',
         ]);
     }
-
-    /**
-     * Device pushing queried data back to server (POST /iclock/querydata).
-     */
-    public function querydata(Request $request): Response
-    {
-        $result = $this->admsService->handleQueryData($request);
-
-        return response($result['response'], 200, [
-            'Content-Type' => 'text/plain',
-        ]);
-    }
-
-    /**
-     * Device pushing photo/file data (POST /iclock/fdata).
-     */
-    public function fdata(Request $request): Response
-    {
-        return response("OK\n", 200, [
-            'Content-Type' => 'text/plain',
-        ]);
-    }
 }
