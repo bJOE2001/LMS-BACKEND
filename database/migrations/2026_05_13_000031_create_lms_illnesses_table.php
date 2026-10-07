@@ -8,7 +8,7 @@ return new class extends Migration
 {
     public function up(): void
     {
-        if (!Schema::hasTable('tblIllnesses')) {
+        if (! Schema::hasTable('tblIllnesses')) {
             Schema::create('tblIllnesses', function (Blueprint $table): void {
                 $table->id();
                 $table->string('name', 255)->unique();

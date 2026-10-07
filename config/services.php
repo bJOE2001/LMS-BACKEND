@@ -35,4 +35,9 @@ return [
         ],
     ],
 
+    'zkbio' => [
+        'api_user' => env('ZKBIO_API_USER'),
+        'api_pass' => env('ZKBIO_API_PASS'),
+    ],
+
 ];

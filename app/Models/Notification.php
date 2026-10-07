@@ -13,6 +13,7 @@ use Illuminate\Support\Facades\Schema;
 class Notification extends Model
 {
     protected $table = 'tblNotifications';
+
     private static ?bool $hasCocApplicationColumn = null;
 
     protected $fillable = [
@@ -36,16 +37,27 @@ class Notification extends Model
     // ─── Notification types ──────────────────────────────────────────
 
     public const TYPE_LEAVE_APPROVED = 'leave_approved';
+
     public const TYPE_LEAVE_REJECTED = 'leave_rejected';
+
     public const TYPE_LEAVE_CANCELLED = 'leave_cancelled';
+
     public const TYPE_LEAVE_EDIT_REQUEST = 'leave_edit_requested';
+
     public const TYPE_LEAVE_REQUEST = 'leave_request';
+
     public const TYPE_LEAVE_PENDING = 'leave_pending';
+
     public const TYPE_COC_REQUEST = 'coc_request';
+
     public const TYPE_COC_PENDING = 'coc_pending';
+
     public const TYPE_COC_APPROVED = 'coc_approved';
+
     public const TYPE_COC_REJECTED = 'coc_rejected';
+
     public const TYPE_REMINDER = 'reminder';
+
     public const TYPE_SYSTEM = 'system';
 
     // ─── Relationships ───────────────────────────────────────────────
@@ -77,8 +89,7 @@ class Notification extends Model
         string $message,
         ?int $leaveApplicationId = null,
         ?int $cocApplicationId = null
-    ): self
-    {
+    ): self {
         $attributes = [
             'notifiable_type' => get_class($recipient),
             'notifiable_id' => $recipient->id,

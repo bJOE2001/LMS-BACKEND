@@ -8,7 +8,7 @@ return new class extends Migration
 {
     public function up(): void
     {
-        if (!Schema::hasColumn('tblDepartments', 'is_inactive')) {
+        if (! Schema::hasColumn('tblDepartments', 'is_inactive')) {
             Schema::table('tblDepartments', function (Blueprint $table): void {
                 $table->boolean('is_inactive')->default(false);
             });

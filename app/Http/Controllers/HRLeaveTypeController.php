@@ -63,7 +63,7 @@ class HRLeaveTypeController extends Controller
     public function update(Request $request, int $id): JsonResponse
     {
         $leaveType = LeaveType::find($id);
-        if (!$leaveType) {
+        if (! $leaveType) {
             return response()->json(['message' => 'Leave type not found.'], 404);
         }
 
@@ -85,7 +85,7 @@ class HRLeaveTypeController extends Controller
             ->withCount(['leaveApplications', 'leaveBalances'])
             ->find($id);
 
-        if (!$leaveType) {
+        if (! $leaveType) {
             return response()->json(['message' => 'Leave type not found.'], 404);
         }
 
@@ -201,13 +201,13 @@ class HRLeaveTypeController extends Controller
         }
 
         if (($validated['category'] ?? null) === LeaveType::CATEGORY_ACCRUED) {
-            if (!array_key_exists('accrual_rate', $validated) || $validated['accrual_rate'] === null) {
+            if (! array_key_exists('accrual_rate', $validated) || $validated['accrual_rate'] === null) {
                 throw ValidationException::withMessages([
                     'accrual_rate' => ['Accrual rate is required for ACCRUED leave types.'],
                 ]);
             }
 
-            if (!array_key_exists('accrual_day_of_month', $validated) || $validated['accrual_day_of_month'] === null) {
+            if (! array_key_exists('accrual_day_of_month', $validated) || $validated['accrual_day_of_month'] === null) {
                 throw ValidationException::withMessages([
                     'accrual_day_of_month' => ['Accrual day is required for ACCRUED leave types.'],
                 ]);

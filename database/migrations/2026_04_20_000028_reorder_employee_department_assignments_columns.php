@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\Schema;
 return new class extends Migration
 {
     private const TABLE = 'tblEmployeeDepartmentAssignments';
+
     private const TEMP_TABLE = 'tblEmployeeDepartmentAssignments__tmp_reorder';
 
     /**
@@ -64,7 +65,7 @@ return new class extends Migration
             return;
         }
 
-        if (!Schema::hasTable(self::TABLE)) {
+        if (! Schema::hasTable(self::TABLE)) {
             return;
         }
 
@@ -104,9 +105,9 @@ return new class extends Migration
             $table->index('assigned_by_department_admin_id');
         });
 
-        DB::unprepared("
-            SET IDENTITY_INSERT [".self::TEMP_TABLE."] ON;
-            INSERT INTO [".self::TEMP_TABLE."] (
+        DB::unprepared('
+            SET IDENTITY_INSERT ['.self::TEMP_TABLE.'] ON;
+            INSERT INTO ['.self::TEMP_TABLE.'] (
                 [id],
                 [employee_control_no],
                 [surname],
@@ -131,9 +132,9 @@ return new class extends Migration
                 [assigned_at],
                 [created_at],
                 [updated_at]
-            FROM [".self::TABLE."];
-            SET IDENTITY_INSERT [".self::TEMP_TABLE."] OFF;
-        ");
+            FROM ['.self::TABLE.'];
+            SET IDENTITY_INSERT ['.self::TEMP_TABLE.'] OFF;
+        ');
 
         Schema::drop(self::TABLE);
         Schema::rename(self::TEMP_TABLE, self::TABLE);
@@ -142,25 +143,25 @@ return new class extends Migration
     private function ensureIdentityColumnsExist(): void
     {
         if (
-            !Schema::hasColumn(self::TABLE, 'surname')
-            || !Schema::hasColumn(self::TABLE, 'firstname')
-            || !Schema::hasColumn(self::TABLE, 'middlename')
-            || !Schema::hasColumn(self::TABLE, 'department_acronym')
+            ! Schema::hasColumn(self::TABLE, 'surname')
+            || ! Schema::hasColumn(self::TABLE, 'firstname')
+            || ! Schema::hasColumn(self::TABLE, 'middlename')
+            || ! Schema::hasColumn(self::TABLE, 'department_acronym')
         ) {
             Schema::table(self::TABLE, function (Blueprint $table): void {
-                if (!Schema::hasColumn(self::TABLE, 'surname')) {
+                if (! Schema::hasColumn(self::TABLE, 'surname')) {
                     $table->string('surname')->nullable();
                 }
 
-                if (!Schema::hasColumn(self::TABLE, 'firstname')) {
+                if (! Schema::hasColumn(self::TABLE, 'firstname')) {
                     $table->string('firstname')->nullable();
                 }
 
-                if (!Schema::hasColumn(self::TABLE, 'middlename')) {
+                if (! Schema::hasColumn(self::TABLE, 'middlename')) {
                     $table->string('middlename')->nullable();
                 }
 
-                if (!Schema::hasColumn(self::TABLE, 'department_acronym')) {
+                if (! Schema::hasColumn(self::TABLE, 'department_acronym')) {
                     $table->string('department_acronym')->nullable();
                 }
             });

@@ -9,25 +9,25 @@ return new class extends Migration
     public function up(): void
     {
         if (
-            !Schema::hasColumn('tblEmployeeDepartmentAssignments', 'surname')
-            || !Schema::hasColumn('tblEmployeeDepartmentAssignments', 'firstname')
-            || !Schema::hasColumn('tblEmployeeDepartmentAssignments', 'middlename')
-            || !Schema::hasColumn('tblEmployeeDepartmentAssignments', 'department_acronym')
+            ! Schema::hasColumn('tblEmployeeDepartmentAssignments', 'surname')
+            || ! Schema::hasColumn('tblEmployeeDepartmentAssignments', 'firstname')
+            || ! Schema::hasColumn('tblEmployeeDepartmentAssignments', 'middlename')
+            || ! Schema::hasColumn('tblEmployeeDepartmentAssignments', 'department_acronym')
         ) {
             Schema::table('tblEmployeeDepartmentAssignments', function (Blueprint $table): void {
-                if (!Schema::hasColumn('tblEmployeeDepartmentAssignments', 'surname')) {
+                if (! Schema::hasColumn('tblEmployeeDepartmentAssignments', 'surname')) {
                     $table->string('surname')->nullable();
                 }
 
-                if (!Schema::hasColumn('tblEmployeeDepartmentAssignments', 'firstname')) {
+                if (! Schema::hasColumn('tblEmployeeDepartmentAssignments', 'firstname')) {
                     $table->string('firstname')->nullable();
                 }
 
-                if (!Schema::hasColumn('tblEmployeeDepartmentAssignments', 'middlename')) {
+                if (! Schema::hasColumn('tblEmployeeDepartmentAssignments', 'middlename')) {
                     $table->string('middlename')->nullable();
                 }
 
-                if (!Schema::hasColumn('tblEmployeeDepartmentAssignments', 'department_acronym')) {
+                if (! Schema::hasColumn('tblEmployeeDepartmentAssignments', 'department_acronym')) {
                     $table->string('department_acronym')->nullable();
                 }
             });

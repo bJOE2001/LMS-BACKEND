@@ -49,12 +49,14 @@ class LoginRequest extends FormRequest
         $account = HRAccount::where('username', $username)->first();
         if ($account && Hash::check($password, $account->getAuthPassword())) {
             RateLimiter::clear($this->throttleKey());
+
             return $account;
         }
 
         $account = DepartmentAdmin::where('username', $username)->first();
         if ($account && Hash::check($password, $account->getAuthPassword())) {
             RateLimiter::clear($this->throttleKey());
+
             return $account;
         }
 
@@ -92,6 +94,6 @@ class LoginRequest extends FormRequest
      */
     public function throttleKey(): string
     {
-        return Str::transliterate(Str::lower($this->string('username')) . '|' . $this->ip());
+        return Str::transliterate(Str::lower($this->string('username')).'|'.$this->ip());
     }
 }

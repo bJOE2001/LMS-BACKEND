@@ -95,9 +95,7 @@ class DepartmentAdmin extends Model implements AuthenticatableContract
         return null;
     }
 
-    public function setRememberToken($value): void
-    {
-    }
+    public function setRememberToken($value): void {}
 
     public function getRememberTokenName(): ?string
     {

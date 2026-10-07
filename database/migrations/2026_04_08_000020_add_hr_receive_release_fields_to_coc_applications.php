@@ -5,9 +5,12 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
-return new class extends Migration {
+return new class extends Migration
+{
     private const TABLE = 'tblCOCApplications';
+
     private const RECEIVED_FOREIGN = 'tblcocapplications_hr_received_by_id_foreign';
+
     private const RELEASED_FOREIGN = 'tblcocapplications_hr_released_by_id_foreign';
 
     private function hasSqlServerForeignKey(string $tableName, string $foreignName): bool
@@ -32,23 +35,23 @@ return new class extends Migration {
     public function up(): void
     {
         Schema::table(self::TABLE, function (Blueprint $table): void {
-            if (!Schema::hasColumn(self::TABLE, 'hr_received_by_id')) {
+            if (! Schema::hasColumn(self::TABLE, 'hr_received_by_id')) {
                 $table->foreignId('hr_received_by_id')
                     ->nullable()
                     ->after('reviewed_by_hr_id');
             }
 
-            if (!Schema::hasColumn(self::TABLE, 'hr_received_at')) {
+            if (! Schema::hasColumn(self::TABLE, 'hr_received_at')) {
                 $table->timestamp('hr_received_at')->nullable()->after('reviewed_at');
             }
 
-            if (!Schema::hasColumn(self::TABLE, 'hr_released_by_id')) {
+            if (! Schema::hasColumn(self::TABLE, 'hr_released_by_id')) {
                 $table->foreignId('hr_released_by_id')
                     ->nullable()
                     ->after('hr_received_by_id');
             }
 
-            if (!Schema::hasColumn(self::TABLE, 'hr_released_at')) {
+            if (! Schema::hasColumn(self::TABLE, 'hr_released_at')) {
                 $table->timestamp('hr_released_at')->nullable()->after('hr_received_at');
             }
         });

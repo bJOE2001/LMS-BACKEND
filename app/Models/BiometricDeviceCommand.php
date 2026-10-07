@@ -136,6 +136,6 @@ class BiometricDeviceCommand extends Model
      */
     public static function buildInfoCommand(): string
     {
-        return "INFO";
+        return 'INFO';
     }
 }

@@ -4,10 +4,11 @@ use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
 
-return new class extends Migration {
+return new class extends Migration
+{
     public function up(): void
     {
-        if (!Schema::hasColumn('tblHRAccounts', 'active_personal_access_token_id')) {
+        if (! Schema::hasColumn('tblHRAccounts', 'active_personal_access_token_id')) {
             Schema::table('tblHRAccounts', function (Blueprint $table): void {
                 $table->unsignedBigInteger('active_personal_access_token_id')
                     ->nullable()
@@ -19,7 +20,7 @@ return new class extends Migration {
             });
         }
 
-        if (!Schema::hasColumn('tblDepartmentAdmins', 'active_personal_access_token_id')) {
+        if (! Schema::hasColumn('tblDepartmentAdmins', 'active_personal_access_token_id')) {
             Schema::table('tblDepartmentAdmins', function (Blueprint $table): void {
                 $table->unsignedBigInteger('active_personal_access_token_id')
                     ->nullable()

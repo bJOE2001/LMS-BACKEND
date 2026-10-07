@@ -8,20 +8,20 @@ return new class extends Migration
 {
     public function up(): void
     {
-        if (!Schema::hasTable('tblCOCApplications')) {
+        if (! Schema::hasTable('tblCOCApplications')) {
             return;
         }
 
         Schema::table('tblCOCApplications', function (Blueprint $table): void {
-            if (!Schema::hasColumn('tblCOCApplications', 'is_late_filed')) {
+            if (! Schema::hasColumn('tblCOCApplications', 'is_late_filed')) {
                 $table->boolean('is_late_filed')->default(false)->after('status');
             }
 
-            if (!Schema::hasColumn('tblCOCApplications', 'late_filing_status')) {
+            if (! Schema::hasColumn('tblCOCApplications', 'late_filing_status')) {
                 $table->string('late_filing_status', 16)->nullable()->after('is_late_filed');
             }
 
-            if (!Schema::hasColumn('tblCOCApplications', 'late_filing_reviewed_by_hr_id')) {
+            if (! Schema::hasColumn('tblCOCApplications', 'late_filing_reviewed_by_hr_id')) {
                 $table->foreignId('late_filing_reviewed_by_hr_id')
                     ->nullable()
                     ->after('late_filing_status')
@@ -29,18 +29,18 @@ return new class extends Migration
                     ->noActionOnDelete();
             }
 
-            if (!Schema::hasColumn('tblCOCApplications', 'late_filing_reviewed_at')) {
+            if (! Schema::hasColumn('tblCOCApplications', 'late_filing_reviewed_at')) {
                 $table->timestamp('late_filing_reviewed_at')->nullable()->after('late_filing_reviewed_by_hr_id');
             }
 
-            if (!Schema::hasColumn('tblCOCApplications', 'late_filing_review_remarks')) {
+            if (! Schema::hasColumn('tblCOCApplications', 'late_filing_review_remarks')) {
                 $table->text('late_filing_review_remarks')->nullable()->after('late_filing_reviewed_at');
             }
         });
 
         if (
             Schema::hasTable('tblCOCApplications')
-            && !Schema::hasIndex('tblCOCApplications', 'ix_tblcocapplications_late_filing')
+            && ! Schema::hasIndex('tblCOCApplications', 'ix_tblcocapplications_late_filing')
         ) {
             Schema::table('tblCOCApplications', function (Blueprint $table): void {
                 $table->index(['is_late_filed', 'late_filing_status', 'created_at'], 'ix_tblcocapplications_late_filing');
@@ -50,7 +50,7 @@ return new class extends Migration
 
     public function down(): void
     {
-        if (!Schema::hasTable('tblCOCApplications')) {
+        if (! Schema::hasTable('tblCOCApplications')) {
             return;
         }
 

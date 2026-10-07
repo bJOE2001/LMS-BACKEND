@@ -4,7 +4,8 @@ use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
 
-return new class extends Migration {
+return new class extends Migration
+{
     /**
      * Run the migrations.
      */
@@ -176,7 +177,7 @@ return new class extends Migration {
             $table->index(['leave_type_id', 'entry_type'], 'ix_tblcocledgerentries_leave_type_entry_type');
         });
 
-        if (Schema::hasTable('tblNotifications') && !Schema::hasColumn('tblNotifications', 'coc_application_id')) {
+        if (Schema::hasTable('tblNotifications') && ! Schema::hasColumn('tblNotifications', 'coc_application_id')) {
             Schema::table('tblNotifications', function (Blueprint $table): void {
                 $table->foreignId('coc_application_id')
                     ->nullable()

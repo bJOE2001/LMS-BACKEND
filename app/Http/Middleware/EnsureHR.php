@@ -15,11 +15,12 @@ class EnsureHR
     public function handle(Request $request, Closure $next): Response
     {
         $user = $request->user();
-        if (!$user instanceof HRAccount) {
+        if (! $user instanceof HRAccount) {
             return response()->json([
                 'message' => 'Only HR accounts can access this resource.',
             ], 403);
         }
+
         return $next($request);
     }
 }

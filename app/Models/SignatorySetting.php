@@ -24,4 +24,3 @@ class SignatorySetting extends Model
         return $this->belongsTo(HRAccount::class, 'updated_by_hr_account_id');
     }
 }
-

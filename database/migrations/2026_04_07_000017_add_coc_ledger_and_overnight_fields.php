@@ -9,12 +9,12 @@ return new class extends Migration
     public function up(): void
     {
         Schema::table('tblCOCApplicationRows', function (Blueprint $table): void {
-            if (!Schema::hasColumn('tblCOCApplicationRows', 'is_overnight')) {
+            if (! Schema::hasColumn('tblCOCApplicationRows', 'is_overnight')) {
                 $table->boolean('is_overnight')->default(false)->after('time_to');
             }
         });
 
-        if (!Schema::hasTable('tblCOCLedgerEntries')) {
+        if (! Schema::hasTable('tblCOCLedgerEntries')) {
             Schema::create('tblCOCLedgerEntries', function (Blueprint $table): void {
                 $table->id();
                 $table->string('employee_control_no');

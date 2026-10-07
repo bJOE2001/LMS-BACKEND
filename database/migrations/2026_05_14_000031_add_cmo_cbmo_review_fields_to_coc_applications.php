@@ -5,8 +5,10 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
-return new class extends Migration {
+return new class extends Migration
+{
     private const TABLE = 'tblCOCApplications';
+
     private const REVIEWED_FOREIGN = 'tblcocapplications_cmo_cbmo_reviewed_by_id_foreign';
 
     private function hasSqlServerForeignKey(string $tableName, string $foreignName): bool
@@ -31,13 +33,13 @@ return new class extends Migration {
     public function up(): void
     {
         Schema::table(self::TABLE, function (Blueprint $table): void {
-            if (!Schema::hasColumn(self::TABLE, 'cmo_cbmo_reviewed_by_id')) {
+            if (! Schema::hasColumn(self::TABLE, 'cmo_cbmo_reviewed_by_id')) {
                 $table->foreignId('cmo_cbmo_reviewed_by_id')
                     ->nullable()
                     ->after('hr_received_by_id');
             }
 
-            if (!Schema::hasColumn(self::TABLE, 'cmo_cbmo_reviewed_at')) {
+            if (! Schema::hasColumn(self::TABLE, 'cmo_cbmo_reviewed_at')) {
                 $table->timestamp('cmo_cbmo_reviewed_at')->nullable()->after('hr_received_at');
             }
         });

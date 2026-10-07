@@ -9,7 +9,7 @@ return new class extends Migration
     public function up(): void
     {
         Schema::table('tblCOCApplicationRows', function (Blueprint $table): void {
-            if (!Schema::hasColumn('tblCOCApplicationRows', 'break_minutes')) {
+            if (! Schema::hasColumn('tblCOCApplicationRows', 'break_minutes')) {
                 $table->unsignedInteger('break_minutes')->default(0)->after('minutes');
             }
         });

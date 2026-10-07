@@ -57,7 +57,7 @@ class HRDepartmentLibraryController extends Controller
     public function update(Request $request, int $id): JsonResponse
     {
         $department = Department::query()->active()->find($id);
-        if (!$department) {
+        if (! $department) {
             return response()->json([
                 'message' => 'Office not found.',
             ], 404);
@@ -81,7 +81,7 @@ class HRDepartmentLibraryController extends Controller
             ->with(['admin:id,department_id', 'departmentHead:id,department_id'])
             ->find($id);
 
-        if (!$department) {
+        if (! $department) {
             return response()->json([
                 'message' => 'Office not found.',
             ], 404);

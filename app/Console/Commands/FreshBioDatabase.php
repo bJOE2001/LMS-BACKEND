@@ -143,6 +143,13 @@ class FreshBioDatabase extends Command
             $this->line('  <fg=green>+</> Migrated: tblBiometricEnrollments, tblBiometricDeviceCommands');
         }
 
+        $templateMigrationFile = database_path('migrations/2026_10_06_100000_create_bio_templates_table.php');
+        if (file_exists($templateMigrationFile)) {
+            $migration = require $templateMigrationFile;
+            $migration->up();
+            $this->line('  <fg=green>+</> Migrated: tblBiometricTemplates');
+        }
+
         if ($this->option('seed')) {
             $this->info('4. Seeding default authorized biometric device...');
             BiometricDevice::query()->create([

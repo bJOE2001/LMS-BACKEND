@@ -12,6 +12,7 @@ use InvalidArgumentException;
 class WorkScheduleService
 {
     public const STANDARD_WORKDAY_HOURS = 8.0;
+
     public const DEDUCTION_PRECISION = 3;
 
     /**
@@ -85,11 +86,11 @@ class WorkScheduleService
     public function createEmployeeOverride(string $employeeControlNo, array $payload, ?HRAccount $updatedBy = null): EmployeeWorkScheduleOverride
     {
         $employee = HrisEmployee::findByControlNo($employeeControlNo, true);
-        if (!$employee) {
+        if (! $employee) {
             throw new InvalidArgumentException('Employee not found in active HRIS records.');
         }
 
-        $override = new EmployeeWorkScheduleOverride();
+        $override = new EmployeeWorkScheduleOverride;
         $override->fill($this->normalizeSchedulePayload($payload, $updatedBy));
         $override->employee_control_no = trim((string) ($employee->control_no ?? $employeeControlNo));
         $override->employee_name = $this->formatEmployeeFullName($employee);
@@ -135,7 +136,7 @@ class WorkScheduleService
             ->where('employee_control_no', $lookupControlNo)
             ->first();
 
-        if (!$override) {
+        if (! $override) {
             return $default;
         }
 
@@ -158,7 +159,7 @@ class WorkScheduleService
     }
 
     /**
-     * @param array<string, mixed> $payload
+     * @param  array<string, mixed>  $payload
      * @return array<string, mixed>
      */
     public function normalizeSchedulePayload(array $payload, ?HRAccount $updatedBy = null): array
@@ -202,7 +203,7 @@ class WorkScheduleService
     ): float {
         $workStart = CarbonImmutable::createFromFormat('H:i', $workStartTime);
         $workEnd = CarbonImmutable::createFromFormat('H:i', $workEndTime);
-        if (!$workStart || !$workEnd || $workEnd->lessThanOrEqualTo($workStart)) {
+        if (! $workStart || ! $workEnd || $workEnd->lessThanOrEqualTo($workStart)) {
             throw new InvalidArgumentException('Work end time must be later than the work start time.');
         }
 
@@ -217,8 +218,8 @@ class WorkScheduleService
             $breakEnd = CarbonImmutable::createFromFormat('H:i', $breakEndTime);
 
             if (
-                !$breakStart ||
-                !$breakEnd ||
+                ! $breakStart ||
+                ! $breakEnd ||
                 $breakEnd->lessThanOrEqualTo($breakStart) ||
                 $breakStart->lessThan($workStart) ||
                 $breakEnd->greaterThan($workEnd)
@@ -237,7 +238,7 @@ class WorkScheduleService
     }
 
     /**
-     * @param array<string, mixed> $data
+     * @param  array<string, mixed>  $data
      * @return array<string, mixed>
      */
     private function formatResolvedSchedule(
@@ -284,7 +285,7 @@ class WorkScheduleService
     }
 
     /**
-     * @param array<string, mixed> $data
+     * @param  array<string, mixed>  $data
      * @return array{office:?string, officeAcronym:?string, hris_office:?string, hrisOfficeAcronym:?string}
      */
     private function resolveOfficeContext(array $data): array
@@ -320,6 +321,7 @@ class WorkScheduleService
     private function normalizeTimeValue(mixed $value): ?string
     {
         $normalized = $this->normalizeNullableTimeValue($value);
+
         return $normalized !== null ? $normalized : null;
     }
 
@@ -348,6 +350,7 @@ class WorkScheduleService
     private function trimNullableString(mixed $value): ?string
     {
         $trimmed = trim((string) ($value ?? ''));
+
         return $trimmed !== '' ? $trimmed : null;
     }
 

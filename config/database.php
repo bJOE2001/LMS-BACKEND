@@ -173,6 +173,18 @@ return [
             'prefix_indexes' => true,
         ],
 
+        'zkbio' => [
+            'driver' => env('ZKBIO_DB_CONNECTION', 'sqlsrv'),
+            'host' => env('ZKBIO_DB_HOST', '127.0.0.1'),
+            'port' => env('ZKBIO_DB_PORT', '1433'),
+            'database' => env('ZKBIO_DB_DATABASE', 'zkbiotime'),
+            'username' => env('ZKBIO_DB_USERNAME', 'sa'),
+            'password' => env('ZKBIO_DB_PASSWORD', ''),
+            'charset' => 'utf8',
+            'prefix' => '',
+            'prefix_indexes' => true,
+        ],
+
     ],
 
     /*
@@ -241,4 +253,3 @@ return [
     ],
 
 ];
-

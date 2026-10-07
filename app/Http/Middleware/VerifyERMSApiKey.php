@@ -19,7 +19,7 @@ class VerifyERMSApiKey
 
         if ($incomingApiKey !== '' && $this->matchesAnyConfiguredKey($incomingApiKey, $configuredKeys)) {
             $allowedIps = $this->allowedIps();
-            if ($allowedIps !== [] && !in_array((string) $request->ip(), $allowedIps, true)) {
+            if ($allowedIps !== [] && ! in_array((string) $request->ip(), $allowedIps, true)) {
                 $this->logFailure('ip_not_allowed', $request, [
                     'allowed_ips' => $allowedIps,
                     'auth_mode' => 'api_key',
@@ -128,7 +128,7 @@ class VerifyERMSApiKey
         }
 
         $refererParts = parse_url($refererHeader);
-        if (!is_array($refererParts) || !isset($refererParts['scheme'], $refererParts['host'])) {
+        if (! is_array($refererParts) || ! isset($refererParts['scheme'], $refererParts['host'])) {
             return null;
         }
 
@@ -150,7 +150,7 @@ class VerifyERMSApiKey
         }
 
         $parts = parse_url($origin);
-        if (!is_array($parts) || !isset($parts['scheme'], $parts['host'])) {
+        if (! is_array($parts) || ! isset($parts['scheme'], $parts['host'])) {
             return null;
         }
 

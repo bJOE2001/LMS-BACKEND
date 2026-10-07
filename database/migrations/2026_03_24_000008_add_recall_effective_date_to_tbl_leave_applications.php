@@ -8,13 +8,13 @@ return new class extends Migration
 {
     public function up(): void
     {
-        if (!Schema::hasColumn('tblLeaveApplications', 'recall_effective_date')) {
+        if (! Schema::hasColumn('tblLeaveApplications', 'recall_effective_date')) {
             Schema::table('tblLeaveApplications', function (Blueprint $table): void {
                 $table->date('recall_effective_date')->nullable();
             });
         }
 
-        if (!Schema::hasColumn('tblLeaveApplications', 'recall_selected_dates')) {
+        if (! Schema::hasColumn('tblLeaveApplications', 'recall_selected_dates')) {
             Schema::table('tblLeaveApplications', function (Blueprint $table): void {
                 $table->longText('recall_selected_dates')->nullable();
             });

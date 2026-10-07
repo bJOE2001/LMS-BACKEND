@@ -72,7 +72,7 @@ class HRIllnessLibraryController extends Controller
     public function update(Request $request, int $id): JsonResponse
     {
         $illness = Illness::query()->find($id);
-        if (!$illness) {
+        if (! $illness) {
             return response()->json([
                 'message' => 'Illness not found.',
             ], 404);
@@ -92,7 +92,7 @@ class HRIllnessLibraryController extends Controller
     public function destroy(int $id): JsonResponse
     {
         $illness = Illness::query()->active()->find($id);
-        if (!$illness) {
+        if (! $illness) {
             return response()->json([
                 'message' => 'Illness not found.',
             ], 404);

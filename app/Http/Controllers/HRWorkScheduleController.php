@@ -14,7 +14,7 @@ class HRWorkScheduleController extends Controller
     public function index(Request $request): JsonResponse
     {
         $hr = $request->user();
-        if (!$hr instanceof HRAccount) {
+        if (! $hr instanceof HRAccount) {
             return response()->json(['message' => 'Only HR accounts can access this resource.'], 403);
         }
 
@@ -29,7 +29,7 @@ class HRWorkScheduleController extends Controller
     public function updateDefault(Request $request): JsonResponse
     {
         $hr = $request->user();
-        if (!$hr instanceof HRAccount) {
+        if (! $hr instanceof HRAccount) {
             return response()->json(['message' => 'Only HR accounts can update work schedules.'], 403);
         }
 
@@ -60,7 +60,7 @@ class HRWorkScheduleController extends Controller
     public function storeOverride(Request $request): JsonResponse
     {
         $hr = $request->user();
-        if (!$hr instanceof HRAccount) {
+        if (! $hr instanceof HRAccount) {
             return response()->json(['message' => 'Only HR accounts can update work schedules.'], 403);
         }
 
@@ -100,12 +100,12 @@ class HRWorkScheduleController extends Controller
     public function updateOverride(Request $request, int $id): JsonResponse
     {
         $hr = $request->user();
-        if (!$hr instanceof HRAccount) {
+        if (! $hr instanceof HRAccount) {
             return response()->json(['message' => 'Only HR accounts can update work schedules.'], 403);
         }
 
         $override = EmployeeWorkScheduleOverride::query()->find($id);
-        if (!$override) {
+        if (! $override) {
             return response()->json(['message' => 'Employee work schedule override not found.'], 404);
         }
 
@@ -135,12 +135,12 @@ class HRWorkScheduleController extends Controller
     public function destroyOverride(Request $request, int $id): JsonResponse
     {
         $hr = $request->user();
-        if (!$hr instanceof HRAccount) {
+        if (! $hr instanceof HRAccount) {
             return response()->json(['message' => 'Only HR accounts can update work schedules.'], 403);
         }
 
         $override = EmployeeWorkScheduleOverride::query()->find($id);
-        if (!$override) {
+        if (! $override) {
             return response()->json(['message' => 'Employee work schedule override not found.'], 404);
         }
 

@@ -88,6 +88,7 @@ class RecycleBinService
 
         if (is_object($actor)) {
             $id = $actor->id ?? $actor->control_no ?? null;
+
             return $id !== null ? (string) $id : null;
         }
 
@@ -96,14 +97,14 @@ class RecycleBinService
 
     private function resolveActorName(mixed $actor): ?string
     {
-        if (!is_object($actor)) {
+        if (! is_object($actor)) {
             return null;
         }
 
         $nameCandidates = [
             $actor->full_name ?? null,
             $actor->name ?? null,
-            trim((string) (($actor->firstname ?? '') . ' ' . ($actor->surname ?? ''))),
+            trim((string) (($actor->firstname ?? '').' '.($actor->surname ?? ''))),
             $actor->username ?? null,
         ];
 
@@ -152,6 +153,7 @@ class RecycleBinService
     private function trimNullableString(mixed $value): ?string
     {
         $trimmed = trim((string) ($value ?? ''));
+
         return $trimmed === '' ? null : $trimmed;
     }
 }

@@ -181,9 +181,9 @@ class HRReportController extends Controller
 
         $fromDate = $validated['from_date'] ?? now()->startOfMonth()->toDateString();
         $toDate = $validated['to_date'] ?? now()->endOfMonth()->toDateString();
-        $start = $fromDate . ' 00:00:00';
-        $end = $toDate . ' 23:59:59';
-        
+        $start = $fromDate.' 00:00:00';
+        $end = $toDate.' 23:59:59';
+
         $actionType = $validated['action_type'] ?? 'all';
 
         $actionMap = [
@@ -218,12 +218,12 @@ class HRReportController extends Controller
                 'applicantAdmin.department:id,name',
                 'logs' => function ($q) use ($start, $end, $targetActions) {
                     $q->whereIn('action', $targetActions)
-                      ->whereBetween('created_at', [$start, $end]);
-                }
+                        ->whereBetween('created_at', [$start, $end]);
+                },
             ])
             ->whereHas('logs', function (Builder $q) use ($start, $end, $targetActions) {
                 $q->whereIn('action', $targetActions)
-                  ->whereBetween('created_at', [$start, $end]);
+                    ->whereBetween('created_at', [$start, $end]);
             })
             ->orderBy('id', 'desc')
             ->get();
@@ -235,11 +235,14 @@ class HRReportController extends Controller
         foreach ($applications as $app) {
             foreach ($app->logs as $log) {
                 $actionLabel = array_search($log->action, $actionMap) ?: 'unknown';
-                if ($actionLabel === 'cmo_reviewed') $actionLabel = 'CMO/CVMO Reviewed';
-                else $actionLabel = ucfirst($actionLabel);
-                
+                if ($actionLabel === 'cmo_reviewed') {
+                    $actionLabel = 'CMO/CVMO Reviewed';
+                } else {
+                    $actionLabel = ucfirst($actionLabel);
+                }
+
                 $rows[] = [
-                    'id' => $app->id . '-' . $log->id,
+                    'id' => $app->id.'-'.$log->id,
                     'leave_application_id' => $app->id,
                     'employee_control_no' => $app->employee_control_no,
                     'employee_name' => $app->employee_name,
@@ -253,7 +256,7 @@ class HRReportController extends Controller
         }
 
         // Sort by date_action_taken descending
-        usort($rows, function($a, $b) {
+        usort($rows, function ($a, $b) {
             return strtotime($b['date_action_taken']) - strtotime($a['date_action_taken']);
         });
 

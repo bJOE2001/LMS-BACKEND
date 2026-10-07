@@ -27,9 +27,9 @@ class LeaveBalance extends Model
     protected function casts(): array
     {
         return [
-            'balance'           => 'decimal:3',
+            'balance' => 'decimal:3',
             'last_accrual_date' => 'date',
-            'year'              => 'integer',
+            'year' => 'integer',
         ];
     }
 

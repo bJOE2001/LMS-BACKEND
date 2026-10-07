@@ -6,8 +6,8 @@ use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use Illuminate\Cache\RateLimiting\Limit;
 use Illuminate\Http\Request;
-use Illuminate\Support\ServiceProvider;
 use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Support\ServiceProvider;
 use Illuminate\Validation\Rules\Password;
 use Laravel\Sanctum\PersonalAccessToken;
 use Laravel\Sanctum\Sanctum;
@@ -40,7 +40,7 @@ class AppServiceProvider extends ServiceProvider
             $user = $request->user();
             $key = $user
                 ? sprintf('user:%s:%s', class_basename($user), (string) ($user->id ?? 'unknown'))
-                : 'ip:' . $request->ip();
+                : 'ip:'.$request->ip();
 
             return [
                 Limit::perMinute($limit)->by($key),
@@ -54,11 +54,11 @@ class AppServiceProvider extends ServiceProvider
 
     private function authenticateSanctumAccessToken(mixed $accessToken, bool $isValid, int $idleTimeoutMinutes): bool
     {
-        if (!$accessToken instanceof PersonalAccessToken) {
+        if (! $accessToken instanceof PersonalAccessToken) {
             return $isValid;
         }
 
-        if (!$isValid) {
+        if (! $isValid) {
             if ($this->supportsManagedSanctumSession($accessToken)) {
                 $this->markSanctumAuthFailure('session_expired');
                 $this->revokeInvalidatedSanctumToken($accessToken);
@@ -67,13 +67,13 @@ class AppServiceProvider extends ServiceProvider
             return false;
         }
 
-        if (!$this->supportsManagedSanctumSession($accessToken)) {
+        if (! $this->supportsManagedSanctumSession($accessToken)) {
             return $isValid;
         }
 
         if (
             (bool) config('sanctum.single_device_login', true)
-            && !$this->matchesActiveAccountToken($accessToken)
+            && ! $this->matchesActiveAccountToken($accessToken)
         ) {
             $this->markSanctumAuthFailure('concurrent_login');
             $this->revokeInvalidatedSanctumToken($accessToken);

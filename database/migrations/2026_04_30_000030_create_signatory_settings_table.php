@@ -4,10 +4,11 @@ use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
 
-return new class extends Migration {
+return new class extends Migration
+{
     public function up(): void
     {
-        if (!Schema::hasTable('tblSignatorySettings')) {
+        if (! Schema::hasTable('tblSignatorySettings')) {
             Schema::create('tblSignatorySettings', function (Blueprint $table): void {
                 $table->id();
                 $table->string('signatory_key')->unique();
@@ -30,4 +31,3 @@ return new class extends Migration {
         Schema::dropIfExists('tblSignatorySettings');
     }
 };
-

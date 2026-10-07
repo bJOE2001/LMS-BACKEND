@@ -11,7 +11,7 @@ return new class extends Migration
      */
     public function up(): void
     {
-        if (!Schema::hasTable('tblNotifications') || Schema::hasColumn('tblNotifications', 'coc_application_id')) {
+        if (! Schema::hasTable('tblNotifications') || Schema::hasColumn('tblNotifications', 'coc_application_id')) {
             return;
         }
 
@@ -29,7 +29,7 @@ return new class extends Migration
      */
     public function down(): void
     {
-        if (!Schema::hasTable('tblNotifications') || !Schema::hasColumn('tblNotifications', 'coc_application_id')) {
+        if (! Schema::hasTable('tblNotifications') || ! Schema::hasColumn('tblNotifications', 'coc_application_id')) {
             return;
         }
 
