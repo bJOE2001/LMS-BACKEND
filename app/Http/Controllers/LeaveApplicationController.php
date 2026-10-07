@@ -13208,7 +13208,7 @@ class LeaveApplicationController extends Controller
                 $filedAt,
                 $allowPayStatusOverride,
                 $leaveType,
-                false
+                true
             );
             if ($flValidation instanceof JsonResponse) {
                 return $flValidation;
@@ -13369,7 +13369,7 @@ class LeaveApplicationController extends Controller
                 $filedAt,
                 $allowPayStatusOverride,
                 $leaveType,
-                false
+                true
             );
             if ($otherValidation instanceof JsonResponse) {
                 return $otherValidation;
@@ -13543,7 +13543,7 @@ class LeaveApplicationController extends Controller
         mixed $filedAt = null,
         bool $allowPayStatusOverride = false,
         ?LeaveType $leaveType = null,
-        bool $isVacationLeave = true
+        bool $enforceAdvanceFiling = true
     ): ?JsonResponse {
         if ($allowPayStatusOverride) {
             return null;
@@ -13557,7 +13557,7 @@ class LeaveApplicationController extends Controller
         $filedDate = $this->resolvePolicyFilingDate($filedAt);
         $normalizedFiledDate = $filedDate->startOfDay();
 
-        $blockedFutureDates = [];
+        $shortNoticeDates = [];
         $latePastDates = [];
 
         foreach ($normalizedDateKeys as $dateKey) {
@@ -13568,44 +13568,67 @@ class LeaveApplicationController extends Controller
 
             $normalizedAvailmentDate = $availmentDate->startOfDay();
 
-            if ($normalizedAvailmentDate->lt($normalizedFiledDate)) {
-                $isWithPay = false;
-
-                if (is_array($selectedDatePayStatus) && array_key_exists($dateKey, $selectedDatePayStatus)) {
-                    $isWithPay = $selectedDatePayStatus[$dateKey] === true || $selectedDatePayStatus[$dateKey] === LeaveApplication::PAY_MODE_WITH_PAY;
+            $isWithPay = false;
+            if (is_array($selectedDatePayStatus) && array_key_exists($dateKey, $selectedDatePayStatus)) {
+                $statusVal = $selectedDatePayStatus[$dateKey];
+                $resolvedMode = $this->resolvePayModeFromStatusValue($statusVal);
+                if ($resolvedMode !== null) {
+                    $isWithPay = $resolvedMode === LeaveApplication::PAY_MODE_WITH_PAY;
                 } else {
-                    $isWithPay = $this->normalizePayMode($payMode, false) === LeaveApplication::PAY_MODE_WITH_PAY;
+                    $isWithPay = $statusVal === true || $statusVal === LeaveApplication::PAY_MODE_WITH_PAY;
                 }
+            } else {
+                $isWithPay = $this->normalizePayMode($payMode, false) === LeaveApplication::PAY_MODE_WITH_PAY;
+            }
 
+            if ($normalizedAvailmentDate->lt($normalizedFiledDate)) {
                 if ($isWithPay) {
                     $latePastDates[] = $availmentDate->format('M j, Y');
                 }
-            } elseif ($isVacationLeave) {
+            } elseif ($enforceAdvanceFiling) {
                 $workingDaysBeforeAvailment = $this->countWorkingDaysFromFiledDateBeforeDate($filedDate, $availmentDate);
 
                 if ($workingDaysBeforeAvailment < self::VL_MIN_WORKING_DAYS_BEFORE_AVAILMENT) {
-                    $blockedFutureDates[] = $availmentDate->format('M j, Y');
+                    if ($isWithPay) {
+                        $shortNoticeDates[] = $availmentDate->format('M j, Y');
+                    }
                 }
             }
         }
 
-        if (count($blockedFutureDates) > 0) {
-            $formattedDates = implode(', ', $blockedFutureDates);
-            $message = 'Vacation leaves must be applied for at least '
+        if (count($shortNoticeDates) > 0 && count($latePastDates) > 0) {
+            $allFormattedDates = implode(', ', array_merge($latePastDates, $shortNoticeDates));
+            $typeName = $leaveType?->name ?? 'Leave';
+            $message = "{$typeName} for past dates or applied less than "
                 .self::VL_MIN_WORKING_DAYS_BEFORE_AVAILMENT
-                ." working days prior to the intended leave date. Your application for {$formattedDates} cannot be processed.";
+                ." working days prior to the intended leave date must be filed as Without Pay (WOP). Please change the pay status for: {$allFormattedDates}.";
 
             return response()->json([
                 'message' => $message,
                 'errors' => [
-                    'selected_dates' => [$message],
+                    'selected_date_pay_status' => [$message],
+                ],
+            ], 422);
+        }
+
+        if (count($shortNoticeDates) > 0) {
+            $formattedDates = implode(', ', $shortNoticeDates);
+            $typeName = $leaveType?->name ?? 'Leave';
+            $message = "{$typeName} applied less than "
+                .self::VL_MIN_WORKING_DAYS_BEFORE_AVAILMENT
+                ." working days prior to the intended leave date must be filed as Without Pay (WOP). Please change the pay status for: {$formattedDates}.";
+
+            return response()->json([
+                'message' => $message,
+                'errors' => [
+                    'selected_date_pay_status' => [$message],
                 ],
             ], 422);
         }
 
         if (count($latePastDates) > 0) {
             $formattedDates = implode(', ', $latePastDates);
-            $typeName = $leaveType?->name ?? ($isVacationLeave ? 'Vacation Leave' : 'Leave');
+            $typeName = $leaveType?->name ?? 'Leave';
             $message = "{$typeName} for past dates must be filed as Without Pay (WOP). Please change the pay status for: {$formattedDates}.";
 
             return response()->json([
