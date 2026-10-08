@@ -16,6 +16,8 @@ class BiometricEnrollment extends Model
 
     public const STATUS_REGISTERED = 'REGISTERED';
 
+    public const STATUS_FINGERPRINT_ENROLLED = 'FINGERPRINT_ENROLLED';
+
     public const STATUS_PENDING_ENROLLMENT = 'PENDING_ENROLLMENT';
 
     public const STATUS_NOT_REGISTERED = 'NOT_REGISTERED';
@@ -42,6 +44,16 @@ class BiometricEnrollment extends Model
     public function isRegistered(): bool
     {
         return $this->status === self::STATUS_REGISTERED;
+    }
+
+    public function isFingerprintEnrolled(): bool
+    {
+        return $this->status === self::STATUS_FINGERPRINT_ENROLLED;
+    }
+
+    public function isEnrolled(): bool
+    {
+        return in_array($this->status, [self::STATUS_REGISTERED, self::STATUS_FINGERPRINT_ENROLLED], true);
     }
 
     public function isSyncedToDevice(string $deviceSerialNumber): bool

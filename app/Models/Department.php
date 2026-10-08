@@ -15,10 +15,14 @@ class Department extends Model
 {
     use HasFactory;
 
+    protected $connection = 'sqlsrv';
+
     protected $table = 'tblDepartments';
 
     protected $fillable = [
         'name',
+        'code',
+        'acronym',
         'is_inactive',
     ];
 
@@ -47,5 +51,17 @@ class Department extends Model
     public function employeeAssignments(): HasMany
     {
         return $this->hasMany(EmployeeDepartmentAssignment::class, 'department_id');
+    }
+
+    public function biometricDevices(): HasMany
+    {
+        return $this->hasMany(BiometricDevice::class, 'department_id');
+    }
+
+    public function primaryBiometricDevice(): HasOne
+    {
+        return $this->hasOne(BiometricDevice::class, 'department_id')
+            ->where('is_active', true)
+            ->where('is_primary', true);
     }
 }

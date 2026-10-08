@@ -129,6 +129,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::post('/dtr/override', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'overrideTime']);
         Route::post('/dtr/recalculate', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'recalculate']);
         Route::get('/devices', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'listDevices']);
+        Route::get('/zkbio-areas', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'listZkBioAreas']);
         Route::post('/devices', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'storeDevice'])->middleware('hr');
         Route::post('/devices/{id}/update', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'updateDevice'])->middleware('hr');
         Route::post('/devices/{id}/authorize', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'authorizeDevice'])->middleware('hr');
@@ -244,6 +245,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::prefix('biometric-registration')->group(function () {
             Route::get('/', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'hrIndex']);
             Route::post('/register', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'hrRegister']);
+            Route::post('/reconcile', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'reconcile']);
             Route::post('/sync-from-logs', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'syncFromLogs']);
         });
 

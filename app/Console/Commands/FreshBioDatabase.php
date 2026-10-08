@@ -2,7 +2,6 @@
 
 namespace App\Console\Commands;
 
-use App\Models\BiometricDevice;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -19,7 +18,6 @@ class FreshBioDatabase extends Command
      */
     protected $signature = 'bio:fresh
                             {--truncate : Only wipe/truncate data records from biometric tables without dropping schemas}
-                            {--seed : Seed a default active MB360 device after refreshing}
                             {--clean-ghosts : Drop leftover non-biometric tables that were mistakenly created in BIO_DB}
                             {--force : Force the operation without interactive confirmation}';
 
@@ -40,7 +38,6 @@ class FreshBioDatabase extends Command
         'tblDailyTimeRecords',
         'tblAttendanceRawLogs',
         'tblBiometricDeviceCommands',
-        'tblBiometricTemplates',
         'tblBiometricEnrollments',
         'tblBiometricDevices',
     ];
@@ -143,28 +140,11 @@ class FreshBioDatabase extends Command
             $this->line('  <fg=green>+</> Migrated: tblBiometricEnrollments, tblBiometricDeviceCommands');
         }
 
-        $templateMigrationFile = database_path('migrations/2026_10_06_100000_create_bio_templates_table.php');
-        if (file_exists($templateMigrationFile)) {
-            $migration = require $templateMigrationFile;
+        $areaIdMigrationFile = database_path('migrations/2026_10_08_000001_add_zkbio_area_id_to_tbl_biometric_devices.php');
+        if (file_exists($areaIdMigrationFile)) {
+            $migration = require $areaIdMigrationFile;
             $migration->up();
-            $this->line('  <fg=green>+</> Migrated: tblBiometricTemplates');
-        }
-
-        if ($this->option('seed')) {
-            $this->info('4. Seeding default authorized biometric device...');
-            BiometricDevice::query()->create([
-                'device_name' => 'HR Enrollment MB360',
-                'serial_number' => 'KMY2252000112',
-                'ip_address' => '192.168.8.230',
-                'port' => 4370,
-                'comm_key' => '0',
-                'communication_mode' => 'ADMS',
-                'model_name' => 'MB360',
-                'department_name' => 'Human Resource Management Office',
-                'is_active' => true,
-                'status' => 'OFFLINE',
-            ]);
-            $this->line('  <fg=green>+</> Seeded device: KMY2252000112 (HR Enrollment MB360)');
+            $this->line('  <fg=green>+</> Migrated: zkbio_area_id & is_primary on tblBiometricDevices');
         }
 
         $this->newLine();

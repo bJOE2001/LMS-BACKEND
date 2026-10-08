@@ -33,6 +33,8 @@ class BiometricDevice extends Model
         'communication_mode',
         'department_id',
         'department_name',
+        'zkbio_area_id',
+        'is_primary',
         'model_name',
         'firmware_version',
         'device_user_count',
@@ -59,6 +61,8 @@ class BiometricDevice extends Model
     {
         return [
             'port' => 'integer',
+            'zkbio_area_id' => 'integer',
+            'is_primary' => 'boolean',
             'device_user_count' => 'integer',
             'device_finger_count' => 'integer',
             'device_face_count' => 'integer',
@@ -97,9 +101,19 @@ class BiometricDevice extends Model
         return $this->department_name ?: 'Tagum City Hall';
     }
 
+    public function department(): \Illuminate\Database\Eloquent\Relations\BelongsTo
+    {
+        return $this->belongsTo(Department::class, 'department_id');
+    }
+
     public function scopeActive(Builder $query): Builder
     {
         return $query->where('is_active', true);
+    }
+
+    public function scopePrimary(Builder $query): Builder
+    {
+        return $query->where('is_primary', true);
     }
 
     public function scopeOnline(Builder $query): Builder

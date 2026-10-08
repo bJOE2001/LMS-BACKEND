@@ -6,7 +6,6 @@ use App\Models\AttendanceRawLog;
 use App\Models\BiometricDevice;
 use App\Models\BiometricDeviceCommand;
 use App\Models\BiometricEnrollment;
-use App\Models\BiometricTemplate;
 use App\Models\HrisEmployee;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -93,8 +92,8 @@ class ZkAdmsService
 
             // 2. Native MB360 Fingerprint push (e.g. FP PIN=022936\tFID=6\tSize=1744\tValid=1\tTMP=...)
             if (preg_match('/^FP\s+/i', $line) || (stripos($line, 'PIN=') !== false && stripos($line, 'TMP=') !== false && (stripos($line, 'FID=') !== false || stripos($line, 'Size=') !== false))) {
-                $savedTpl = $this->handleFingerprintPush($request, $serialNumber, $line);
-                if ($savedTpl !== null) {
+                $saved = $this->handleFingerprintPush($request, $serialNumber, $line);
+                if ($saved) {
                     $importedCount++;
                 }
 
@@ -537,7 +536,7 @@ class ZkAdmsService
      * Handle a native FP line from ZKTeco MB360:
      * Format: FP PIN={pin}\tFID={fid}\tSize={size}\tValid={valid}\tTMP={tmp}
      */
-    public function handleFingerprintPush(Request $request, string $serialNumber, string $line): ?BiometricTemplate
+    public function handleFingerprintPush(Request $request, string $serialNumber, string $line): bool
     {
         $cleanLine = trim($line);
         if (preg_match('/^FP\s+/i', $cleanLine)) {
@@ -546,7 +545,7 @@ class ZkAdmsService
 
         $parts = preg_split('/\t+|\s{2,}/', $cleanLine);
         if (! $parts) {
-            return null;
+            return false;
         }
 
         $kvMap = [];
@@ -563,39 +562,11 @@ class ZkAdmsService
         if (! $pin || ! $tmp) {
             Log::warning("ZkAdmsService: Discarded invalid FP line (missing PIN or TMP): {$line}");
 
-            return null;
+            return false;
         }
 
         $emp = HrisEmployee::findByControlNo($pin, true);
         $canonicalControlNo = $emp?->control_no ? (string) $emp->control_no : $pin;
-
-        $fingerId = isset($kvMap['fid'])
-            ? (int) $kvMap['fid']
-            : (isset($kvMap['fingerid']) ? (int) $kvMap['fingerid'] : (isset($kvMap['index']) ? (int) $kvMap['index'] : 0));
-
-        $size = isset($kvMap['size']) ? (int) $kvMap['size'] : null;
-        $valid = isset($kvMap['valid']) ? (int) $kvMap['valid'] : null;
-
-        $attributes = [
-            'template_size' => $size,
-            'template_version' => '10',
-            'template_data' => $tmp,
-            'raw_payload' => $line,
-            'source_device_sn' => $serialNumber ?: null,
-        ];
-
-        if ($valid !== null) {
-            $attributes['valid'] = $valid;
-        }
-
-        $template = BiometricTemplate::query()->updateOrCreate(
-            [
-                'employee_control_no' => $canonicalControlNo,
-                'biometric_type' => BiometricTemplate::TYPE_FINGERPRINT,
-                'finger_id' => $fingerId,
-            ],
-            $attributes
-        );
 
         $enrollment = BiometricEnrollment::query()->firstOrNew([
             'employee_control_no' => $canonicalControlNo,
@@ -622,9 +593,9 @@ class ZkAdmsService
             }
         }
 
-        Log::info("ZkAdmsService: Successfully stored native MB360 fingerprint template for employee [{$canonicalControlNo}], FID [{$fingerId}], Size [{$size}] from device [{$serialNumber}]");
+        Log::info("ZkAdmsService: Processed native MB360 biometric push for employee [{$canonicalControlNo}] from device [{$serialNumber}]");
 
-        return $template;
+        return true;
     }
 
     /**
@@ -649,7 +620,7 @@ class ZkAdmsService
 
             if (preg_match('/^FP\s+/i', $line)) {
                 $saved = $this->handleFingerprintPush($request, $serialNumber, $line);
-                if ($saved !== null) {
+                if ($saved) {
                     $imported++;
                 }
 
@@ -682,34 +653,6 @@ class ZkAdmsService
             if (! $templateData) {
                 continue;
             }
-
-            $fingerId = isset($kvMap['fid'])
-                ? (int) $kvMap['fid']
-                : (isset($kvMap['fingerid']) ? (int) $kvMap['fingerid'] : (isset($kvMap['index']) ? (int) $kvMap['index'] : 0));
-
-            $typeCode = isset($kvMap['type']) ? (int) $kvMap['type'] : 1;
-            $biometricType = ($typeCode === 9 || strtolower($table) === 'biodata' && $typeCode === 9)
-                ? BiometricTemplate::TYPE_FACE
-                : BiometricTemplate::TYPE_FINGERPRINT;
-
-            $size = isset($kvMap['size']) ? (int) $kvMap['size'] : strlen($templateData);
-            $valid = isset($kvMap['valid']) ? (int) $kvMap['valid'] : 1;
-
-            BiometricTemplate::query()->updateOrCreate(
-                [
-                    'employee_control_no' => $canonicalControlNo,
-                    'biometric_type' => $biometricType,
-                    'finger_id' => $fingerId,
-                ],
-                [
-                    'template_size' => $size,
-                    'valid' => $valid,
-                    'template_version' => '10',
-                    'template_data' => $templateData,
-                    'raw_payload' => $line,
-                    'source_device_sn' => $serialNumber ?: null,
-                ]
-            );
 
             // Ensure employee enrollment status is marked REGISTERED
             $enrollment = BiometricEnrollment::query()->firstOrNew([

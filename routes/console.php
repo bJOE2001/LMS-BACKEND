@@ -10,6 +10,7 @@ use Illuminate\Support\Facades\Schedule;
 Schedule::command('leave:accrue')->monthlyOn(1, '00:01');
 Schedule::command('leave:reset')->yearlyOn(1, 1, '00:05');
 Schedule::command('coc:expire')->yearlyOn(1, 1, '00:10');
+Schedule::command('zkbio:reconcile-enrollments')->everyMinute();
 
 Artisan::command('inspire', function () {
     $this->comment(Inspiring::quote());

@@ -3,12 +3,14 @@
 namespace App\Http\Controllers\Attendance;
 
 use App\Http\Controllers\Controller;
+use App\Models\BiometricDevice;
 use App\Models\BiometricDeviceCommand;
 use App\Models\BiometricEnrollment;
 use App\Models\DepartmentAdmin;
 use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
+use App\Services\Attendance\ZkBioTimeReconciliationService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -17,6 +19,10 @@ use Illuminate\Support\Facades\Log;
 
 class BiometricRegistrationController extends Controller
 {
+    public function __construct(
+        protected ZkBioTimeReconciliationService $reconciliationService
+    ) {}
+
     private function zkBioUrl(string $path): string
     {
         return rtrim((string) config('services.zkbio.base_url', 'http://127.0.0.1'), '/').'/'.ltrim($path, '/');
@@ -44,59 +50,10 @@ class BiometricRegistrationController extends Controller
      */
     private function pushEmployeeToZkBioTime(string $empCode, string $fullName, int $areaId): ?string
     {
-        $token = $this->getZkBioToken();
-        if (! $token) {
-            return 'Unable to authenticate with ZKBio Time. Check ZKBIO_API_USER / ZKBIO_API_PASS.';
-        }
+        $result = $this->reconciliationService->assignEmployeeExclusivelyToArea($empCode, $areaId, $fullName);
 
-        $client = Http::timeout(15)->withHeaders(['Authorization' => 'Token '.$token]);
-
-        try {
-            $existing = $client->get($this->zkBioUrl('personnel/api/employees/'), ['emp_code' => $empCode])->json('data.0');
-
-            if ($existing) {
-                $employeeId = (int) $existing['id'];
-                $areas = array_map('intval', array_column($existing['area'] ?? [], 'id'));
-
-                if (! in_array($areaId, $areas, true)) {
-                    $areas[] = $areaId;
-                    $adjust = $client->post($this->zkBioUrl('personnel/api/employees/adjust_area/'), [
-                        'employees' => [$employeeId],
-                        'areas' => array_values(array_unique($areas)),
-                    ]);
-                    if (! $adjust->successful()) {
-                        Log::error('ZKBio Time: adjust_area failed', ['emp_code' => $empCode, 'body' => $adjust->body()]);
-
-                        return 'ZKBio Time rejected the area assignment.';
-                    }
-                }
-            } else {
-                $create = $client->post($this->zkBioUrl('personnel/api/employees/'), [
-                    'emp_code' => $empCode,
-                    'first_name' => $fullName,
-                    'department' => 1,
-                    'area' => [$areaId],
-                ]);
-                if (! $create->successful()) {
-                    Log::error('ZKBio Time: employee create failed', ['emp_code' => $empCode, 'body' => $create->body()]);
-
-                    return 'ZKBio Time rejected the employee record.';
-                }
-                $employeeId = (int) $create->json('id');
-            }
-
-            $resync = $client->post($this->zkBioUrl('personnel/api/employees/resync_to_device/'), [
-                'employees' => [$employeeId],
-            ]);
-            if (! $resync->successful()) {
-                Log::error('ZKBio Time: resync_to_device failed', ['emp_code' => $empCode, 'body' => $resync->body()]);
-
-                return 'ZKBio Time could not queue the sync to the terminal.';
-            }
-        } catch (\Throwable $e) {
-            Log::error('ZKBio Time: push failed', ['emp_code' => $empCode, 'error' => $e->getMessage()]);
-
-            return 'Unable to reach ZKBio Time.';
+        if (! $result['success']) {
+            return $result['message'];
         }
 
         return null;
@@ -107,9 +64,14 @@ class BiometricRegistrationController extends Controller
      */
     private function findZkBioAreaId(string $deviceSn): ?int
     {
+        $bioArea = BiometricDevice::query()->where('serial_number', $deviceSn)->value('zkbio_area_id');
+        if ($bioArea !== null && (int) $bioArea > 1) {
+            return (int) $bioArea;
+        }
+
         $areaId = DB::connection('zkbio')->table('iclock_terminal')->where('sn', $deviceSn)->value('area_id');
 
-        return $areaId !== null ? (int) $areaId : null;
+        return ($areaId !== null && (int) $areaId > 1) ? (int) $areaId : null;
     }
 
     public function hrIndex(Request $request): JsonResponse
@@ -135,6 +97,14 @@ class BiometricRegistrationController extends Controller
         }
 
         $enrollments = $query->paginate(30);
+
+        // Auto-reconcile pending enrollments on the current page against ZKBio Time
+        foreach ($enrollments->items() as $enrollment) {
+            if (in_array($enrollment->status, [BiometricEnrollment::STATUS_PENDING_ENROLLMENT, BiometricEnrollment::STATUS_FINGERPRINT_ENROLLED], true)) {
+                $this->reconciliationService->reconcileEnrollment($enrollment);
+            }
+        }
+
         $enrolledControlNos = $enrollments->pluck('employee_control_no')->all();
 
         if ($statusFilter === 'all' || $statusFilter === 'not_registered') {
@@ -162,6 +132,8 @@ class BiometricRegistrationController extends Controller
                 'full_name' => $enrollment->employee_name,
                 'biometric_status' => $enrollment->status,
                 'enrolled_at' => $enrollment->enrolled_at,
+                'enrollment_device_sn' => $enrollment->enrollment_device_sn,
+                'synced_devices' => $enrollment->synced_devices ?? [],
                 'office' => $hris?->office ?: 'Unknown',
                 'office_acronym' => $hris?->officeAcronym,
                 'designation' => $hris?->designation,
@@ -174,6 +146,8 @@ class BiometricRegistrationController extends Controller
                 'full_name' => trim(($hris->firstname ?? '').' '.($hris->middlename ? $hris->middlename[0].'. ' : '').($hris->surname ?? '')),
                 'biometric_status' => 'NOT REGISTERED',
                 'enrolled_at' => null,
+                'enrollment_device_sn' => null,
+                'synced_devices' => [],
                 'office' => $hris->office ?: 'Unknown',
                 'office_acronym' => $hris->officeAcronym ?? null,
                 'designation' => $hris->designation ?? null,
@@ -183,6 +157,7 @@ class BiometricRegistrationController extends Controller
         $totalHris = HrisEmployee::query(true)->count();
         $allEnrollments = BiometricEnrollment::query()->get();
         $registeredCount = $allEnrollments->where('status', BiometricEnrollment::STATUS_REGISTERED)->count();
+        $enrolledCount = $allEnrollments->where('status', BiometricEnrollment::STATUS_FINGERPRINT_ENROLLED)->count();
         $pendingCount = $allEnrollments->where('status', BiometricEnrollment::STATUS_PENDING_ENROLLMENT)->count();
 
         return response()->json([
@@ -191,8 +166,9 @@ class BiometricRegistrationController extends Controller
             'stats' => [
                 'total_employees' => $totalHris,
                 'registered' => $registeredCount,
+                'enrolled' => $enrolledCount,
                 'pending' => $pendingCount,
-                'not_registered' => max(0, $totalHris - $registeredCount - $pendingCount),
+                'not_registered' => max(0, $totalHris - $registeredCount - $enrolledCount - $pendingCount),
             ],
         ]);
     }
@@ -262,13 +238,55 @@ class BiometricRegistrationController extends Controller
             ->where('employee_control_no', $controlNo)
             ->first();
 
+        if ($enrollment && in_array($enrollment->status, [BiometricEnrollment::STATUS_PENDING_ENROLLMENT, BiometricEnrollment::STATUS_FINGERPRINT_ENROLLED], true)) {
+            $this->reconciliationService->reconcileEnrollment($enrollment);
+        }
+
         return response()->json([
             'control_no' => $controlNo,
             'is_registered' => $enrollment?->isRegistered() ?? false,
+            'is_enrolled' => $enrollment?->isEnrolled() ?? false,
             'status' => $enrollment?->status ?? 'NOT_REGISTERED',
             'enrolled_at' => $enrollment?->enrolled_at?->format('Y-m-d H:i:s'),
             'enrollment_device_sn' => $enrollment?->enrollment_device_sn,
             'synced_devices' => $enrollment?->synced_devices ?? [],
+        ]);
+    }
+
+    /**
+     * Manually trigger biometric reconciliation against ZKBio Time and command logs.
+     * Can reconcile a specific employee or all pending records.
+     */
+    public function reconcile(Request $request): JsonResponse
+    {
+        $controlNo = $request->input('employee_control_no');
+
+        if ($controlNo) {
+            $enrollment = BiometricEnrollment::query()->where('employee_control_no', $controlNo)->first();
+            if (! $enrollment) {
+                return response()->json(['message' => "No enrollment found for control number [{$controlNo}]."], 404);
+            }
+
+            $this->reconciliationService->reconcileEnrollment($enrollment);
+
+            return response()->json([
+                'message' => "Biometric enrollment for [{$controlNo}] reconciled.",
+                'enrollment' => [
+                    'control_no' => $enrollment->employee_control_no,
+                    'status' => $enrollment->status,
+                    'enrollment_device_sn' => $enrollment->enrollment_device_sn,
+                    'enrolled_at' => $enrollment->enrolled_at?->format('Y-m-d H:i:s'),
+                    'synced_devices' => $enrollment->synced_devices ?? [],
+                    'notes' => $enrollment->notes,
+                ],
+            ]);
+        }
+
+        $updatedCount = $this->reconciliationService->reconcilePendingEnrollments();
+
+        return response()->json([
+            'message' => "Reconciliation complete. {$updatedCount} enrollment(s) updated.",
+            'updated_count' => $updatedCount,
         ]);
     }
 

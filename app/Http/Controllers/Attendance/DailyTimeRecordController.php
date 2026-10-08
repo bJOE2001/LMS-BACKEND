@@ -13,6 +13,7 @@ use App\Models\HRAccount;
 use App\Models\HrisEmployee;
 use App\Services\Attendance\DtrCalculationService;
 use App\Services\Attendance\UsbAttlogParserService;
+use App\Services\Attendance\ZkBioPunchSyncService;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -26,7 +27,8 @@ class DailyTimeRecordController extends Controller
 {
     public function __construct(
         private readonly DtrCalculationService $dtrService,
-        private readonly UsbAttlogParserService $usbParser
+        private readonly UsbAttlogParserService $usbParser,
+        private readonly ZkBioPunchSyncService $punchSyncService
     ) {}
 
     /**
@@ -54,6 +56,9 @@ class DailyTimeRecordController extends Controller
         }
 
         $canonicalControlNo = (string) ($employee->control_no ?? $controlNo);
+
+        // Sync any recent punches from ZKBio Time
+        $this->punchSyncService->syncPunches();
 
         // Calculate/refresh DTR for the full month
         $records = $this->dtrService->calculateForEmployeeRange(
@@ -127,6 +132,9 @@ class DailyTimeRecordController extends Controller
 
         $targetDepartmentId = $isAdmin ? (int) $account->department_id : (isset($validated['department_id']) ? (int) $validated['department_id'] : null);
         $targetDate = $validated['date'] ?? now()->format('Y-m-d');
+
+        // Sync any recent punches from ZKBio Time
+        $this->punchSyncService->syncPunches();
 
         // Resolve assigned employee control numbers
         $query = EmployeeDepartmentAssignment::query();

@@ -4,9 +4,8 @@ namespace App\Services\Attendance;
 
 use App\Models\AttendanceRawLog;
 use App\Models\BiometricDevice;
-use App\Models\BiometricDeviceCommand;
 use App\Models\BiometricEnrollment;
-use App\Models\BiometricTemplate;
+use App\Models\Department;
 use App\Models\HrisEmployee;
 use Illuminate\Support\Facades\Log;
 use Throwable;
@@ -21,6 +20,15 @@ class BiometricTransferService
      * CHRMO department ID (Central Human Resource Management Office).
      */
     public const CHRMO_DEPARTMENT_ID = 18;
+
+    /**
+     * Central enrollment pool area in ZKBio Time (CHRMO).
+     */
+    public const CHRMO_AREA_ID = 3;
+
+    public function __construct(
+        protected ZkBioTimeReconciliationService $zkBioReconciliation
+    ) {}
 
     /**
      * Transfer an employee's biometric profile and templates to the target office's
@@ -45,18 +53,33 @@ class BiometricTransferService
                 ? trim(($emp->firstname ?? '').' '.($emp->middlename ? $emp->middlename[0].'. ' : '').($emp->surname ?? ''))
                 : 'EMP '.$controlNo;
 
-            // 1. Identify target office's active biometric terminal(s)
+            // 1. Identify target office and its active biometric terminal(s)
+            $department = Department::query()->find($newDepartmentId);
+            $departmentLabel = $department?->acronym ?: ($department?->name ?: "Office #{$newDepartmentId}");
+
             $targetDevices = BiometricDevice::query()
                 ->where('department_id', $newDepartmentId)
                 ->where('is_active', true)
+                ->orderByDesc('is_primary')
                 ->get();
 
             if ($targetDevices->isEmpty()) {
-                Log::info("BiometricTransferService: No active biometric device assigned to department ID [{$newDepartmentId}] for employee [{$canonicalControlNo}].");
+                Log::info("BiometricTransferService: No active biometric device assigned to department [{$departmentLabel}] for employee [{$canonicalControlNo}].");
 
                 return [
                     'transferred' => false,
-                    'message' => 'No active biometric terminal mapped to this office.',
+                    'message' => "{$departmentLabel} does not have an active biometric device configured.",
+                ];
+            }
+
+            // Verify ZKBio Area mapping on primary target device
+            $primaryTarget = $targetDevices->first();
+            $targetAreaId = (int) ($primaryTarget->zkbio_area_id ?? 0);
+
+            if ($targetAreaId <= 0 || $targetAreaId === 1) {
+                return [
+                    'transferred' => false,
+                    'message' => "The biometric device for {$departmentLabel} does not have a valid ZKBio Time Area configured (Area 1 is not supported).",
                 ];
             }
 
@@ -105,123 +128,43 @@ class BiometricTransferService
 
             $queuedCount = 0;
 
-            // 3. Queue DATA USER and template commands to target office terminal(s)
-            $templates = BiometricTemplate::query()
-                ->where('employee_control_no', $canonicalControlNo)
-                ->get();
+            // 3. Assign employee exclusively to target office area in ZKBio Time
+            // This triggers ZKBio Time to:
+            // - Push DATA UPDATE USERINFO & DATA UPDATE FINGERTMP to the target office device
+            // - Send DATA DELETE USERINFO to the device(s) of their previous area
+            $syncResult = $this->zkBioReconciliation->assignEmployeeExclusivelyToArea(
+                $canonicalControlNo,
+                $targetAreaId,
+                $fullName
+            );
 
-            foreach ($targetDevices as $targetDev) {
-                // A. Create/Update user on target device
-                $userPayload = BiometricDeviceCommand::buildDataUserCommand($canonicalControlNo, $fullName);
-                BiometricDeviceCommand::query()->create([
-                    'device_serial_number' => $targetDev->serial_number,
-                    'command_type' => BiometricDeviceCommand::CMD_DATA_USER,
-                    'command_payload' => $userPayload,
-                    'employee_control_no' => $canonicalControlNo,
-                    'employee_name' => $fullName,
-                    'status' => BiometricDeviceCommand::STATUS_PENDING,
-                    'created_by_user_id' => $userId,
+            if (! $syncResult['success']) {
+                Log::warning("BiometricTransferService: ZKBio Time exclusive area sync warning for [{$canonicalControlNo}]", [
+                    'message' => $syncResult['message'],
                 ]);
-                $queuedCount++;
-
-                // B. Upload stored templates (fingerprint and face) to target device
-                if ($templates->isNotEmpty()) {
-                    foreach ($templates as $tpl) {
-                        $templatePayload = $tpl->biometric_type === BiometricTemplate::TYPE_FACE
-                            ? BiometricDeviceCommand::buildDataBiodataCommand(
-                                $canonicalControlNo,
-                                9,
-                                (int) $tpl->finger_id,
-                                (string) $tpl->template_data,
-                                (int) $tpl->valid
-                            )
-                            : BiometricDeviceCommand::buildDataFpCommand(
-                                $canonicalControlNo,
-                                (int) $tpl->finger_id,
-                                (int) $tpl->template_size,
-                                (int) $tpl->valid,
-                                (string) $tpl->template_data
-                            );
-
-                        BiometricDeviceCommand::query()->create([
-                            'device_serial_number' => $targetDev->serial_number,
-                            'command_type' => BiometricDeviceCommand::CMD_UPDATE_TEMPLATE,
-                            'command_payload' => $templatePayload,
-                            'employee_control_no' => $canonicalControlNo,
-                            'employee_name' => $fullName,
-                            'status' => BiometricDeviceCommand::STATUS_PENDING,
-                            'created_by_user_id' => $userId,
-                        ]);
-                        $queuedCount++;
-                    }
-                }
             }
 
-            // C. If server does not have templates yet, query source terminal(s) before deleting
-            if ($templates->isEmpty() && count($sourceSns) > 0) {
-                foreach ($sourceSns as $srcSn) {
-                    BiometricDeviceCommand::query()->create([
-                        'device_serial_number' => $srcSn,
-                        'command_type' => BiometricDeviceCommand::CMD_QUERY,
-                        'command_payload' => BiometricDeviceCommand::buildQueryTemplateCommand($canonicalControlNo),
-                        'employee_control_no' => $canonicalControlNo,
-                        'employee_name' => $fullName,
-                        'status' => BiometricDeviceCommand::STATUS_PENDING,
-                        'created_by_user_id' => $userId,
-                    ]);
-                    BiometricDeviceCommand::query()->create([
-                        'device_serial_number' => $srcSn,
-                        'command_type' => BiometricDeviceCommand::CMD_QUERY,
-                        'command_payload' => BiometricDeviceCommand::buildQueryBiodataCommand($canonicalControlNo),
-                        'employee_control_no' => $canonicalControlNo,
-                        'employee_name' => $fullName,
-                        'status' => BiometricDeviceCommand::STATUS_PENDING,
-                        'created_by_user_id' => $userId,
-                    ]);
-                    $queuedCount += 2;
-                }
-            }
-
-            // 4. Queue DATA DELETE user on source terminal(s) (e.g. CHRMO machine)
-            foreach ($sourceSns as $srcSn) {
-                BiometricDeviceCommand::query()->create([
-                    'device_serial_number' => $srcSn,
-                    'command_type' => BiometricDeviceCommand::CMD_DELETE_USER,
-                    'command_payload' => BiometricDeviceCommand::buildDeleteUserCommand($canonicalControlNo),
-                    'employee_control_no' => $canonicalControlNo,
-                    'employee_name' => $fullName,
-                    'status' => BiometricDeviceCommand::STATUS_PENDING,
-                    'created_by_user_id' => $userId,
-                ]);
-                $queuedCount++;
-            }
-
-            // 5. Update BiometricEnrollment record
+            // 4. Update BiometricEnrollment record
             if (! $enrollment) {
                 $enrollment = new BiometricEnrollment([
                     'employee_control_no' => $canonicalControlNo,
                 ]);
             }
 
-            $currentSynced = is_array($enrollment->synced_devices) ? $enrollment->synced_devices : [];
-            $updatedSynced = array_values(array_unique(array_merge(
-                array_diff($currentSynced, $sourceSns),
-                $targetSns
-            )));
-
-            $targetNames = $targetDevices->pluck('device_name')->implode(', ');
+            $primarySn = $primaryTarget->serial_number;
+            $targetName = $primaryTarget->device_name ?: "Terminal {$primarySn}";
             $sourceNames = count($sourceSns) > 0
                 ? BiometricDevice::query()->whereIn('serial_number', $sourceSns)->pluck('device_name')->implode(', ')
-                : 'source device';
+                : 'previous terminal';
 
             $enrollment->employee_name = $fullName;
             $enrollment->status = BiometricEnrollment::STATUS_REGISTERED;
             $enrollment->enrolled_at = $enrollment->enrolled_at ?? now();
-            $enrollment->synced_devices = $updatedSynced;
-            $enrollment->notes = "Transferred to {$targetNames} (deleted from {$sourceNames})";
+            $enrollment->synced_devices = [$primarySn];
+            $enrollment->notes = "Transferred exclusively to {$departmentLabel} ({$targetName}), deleted from {$sourceNames}";
             $enrollment->save();
 
-            Log::info("BiometricTransferService: Transferred employee [{$canonicalControlNo}] to [{$targetNames}], queued delete for [{$sourceNames}].");
+            Log::info("BiometricTransferService: Transferred employee [{$canonicalControlNo}] exclusively to [{$departmentLabel}] ({$primarySn}), deleted from [{$sourceNames}].");
 
             return [
                 'transferred' => true,
@@ -229,8 +172,8 @@ class BiometricTransferService
                 'employee_name' => $fullName,
                 'target_devices' => $targetDevices->pluck('device_name')->all(),
                 'source_devices' => $sourceSns,
-                'commands_queued' => $queuedCount,
-                'message' => "Biometrics transferred to {$targetNames} and deleted from {$sourceNames}.",
+                'commands_queued' => 1,
+                'message' => "Biometrics transferred to {$departmentLabel} ({$targetName}) and deleted from {$sourceNames}.",
             ];
         } catch (Throwable $e) {
             Log::error("BiometricTransferService: Transfer failed for [{$controlNo}]", [
@@ -260,27 +203,17 @@ class BiometricTransferService
                 ? trim(($emp->firstname ?? '').' '.($emp->middlename ? $emp->middlename[0].'. ' : '').($emp->surname ?? ''))
                 : 'EMP '.$controlNo;
 
-            $oldDevices = BiometricDevice::query()
-                ->where('department_id', $oldDepartmentId)
-                ->where('is_active', true)
-                ->get();
+            // Reset employee area back to CHRMO central enrollment area (Area 3)
+            // This causes ZKBio Time to automatically send DATA DELETE USERINFO to the office device
+            $resetResult = $this->zkBioReconciliation->assignEmployeeExclusivelyToArea(
+                $canonicalControlNo,
+                self::CHRMO_AREA_ID,
+                $fullName
+            );
 
-            if ($oldDevices->isEmpty()) {
-                return [
-                    'removed' => false,
-                    'message' => 'No active devices for this department.',
-                ];
-            }
-
-            foreach ($oldDevices as $dev) {
-                BiometricDeviceCommand::query()->create([
-                    'device_serial_number' => $dev->serial_number,
-                    'command_type' => BiometricDeviceCommand::CMD_DELETE_USER,
-                    'command_payload' => BiometricDeviceCommand::buildDeleteUserCommand($canonicalControlNo),
-                    'employee_control_no' => $canonicalControlNo,
-                    'employee_name' => $fullName,
-                    'status' => BiometricDeviceCommand::STATUS_PENDING,
-                    'created_by_user_id' => $userId,
+            if (! $resetResult['success']) {
+                Log::warning("BiometricTransferService: De-assignment area reset warning for [{$canonicalControlNo}]", [
+                    'message' => $resetResult['message'],
                 ]);
             }
 
@@ -289,15 +222,15 @@ class BiometricTransferService
                 ->where('employee_control_no', $canonicalControlNo)
                 ->first();
 
-            if ($enrollment && is_array($enrollment->synced_devices)) {
-                $oldSns = $oldDevices->pluck('serial_number')->all();
-                $enrollment->synced_devices = array_values(array_diff($enrollment->synced_devices, $oldSns));
+            if ($enrollment) {
+                $enrollment->synced_devices = [];
+                $enrollment->notes = 'Removed from office roster, reset to central enrollment pool';
                 $enrollment->save();
             }
 
             return [
                 'removed' => true,
-                'message' => 'Biometric deletion queued for old office terminal(s).',
+                'message' => 'Employee removed from office and biometrics cleared from office terminal.',
             ];
         } catch (Throwable $e) {
             Log::error("BiometricTransferService: De-assignment failed for [{$controlNo}]", [

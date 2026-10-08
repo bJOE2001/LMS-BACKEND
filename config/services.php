@@ -36,6 +36,7 @@ return [
     ],
 
     'zkbio' => [
+        'base_url' => env('ZKBIO_API_BASE_URL', 'http://127.0.0.1'),
         'api_user' => env('ZKBIO_API_USER'),
         'api_pass' => env('ZKBIO_API_PASS'),
     ],
