@@ -1422,25 +1422,7 @@ class EmployeeController extends Controller
             $currentLedgerBalances = $runningBalances;
 
             foreach ($approvedApplications as $application) {
-                $typeId = (int) $application->leave_type_id;
-                $typeKey = $typeIdToKey[$typeId] ?? null;
-                $isForcedLeave = is_int($forcedLeaveTypeId)
-                    && $forcedLeaveTypeId > 0
-                    && $typeId === $forcedLeaveTypeId;
-                if ($isForcedLeave && $typeKey === null) {
-                    $typeKey = 'other';
-                }
-                if ($typeKey === null) {
-                    continue;
-                }
-                $balanceKey = $balanceKeyByTypeId[$typeId]
-                    ?? $this->resolveLedgerRunningBalanceKey($typeKey, $typeId, $isForcedLeave);
-                if (! is_string($balanceKey) || $balanceKey === '') {
-                    continue;
-                }
-                $isUsageOnlyOtherType = $typeKey === 'other'
-                    && in_array($typeId, $otherUsageOnlyTypeIds, true);
-
+                $applicationId = (int) $application->id;
                 $isCancelledApp = $application->status === LeaveApplication::STATUS_CANCELLED;
                 $cancelUpdateRequest = $isCancelledApp && $application->relationLoaded('updateRequests')
                     ? $application->updateRequests->first(function (LeaveApplicationUpdateRequest $req): bool {
@@ -1455,6 +1437,35 @@ class EmployeeController extends Controller
                             || $cancelLeave;
                     })
                     : null;
+
+                $approvedUpdateRequests = $application->relationLoaded('updateRequests')
+                    ? $application->updateRequests->filter(function (LeaveApplicationUpdateRequest $req): bool {
+                        if ($req->status !== LeaveApplicationUpdateRequest::STATUS_APPROVED) {
+                            return false;
+                        }
+                        $payload = is_array($req->requested_payload) ? $req->requested_payload : [];
+                        $actionType = strtoupper((string) ($payload['action_type'] ?? ''));
+                        $requestKind = strtolower((string) ($payload['request_kind'] ?? ''));
+                        $cancelLeave = (bool) ($payload['cancel_leave'] ?? false);
+
+                        $isCancel = $actionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
+                            || str_contains($actionType, 'CANCEL')
+                            || $requestKind === 'cancel'
+                            || $cancelLeave;
+
+                        $isRecall = $actionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                            || str_contains($actionType, 'RECALL')
+                            || $requestKind === 'recall';
+
+                        return ! $isCancel && ! $isRecall;
+                    })->sortBy(function (LeaveApplicationUpdateRequest $req): string {
+                        return (string) (
+                            $req->reviewed_at?->toIso8601String()
+                            ?? $req->created_at?->toIso8601String()
+                            ?? str_pad((string) $req->id, 10, '0', STR_PAD_LEFT)
+                        );
+                    })->values()
+                    : collect();
 
                 $firstApprovalLog = $application->relationLoaded('logs')
                     ? $application->logs->first(function (LeaveApplicationLog $log): bool {
@@ -1473,28 +1484,24 @@ class EmployeeController extends Controller
                     });
                 }
 
-                if ($isCancelledApp) {
-                    $transactionDate = $firstApprovalLog?->created_at?->toDateString()
-                        ?? $application->created_at?->toDateString();
-                    $transactionTimestamp = (string) (
-                        $firstApprovalLog?->created_at?->toIso8601String()
-                        ?? $application->created_at?->toIso8601String()
-                        ?? $transactionDate
-                    );
-                } else {
-                    $transactionDate = $application->hr_approved_at?->toDateString()
-                        ?? $firstApprovalLog?->created_at?->toDateString()
-                        ?? $application->created_at?->toDateString();
-                    $transactionTimestamp = (string) (
-                        $application->hr_approved_at?->toIso8601String()
-                        ?? $firstApprovalLog?->created_at?->toIso8601String()
-                        ?? $application->created_at?->toIso8601String()
-                        ?? $transactionDate
-                    );
+                $typeId = (int) $application->leave_type_id;
+                $typeKey = $typeIdToKey[$typeId] ?? null;
+                $isForcedLeave = is_int($forcedLeaveTypeId)
+                    && $forcedLeaveTypeId > 0
+                    && $typeId === $forcedLeaveTypeId;
+                if ($isForcedLeave && $typeKey === null) {
+                    $typeKey = 'other';
                 }
-                if ($transactionDate === null) {
+                if ($typeKey === null) {
                     continue;
                 }
+                $balanceKey = $balanceKeyByTypeId[$typeId]
+                    ?? $this->resolveLedgerRunningBalanceKey($typeKey, $typeId, $isForcedLeave);
+                if (! is_string($balanceKey) || $balanceKey === '') {
+                    continue;
+                }
+                $isUsageOnlyOtherType = $typeKey === 'other'
+                    && in_array($typeId, $otherUsageOnlyTypeIds, true);
 
                 $totalDays = round((float) ($application->total_days ?? 0), 2);
                 $deductibleDays = round((float) ($application->deductible_days ?? $totalDays), 3);
@@ -1541,19 +1548,6 @@ class EmployeeController extends Controller
                         $inferredAmount = (float) ($inferredForcedLeaveDeductions['by_application_id'][(int) $application->id] ?? 0.0);
                         $linkedForcedWithPayAmount = $inferredAmount > 0.0 ? round($inferredAmount, 3) : $withPayAmount;
                     }
-                } elseif ($isCancelledApp) {
-                    if ($linkedVacationWithPayAmount <= 0.0 && $typeKey !== 'vacation') {
-                        $snapshotVl = (float) ($application->certification_leave_credits_snapshot['vacation']['less_this_application'] ?? 0.0);
-                        if ($snapshotVl > 0.0) {
-                            $linkedVacationWithPayAmount = round(min($snapshotVl, $withPayAmount), 3);
-                        }
-                    }
-                    if ($linkedSickWithPayAmount <= 0.0 && $typeKey !== 'sick') {
-                        $snapshotSl = (float) ($application->certification_leave_credits_snapshot['sick']['less_this_application'] ?? 0.0);
-                        if ($snapshotSl > 0.0) {
-                            $linkedSickWithPayAmount = round(min($snapshotSl, $withPayAmount), 3);
-                        }
-                    }
                 }
                 if ($typeKey !== 'vacation' && ! $isForcedLeave) {
                     $linkedForcedWithPayAmount = 0.0;
@@ -1573,224 +1567,290 @@ class EmployeeController extends Controller
                         max($withPayAmount - $linkedVacationWithPayAmount - $linkedSickWithPayAmount, 0.0),
                         self::LEDGER_DECIMAL_PRECISION
                     );
-
                 $withoutPayAmount = round(
                     max((float) ($payAmounts['without_pay'] ?? 0.0), 0.0),
                     self::LEDGER_DECIMAL_PRECISION
                 );
-
-                $monetizationComponents = $isMonetization
-                    ? $this->resolveLedgerMonetizationComponents(
-                        $application,
-                        $typeIdToKey,
-                        $typeKey,
-                        $deductibleDays
-                    )
-                    : [];
-
-                if ($isMonetization && $monetizationComponents === []) {
-                    continue;
-                }
-
-                if (
-                    ! $isMonetization
-                    && $primaryWithPayAmount <= 0
-                    && $linkedForcedWithPayAmount <= 0
-                    && $linkedVacationWithPayAmount <= 0
-                    && $linkedSickWithPayAmount <= 0
-                    && $withoutPayAmount <= 0
-                ) {
-                    continue;
-                }
-
-                // Ledger particulars should reflect the requested leave duration,
-                // not schedule-inflated credit deductions. A whole-day leave stays
-                // `1-0-0` here even when a 10-hour schedule deducts 1.25 credits.
                 $otherTypeCode = $typeKey === 'other'
                     ? ($otherTypeCodeById[$typeId] ?? null)
                     : null;
-                $leaveTypeCode = $this->resolveLedgerTypeCode(
-                    $typeKey,
-                    is_string($otherTypeCode) ? $otherTypeCode : null,
-                    $isForcedLeave,
-                );
                 $particularsPrefixOverride = $this->resolveLedgerParticularsPrefixOverride(
                     $typeKey,
                     $linkedVacationWithPayAmount,
                     $linkedSickWithPayAmount
                 );
-                $particulars = $this->buildLedgerParticulars(
-                    'deduction',
-                    $typeKey,
-                    $totalDays,
-                    $isMonetization,
-                    $isForcedLeave,
-                    is_string($otherTypeCode) ? $otherTypeCode : null,
-                    $particularsPrefixOverride
-                );
-                $applicationId = (int) $application->id;
-                $actionTaken = sprintf(
-                    'Application #%d%s',
-                    $applicationId,
-                    $isMonetization ? ' (Monetization)' : ''
-                );
-                $inclusiveStartDate = $application->start_date?->toDateString();
-                $inclusiveEndDate = $application->end_date?->toDateString();
-                if ($isCancelledApp && $inclusiveStartDate === null && ! empty($cancelUpdateRequest?->requested_payload['start_date'])) {
-                    $inclusiveStartDate = $cancelUpdateRequest->requested_payload['start_date'];
-                }
-                if ($isCancelledApp && $inclusiveEndDate === null && ! empty($cancelUpdateRequest?->requested_payload['end_date'])) {
-                    $inclusiveEndDate = $cancelUpdateRequest->requested_payload['end_date'];
-                }
-                $selectedDatesCandidate = $application->selected_dates;
-                if ($isCancelledApp && empty($selectedDatesCandidate) && ! empty($cancelUpdateRequest?->requested_payload['selected_dates'])) {
-                    $selectedDatesCandidate = $cancelUpdateRequest->requested_payload['selected_dates'];
-                }
-                $inclusiveDates = $this->resolveLedgerInclusiveDates(
-                    $selectedDatesCandidate,
-                    $inclusiveStartDate,
-                    $inclusiveEndDate
-                );
-                $mergeKey = 'app-'.$applicationId;
 
-                if ($isMonetization) {
-                    foreach ($monetizationComponents as $component) {
-                        $componentTypeKey = (string) $component['type_key'];
-                        $componentAmount = round(max((float) $component['days'], 0.0), self::LEDGER_DECIMAL_PRECISION);
-                        if ($componentAmount <= 0.0) {
-                            continue;
+                $hasLedgerUpdate = false;
+                $origTypeId = null;
+                $origTotalDays = null;
+                $origPayMode = null;
+                $origWithoutPayDays = null;
+                $origDeductibleDays = null;
+                $origStartDate = null;
+                $origEndDate = null;
+                $origSelectedDates = [];
+                $origApprovalDate = null;
+                $origApprovalTimestamp = null;
+
+                if (! $approvedUpdateRequests->isEmpty()) {
+                    $firstUpdateRequest = $approvedUpdateRequests->first();
+                    $firstPayload = is_array($firstUpdateRequest?->requested_payload) ? $firstUpdateRequest->requested_payload : [];
+
+                    $origTypeId = (int) ($firstPayload['previous_leave_type_id'] ?? $application->leave_type_id);
+                    $origTotalDays = round((float) ($firstPayload['previous_total_days'] ?? $application->total_days ?? 0), 2);
+                    $origPayMode = strtoupper(trim((string) ($firstPayload['previous_pay_mode'] ?? $application->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY)));
+                    if (! in_array($origPayMode, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
+                        $origPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
+                    }
+                    $origWithoutPayDays = round(max((float) ($firstPayload['previous_without_pay_days'] ?? 0.0), 0.0), 3);
+                    $origDeductibleDays = round(max(
+                        $origPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : ($origTotalDays - $origWithoutPayDays),
+                        0.0
+                    ), 3);
+                    $origStartDate = $firstPayload['previous_start_date'] ?? $application->start_date?->toDateString();
+                    $origEndDate = $firstPayload['previous_end_date'] ?? $application->end_date?->toDateString();
+                    $origSelectedDates = ! empty($firstPayload['previous_selected_dates']) && is_array($firstPayload['previous_selected_dates'])
+                        ? $firstPayload['previous_selected_dates']
+                        : (is_array($application->selected_dates) ? $application->selected_dates : []);
+
+                    $origApprovalDate = $firstApprovalLog?->created_at?->toDateString()
+                        ?? $application->created_at?->toDateString();
+                    $origApprovalTimestamp = (string) (
+                        $firstApprovalLog?->created_at?->toIso8601String()
+                        ?? $application->created_at?->toIso8601String()
+                        ?? $origApprovalDate
+                    );
+
+                    $currentSelectedDates = is_array($application->selected_dates) ? $application->selected_dates : [];
+                    $datesChanged = ($origStartDate !== $application->start_date?->toDateString())
+                        || ($origEndDate !== $application->end_date?->toDateString())
+                        || (array_values($origSelectedDates) !== array_values($currentSelectedDates));
+
+                    $leaveTypeChanged = ($origTypeId !== (int) $application->leave_type_id);
+                    $creditsChanged = ($origTotalDays !== $totalDays)
+                        || ($origPayMode !== $payMode)
+                        || ($origWithoutPayDays !== $withoutPayAmount);
+
+                    $hasLedgerUpdate = $datesChanged || $leaveTypeChanged || $creditsChanged;
+                }
+
+                if (! $hasLedgerUpdate) {
+                    if ($isCancelledApp) {
+                        $transactionDate = $firstApprovalLog?->created_at?->toDateString()
+                            ?? $application->created_at?->toDateString();
+                        $transactionTimestamp = (string) (
+                            $firstApprovalLog?->created_at?->toIso8601String()
+                            ?? $application->created_at?->toIso8601String()
+                            ?? $transactionDate
+                        );
+                    } else {
+                        $transactionDate = $application->hr_approved_at?->toDateString()
+                            ?? $firstApprovalLog?->created_at?->toDateString()
+                            ?? $application->created_at?->toDateString();
+                        $transactionTimestamp = (string) (
+                            $application->hr_approved_at?->toIso8601String()
+                            ?? $firstApprovalLog?->created_at?->toIso8601String()
+                            ?? $application->created_at?->toIso8601String()
+                            ?? $transactionDate
+                        );
+                    }
+                    if ($transactionDate === null) {
+                        continue;
+                    }
+
+                    $mergeKey = 'app-'.$applicationId;
+                    $actionTaken = sprintf(
+                        'Application #%d%s',
+                        $applicationId,
+                        $isMonetization ? ' (Monetization)' : ''
+                    );
+                    $inclusiveStartDate = $application->start_date?->toDateString();
+                    $inclusiveEndDate = $application->end_date?->toDateString();
+                    if ($isCancelledApp && $inclusiveStartDate === null && ! empty($cancelUpdateRequest?->requested_payload['start_date'])) {
+                        $inclusiveStartDate = $cancelUpdateRequest->requested_payload['start_date'];
+                    }
+                    if ($isCancelledApp && $inclusiveEndDate === null && ! empty($cancelUpdateRequest?->requested_payload['end_date'])) {
+                        $inclusiveEndDate = $cancelUpdateRequest->requested_payload['end_date'];
+                    }
+                    $selectedDatesCandidate = $application->selected_dates;
+                    if ($isCancelledApp && empty($selectedDatesCandidate) && ! empty($cancelUpdateRequest?->requested_payload['selected_dates'])) {
+                        $selectedDatesCandidate = $cancelUpdateRequest->requested_payload['selected_dates'];
+                    }
+
+                    $appState = [
+                        'type_id' => $typeId,
+                        'total_days' => $totalDays,
+                        'deductible_days' => $deductibleDays,
+                        'pay_mode' => $payMode,
+                        'is_monetization' => $isMonetization,
+                        'start_date' => $inclusiveStartDate,
+                        'end_date' => $inclusiveEndDate,
+                        'selected_dates' => $selectedDatesCandidate,
+                        'linked_vacation_leave_deducted_days' => $linkedVacationWithPayAmount,
+                        'linked_forced_leave_deducted_days' => $linkedForcedWithPayAmount,
+                        'linked_sick_leave_deducted_days' => $linkedSickWithPayAmount,
+                        'transaction_date' => $transactionDate,
+                        'transaction_timestamp' => $transactionTimestamp,
+                        'action_taken' => $actionTaken,
+                        'merge_key' => $mergeKey,
+                        'row_id_prefix' => $mergeKey,
+                    ];
+
+                    $activeDeductionTxs = $this->buildLedgerApplicationStateTransactions(
+                        $application,
+                        $appState,
+                        $typeIdToKey,
+                        $forcedLeaveTypeId,
+                        $balanceKeyByTypeId,
+                        $otherUsageOnlyTypeIds,
+                        $otherTypeCodeById,
+                        $inferredForcedLeaveDeductions
+                    );
+                    foreach ($activeDeductionTxs as $tx) {
+                        $transactions[] = $tx;
+                    }
+                } else {
+                    // Approved Update Request(s) exist that changed dates, leave type, or credits:
+                    // Render Old record (superseded/original) and directly under it render Updated record.
+                    // No "Adjusted" reversal row is emitted.
+                    $firstUpdateRequest = $approvedUpdateRequests->first();
+                    $firstPayload = is_array($firstUpdateRequest?->requested_payload) ? $firstUpdateRequest->requested_payload : [];
+
+                    $origTypeId = (int) ($firstPayload['previous_leave_type_id'] ?? $application->leave_type_id);
+                    $origTotalDays = round((float) ($firstPayload['previous_total_days'] ?? $application->total_days ?? 0), 2);
+                    $origPayMode = strtoupper(trim((string) ($firstPayload['previous_pay_mode'] ?? $application->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY)));
+                    if (! in_array($origPayMode, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
+                        $origPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
+                    }
+                    $origWithoutPayDays = round(max((float) ($firstPayload['previous_without_pay_days'] ?? 0.0), 0.0), 3);
+                    $origDeductibleDays = round(max(
+                        $origPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : ($origTotalDays - $origWithoutPayDays),
+                        0.0
+                    ), 3);
+                    $origStartDate = $firstPayload['previous_start_date'] ?? $application->start_date?->toDateString();
+                    $origEndDate = $firstPayload['previous_end_date'] ?? $application->end_date?->toDateString();
+                    $origSelectedDates = ! empty($firstPayload['previous_selected_dates']) && is_array($firstPayload['previous_selected_dates'])
+                        ? $firstPayload['previous_selected_dates']
+                        : (is_array($application->selected_dates) ? $application->selected_dates : []);
+
+                    $origApprovalDate = $firstApprovalLog?->created_at?->toDateString()
+                        ?? $application->created_at?->toDateString();
+                    $origApprovalTimestamp = (string) (
+                        $firstApprovalLog?->created_at?->toIso8601String()
+                        ?? $application->created_at?->toIso8601String()
+                        ?? $origApprovalDate
+                    );
+
+                    $origTypeKey = $typeIdToKey[$origTypeId] ?? null;
+                    $origIsForced = is_int($forcedLeaveTypeId) && $forcedLeaveTypeId > 0 && $origTypeId === $forcedLeaveTypeId;
+                    if ($origIsForced) {
+                        $origTypeKey = 'vacation';
+                        $origBalanceKey = 'vacation';
+                    } else {
+                        if ($origTypeKey === null) {
+                            $origTypeKey = $typeKey;
                         }
-
-                        $transactions[] = [
-                            'row_id' => $mergeKey.'-monetization-'.$componentTypeKey,
-                            'merge_key' => $mergeKey,
-                            'type_key' => $componentTypeKey,
-                            'balance_key' => $this->resolveLedgerRunningBalanceKey($componentTypeKey),
-                            'leave_type_code' => $this->resolveLedgerTypeCode($componentTypeKey),
-                            'transaction_date' => $transactionDate,
-                            'sort_date' => $transactionDate,
-                            'sort_timestamp' => $transactionTimestamp,
-                            'particulars' => $particulars,
-                            'action_taken' => $actionTaken,
-                            'inclusive_start_date' => $inclusiveStartDate,
-                            'inclusive_end_date' => $inclusiveEndDate,
-                            'inclusive_dates' => $inclusiveDates,
-                            'category' => 'deduction_with_pay',
-                            'amount' => $componentAmount,
-                            'balance_delta' => -$componentAmount,
-                        ];
+                        $origBalanceKey = $balanceKeyByTypeId[$origTypeId]
+                            ?? $this->resolveLedgerRunningBalanceKey($origTypeKey, $origTypeId, false);
+                        if (! is_string($origBalanceKey) || $origBalanceKey === '') {
+                            $origBalanceKey = $balanceKey;
+                        }
                     }
-                } elseif ($primaryWithPayAmount > 0) {
+
+                    $origOtherCode = (! $origIsForced && $origTypeKey === 'other')
+                        ? ($otherTypeCodeById[$origTypeId] ?? null)
+                        : null;
+                    $origLeaveTypeCode = $this->resolveLedgerTypeCode(
+                        $origTypeKey,
+                        is_string($origOtherCode) ? $origOtherCode : null,
+                        $origIsForced
+                    );
+                    $origParticulars = $this->buildLedgerParticulars(
+                        'deduction',
+                        $origTypeKey,
+                        $origTotalDays,
+                        $isMonetization,
+                        $origIsForced,
+                        is_string($origOtherCode) ? $origOtherCode : null
+                    );
+                    $origInclusiveDates = $this->resolveLedgerInclusiveDates(
+                        $origSelectedDates,
+                        $origStartDate,
+                        $origEndDate
+                    );
+
+                    // Row 1: Old Approved Application (Original) - Superseded (no balance deduction)
                     $transactions[] = [
-                        'row_id' => $mergeKey.'-wp',
-                        'merge_key' => $mergeKey,
-                        'type_key' => $typeKey,
-                        'balance_key' => $balanceKey,
-                        'leave_type_code' => $leaveTypeCode,
-                        'transaction_date' => $transactionDate,
-                        'sort_date' => $transactionDate,
-                        'sort_timestamp' => $transactionTimestamp,
-                        'particulars' => $particulars,
-                        'action_taken' => $actionTaken,
-                        'inclusive_start_date' => $inclusiveStartDate,
-                        'inclusive_end_date' => $inclusiveEndDate,
-                        'inclusive_dates' => $inclusiveDates,
-                        'category' => 'deduction_with_pay',
-                        'amount' => $primaryWithPayAmount,
-                        'balance_delta' => $isUsageOnlyOtherType ? 0.0 : -$primaryWithPayAmount,
-                        'is_usage_only' => $isUsageOnlyOtherType,
-                    ];
-                }
-
-                if (! $isMonetization && $linkedForcedWithPayAmount > 0 && is_int($forcedLeaveTypeId)) {
-                    $forcedBalanceKey = $balanceKeyByTypeId[$forcedLeaveTypeId]
-                        ?? $this->resolveLedgerRunningBalanceKey('other', $forcedLeaveTypeId, true);
-
-                    if (is_string($forcedBalanceKey) && $forcedBalanceKey !== '') {
-                        $transactions[] = [
-                            'row_id' => $mergeKey.'-fl-linked',
-                            'merge_key' => $mergeKey,
-                            'type_key' => 'other',
-                            'balance_key' => $forcedBalanceKey,
-                            'leave_type_code' => $this->resolveLedgerTypeCode('other', 'FL', true),
-                            'transaction_date' => $transactionDate,
-                            'sort_date' => $transactionDate,
-                            'sort_timestamp' => $transactionTimestamp,
-                            'particulars' => $particulars,
-                            'action_taken' => $actionTaken,
-                            'inclusive_start_date' => $inclusiveStartDate,
-                            'inclusive_end_date' => $inclusiveEndDate,
-                            'inclusive_dates' => $inclusiveDates,
-                            'category' => 'deduction_with_pay',
-                            'amount' => $linkedForcedWithPayAmount,
-                            'balance_delta' => -$linkedForcedWithPayAmount,
-                            'suppress_display' => true,
-                        ];
-                    }
-                }
-
-                if (! $isMonetization && $linkedVacationWithPayAmount > 0) {
-                    $transactions[] = [
-                        'row_id' => $mergeKey.'-vl-topup',
-                        'merge_key' => $mergeKey,
-                        'type_key' => 'vacation',
-                        'balance_key' => 'vacation',
-                        'leave_type_code' => $this->resolveLedgerTypeCode('vacation'),
-                        'transaction_date' => $transactionDate,
-                        'sort_date' => $transactionDate,
-                        'sort_timestamp' => $transactionTimestamp,
-                        'particulars' => $particulars,
-                        'action_taken' => $actionTaken,
-                        'inclusive_start_date' => $inclusiveStartDate,
-                        'inclusive_end_date' => $inclusiveEndDate,
-                        'inclusive_dates' => $inclusiveDates,
-                        'category' => 'deduction_with_pay',
-                        'amount' => $linkedVacationWithPayAmount,
-                        'balance_delta' => -$linkedVacationWithPayAmount,
-                    ];
-                }
-
-                if (! $isMonetization && $linkedSickWithPayAmount > 0) {
-                    $transactions[] = [
-                        'row_id' => $mergeKey.'-sl-topup',
-                        'merge_key' => $mergeKey,
-                        'type_key' => 'sick',
-                        'balance_key' => 'sick',
-                        'leave_type_code' => $this->resolveLedgerTypeCode('sick'),
-                        'transaction_date' => $transactionDate,
-                        'sort_date' => $transactionDate,
-                        'sort_timestamp' => $transactionTimestamp,
-                        'particulars' => $particulars,
-                        'action_taken' => $actionTaken,
-                        'inclusive_start_date' => $inclusiveStartDate,
-                        'inclusive_end_date' => $inclusiveEndDate,
-                        'inclusive_dates' => $inclusiveDates,
-                        'category' => 'deduction_with_pay',
-                        'amount' => $linkedSickWithPayAmount,
-                        'balance_delta' => -$linkedSickWithPayAmount,
-                    ];
-                }
-
-                if (! $isMonetization && $withoutPayAmount > 0) {
-                    $transactions[] = [
-                        'row_id' => $mergeKey.'-wop',
-                        'merge_key' => $mergeKey,
-                        'type_key' => $isForcedLeave ? 'vacation' : $typeKey,
-                        'balance_key' => $isForcedLeave ? 'vacation' : $balanceKey,
-                        'leave_type_code' => $isForcedLeave ? $this->resolveLedgerTypeCode('vacation') : $leaveTypeCode,
-                        'transaction_date' => $transactionDate,
-                        'sort_date' => $transactionDate,
-                        'sort_timestamp' => $transactionTimestamp,
-                        'particulars' => $particulars,
-                        'action_taken' => $actionTaken,
-                        'inclusive_start_date' => $inclusiveStartDate,
-                        'inclusive_end_date' => $inclusiveEndDate,
-                        'inclusive_dates' => $inclusiveDates,
-                        'category' => 'deduction_without_pay',
-                        'amount' => $withoutPayAmount,
+                        'row_id' => 'app-'.$applicationId.'-original',
+                        'merge_key' => 'app-'.$applicationId.'-original',
+                        'type_key' => $origTypeKey,
+                        'balance_key' => $origBalanceKey,
+                        'leave_type_code' => $origLeaveTypeCode,
+                        'transaction_date' => $origApprovalDate,
+                        'sort_date' => $origApprovalDate,
+                        'sort_timestamp' => $origApprovalTimestamp,
+                        'particulars' => $origParticulars,
+                        'action_taken' => sprintf('Application #%d (Original)', $applicationId),
+                        'inclusive_start_date' => $origStartDate,
+                        'inclusive_end_date' => $origEndDate,
+                        'inclusive_dates' => $origInclusiveDates,
+                        'selected_dates' => $origSelectedDates,
+                        'category' => 'superseded',
+                        'orig_pay_mode' => $origPayMode,
+                        'orig_without_pay_days' => $origWithoutPayDays,
+                        'orig_deductible_days' => $origDeductibleDays,
+                        'amount' => 0.0,
                         'balance_delta' => 0.0,
-                        'is_usage_only' => $isUsageOnlyOtherType,
+                        'allow_zero_display' => true,
                     ];
+
+                    // Row 2: Active Updated Application - placed directly below original row
+                    $lastUpdateRequest = $approvedUpdateRequests->last();
+                    $updateDate = $lastUpdateRequest->reviewed_at?->toDateString()
+                        ?? $lastUpdateRequest->created_at?->toDateString()
+                        ?? $application->updated_at?->toDateString();
+                    $updateDateFormatted = $updateDate ? Carbon::parse($updateDate)->format('F j, Y') : '';
+
+                    $updActionTaken = $updateDateFormatted !== ''
+                        ? sprintf('Application #%d (Updated %s)', $applicationId, $updateDateFormatted)
+                        : sprintf('Application #%d (Updated)', $applicationId);
+
+                    // Timestamp set to 1 second after original approval so it sorts immediately under Row 1
+                    $updTimestamp = (string) Carbon::parse($origApprovalTimestamp)->addSecond()->toIso8601String();
+
+                    $updState = [
+                        'type_id' => $typeId,
+                        'total_days' => $totalDays,
+                        'deductible_days' => $deductibleDays,
+                        'without_pay_days' => $withoutPayAmount,
+                        'pay_mode' => $payMode,
+                        'is_monetization' => $isMonetization,
+                        'start_date' => $application->start_date?->toDateString(),
+                        'end_date' => $application->end_date?->toDateString(),
+                        'selected_dates' => is_array($application->selected_dates) ? $application->selected_dates : [],
+                        'linked_vacation_leave_deducted_days' => $linkedVacationWithPayAmount,
+                        'linked_forced_leave_deducted_days' => $linkedForcedWithPayAmount,
+                        'linked_sick_leave_deducted_days' => $linkedSickWithPayAmount,
+                        'transaction_date' => $origApprovalDate,
+                        'transaction_timestamp' => $updTimestamp,
+                        'action_taken' => $updActionTaken,
+                        'merge_key' => 'app-'.$applicationId.'-updated',
+                        'row_id_prefix' => 'app-'.$applicationId.'-updated',
+                    ];
+
+                    $activeDeductionTxs = $this->buildLedgerApplicationStateTransactions(
+                        $application,
+                        $updState,
+                        $typeIdToKey,
+                        $forcedLeaveTypeId,
+                        $balanceKeyByTypeId,
+                        $otherUsageOnlyTypeIds,
+                        $otherTypeCodeById,
+                        $inferredForcedLeaveDeductions
+                    );
+                    foreach ($activeDeductionTxs as $tx) {
+                        $transactions[] = $tx;
+                    }
                 }
 
                 if ($isCancelledApp) {
@@ -1809,13 +1869,13 @@ class EmployeeController extends Controller
                         ?? $cancelLog?->created_at?->toDateString()
                         ?? $application->hr_approved_at?->toDateString()
                         ?? $application->updated_at?->toDateString()
-                        ?? $transactionDate;
+                        ?? ($transactionDate ?? null);
                     $cancellationTimestamp = (string) (
                         $cancelUpdateRequest?->reviewed_at?->toIso8601String()
                         ?? $cancelLog?->created_at?->toIso8601String()
                         ?? $application->hr_approved_at?->toIso8601String()
                         ?? $application->updated_at?->toIso8601String()
-                        ?? $cancellationDate.'T23:59:59Z'
+                        ?? ($cancellationDate ? $cancellationDate.'T23:59:59Z' : '')
                     );
                     $cancellationDateFormatted = $cancellationDate ? Carbon::parse($cancellationDate)->format('F j, Y') : '';
 
@@ -1824,127 +1884,18 @@ class EmployeeController extends Controller
                         ? sprintf('Cancelled Application #%d (%s)', $applicationId, $cancellationDateFormatted)
                         : sprintf('Cancelled Application #%d', $applicationId);
 
-                    if ($isMonetization) {
-                        foreach ($monetizationComponents as $component) {
-                            $componentTypeKey = (string) $component['type_key'];
-                            $componentAmount = round(max((float) $component['days'], 0.0), self::LEDGER_DECIMAL_PRECISION);
-                            if ($componentAmount <= 0.0) {
-                                continue;
-                            }
-
-                            $transactions[] = [
-                                'row_id' => 'cancelled-'.$mergeKey.'-monetization-'.$componentTypeKey,
-                                'merge_key' => 'cancelled-'.$mergeKey,
-                                'type_key' => $componentTypeKey,
-                                'balance_key' => $this->resolveLedgerRunningBalanceKey($componentTypeKey),
-                                'leave_type_code' => $this->resolveLedgerTypeCode($componentTypeKey),
-                                'transaction_date' => $cancellationDate,
-                                'sort_date' => $cancellationDate,
-                                'sort_timestamp' => $cancellationTimestamp,
-                                'particulars' => $cancelParticulars,
-                                'action_taken' => $cancelActionTaken,
-                                'inclusive_start_date' => $inclusiveStartDate,
-                                'inclusive_end_date' => $inclusiveEndDate,
-                                'inclusive_dates' => $inclusiveDates,
-                                'selected_dates' => $inclusiveDates,
-                                'category' => 'earned',
-                                'amount' => $componentAmount,
-                                'balance_delta' => $componentAmount,
-                            ];
-                        }
-                    } elseif ($primaryWithPayAmount > 0) {
-                        $transactions[] = [
-                            'row_id' => 'cancelled-'.$mergeKey.'-wp',
-                            'merge_key' => 'cancelled-'.$mergeKey,
-                            'type_key' => $typeKey,
-                            'balance_key' => $balanceKey,
-                            'leave_type_code' => $leaveTypeCode,
-                            'transaction_date' => $cancellationDate,
-                            'sort_date' => $cancellationDate,
-                            'sort_timestamp' => $cancellationTimestamp,
-                            'particulars' => $cancelParticulars,
-                            'action_taken' => $cancelActionTaken,
-                            'inclusive_start_date' => $inclusiveStartDate,
-                            'inclusive_end_date' => $inclusiveEndDate,
-                            'inclusive_dates' => $inclusiveDates,
-                            'selected_dates' => $inclusiveDates,
-                            'category' => 'earned',
-                            'amount' => $primaryWithPayAmount,
-                            'balance_delta' => $isUsageOnlyOtherType ? 0.0 : $primaryWithPayAmount,
-                            'is_usage_only' => $isUsageOnlyOtherType,
-                        ];
-                    }
-
-                    if (! $isMonetization && $linkedForcedWithPayAmount > 0 && is_int($forcedLeaveTypeId)) {
-                        $forcedBalanceKey = $balanceKeyByTypeId[$forcedLeaveTypeId]
-                            ?? $this->resolveLedgerRunningBalanceKey('other', $forcedLeaveTypeId, true);
-
-                        if (is_string($forcedBalanceKey) && $forcedBalanceKey !== '') {
-                            $transactions[] = [
-                                'row_id' => 'cancelled-'.$mergeKey.'-fl-linked',
-                                'merge_key' => 'cancelled-'.$mergeKey,
-                                'type_key' => 'other',
-                                'balance_key' => $forcedBalanceKey,
-                                'leave_type_code' => $this->resolveLedgerTypeCode('other', 'FL', true),
-                                'transaction_date' => $cancellationDate,
-                                'sort_date' => $cancellationDate,
-                                'sort_timestamp' => $cancellationTimestamp,
-                                'particulars' => $cancelParticulars,
-                                'action_taken' => $cancelActionTaken,
-                                'inclusive_start_date' => $inclusiveStartDate,
-                                'inclusive_end_date' => $inclusiveEndDate,
-                                'inclusive_dates' => $inclusiveDates,
-                                'selected_dates' => $inclusiveDates,
-                                'category' => 'earned',
-                                'amount' => $linkedForcedWithPayAmount,
-                                'balance_delta' => $linkedForcedWithPayAmount,
-                                'suppress_display' => true,
-                            ];
-                        }
-                    }
-
-                    if (! $isMonetization && $linkedVacationWithPayAmount > 0) {
-                        $transactions[] = [
-                            'row_id' => 'cancelled-'.$mergeKey.'-vl-topup',
-                            'merge_key' => 'cancelled-'.$mergeKey,
-                            'type_key' => 'vacation',
-                            'balance_key' => 'vacation',
-                            'leave_type_code' => $this->resolveLedgerTypeCode('vacation'),
-                            'transaction_date' => $cancellationDate,
-                            'sort_date' => $cancellationDate,
-                            'sort_timestamp' => $cancellationTimestamp,
-                            'particulars' => $cancelParticulars,
-                            'action_taken' => $cancelActionTaken,
-                            'inclusive_start_date' => $inclusiveStartDate,
-                            'inclusive_end_date' => $inclusiveEndDate,
-                            'inclusive_dates' => $inclusiveDates,
-                            'selected_dates' => $inclusiveDates,
-                            'category' => 'earned',
-                            'amount' => $linkedVacationWithPayAmount,
-                            'balance_delta' => $linkedVacationWithPayAmount,
-                        ];
-                    }
-
-                    if (! $isMonetization && $linkedSickWithPayAmount > 0) {
-                        $transactions[] = [
-                            'row_id' => 'cancelled-'.$mergeKey.'-sl-topup',
-                            'merge_key' => 'cancelled-'.$mergeKey,
-                            'type_key' => 'sick',
-                            'balance_key' => 'sick',
-                            'leave_type_code' => $this->resolveLedgerTypeCode('sick'),
-                            'transaction_date' => $cancellationDate,
-                            'sort_date' => $cancellationDate,
-                            'sort_timestamp' => $cancellationTimestamp,
-                            'particulars' => $cancelParticulars,
-                            'action_taken' => $cancelActionTaken,
-                            'inclusive_start_date' => $inclusiveStartDate,
-                            'inclusive_end_date' => $inclusiveEndDate,
-                            'inclusive_dates' => $inclusiveDates,
-                            'selected_dates' => $inclusiveDates,
-                            'category' => 'earned',
-                            'amount' => $linkedSickWithPayAmount,
-                            'balance_delta' => $linkedSickWithPayAmount,
-                        ];
+                    $cancelMergeKey = 'cancelled-app-'.$applicationId;
+                    $cancelTxs = $this->buildLedgerApplicationReversalTransactions(
+                        $activeDeductionTxs,
+                        $cancellationDate,
+                        $cancellationTimestamp,
+                        $cancelActionTaken,
+                        $cancelParticulars,
+                        $cancelMergeKey,
+                        $cancelMergeKey
+                    );
+                    foreach ($cancelTxs as $tx) {
+                        $transactions[] = $tx;
                     }
                 }
 
@@ -2248,7 +2199,49 @@ class EmployeeController extends Controller
                 $ledgerRows[$rowIndex]['leave_type_code'] = $leaveTypeCode;
             }
 
-            if ($displayTypeKey === 'vacation') {
+            if ($category === 'superseded') {
+                $ledgerRows[$rowIndex]['is_superseded'] = true;
+                $origPayMode = (string) ($transaction['orig_pay_mode'] ?? '');
+                $origWop = (float) ($transaction['orig_without_pay_days'] ?? 0.0);
+                $origDed = (float) ($transaction['orig_deductible_days'] ?? 0.0);
+                $isPureWop = $origPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY || ($origWop > 0.0 && $origDed <= 0.0);
+                $hasBoth = $origWop > 0.0 && $origDed > 0.0;
+
+                if ($displayTypeKey === 'vacation' || $leaveTypeCode === 'FL') {
+                    if ($isPureWop) {
+                        $ledgerRows[$rowIndex]['vacation_abs_und_wop'] = '—';
+                    } elseif ($hasBoth) {
+                        $ledgerRows[$rowIndex]['vacation_abs_und_wp'] = '—';
+                        $ledgerRows[$rowIndex]['vacation_abs_und_wop'] = '—';
+                    } else {
+                        $ledgerRows[$rowIndex]['vacation_abs_und_wp'] = '—';
+                    }
+                    $ledgerRows[$rowIndex]['vacation_balance'] = '—';
+                } elseif ($displayTypeKey === 'sick') {
+                    if ($isPureWop) {
+                        $ledgerRows[$rowIndex]['sick_abs_und_wop'] = '—';
+                    } elseif ($hasBoth) {
+                        $ledgerRows[$rowIndex]['sick_abs_und'] = '—';
+                        $ledgerRows[$rowIndex]['sick_abs_und_wop'] = '—';
+                    } else {
+                        $ledgerRows[$rowIndex]['sick_abs_und'] = '—';
+                    }
+                    $ledgerRows[$rowIndex]['sick_balance'] = '—';
+                } elseif ($displayTypeKey === 'other') {
+                    $isUsageOnly = (bool) ($transaction['is_usage_only'] ?? false);
+                    if ($isPureWop) {
+                        $ledgerRows[$rowIndex]['other_abs_und_wop'] = '—';
+                    } elseif ($hasBoth) {
+                        $ledgerRows[$rowIndex]['other_abs_und'] = '—';
+                        $ledgerRows[$rowIndex]['other_abs_und_wop'] = '—';
+                    } else {
+                        $ledgerRows[$rowIndex]['other_abs_und'] = '—';
+                    }
+                    if (! $isUsageOnly) {
+                        $ledgerRows[$rowIndex]['other_balance'] = '—';
+                    }
+                }
+            } elseif ($displayTypeKey === 'vacation') {
                 if (! array_key_exists('vacation_balance', $ledgerRows[$rowIndex])) {
                     $ledgerRows[$rowIndex]['vacation_balance'] = $currentBalance;
                 }
@@ -3741,6 +3734,10 @@ class EmployeeController extends Controller
 
     private function resolveLedgerDisplayTypeKey(?string $typeKey, ?string $leaveTypeCode = null): ?string
     {
+        if (strtoupper(trim((string) $leaveTypeCode)) === 'FL') {
+            return 'vacation';
+        }
+
         return $typeKey;
     }
 
@@ -4376,6 +4373,372 @@ class EmployeeController extends Controller
             'with_pay' => round(max($withPayAmount, 0.0), self::LEDGER_DECIMAL_PRECISION),
             'without_pay' => round(max($weightedWithoutPay, 0.0), self::LEDGER_DECIMAL_PRECISION),
         ];
+    }
+
+    /**
+     * Build deduction transactions for an application state (original or updated).
+     *
+     * @param  array<string, mixed>  $state
+     * @param  array<int, string>  $typeIdToKey
+     * @param  array<int, string>  $balanceKeyByTypeId
+     * @param  array<int, int>  $otherUsageOnlyTypeIds
+     * @param  array<int, string>  $otherTypeCodeById
+     * @param  array<string, mixed>  $inferredForcedLeaveDeductions
+     * @return array<int, array<string, mixed>>
+     */
+    private function buildLedgerApplicationStateTransactions(
+        LeaveApplication $application,
+        array $state,
+        array $typeIdToKey,
+        ?int $forcedLeaveTypeId,
+        array $balanceKeyByTypeId,
+        array $otherUsageOnlyTypeIds,
+        array $otherTypeCodeById,
+        array $inferredForcedLeaveDeductions = []
+    ): array {
+        $typeId = (int) ($state['type_id'] ?? $application->leave_type_id);
+        $typeKey = $typeIdToKey[$typeId] ?? null;
+        $isForcedLeave = is_int($forcedLeaveTypeId)
+            && $forcedLeaveTypeId > 0
+            && $typeId === $forcedLeaveTypeId;
+        if ($isForcedLeave && $typeKey === null) {
+            $typeKey = 'other';
+        }
+        if ($typeKey === null) {
+            return [];
+        }
+        $balanceKey = $balanceKeyByTypeId[$typeId]
+            ?? $this->resolveLedgerRunningBalanceKey($typeKey, $typeId, $isForcedLeave);
+        if (! is_string($balanceKey) || $balanceKey === '') {
+            return [];
+        }
+        $isUsageOnlyOtherType = $typeKey === 'other'
+            && in_array($typeId, $otherUsageOnlyTypeIds, true);
+
+        $totalDays = round((float) ($state['total_days'] ?? 0), 2);
+        $deductibleDays = round((float) ($state['deductible_days'] ?? $totalDays), 3);
+        $payMode = strtoupper(trim((string) ($state['pay_mode'] ?? LeaveApplication::PAY_MODE_WITH_PAY)));
+        if (! in_array($payMode, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
+            $payMode = LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+        $isMonetization = (bool) ($state['is_monetization'] ?? false);
+
+        if (array_key_exists('with_pay_amount', $state)) {
+            $withPayAmount = round(max((float) $state['with_pay_amount'], 0.0), 3);
+            $withoutPayAmount = round(max((float) ($state['without_pay_amount'] ?? 0.0), 0.0), self::LEDGER_DECIMAL_PRECISION);
+        } else {
+            $payAmounts = $this->resolveLedgerApplicationPayAmounts(
+                $application,
+                $totalDays,
+                $deductibleDays,
+                $payMode,
+                $isMonetization
+            );
+            $withPayAmount = round(max((float) ($payAmounts['with_pay'] ?? 0.0), 0.0), 3);
+            $withoutPayAmount = round(
+                max((float) ($payAmounts['without_pay'] ?? 0.0), 0.0),
+                self::LEDGER_DECIMAL_PRECISION
+            );
+        }
+
+        $linkedVacationWithPayAmount = round(
+            max((float) ($state['linked_vacation_leave_deducted_days'] ?? 0), 0.0),
+            3
+        );
+        $linkedForcedWithPayAmount = round(
+            max((float) ($state['linked_forced_leave_deducted_days'] ?? 0), 0.0),
+            3
+        );
+        $linkedSickWithPayAmount = round(
+            max((float) ($state['linked_sick_leave_deducted_days'] ?? 0), 0.0),
+            3
+        );
+        if ($isForcedLeave) {
+            if ($linkedVacationWithPayAmount <= 0.0) {
+                $snapshotVl = (float) ($application->certification_leave_credits_snapshot['vacation']['less_this_application'] ?? 0.0);
+                $linkedVacationWithPayAmount = $snapshotVl > 0.0 ? round(min($snapshotVl, $withPayAmount), 3) : $withPayAmount;
+            }
+            if ($linkedForcedWithPayAmount <= 0.0) {
+                $inferredAmount = (float) ($inferredForcedLeaveDeductions['by_application_id'][(int) $application->id] ?? 0.0);
+                $linkedForcedWithPayAmount = $inferredAmount > 0.0 ? round($inferredAmount, 3) : $withPayAmount;
+            }
+        }
+        if ($typeKey !== 'vacation' && ! $isForcedLeave) {
+            $linkedForcedWithPayAmount = 0.0;
+        }
+        if ($typeKey === 'vacation') {
+            $linkedVacationWithPayAmount = 0.0;
+        }
+        if ($typeKey === 'sick') {
+            $linkedSickWithPayAmount = 0.0;
+        }
+        $linkedForcedWithPayAmount = round(min($linkedForcedWithPayAmount, $withPayAmount), self::LEDGER_DECIMAL_PRECISION);
+        $linkedVacationWithPayAmount = round(min($linkedVacationWithPayAmount, $withPayAmount), self::LEDGER_DECIMAL_PRECISION);
+        $linkedSickWithPayAmount = round(min($linkedSickWithPayAmount, $withPayAmount), self::LEDGER_DECIMAL_PRECISION);
+        $primaryWithPayAmount = $isForcedLeave
+            ? 0.0
+            : round(
+                max($withPayAmount - $linkedVacationWithPayAmount - $linkedSickWithPayAmount, 0.0),
+                self::LEDGER_DECIMAL_PRECISION
+            );
+
+        $monetizationComponents = $isMonetization
+            ? $this->resolveLedgerMonetizationComponents(
+                $application,
+                $typeIdToKey,
+                $typeKey,
+                $deductibleDays
+            )
+            : [];
+
+        if ($isMonetization && $monetizationComponents === []) {
+            return [];
+        }
+
+        if (
+            ! $isMonetization
+            && $primaryWithPayAmount <= 0
+            && $linkedForcedWithPayAmount <= 0
+            && $linkedVacationWithPayAmount <= 0
+            && $linkedSickWithPayAmount <= 0
+            && $withoutPayAmount <= 0
+        ) {
+            return [];
+        }
+
+        $otherTypeCode = $typeKey === 'other'
+            ? ($otherTypeCodeById[$typeId] ?? null)
+            : null;
+        $leaveTypeCode = $this->resolveLedgerTypeCode(
+            $typeKey,
+            is_string($otherTypeCode) ? $otherTypeCode : null,
+            $isForcedLeave,
+        );
+        $particularsPrefixOverride = $this->resolveLedgerParticularsPrefixOverride(
+            $typeKey,
+            $linkedVacationWithPayAmount,
+            $linkedSickWithPayAmount
+        );
+        $particulars = $this->buildLedgerParticulars(
+            'deduction',
+            $typeKey,
+            $totalDays,
+            $isMonetization,
+            $isForcedLeave,
+            is_string($otherTypeCode) ? $otherTypeCode : null,
+            $particularsPrefixOverride
+        );
+
+        $actionTaken = (string) ($state['action_taken'] ?? sprintf('Application #%d', (int) $application->id));
+        $inclusiveStartDate = $state['start_date'] ?? null;
+        $inclusiveEndDate = $state['end_date'] ?? null;
+        $inclusiveDates = $this->resolveLedgerInclusiveDates(
+            $state['selected_dates'] ?? null,
+            $inclusiveStartDate,
+            $inclusiveEndDate
+        );
+
+        $transactionDate = (string) $state['transaction_date'];
+        $transactionTimestamp = (string) ($state['transaction_timestamp'] ?? $transactionDate);
+        $mergeKey = (string) ($state['merge_key'] ?? 'app-'.(int) $application->id);
+        $rowIdPrefix = (string) ($state['row_id_prefix'] ?? $mergeKey);
+
+        $transactions = [];
+
+        if ($isMonetization) {
+            foreach ($monetizationComponents as $component) {
+                $componentTypeKey = (string) $component['type_key'];
+                $componentAmount = round(max((float) $component['days'], 0.0), self::LEDGER_DECIMAL_PRECISION);
+                if ($componentAmount <= 0.0) {
+                    continue;
+                }
+
+                $transactions[] = [
+                    'row_id' => $rowIdPrefix.'-monetization-'.$componentTypeKey,
+                    'merge_key' => $mergeKey,
+                    'type_key' => $componentTypeKey,
+                    'balance_key' => $this->resolveLedgerRunningBalanceKey($componentTypeKey),
+                    'leave_type_code' => $this->resolveLedgerTypeCode($componentTypeKey),
+                    'transaction_date' => $transactionDate,
+                    'sort_date' => $transactionDate,
+                    'sort_timestamp' => $transactionTimestamp,
+                    'particulars' => $particulars,
+                    'action_taken' => $actionTaken,
+                    'inclusive_start_date' => $inclusiveStartDate,
+                    'inclusive_end_date' => $inclusiveEndDate,
+                    'inclusive_dates' => $inclusiveDates,
+                    'category' => 'deduction_with_pay',
+                    'amount' => $componentAmount,
+                    'balance_delta' => -$componentAmount,
+                ];
+            }
+        } elseif ($primaryWithPayAmount > 0) {
+            $transactions[] = [
+                'row_id' => $rowIdPrefix.'-wp',
+                'merge_key' => $mergeKey,
+                'type_key' => $typeKey,
+                'balance_key' => $balanceKey,
+                'leave_type_code' => $leaveTypeCode,
+                'transaction_date' => $transactionDate,
+                'sort_date' => $transactionDate,
+                'sort_timestamp' => $transactionTimestamp,
+                'particulars' => $particulars,
+                'action_taken' => $actionTaken,
+                'inclusive_start_date' => $inclusiveStartDate,
+                'inclusive_end_date' => $inclusiveEndDate,
+                'inclusive_dates' => $inclusiveDates,
+                'category' => 'deduction_with_pay',
+                'amount' => $primaryWithPayAmount,
+                'balance_delta' => $isUsageOnlyOtherType ? 0.0 : -$primaryWithPayAmount,
+                'is_usage_only' => $isUsageOnlyOtherType,
+            ];
+        }
+
+        if (! $isMonetization && $linkedForcedWithPayAmount > 0 && is_int($forcedLeaveTypeId)) {
+            $forcedBalanceKey = $balanceKeyByTypeId[$forcedLeaveTypeId]
+                ?? $this->resolveLedgerRunningBalanceKey('other', $forcedLeaveTypeId, true);
+
+            if (is_string($forcedBalanceKey) && $forcedBalanceKey !== '') {
+                $transactions[] = [
+                    'row_id' => $rowIdPrefix.'-fl-linked',
+                    'merge_key' => $mergeKey,
+                    'type_key' => 'other',
+                    'balance_key' => $forcedBalanceKey,
+                    'leave_type_code' => $this->resolveLedgerTypeCode('other', 'FL', true),
+                    'transaction_date' => $transactionDate,
+                    'sort_date' => $transactionDate,
+                    'sort_timestamp' => $transactionTimestamp,
+                    'particulars' => $particulars,
+                    'action_taken' => $actionTaken,
+                    'inclusive_start_date' => $inclusiveStartDate,
+                    'inclusive_end_date' => $inclusiveEndDate,
+                    'inclusive_dates' => $inclusiveDates,
+                    'category' => 'deduction_with_pay',
+                    'amount' => $linkedForcedWithPayAmount,
+                    'balance_delta' => -$linkedForcedWithPayAmount,
+                    'suppress_display' => true,
+                ];
+            }
+        }
+
+        if (! $isMonetization && $linkedVacationWithPayAmount > 0) {
+            $transactions[] = [
+                'row_id' => $rowIdPrefix.'-vl-topup',
+                'merge_key' => $mergeKey,
+                'type_key' => 'vacation',
+                'balance_key' => 'vacation',
+                'leave_type_code' => $isForcedLeave ? 'FL' : $this->resolveLedgerTypeCode('vacation'),
+                'transaction_date' => $transactionDate,
+                'sort_date' => $transactionDate,
+                'sort_timestamp' => $transactionTimestamp,
+                'particulars' => $particulars,
+                'action_taken' => $actionTaken,
+                'inclusive_start_date' => $inclusiveStartDate,
+                'inclusive_end_date' => $inclusiveEndDate,
+                'inclusive_dates' => $inclusiveDates,
+                'category' => 'deduction_with_pay',
+                'amount' => $linkedVacationWithPayAmount,
+                'balance_delta' => -$linkedVacationWithPayAmount,
+            ];
+        }
+
+        if (! $isMonetization && $linkedSickWithPayAmount > 0) {
+            $transactions[] = [
+                'row_id' => $rowIdPrefix.'-sl-topup',
+                'merge_key' => $mergeKey,
+                'type_key' => 'sick',
+                'balance_key' => 'sick',
+                'leave_type_code' => $this->resolveLedgerTypeCode('sick'),
+                'transaction_date' => $transactionDate,
+                'sort_date' => $transactionDate,
+                'sort_timestamp' => $transactionTimestamp,
+                'particulars' => $particulars,
+                'action_taken' => $actionTaken,
+                'inclusive_start_date' => $inclusiveStartDate,
+                'inclusive_end_date' => $inclusiveEndDate,
+                'inclusive_dates' => $inclusiveDates,
+                'category' => 'deduction_with_pay',
+                'amount' => $linkedSickWithPayAmount,
+                'balance_delta' => -$linkedSickWithPayAmount,
+            ];
+        }
+
+        if (! $isMonetization && $withoutPayAmount > 0) {
+            $transactions[] = [
+                'row_id' => $rowIdPrefix.'-wop',
+                'merge_key' => $mergeKey,
+                'type_key' => $isForcedLeave ? 'vacation' : $typeKey,
+                'balance_key' => $isForcedLeave ? 'vacation' : $balanceKey,
+                'leave_type_code' => $isForcedLeave ? $this->resolveLedgerTypeCode('vacation') : $leaveTypeCode,
+                'transaction_date' => $transactionDate,
+                'sort_date' => $transactionDate,
+                'sort_timestamp' => $transactionTimestamp,
+                'particulars' => $particulars,
+                'action_taken' => $actionTaken,
+                'inclusive_start_date' => $inclusiveStartDate,
+                'inclusive_end_date' => $inclusiveEndDate,
+                'inclusive_dates' => $inclusiveDates,
+                'category' => 'deduction_without_pay',
+                'amount' => $withoutPayAmount,
+                'balance_delta' => 0.0,
+                'is_usage_only' => $isUsageOnlyOtherType,
+            ];
+        }
+
+        return $transactions;
+    }
+
+    /**
+     * Build reversal / restoration transactions from active deductions.
+     *
+     * @param  array<int, array<string, mixed>>  $deductionTransactions
+     * @return array<int, array<string, mixed>>
+     */
+    private function buildLedgerApplicationReversalTransactions(
+        array $deductionTransactions,
+        string $reversalDate,
+        string $reversalTimestamp,
+        string $reversalActionTaken,
+        string $reversalParticulars,
+        string $reversalMergeKey,
+        string $reversalRowPrefix
+    ): array {
+        $revTxs = [];
+        foreach ($deductionTransactions as $tx) {
+            if (($tx['category'] ?? '') !== 'deduction_with_pay') {
+                continue;
+            }
+            $amount = (float) ($tx['amount'] ?? 0.0);
+            if ($amount <= 0.0) {
+                continue;
+            }
+
+            $suffix = substr((string) $tx['row_id'], strrpos((string) $tx['row_id'], '-') + 1);
+
+            $revTxs[] = [
+                'row_id' => $reversalRowPrefix.'-'.$suffix,
+                'merge_key' => $reversalMergeKey,
+                'type_key' => $tx['type_key'],
+                'balance_key' => $tx['balance_key'],
+                'leave_type_code' => $tx['leave_type_code'],
+                'transaction_date' => $reversalDate,
+                'sort_date' => $reversalDate,
+                'sort_timestamp' => $reversalTimestamp,
+                'particulars' => $reversalParticulars,
+                'action_taken' => $reversalActionTaken,
+                'inclusive_start_date' => $tx['inclusive_start_date'] ?? null,
+                'inclusive_end_date' => $tx['inclusive_end_date'] ?? null,
+                'inclusive_dates' => $tx['inclusive_dates'] ?? [],
+                'selected_dates' => $tx['selected_dates'] ?? ($tx['inclusive_dates'] ?? []),
+                'category' => 'earned',
+                'amount' => $amount,
+                'balance_delta' => ! empty($tx['is_usage_only']) ? 0.0 : $amount,
+                'is_usage_only' => $tx['is_usage_only'] ?? false,
+                'suppress_display' => $tx['suppress_display'] ?? false,
+            ];
+        }
+
+        return $revTxs;
     }
 
     /**
@@ -5492,7 +5855,20 @@ class EmployeeController extends Controller
 
         // 3. Approved & Approved-Cancelled CTO Leave Applications (Compensatory Time-Off Taken)
         $ctoApplications = LeaveApplication::query()
-            ->with(['logs', 'updateRequests', 'leaveType'])
+            ->with([
+                'logs' => function ($query) {
+                    $query->orderBy('created_at')->orderBy('id');
+                },
+                'updateRequests' => function ($query) {
+                    $query->whereIn('status', [
+                        LeaveApplicationUpdateRequest::STATUS_APPROVED,
+                        LeaveApplicationUpdateRequest::STATUS_PENDING,
+                    ])
+                        ->orderByDesc('reviewed_at')
+                        ->orderByDesc('id');
+                },
+                'leaveType',
+            ])
             ->whereIn('employee_control_no', $controlNoCandidates)
             ->where(function ($q) use ($ctoLeaveTypeId) {
                 if ($ctoLeaveTypeId) {
@@ -5504,15 +5880,28 @@ class EmployeeController extends Controller
                 });
             })
             ->where(function ($q) {
-                $q->where('status', LeaveApplication::STATUS_APPROVED)
-                    ->orWhere(function ($sq) {
-                        $sq->where('status', LeaveApplication::STATUS_CANCELLED)
-                            ->where(function ($ssq) {
-                                $ssq->whereNotNull('hr_approved_at')
-                                    ->orWhereHas('logs', fn ($l) => $l->where('action', LeaveApplicationLog::ACTION_HR_APPROVED))
-                                    ->orWhereHas('updateRequests', fn ($u) => $u->where('status', LeaveApplicationUpdateRequest::STATUS_APPROVED));
-                            });
+                $q->whereIn('status', [
+                    LeaveApplication::STATUS_APPROVED,
+                    LeaveApplication::STATUS_RECALLED,
+                ])->orWhere(function ($subQuery) {
+                    $subQuery->whereIn('status', [
+                        LeaveApplication::STATUS_PENDING_HR,
+                        LeaveApplication::STATUS_PENDING_ADMIN,
+                    ])->whereExists(function ($reqQuery) {
+                        $reqQuery->select(\Illuminate\Support\Facades\DB::raw(1))
+                            ->from('tblLeaveApplicationUpdateRequests as req')
+                            ->whereColumn('req.leave_application_id', 'tblLeaveApplications.id')
+                            ->where('req.status', 'PENDING')
+                            ->whereRaw('UPPER(LTRIM(RTRIM(req.previous_status))) = ?', [LeaveApplication::STATUS_APPROVED]);
                     });
+                })->orWhere(function ($sq) {
+                    $sq->where('status', LeaveApplication::STATUS_CANCELLED)
+                        ->where(function ($ssq) {
+                            $ssq->whereNotNull('hr_approved_at')
+                                ->orWhereHas('logs', fn ($l) => $l->where('action', LeaveApplicationLog::ACTION_HR_APPROVED))
+                                ->orWhereHas('updateRequests', fn ($u) => $u->where('status', LeaveApplicationUpdateRequest::STATUS_APPROVED));
+                        });
+                });
             })
             ->orderByDesc('hr_approved_at')
             ->orderByDesc('created_at')
@@ -5533,6 +5922,35 @@ class EmployeeController extends Controller
                 })
                 : null;
 
+            $approvedUpdateRequests = $app->relationLoaded('updateRequests')
+                ? $app->updateRequests->filter(function (LeaveApplicationUpdateRequest $req): bool {
+                    if ($req->status !== LeaveApplicationUpdateRequest::STATUS_APPROVED) {
+                        return false;
+                    }
+                    $payload = is_array($req->requested_payload) ? $req->requested_payload : [];
+                    $actionType = strtoupper((string) ($payload['action_type'] ?? ''));
+                    $requestKind = strtolower((string) ($payload['request_kind'] ?? ''));
+                    $cancelLeave = (bool) ($payload['cancel_leave'] ?? false);
+
+                    $isCancel = $actionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
+                        || str_contains($actionType, 'CANCEL')
+                        || $requestKind === 'cancel'
+                        || $cancelLeave;
+
+                    $isRecall = $actionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
+                        || str_contains($actionType, 'RECALL')
+                        || $requestKind === 'recall';
+
+                    return ! $isCancel && ! $isRecall;
+                })->sortBy(function (LeaveApplicationUpdateRequest $req): string {
+                    return (string) (
+                        $req->reviewed_at?->toIso8601String()
+                        ?? $req->created_at?->toIso8601String()
+                        ?? str_pad((string) $req->id, 10, '0', STR_PAD_LEFT)
+                    );
+                })->values()
+                : collect();
+
             $firstApprovalLog = $app->relationLoaded('logs')
                 ? $app->logs->first(function (LeaveApplicationLog $log): bool {
                     $remarks = strtolower((string) $log->remarks);
@@ -5550,77 +5968,255 @@ class EmployeeController extends Controller
                 });
             }
 
-            if ($isCancelled) {
-                $appDate = $firstApprovalLog?->created_at?->toDateString()
+            $hasLedgerUpdate = false;
+            $origTotalDays = null;
+            $origDeductibleDays = null;
+            $origCtoHours = null;
+            $origUsedHours = null;
+            $origUsedDays = null;
+            $origStartDate = null;
+            $origEndDate = null;
+            $origSelectedDates = [];
+            $origApprovalDate = null;
+            $origApprovalTimestamp = null;
+
+            if (! $approvedUpdateRequests->isEmpty()) {
+                $firstUpdateRequest = $approvedUpdateRequests->first();
+                $firstPayload = is_array($firstUpdateRequest?->requested_payload) ? $firstUpdateRequest->requested_payload : [];
+
+                $origTotalDays = round((float) ($firstPayload['previous_total_days'] ?? $app->total_days ?? 0.0), 2);
+                $origDeductibleDays = round((float) ($firstPayload['previous_deductible_days'] ?? $app->deductible_days ?? $origTotalDays), 3);
+                if ($origDeductibleDays <= 0.0 && $origTotalDays > 0.0) {
+                    $origDeductibleDays = $origTotalDays;
+                }
+
+                $origCtoHours = (float) ($firstPayload['previous_cto_deducted_hours'] ?? 0.0);
+                if ($origCtoHours <= 0.0) {
+                    $origCtoHours = $origDeductibleDays * self::LEDGER_HOURS_PER_DAY;
+                }
+
+                $origUsedHours = round($origCtoHours, 2);
+                $origUsedDays = round($origCtoHours / self::LEDGER_HOURS_PER_DAY, 3);
+
+                $origStartDate = $firstPayload['previous_start_date'] ?? $app->start_date?->toDateString();
+                $origEndDate = $firstPayload['previous_end_date'] ?? $app->end_date?->toDateString();
+                $origSelectedDates = ! empty($firstPayload['previous_selected_dates']) && is_array($firstPayload['previous_selected_dates'])
+                    ? $firstPayload['previous_selected_dates']
+                    : (is_array($app->selected_dates) ? $app->selected_dates : []);
+
+                $origApprovalDate = $firstApprovalLog?->created_at?->toDateString()
                     ?? $app->created_at?->toDateString();
-                $appTimestamp = (string) (
+                $origApprovalTimestamp = (string) (
                     $firstApprovalLog?->created_at?->toIso8601String()
                     ?? $app->created_at?->toIso8601String()
-                    ?? $appDate
+                    ?? $origApprovalDate
                 );
+
+                $currentSelectedDates = is_array($app->selected_dates) ? $app->selected_dates : [];
+                $datesChanged = ($origStartDate !== $app->start_date?->toDateString())
+                    || ($origEndDate !== $app->end_date?->toDateString())
+                    || (array_values($origSelectedDates) !== array_values($currentSelectedDates));
+
+                $hoursChanged = ($origUsedHours !== $usedHours) || ($origTotalDays !== $totalDays);
+
+                $hasLedgerUpdate = $datesChanged || $hoursChanged;
+            }
+
+            if (! $hasLedgerUpdate) {
+                if ($isCancelled) {
+                    $appDate = $firstApprovalLog?->created_at?->toDateString()
+                        ?? $app->created_at?->toDateString();
+                    $appTimestamp = (string) (
+                        $firstApprovalLog?->created_at?->toIso8601String()
+                        ?? $app->created_at?->toIso8601String()
+                        ?? $appDate
+                    );
+                } else {
+                    $appDate = $app->hr_approved_at?->toDateString()
+                        ?? $firstApprovalLog?->created_at?->toDateString()
+                        ?? $app->created_at?->toDateString();
+                    $appTimestamp = (string) (
+                        $app->hr_approved_at?->toIso8601String()
+                        ?? $firstApprovalLog?->created_at?->toIso8601String()
+                        ?? $app->created_at?->toIso8601String()
+                        ?? $appDate
+                    );
+                }
+                if ($appDate === null) {
+                    continue;
+                }
+
+                $totalDays = (float) ($app->total_days ?? 0.0);
+                $deductibleDays = (float) ($app->deductible_days ?? 0.0);
+                if ($isCancelled && $deductibleDays <= 0.0) {
+                    $payload = is_array($cancelUpdateRequest?->requested_payload) ? $cancelUpdateRequest->requested_payload : [];
+                    $deductibleDays = (float) ($payload['deductible_days'] ?? $payload['total_days'] ?? $totalDays);
+                }
+                if ($deductibleDays <= 0.0 && $totalDays > 0.0) {
+                    $deductibleDays = $totalDays;
+                }
+
+                $ctoHours = (float) ($app->cto_deducted_hours ?? 0.0);
+                if ($ctoHours <= 0.0) {
+                    $ctoHours = $deductibleDays * self::LEDGER_HOURS_PER_DAY;
+                }
+
+                $usedHours = round($ctoHours, 2);
+                $usedDays = round($ctoHours / self::LEDGER_HOURS_PER_DAY, 3);
+                if ($usedHours <= 0.0) {
+                    continue;
+                }
+
+                $inclusiveStartDate = $app->start_date?->toDateString();
+                $inclusiveEndDate = $app->end_date?->toDateString();
+                $inclusiveDates = $this->resolveLedgerInclusiveDates(
+                    $app->selected_dates,
+                    $inclusiveStartDate,
+                    $inclusiveEndDate
+                );
+
+                $particulars = $this->buildLedgerParticulars('deduction', 'other', $totalDays, false, false, 'CTO');
+                $actionTaken = sprintf('Application #%d', (int) $app->id);
+
+                // Original Deduction
+                $transactions[] = [
+                    'row_id' => 'cto-app-'.(int) $app->id,
+                    'transaction_date' => $appDate,
+                    'sort_date' => $appDate,
+                    'sort_timestamp' => $appTimestamp,
+                    'particulars' => $particulars,
+                    'action_taken' => $actionTaken,
+                    'category' => 'deduction',
+                    'amount_hours' => $usedHours,
+                    'amount_days' => $usedDays,
+                    'balance_delta' => -$usedHours,
+                    'inclusive_dates' => $inclusiveDates,
+                    'inclusive_start_date' => $inclusiveStartDate,
+                    'inclusive_end_date' => $inclusiveEndDate,
+                ];
+
+                $activeHours = $usedHours;
+                $activeDays = $usedDays;
+                $activeInclusiveDates = $inclusiveDates;
+                $activeStartDate = $inclusiveStartDate;
+                $activeEndDate = $inclusiveEndDate;
             } else {
-                $appDate = $app->hr_approved_at?->toDateString()
-                    ?? $firstApprovalLog?->created_at?->toDateString()
-                    ?? $app->created_at?->toDateString();
-                $appTimestamp = (string) (
-                    $app->hr_approved_at?->toIso8601String()
-                    ?? $firstApprovalLog?->created_at?->toIso8601String()
-                    ?? $app->created_at?->toIso8601String()
-                    ?? $appDate
+                // Approved Update Request(s) exist that changed dates or hours:
+                // Render Old record (superseded/original) and directly under it render Updated record.
+                // No "Adjusted" reversal row is emitted.
+                $firstUpdateRequest = $approvedUpdateRequests->first();
+                $firstPayload = is_array($firstUpdateRequest?->requested_payload) ? $firstUpdateRequest->requested_payload : [];
+
+                $origTotalDays = round((float) ($firstPayload['previous_total_days'] ?? $app->total_days ?? 0.0), 2);
+                $origDeductibleDays = round((float) ($firstPayload['previous_deductible_days'] ?? $app->deductible_days ?? $origTotalDays), 3);
+                if ($origDeductibleDays <= 0.0 && $origTotalDays > 0.0) {
+                    $origDeductibleDays = $origTotalDays;
+                }
+
+                $origCtoHours = (float) ($firstPayload['previous_cto_deducted_hours'] ?? 0.0);
+                if ($origCtoHours <= 0.0) {
+                    $origCtoHours = $origDeductibleDays * self::LEDGER_HOURS_PER_DAY;
+                }
+
+                $origUsedHours = round($origCtoHours, 2);
+                $origUsedDays = round($origCtoHours / self::LEDGER_HOURS_PER_DAY, 3);
+
+                $origStartDate = $firstPayload['previous_start_date'] ?? $app->start_date?->toDateString();
+                $origEndDate = $firstPayload['previous_end_date'] ?? $app->end_date?->toDateString();
+                $origSelectedDates = ! empty($firstPayload['previous_selected_dates']) && is_array($firstPayload['previous_selected_dates'])
+                    ? $firstPayload['previous_selected_dates']
+                    : (is_array($app->selected_dates) ? $app->selected_dates : []);
+
+                $origInclusiveDates = $this->resolveLedgerInclusiveDates(
+                    $origSelectedDates,
+                    $origStartDate,
+                    $origEndDate
                 );
-            }
-            if ($appDate === null) {
-                continue;
-            }
+                $origParticulars = $this->buildLedgerParticulars('deduction', 'other', $origTotalDays, false, false, 'CTO');
 
-            $totalDays = (float) ($app->total_days ?? 0.0);
-            $deductibleDays = (float) ($app->deductible_days ?? 0.0);
-            if ($isCancelled && $deductibleDays <= 0.0) {
-                $payload = is_array($cancelUpdateRequest?->requested_payload) ? $cancelUpdateRequest->requested_payload : [];
-                $deductibleDays = (float) ($payload['deductible_days'] ?? $payload['total_days'] ?? $totalDays);
+                $origApprovalDate = $firstApprovalLog?->created_at?->toDateString()
+                    ?? $app->created_at?->toDateString();
+                $origApprovalTimestamp = (string) (
+                    $firstApprovalLog?->created_at?->toIso8601String()
+                    ?? $app->created_at?->toIso8601String()
+                    ?? $origApprovalDate
+                );
+
+                // Row 1: Old Approved Application (Original) - Superseded (no balance deduction)
+                $transactions[] = [
+                    'row_id' => 'cto-app-'.(int) $app->id.'-original',
+                    'transaction_date' => $origApprovalDate,
+                    'sort_date' => $origApprovalDate,
+                    'sort_timestamp' => $origApprovalTimestamp,
+                    'particulars' => $origParticulars,
+                    'action_taken' => sprintf('Application #%d (Original)', (int) $app->id),
+                    'category' => 'superseded',
+                    'amount_hours' => null,
+                    'amount_days' => null,
+                    'balance_delta' => 0.0,
+                    'inclusive_dates' => $origInclusiveDates,
+                    'inclusive_start_date' => $origStartDate,
+                    'inclusive_end_date' => $origEndDate,
+                ];
+
+                // Row 2: Active Updated Application - placed directly below original row
+                $lastUpdateRequest = $approvedUpdateRequests->last();
+                $updateDate = $lastUpdateRequest->reviewed_at?->toDateString()
+                    ?? $lastUpdateRequest->created_at?->toDateString()
+                    ?? $app->updated_at?->toDateString();
+                $updateDateFormatted = $updateDate ? Carbon::parse($updateDate)->format('F j, Y') : '';
+
+                $updActionTaken = $updateDateFormatted !== ''
+                    ? sprintf('Application #%d (Updated %s)', (int) $app->id, $updateDateFormatted)
+                    : sprintf('Application #%d (Updated)', (int) $app->id);
+
+                // Timestamp set to 1 second after original approval so it sorts immediately under Row 1
+                $updTimestamp = (string) Carbon::parse($origApprovalTimestamp)->addSecond()->toIso8601String();
+
+                $updTotalDays = (float) ($app->total_days ?? 0.0);
+                $updDeductibleDays = (float) ($app->deductible_days ?? $updTotalDays);
+                if ($updDeductibleDays <= 0.0 && $updTotalDays > 0.0) {
+                    $updDeductibleDays = $updTotalDays;
+                }
+                $updHours = (float) ($app->cto_deducted_hours ?? 0.0);
+                if ($updHours <= 0.0) {
+                    $updHours = $updDeductibleDays * self::LEDGER_HOURS_PER_DAY;
+                }
+                $updUsedHours = round($updHours, 2);
+                $updUsedDays = round($updHours / self::LEDGER_HOURS_PER_DAY, 3);
+
+                $updStartDate = $app->start_date?->toDateString();
+                $updEndDate = $app->end_date?->toDateString();
+                $updSelectedDates = is_array($app->selected_dates) ? $app->selected_dates : [];
+                $updInclusiveDates = $this->resolveLedgerInclusiveDates(
+                    $updSelectedDates,
+                    $updStartDate,
+                    $updEndDate
+                );
+                $updParticulars = $this->buildLedgerParticulars('deduction', 'other', $updTotalDays, false, false, 'CTO');
+
+                $transactions[] = [
+                    'row_id' => 'cto-app-'.(int) $app->id.'-updated',
+                    'transaction_date' => $origApprovalDate,
+                    'sort_date' => $origApprovalDate,
+                    'sort_timestamp' => $updTimestamp,
+                    'particulars' => $updParticulars,
+                    'action_taken' => $updActionTaken,
+                    'category' => 'deduction',
+                    'amount_hours' => $updUsedHours,
+                    'amount_days' => $updUsedDays,
+                    'balance_delta' => -$updUsedHours,
+                    'inclusive_dates' => $updInclusiveDates,
+                    'inclusive_start_date' => $updStartDate,
+                    'inclusive_end_date' => $updEndDate,
+                ];
+
+                $activeHours = $updUsedHours;
+                $activeDays = $updUsedDays;
+                $activeInclusiveDates = $updInclusiveDates;
+                $activeStartDate = $updStartDate;
+                $activeEndDate = $updEndDate;
             }
-            if ($deductibleDays <= 0.0 && $totalDays > 0.0) {
-                $deductibleDays = $totalDays;
-            }
-
-            $ctoHours = (float) ($app->cto_deducted_hours ?? 0.0);
-            if ($ctoHours <= 0.0) {
-                $ctoHours = $deductibleDays * self::LEDGER_HOURS_PER_DAY;
-            }
-
-            $usedHours = round($ctoHours, 2);
-            $usedDays = round($ctoHours / self::LEDGER_HOURS_PER_DAY, 3);
-            if ($usedHours <= 0.0) {
-                continue;
-            }
-
-            $inclusiveStartDate = $app->start_date?->toDateString();
-            $inclusiveEndDate = $app->end_date?->toDateString();
-            $inclusiveDates = $this->resolveLedgerInclusiveDates(
-                $app->selected_dates,
-                $inclusiveStartDate,
-                $inclusiveEndDate
-            );
-
-            $particulars = $this->buildLedgerParticulars('deduction', 'other', $totalDays, false, false, 'CTO');
-            $actionTaken = $appDate ? Carbon::parse($appDate)->format('F j, Y') : '';
-
-            // Original Deduction
-            $transactions[] = [
-                'row_id' => 'cto-app-'.(int) $app->id,
-                'transaction_date' => $appDate,
-                'sort_date' => $appDate,
-                'sort_timestamp' => $appTimestamp,
-                'particulars' => $particulars,
-                'action_taken' => $actionTaken,
-                'category' => 'deduction',
-                'amount_hours' => $usedHours,
-                'amount_days' => $usedDays,
-                'balance_delta' => -$usedHours,
-                'inclusive_dates' => $inclusiveDates,
-                'inclusive_start_date' => $inclusiveStartDate,
-                'inclusive_end_date' => $inclusiveEndDate,
-            ];
 
             // If Cancelled, Restoration Row
             if ($isCancelled) {
@@ -5639,19 +6235,19 @@ class EmployeeController extends Controller
                     ?? $cancelLog?->created_at?->toDateString()
                     ?? $app->hr_approved_at?->toDateString()
                     ?? $app->updated_at?->toDateString()
-                    ?? $appDate;
+                    ?? ($appDate ?? null);
                 $cancellationTimestamp = (string) (
                     $cancelUpdateRequest?->reviewed_at?->toIso8601String()
                     ?? $cancelLog?->created_at?->toIso8601String()
                     ?? $app->hr_approved_at?->toIso8601String()
                     ?? $app->updated_at?->toIso8601String()
-                    ?? $cancellationDate.'T23:59:59Z'
+                    ?? ($cancellationDate ? $cancellationDate.'T23:59:59Z' : '')
                 );
                 $cancellationDateFormatted = $cancellationDate ? Carbon::parse($cancellationDate)->format('F j, Y') : '';
 
                 $cancelActionTaken = $cancellationDateFormatted !== ''
-                    ? $cancellationDateFormatted
-                    : ($cancellationDate ? Carbon::parse($cancellationDate)->format('F j, Y') : '');
+                    ? sprintf('Cancelled Application #%d (%s)', (int) $app->id, $cancellationDateFormatted)
+                    : sprintf('Cancelled Application #%d', (int) $app->id);
 
                 $transactions[] = [
                     'row_id' => 'cancelled-cto-app-'.(int) $app->id,
@@ -5661,12 +6257,12 @@ class EmployeeController extends Controller
                     'particulars' => 'Cancelled',
                     'action_taken' => $cancelActionTaken,
                     'category' => 'earned',
-                    'amount_hours' => $usedHours,
-                    'amount_days' => $usedDays,
-                    'balance_delta' => $usedHours,
-                    'inclusive_dates' => $inclusiveDates,
-                    'inclusive_start_date' => $inclusiveStartDate,
-                    'inclusive_end_date' => $inclusiveEndDate,
+                    'amount_hours' => $activeHours,
+                    'amount_days' => $activeDays,
+                    'balance_delta' => $activeHours,
+                    'inclusive_dates' => $activeInclusiveDates,
+                    'inclusive_start_date' => $activeStartDate,
+                    'inclusive_end_date' => $activeEndDate,
                 ];
             }
         }
@@ -5700,14 +6296,15 @@ class EmployeeController extends Controller
 
             $runningHours = round($runningHours - (float) ($tx['balance_delta'] ?? 0.0), 2);
 
+            $isSuperseded = ($tx['category'] ?? '') === 'superseded';
             $earnedHours = $tx['category'] === 'earned' ? $tx['amount_hours'] : null;
             $earnedDays = $tx['category'] === 'earned' ? $tx['amount_days'] : null;
-            $usedHours = $tx['category'] === 'deduction' ? $tx['amount_hours'] : null;
-            $usedDays = $tx['category'] === 'deduction' ? $tx['amount_days'] : null;
+            $usedHours = $isSuperseded ? '—' : ($tx['category'] === 'deduction' ? $tx['amount_hours'] : null);
+            $usedDays = $isSuperseded ? '—' : ($tx['category'] === 'deduction' ? $tx['amount_days'] : null);
 
             $earnedMinutes = $tx['category'] === 'earned' ? (int) round(((float) $tx['amount_hours']) * 60) : null;
             $usedMinutes = $tx['category'] === 'deduction' ? (int) round(((float) $tx['amount_hours']) * 60) : null;
-            $balanceMinutes = (int) round($currentHoursAtStep * 60);
+            $balanceMinutes = ! $isSuperseded ? (int) round($currentHoursAtStep * 60) : null;
 
             $ledgerRows[] = [
                 'id' => $tx['row_id'],
@@ -5723,10 +6320,11 @@ class EmployeeController extends Controller
                 'used_hours' => $usedHours,
                 'used_days' => $usedDays,
                 'used_minutes' => $usedMinutes,
-                'balance_hours' => $currentHoursAtStep,
-                'balance_days' => $currentDaysAtStep,
+                'balance_hours' => ! $isSuperseded ? $currentHoursAtStep : '—',
+                'balance_days' => ! $isSuperseded ? $currentDaysAtStep : '—',
                 'balance_minutes' => $balanceMinutes,
                 'action_taken' => $tx['action_taken'],
+                'is_superseded' => $isSuperseded,
             ];
         }
 
