@@ -49,6 +49,8 @@ class LeaveApplicationController extends Controller
 
     private const VL_MIN_WORKING_DAYS_BEFORE_AVAILMENT = 3;
 
+    private const APPROVED_LEAVE_REQUEST_MIN_WORKING_DAYS_BEFORE_START = 5;
+
     private const TERMINAL_LEAVE_ESTIMATE_FACTOR = 0.0478087;
 
     private const TERMINAL_LEAVE_AMOUNT_PRECISION = 12;
@@ -1127,6 +1129,11 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
+        $leadTimeValidation = $this->validateApprovedLeaveRequestLeadTime($app, 'cancel');
+        if ($leadTimeValidation instanceof JsonResponse) {
+            return $leadTimeValidation;
+        }
+
         $requestReason = trim((string) (
             $validated['cancellation_reason']
             ?? $validated['remarks']
@@ -1449,6 +1456,13 @@ class LeaveApplicationController extends Controller
             return response()->json([
                 'message' => "Cannot request edit: application status is '{$this->ermsStatusLabel($app->status)}'. Only pending or approved applications can request edits.",
             ], 422);
+        }
+
+        if ($isApprovedApplication) {
+            $leadTimeValidation = $this->validateApprovedLeaveRequestLeadTime($app, 'update');
+            if ($leadTimeValidation instanceof JsonResponse) {
+                return $leadTimeValidation;
+            }
         }
 
         $requestedUpdatePayload = $this->buildRequestedLeaveUpdatePayload($request, $validated, $app);
@@ -9929,6 +9943,69 @@ class LeaveApplicationController extends Controller
         $previousStatus = strtoupper(trim((string) ($pendingUpdateMeta['previous_status'] ?? '')));
 
         return $previousStatus === LeaveApplication::STATUS_APPROVED;
+    }
+
+    /**
+     * Resolve the earliest intended leave date (start date) for an application.
+     */
+    private function resolveEffectiveLeaveStartDate(LeaveApplication $app): ?\Carbon\CarbonImmutable
+    {
+        $candidateDate = null;
+        if (! empty($app->selected_dates) && is_array($app->selected_dates)) {
+            $sortedDates = collect($app->selected_dates)->filter()->sort()->values();
+            if ($sortedDates->isNotEmpty()) {
+                $candidateDate = (string) $sortedDates->first();
+            }
+        }
+
+        if (! $candidateDate && $app->start_date) {
+            $candidateDate = $app->start_date instanceof \DateTimeInterface
+                ? $app->start_date->format('Y-m-d')
+                : (string) $app->start_date;
+        }
+
+        if (! $candidateDate) {
+            return null;
+        }
+
+        try {
+            return \Carbon\CarbonImmutable::parse($candidateDate)->startOfDay();
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Validate whether an approved leave application can be cancelled or updated,
+     * requiring a minimum of 5 working days (excluding weekends) before the leave start date.
+     */
+    private function validateApprovedLeaveRequestLeadTime(LeaveApplication $app, string $actionLabel = 'cancel'): ?JsonResponse
+    {
+        if ($app->status !== LeaveApplication::STATUS_APPROVED) {
+            return null;
+        }
+
+        if ((bool) $app->is_monetization) {
+            return null;
+        }
+
+        $startDate = $this->resolveEffectiveLeaveStartDate($app);
+        if (! $startDate) {
+            return null;
+        }
+
+        $today = \Carbon\CarbonImmutable::today();
+        $workingDaysBeforeStart = $this->countWorkingDaysFromFiledDateBeforeDate($today, $startDate);
+
+        if ($workingDaysBeforeStart < self::APPROVED_LEAVE_REQUEST_MIN_WORKING_DAYS_BEFORE_START) {
+            $actionVerb = strtolower($actionLabel) === 'update' ? 'edit or update' : 'cancel';
+
+            return response()->json([
+                'message' => "Requests to {$actionVerb} an approved leave application must be submitted at least ".self::APPROVED_LEAVE_REQUEST_MIN_WORKING_DAYS_BEFORE_START.' working days before the leave date. Please contact the HR.',
+            ], 422);
+        }
+
+        return null;
     }
 
     private function shouldPresentApprovedWhilePendingUpdate(
