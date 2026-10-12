@@ -1831,7 +1831,7 @@ class EmployeeController extends Controller
                         'linked_vacation_leave_deducted_days' => $linkedVacationWithPayAmount,
                         'linked_forced_leave_deducted_days' => $linkedForcedWithPayAmount,
                         'linked_sick_leave_deducted_days' => $linkedSickWithPayAmount,
-                        'transaction_date' => $origApprovalDate,
+                        'transaction_date' => $updateDate ?: $origApprovalDate,
                         'transaction_timestamp' => $updTimestamp,
                         'action_taken' => $updActionTaken,
                         'merge_key' => 'app-'.$applicationId.'-updated',
@@ -6197,8 +6197,8 @@ class EmployeeController extends Controller
 
                 $transactions[] = [
                     'row_id' => 'cto-app-'.(int) $app->id.'-updated',
-                    'transaction_date' => $origApprovalDate,
-                    'sort_date' => $origApprovalDate,
+                    'transaction_date' => $updateDate ?: $origApprovalDate,
+                    'sort_date' => $updateDate ?: $origApprovalDate,
                     'sort_timestamp' => $updTimestamp,
                     'particulars' => $updParticulars,
                     'action_taken' => $updActionTaken,
