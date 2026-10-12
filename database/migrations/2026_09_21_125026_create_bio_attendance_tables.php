@@ -38,22 +38,22 @@ return new class extends Migration
             });
         }
 
-        if (! Schema::connection('bio')->hasTable('tblAttendanceRawLogs')) {
-            Schema::connection('bio')->create('tblAttendanceRawLogs', function (Blueprint $table): void {
+        if (! Schema::connection('bio')->hasTable('tblAttendanceLogs')) {
+            Schema::connection('bio')->create('tblAttendanceLogs', function (Blueprint $table): void {
                 $table->id();
-                $table->string('device_serial_number', 50)->nullable()->index('IX_tblAttendanceRawLogs_device_sn');
-                $table->string('biometric_pin', 64)->index('IX_tblAttendanceRawLogs_biometric_pin');
-                $table->string('employee_control_no', 64)->nullable()->index('IX_tblAttendanceRawLogs_employee_control_no');
-                $table->dateTime('punch_time')->index('IX_tblAttendanceRawLogs_punch_time');
+                $table->string('device_serial_number', 50)->nullable()->index('IX_tblAttendanceLogs_device_sn');
+                $table->string('biometric_pin', 64)->index('IX_tblAttendanceLogs_biometric_pin');
+                $table->string('employee_control_no', 64)->nullable()->index('IX_tblAttendanceLogs_employee_control_no');
+                $table->dateTime('punch_time')->index('IX_tblAttendanceLogs_punch_time');
                 $table->smallInteger('punch_state')->default(0); // 0: Check-In, 1: Check-Out, 2: Break-Out, 3: Break-In, 4: OT-In, 5: OT-Out
                 $table->smallInteger('verify_type')->default(15); // 1: Fingerprint, 15: Face, 4: Card, 0: Password
                 $table->string('work_code', 20)->nullable();
                 $table->string('sync_source', 20)->default('ADMS'); // ADMS, USB_IMPORT, MANUAL_SYNC
                 $table->string('raw_payload', 255)->nullable();
-                $table->timestamp('processed_at')->nullable()->index('IX_tblAttendanceRawLogs_processed_at');
+                $table->timestamp('processed_at')->nullable()->index('IX_tblAttendanceLogs_processed_at');
                 $table->timestamps();
 
-                $table->unique(['biometric_pin', 'punch_time'], 'UQ_tblAttendanceRawLogs_pin_punch_time');
+                $table->unique(['biometric_pin', 'punch_time'], 'UQ_tblAttendanceLogs_pin_punch_time');
             });
         }
 
@@ -94,7 +94,7 @@ return new class extends Migration
     public function down(): void
     {
         Schema::connection('bio')->dropIfExists('tblDailyTimeRecords');
-        Schema::connection('bio')->dropIfExists('tblAttendanceRawLogs');
+        Schema::connection('bio')->dropIfExists('tblAttendanceLogs');
         Schema::connection('bio')->dropIfExists('tblBiometricDevices');
     }
 };

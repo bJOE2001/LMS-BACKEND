@@ -36,8 +36,8 @@ class FreshBioDatabase extends Command
      */
     private const BIO_TABLES = [
         'tblDailyTimeRecords',
-        'tblAttendanceRawLogs',
-        'tblBiometricDeviceCommands',
+        'tblAttendanceLogs',
+        'tblBiometricTransferLogs',
         'tblBiometricEnrollments',
         'tblBiometricDevices',
     ];
@@ -130,14 +130,21 @@ class FreshBioDatabase extends Command
         if (file_exists($attendanceMigrationFile)) {
             $migration = require $attendanceMigrationFile;
             $migration->up();
-            $this->line('  <fg=green>+</> Migrated: tblBiometricDevices, tblAttendanceRawLogs, tblDailyTimeRecords');
+            $this->line('  <fg=green>+</> Migrated: tblBiometricDevices, tblAttendanceLogs, tblDailyTimeRecords');
         }
 
-        $commandMigrationFile = database_path('migrations/2026_09_21_135314_create_bio_commands_and_enrollments_tables.php');
-        if (file_exists($commandMigrationFile)) {
-            $migration = require $commandMigrationFile;
+        $enrollmentMigrationFile = database_path('migrations/2026_09_21_135314_create_bio_commands_and_enrollments_tables.php');
+        if (file_exists($enrollmentMigrationFile)) {
+            $migration = require $enrollmentMigrationFile;
             $migration->up();
-            $this->line('  <fg=green>+</> Migrated: tblBiometricEnrollments, tblBiometricDeviceCommands');
+            $this->line('  <fg=green>+</> Migrated: tblBiometricEnrollments');
+        }
+
+        $transferLogMigrationFile = database_path('migrations/2026_10_09_000002_create_tbl_biometric_transfer_logs_table.php');
+        if (file_exists($transferLogMigrationFile)) {
+            $migration = require $transferLogMigrationFile;
+            $migration->up();
+            $this->line('  <fg=green>+</> Migrated: tblBiometricTransferLogs');
         }
 
         $areaIdMigrationFile = database_path('migrations/2026_10_08_000001_add_zkbio_area_id_to_tbl_biometric_devices.php');

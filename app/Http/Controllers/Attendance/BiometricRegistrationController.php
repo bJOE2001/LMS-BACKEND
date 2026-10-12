@@ -4,8 +4,8 @@ namespace App\Http\Controllers\Attendance;
 
 use App\Http\Controllers\Controller;
 use App\Models\BiometricDevice;
-use App\Models\BiometricDeviceCommand;
 use App\Models\BiometricEnrollment;
+use App\Models\BiometricTransferLog;
 use App\Models\DepartmentAdmin;
 use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HRAccount;
@@ -76,99 +76,237 @@ class BiometricRegistrationController extends Controller
 
     public function hrIndex(Request $request): JsonResponse
     {
-        $search = $request->input('search');
-        $statusFilter = $request->input('status', 'all');
+        $search = trim((string) $request->input('search', ''));
+        $statusFilter = strtolower(trim((string) $request->input('status', 'all')));
+        $page = max(1, (int) $request->input('page', 1));
+        $perPage = max(1, min(100, (int) $request->input('per_page', 30)));
 
-        $query = BiometricEnrollment::query();
+        $allEnrollments = BiometricEnrollment::query()->get();
+        $registeredCount = $allEnrollments->whereIn('status', [BiometricEnrollment::STATUS_REGISTERED, BiometricEnrollment::STATUS_FINGERPRINT_ENROLLED])->count();
+        $pendingCount = $allEnrollments->where('status', BiometricEnrollment::STATUS_PENDING_ENROLLMENT)->count();
+        $totalHris = HrisEmployee::query(true)->count();
+        $notRegisteredCount = max(0, $totalHris - $registeredCount - $pendingCount);
 
-        if ($search) {
-            $query->where(function ($q) use ($search) {
-                $q->where('employee_control_no', 'like', "%{$search}%")
-                    ->orWhere('employee_name', 'like', "%{$search}%");
-            });
-        }
+        $enrolledControlNos = $allEnrollments
+            ->filter(fn ($e) => in_array($e->status, [
+                BiometricEnrollment::STATUS_REGISTERED,
+                BiometricEnrollment::STATUS_FINGERPRINT_ENROLLED,
+                BiometricEnrollment::STATUS_PENDING_ENROLLMENT,
+            ], true))
+            ->pluck('employee_control_no')
+            ->all();
 
-        if ($statusFilter !== 'all') {
-            if ($statusFilter === 'not_registered') {
-                $query->whereNull('id');
-            } else {
-                $query->where('status', strtoupper($statusFilter));
+        $deviceMap = BiometricDevice::query()->get()->keyBy('serial_number');
+        $resolveDeviceOffices = function ($enrollment) use ($deviceMap) {
+            $sns = $enrollment->synced_devices ?: ($enrollment->enrollment_device_sn ? [$enrollment->enrollment_device_sn] : []);
+
+            return collect($sns)->map(function ($sn) use ($deviceMap) {
+                $dev = $deviceMap->get($sn);
+
+                return $dev ? ($dev->device_name ?: $dev->department_name ?: $sn) : $sn;
+            })->unique()->values()->all();
+        };
+
+        $items = collect();
+        $total = 0;
+
+        if ($statusFilter === 'registered') {
+            $query = BiometricEnrollment::query()
+                ->whereIn('status', [BiometricEnrollment::STATUS_REGISTERED, BiometricEnrollment::STATUS_FINGERPRINT_ENROLLED]);
+
+            if ($search !== '') {
+                $query->where(function ($q) use ($search) {
+                    $q->where('employee_control_no', 'like', "%{$search}%")
+                        ->orWhere('employee_name', 'like', "%{$search}%");
+                });
             }
-        }
 
-        $enrollments = $query->paginate(30);
+            $total = $query->count();
+            $enrollments = $query->forPage($page, $perPage)->get();
 
-        // Auto-reconcile pending enrollments on the current page against ZKBio Time
-        foreach ($enrollments->items() as $enrollment) {
-            if (in_array($enrollment->status, [BiometricEnrollment::STATUS_PENDING_ENROLLMENT, BiometricEnrollment::STATUS_FINGERPRINT_ENROLLED], true)) {
+            $items = $enrollments->map(function ($enrollment) use ($resolveDeviceOffices) {
+                $hris = HrisEmployee::findByControlNo($enrollment->employee_control_no, true);
+
+                return [
+                    'control_no' => $enrollment->employee_control_no,
+                    'full_name' => $enrollment->employee_name,
+                    'biometric_status' => BiometricEnrollment::STATUS_REGISTERED,
+                    'enrolled_at' => $enrollment->enrolled_at,
+                    'enrollment_device_sn' => $enrollment->enrollment_device_sn,
+                    'synced_devices' => $enrollment->synced_devices ?? [],
+                    'device_offices' => $resolveDeviceOffices($enrollment),
+                    'office' => $hris?->office ?: 'Unknown',
+                    'office_acronym' => $hris?->officeAcronym,
+                    'designation' => $hris?->designation,
+                ];
+            });
+        } elseif ($statusFilter === 'pending' || $statusFilter === 'pending_enrollment') {
+            $query = BiometricEnrollment::query()
+                ->where('status', BiometricEnrollment::STATUS_PENDING_ENROLLMENT);
+
+            if ($search !== '') {
+                $query->where(function ($q) use ($search) {
+                    $q->where('employee_control_no', 'like', "%{$search}%")
+                        ->orWhere('employee_name', 'like', "%{$search}%");
+                });
+            }
+
+            $total = $query->count();
+            $enrollments = $query->forPage($page, $perPage)->get();
+
+            foreach ($enrollments as $enrollment) {
                 $this->reconciliationService->reconcileEnrollment($enrollment);
             }
-        }
 
-        $enrolledControlNos = $enrollments->pluck('employee_control_no')->all();
+            $items = $enrollments->map(function ($enrollment) use ($resolveDeviceOffices) {
+                $hris = HrisEmployee::findByControlNo($enrollment->employee_control_no, true);
 
-        if ($statusFilter === 'all' || $statusFilter === 'not_registered') {
+                return [
+                    'control_no' => $enrollment->employee_control_no,
+                    'full_name' => $enrollment->employee_name,
+                    'biometric_status' => $enrollment->status,
+                    'enrolled_at' => $enrollment->enrolled_at,
+                    'enrollment_device_sn' => $enrollment->enrollment_device_sn,
+                    'synced_devices' => $enrollment->synced_devices ?? [],
+                    'device_offices' => $resolveDeviceOffices($enrollment),
+                    'office' => $hris?->office ?: 'Unknown',
+                    'office_acronym' => $hris?->officeAcronym,
+                    'designation' => $hris?->designation,
+                ];
+            });
+        } elseif ($statusFilter === 'not_registered') {
             $hrisQuery = HrisEmployee::query(true);
-            if ($search) {
+
+            if (! empty($enrolledControlNos)) {
+                $hrisQuery->whereNotIn('xp.ControlNo', $enrolledControlNos);
+            }
+
+            if ($search !== '') {
                 $hrisQuery->where(function ($q) use ($search) {
                     $q->where('xp.ControlNo', 'like', "%{$search}%")
                         ->orWhere('xp.Firstname', 'like', "%{$search}%")
                         ->orWhere('xp.Surname', 'like', "%{$search}%");
                 });
             }
-            if ($enrolledControlNos !== []) {
+
+            $total = $hrisQuery->count();
+            $hrisEmployees = $hrisQuery->forPage($page, $perPage)->get();
+
+            $items = $hrisEmployees->map(function ($hris) {
+                return [
+                    'control_no' => $hris->control_no,
+                    'full_name' => trim(($hris->firstname ?? '').' '.($hris->middlename ? $hris->middlename[0].'. ' : '').($hris->surname ?? '')),
+                    'biometric_status' => 'NOT REGISTERED',
+                    'enrolled_at' => null,
+                    'enrollment_device_sn' => null,
+                    'synced_devices' => [],
+                    'device_offices' => [],
+                    'office' => $hris->office ?: 'Unknown',
+                    'office_acronym' => $hris->officeAcronym ?? null,
+                    'designation' => $hris->designation ?? null,
+                ];
+            });
+        } else {
+            // 'all'
+            $enrollmentsQuery = BiometricEnrollment::query();
+            if ($search !== '') {
+                $enrollmentsQuery->where(function ($q) use ($search) {
+                    $q->where('employee_control_no', 'like', "%{$search}%")
+                        ->orWhere('employee_name', 'like', "%{$search}%");
+                });
+            }
+            $enrollmentsTotal = $enrollmentsQuery->count();
+
+            $hrisQuery = HrisEmployee::query(true);
+            if (! empty($enrolledControlNos)) {
                 $hrisQuery->whereNotIn('xp.ControlNo', $enrolledControlNos);
             }
-            $hrisEmployees = $hrisQuery->limit(30 - $enrollments->count())->get();
-        } else {
-            $hrisEmployees = collect();
+            if ($search !== '') {
+                $hrisQuery->where(function ($q) use ($search) {
+                    $q->where('xp.ControlNo', 'like', "%{$search}%")
+                        ->orWhere('xp.Firstname', 'like', "%{$search}%")
+                        ->orWhere('xp.Surname', 'like', "%{$search}%");
+                });
+            }
+            $hrisTotal = $hrisQuery->count();
+            $total = $enrollmentsTotal + $hrisTotal;
+
+            $offset = ($page - 1) * $perPage;
+
+            if ($offset < $enrollmentsTotal) {
+                $takeEnrollments = min($perPage, $enrollmentsTotal - $offset);
+                $enrollments = $enrollmentsQuery->skip($offset)->take($takeEnrollments)->get();
+
+                foreach ($enrollments as $enrollment) {
+                    $hris = HrisEmployee::findByControlNo($enrollment->employee_control_no, true);
+                    $status = $enrollment->status;
+                    if ($status === BiometricEnrollment::STATUS_FINGERPRINT_ENROLLED) {
+                        $status = BiometricEnrollment::STATUS_REGISTERED;
+                    }
+
+                    $items->push([
+                        'control_no' => $enrollment->employee_control_no,
+                        'full_name' => $enrollment->employee_name,
+                        'biometric_status' => $status,
+                        'enrolled_at' => $enrollment->enrolled_at,
+                        'enrollment_device_sn' => $enrollment->enrollment_device_sn,
+                        'synced_devices' => $enrollment->synced_devices ?? [],
+                        'device_offices' => $resolveDeviceOffices($enrollment),
+                        'office' => $hris?->office ?: 'Unknown',
+                        'office_acronym' => $hris?->officeAcronym,
+                        'designation' => $hris?->designation,
+                    ]);
+                }
+
+                $remaining = $perPage - $items->count();
+                if ($remaining > 0) {
+                    $hrisEmployees = $hrisQuery->skip(0)->take($remaining)->get();
+                    foreach ($hrisEmployees as $hris) {
+                        $items->push([
+                            'control_no' => $hris->control_no,
+                            'full_name' => trim(($hris->firstname ?? '').' '.($hris->middlename ? $hris->middlename[0].'. ' : '').($hris->surname ?? '')),
+                            'biometric_status' => 'NOT REGISTERED',
+                            'enrolled_at' => null,
+                            'enrollment_device_sn' => null,
+                            'synced_devices' => [],
+                            'device_offices' => [],
+                            'office' => $hris->office ?: 'Unknown',
+                            'office_acronym' => $hris->officeAcronym ?? null,
+                            'designation' => $hris->designation ?? null,
+                        ]);
+                    }
+                }
+            } else {
+                $hrisOffset = $offset - $enrollmentsTotal;
+                $hrisEmployees = $hrisQuery->skip($hrisOffset)->take($perPage)->get();
+
+                foreach ($hrisEmployees as $hris) {
+                    $items->push([
+                        'control_no' => $hris->control_no,
+                        'full_name' => trim(($hris->firstname ?? '').' '.($hris->middlename ? $hris->middlename[0].'. ' : '').($hris->surname ?? '')),
+                        'biometric_status' => 'NOT REGISTERED',
+                        'enrolled_at' => null,
+                        'enrollment_device_sn' => null,
+                        'synced_devices' => [],
+                        'device_offices' => [],
+                        'office' => $hris->office ?: 'Unknown',
+                        'office_acronym' => $hris->officeAcronym ?? null,
+                        'designation' => $hris->designation ?? null,
+                    ]);
+                }
+            }
         }
-
-        $items = collect($enrollments->items())->map(function ($enrollment) {
-            $hris = HrisEmployee::findByControlNo($enrollment->employee_control_no, true);
-
-            return [
-                'control_no' => $enrollment->employee_control_no,
-                'full_name' => $enrollment->employee_name,
-                'biometric_status' => $enrollment->status,
-                'enrolled_at' => $enrollment->enrolled_at,
-                'enrollment_device_sn' => $enrollment->enrollment_device_sn,
-                'synced_devices' => $enrollment->synced_devices ?? [],
-                'office' => $hris?->office ?: 'Unknown',
-                'office_acronym' => $hris?->officeAcronym,
-                'designation' => $hris?->designation,
-            ];
-        });
-
-        foreach ($hrisEmployees as $hris) {
-            $items->push([
-                'control_no' => $hris->control_no,
-                'full_name' => trim(($hris->firstname ?? '').' '.($hris->middlename ? $hris->middlename[0].'. ' : '').($hris->surname ?? '')),
-                'biometric_status' => 'NOT REGISTERED',
-                'enrolled_at' => null,
-                'enrollment_device_sn' => null,
-                'synced_devices' => [],
-                'office' => $hris->office ?: 'Unknown',
-                'office_acronym' => $hris->officeAcronym ?? null,
-                'designation' => $hris->designation ?? null,
-            ]);
-        }
-
-        $totalHris = HrisEmployee::query(true)->count();
-        $allEnrollments = BiometricEnrollment::query()->get();
-        $registeredCount = $allEnrollments->where('status', BiometricEnrollment::STATUS_REGISTERED)->count();
-        $enrolledCount = $allEnrollments->where('status', BiometricEnrollment::STATUS_FINGERPRINT_ENROLLED)->count();
-        $pendingCount = $allEnrollments->where('status', BiometricEnrollment::STATUS_PENDING_ENROLLMENT)->count();
 
         return response()->json([
-            'employees' => $items,
-            'total' => $enrollments->total() + ($statusFilter === 'not_registered' ? $hrisEmployees->count() : 0),
+            'employees' => $items->values()->all(),
+            'total' => $total,
+            'page' => $page,
+            'per_page' => $perPage,
             'stats' => [
                 'total_employees' => $totalHris,
                 'registered' => $registeredCount,
-                'enrolled' => $enrolledCount,
                 'pending' => $pendingCount,
-                'not_registered' => max(0, $totalHris - $registeredCount - $enrolledCount - $pendingCount),
+                'not_registered' => $notRegisteredCount,
             ],
         ]);
     }
@@ -212,19 +350,24 @@ class BiometricRegistrationController extends Controller
             return response()->json(['message' => $error], 502);
         }
 
-        $commandString = BiometricDeviceCommand::buildDataUserCommand($controlNo, $fullName);
-        $command = BiometricDeviceCommand::query()->create([
-            'device_serial_number' => $deviceSn,
-            'command_type' => BiometricDeviceCommand::CMD_DATA_USER,
-            'command_payload' => $commandString,
+        $transferLog = BiometricTransferLog::query()->create([
             'employee_control_no' => $controlNo,
             'employee_name' => $fullName,
-            'status' => BiometricDeviceCommand::STATUS_PENDING,
+            'action_type' => BiometricTransferLog::ACTION_REGISTRATION,
+            'target_department_id' => \App\Services\Attendance\BiometricTransferService::CHRMO_DEPARTMENT_ID,
+            'target_office_name' => 'CHRMO',
+            'target_device_sn' => $deviceSn,
+            'target_area_id' => $areaId,
+            'status' => BiometricTransferLog::STATUS_SUCCESS,
+            'remarks' => "Registration initiated on device {$deviceSn}. Awaiting scan.",
+            'performed_by_user_id' => $request->user()->id,
+            'performed_by_name' => $request->user()->full_name ?? $request->user()->username ?? 'HR Admin',
         ]);
 
         return response()->json([
             'message' => "Registration initiated for {$fullName}. Please step up to the device to scan your fingerprint.",
-            'command_id' => $command->id,
+            'transfer_log_id' => $transferLog->id,
+            'command_id' => $transferLog->id,
             'enrollment' => $enrollment,
         ]);
     }
@@ -334,19 +477,27 @@ class BiometricRegistrationController extends Controller
             return response()->json(['message' => $error], 502);
         }
 
-        $commandString = BiometricDeviceCommand::buildDataUserCommand($controlNo, $fullName);
-        $command = BiometricDeviceCommand::query()->create([
-            'device_serial_number' => $deviceSn,
-            'command_type' => BiometricDeviceCommand::CMD_DATA_USER,
-            'command_payload' => $commandString,
+        $deptLabel = $account->department?->acronym ?: ($account->department?->name ?: "Office #{$account->department_id}");
+        $transferLog = BiometricTransferLog::query()->create([
             'employee_control_no' => $controlNo,
             'employee_name' => $fullName,
-            'status' => BiometricDeviceCommand::STATUS_PENDING,
+            'action_type' => BiometricTransferLog::ACTION_ASSIGN,
+            'source_department_id' => \App\Services\Attendance\BiometricTransferService::CHRMO_DEPARTMENT_ID,
+            'source_office_name' => 'CHRMO',
+            'target_department_id' => $account->department_id,
+            'target_office_name' => $deptLabel,
+            'target_device_sn' => $deviceSn,
+            'target_area_id' => $areaId,
+            'status' => BiometricTransferLog::STATUS_SUCCESS,
+            'remarks' => "Employee assigned to Office Biometric Terminal ({$deviceSn}) via ZKBio Time API.",
+            'performed_by_user_id' => $account->id,
+            'performed_by_name' => $account->full_name ?? $account->username ?? 'Department Admin',
         ]);
 
         return response()->json([
             'message' => "Employee {$fullName} assigned to Office Biometric Terminal ({$deviceSn}) via ZKBio Time API.",
-            'command_id' => $command->id,
+            'transfer_log_id' => $transferLog->id,
+            'command_id' => $transferLog->id,
         ]);
     }
 
@@ -402,7 +553,7 @@ class BiometricRegistrationController extends Controller
 
     public function syncFromLogs(): JsonResponse
     {
-        $rawLogs = \App\Models\AttendanceRawLog::query()
+        $rawLogs = \App\Models\AttendanceLog::query()
             ->select('biometric_pin', 'device_serial_number', 'punch_time')
             ->orderBy('id')
             ->get();
@@ -464,6 +615,47 @@ class BiometricRegistrationController extends Controller
         return response()->json([
             'message' => "Successfully synchronized {$syncedCount} employee(s) from attendance logs into biometric registry.",
             'synced_count' => $syncedCount,
+        ]);
+    }
+
+    /**
+     * Retrieve paginated biometric transfer and assignment audit transaction logs.
+     */
+    public function transferLogs(Request $request): JsonResponse
+    {
+        $query = BiometricTransferLog::query();
+
+        if ($request->filled('employee_control_no')) {
+            $query->where('employee_control_no', $request->input('employee_control_no'));
+        }
+
+        if ($request->filled('action_type')) {
+            $query->where('action_type', $request->input('action_type'));
+        }
+
+        if ($request->filled('status')) {
+            $query->where('status', $request->input('status'));
+        }
+
+        if ($request->filled('search')) {
+            $search = trim((string) $request->input('search'));
+            $query->where(function ($q) use ($search): void {
+                $q->where('employee_control_no', 'like', "%{$search}%")
+                    ->orWhere('employee_name', 'like', "%{$search}%")
+                    ->orWhere('source_office_name', 'like', "%{$search}%")
+                    ->orWhere('target_office_name', 'like', "%{$search}%")
+                    ->orWhere('remarks', 'like', "%{$search}%");
+            });
+        }
+
+        $perPage = max(1, min(100, (int) $request->input('per_page', 20)));
+        $logs = $query->orderByDesc('id')->paginate($perPage);
+
+        return response()->json([
+            'logs' => $logs->items(),
+            'total' => $logs->total(),
+            'current_page' => $logs->currentPage(),
+            'last_page' => $logs->lastPage(),
         ]);
     }
 }

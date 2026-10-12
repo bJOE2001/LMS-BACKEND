@@ -11,6 +11,10 @@ return new class extends Migration
      */
     public function up(): void
     {
+        if (Schema::connection('bio')->hasTable('tblBiometricDeviceCommands')) {
+            Schema::connection('bio')->dropIfExists('tblBiometricDeviceCommands');
+        }
+
         if (! Schema::connection('bio')->hasTable('tblBiometricEnrollments')) {
             Schema::connection('bio')->create('tblBiometricEnrollments', function (Blueprint $table): void {
                 $table->id();
@@ -25,25 +29,6 @@ return new class extends Migration
                 $table->timestamps();
 
                 $table->index(['status'], 'IX_tblBiometricEnrollments_status');
-            });
-        }
-
-        if (! Schema::connection('bio')->hasTable('tblBiometricDeviceCommands')) {
-            Schema::connection('bio')->create('tblBiometricDeviceCommands', function (Blueprint $table): void {
-                $table->id();
-                $table->string('device_serial_number', 50)->index('IX_tblBiometricDeviceCommands_device_sn');
-                $table->string('command_type', 40)->default('DATA_USER'); // DATA_USER, DELETE_USER, INFO, REBOOT
-                $table->text('command_payload');
-                $table->string('employee_control_no', 50)->nullable()->index('IX_tblBiometricDeviceCommands_control_no');
-                $table->string('employee_name', 150)->nullable();
-                $table->string('status', 30)->default('PENDING'); // PENDING, SENT, SUCCESS, FAILED
-                $table->string('response_payload', 255)->nullable();
-                $table->unsignedBigInteger('created_by_user_id')->nullable();
-                $table->dateTime('sent_at')->nullable();
-                $table->dateTime('executed_at')->nullable();
-                $table->timestamps();
-
-                $table->index(['device_serial_number', 'status'], 'IX_tblBiometricDeviceCommands_device_status');
             });
         }
     }

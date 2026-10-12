@@ -2,7 +2,6 @@
 
 namespace App\Services\Attendance;
 
-use App\Models\BiometricDeviceCommand;
 use App\Models\BiometricEnrollment;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -247,23 +246,6 @@ class ZkBioTimeReconciliationService
         $enrollment->enrolled_at = $enrolledAt;
         $enrollment->synced_devices = $allDevices;
         $enrollment->save();
-
-        // Idempotently close any pending local device commands for this employee
-        try {
-            BiometricDeviceCommand::query()
-                ->where('employee_control_no', $controlNo)
-                ->where('status', BiometricDeviceCommand::STATUS_PENDING)
-                ->update([
-                    'status' => BiometricDeviceCommand::STATUS_SUCCESS,
-                    'executed_at' => now(),
-                    'response_payload' => 'Completed via ZKBio Time biometric reconciliation',
-                ]);
-        } catch (Throwable $e) {
-            Log::warning('ZkBioTimeReconciliationService: Failed to update local commands', [
-                'control_no' => $controlNo,
-                'error' => $e->getMessage(),
-            ]);
-        }
 
         return $enrollment;
     }

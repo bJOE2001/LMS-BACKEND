@@ -43,13 +43,6 @@ Route::post('/login', [AuthController::class, 'login']);
 Route::post('/forgot-password', [PasswordResetController::class, 'forgotPassword']);
 Route::post('/reset-password', [PasswordResetController::class, 'resetPassword']);
 
-// ZKTeco MB360 ADMS Push Protocol Endpoints
-Route::match(['GET', 'POST'], '/iclock/cdata', [\App\Http\Controllers\Attendance\ZkAdmsController::class, 'cdata']);
-Route::get('/iclock/getrequest', [\App\Http\Controllers\Attendance\ZkAdmsController::class, 'getrequest']);
-Route::post('/iclock/devicecmd', [\App\Http\Controllers\Attendance\ZkAdmsController::class, 'devicecmd']);
-Route::match(['GET', 'POST'], '/iclock/querydata', [\App\Http\Controllers\Attendance\ZkAdmsController::class, 'querydata']);
-Route::match(['GET', 'POST'], '/iclock/fdata', [\App\Http\Controllers\Attendance\ZkAdmsController::class, 'fdata']);
-
 /*
 |--------------------------------------------------------------------------
 | ERMS Integration Routes (trusted frontend origins or API key protected)
@@ -141,6 +134,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::get('/biometric/employee-status/{controlNo}', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'employeeStatus']);
         Route::post('/biometric/pull-to-office', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'adminPullToOffice']);
         Route::post('/biometric/pull-department-roster', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'adminPullDepartmentRoster']);
+        Route::get('/biometric/transfer-logs', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'transferLogs']);
     });
 
     Route::middleware('department_admin')->prefix('admin')->group(function () {
@@ -247,6 +241,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::post('/register', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'hrRegister']);
             Route::post('/reconcile', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'reconcile']);
             Route::post('/sync-from-logs', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'syncFromLogs']);
+            Route::get('/transfer-logs', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'transferLogs']);
         });
 
         Route::middleware('hr.module:access_control')->prefix('access-control')->group(function () {

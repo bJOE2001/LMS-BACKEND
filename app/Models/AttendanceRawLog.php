@@ -15,7 +15,7 @@ class AttendanceRawLog extends Model
 {
     protected $connection = 'bio';
 
-    protected $table = 'tblAttendanceRawLogs';
+    protected $table = 'tblAttendanceLogs';
 
     /** Punch state constants standard in ZKTeco firmware */
     public const STATE_CHECK_IN = 0;

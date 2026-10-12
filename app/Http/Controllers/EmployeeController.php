@@ -3084,6 +3084,7 @@ class EmployeeController extends Controller
 
         $updatedEmployee = HrisEmployee::findByControlNo($storedControlNo, true) ?? $employee;
         if ($existingAssignment) {
+            $sourceDeptId = (int) $existingAssignment->department_id;
             $existingAssignment->fill([
                 'department_id' => $admin->department_id,
                 'assigned_by_department_admin_id' => $admin->id,
@@ -3093,7 +3094,7 @@ class EmployeeController extends Controller
             $existingAssignment->save();
 
             $transferResult = app(BiometricTransferService::class)
-                ->transferOnDepartmentAssignment($storedControlNo, (int) $admin->department_id, (int) $admin->id);
+                ->transferOnDepartmentAssignment($storedControlNo, (int) $admin->department_id, (int) $admin->id, $sourceDeptId);
 
             $responseMessage = 'Employee pulled to your office successfully.';
             if (! empty($transferResult['transferred']) && ! empty($transferResult['message'])) {

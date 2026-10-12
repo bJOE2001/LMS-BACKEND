@@ -80,7 +80,7 @@ class BiometricDevice extends Model
 
     public function getIsOnlineAttribute(): bool
     {
-        if (! $this->is_active || $this->status === self::STATUS_PENDING_APPROVAL) {
+        if (! $this->is_active || $this->status === self::STATUS_PENDING_APPROVAL || $this->status === self::STATUS_BLOCKED) {
             return false;
         }
 

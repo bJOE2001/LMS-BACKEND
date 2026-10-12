@@ -323,10 +323,27 @@ class DailyTimeRecordController extends Controller
             $dtr->ot_departure = $this->normalizeTimeInput($validated['ot_departure']);
         }
 
-        // When justified with official business/pass slip, waive absence/tardiness
-        $dtr->status = $dtr->adjustment_reason;
-        if ($dtr->rendered_hours <= 0) {
-            $dtr->rendered_hours = 8.00;
+        if ($dtr->adjustment_reason === 'MANUAL_OVERRIDE') {
+            $schedule = $this->dtrService->resolveSchedule($dtr->employee_control_no);
+            $lateAndUndertime = $this->dtrService->calculateLateAndUndertime(
+                $dtr->am_arrival,
+                $dtr->am_departure,
+                $dtr->pm_arrival,
+                $dtr->pm_departure,
+                $schedule
+            );
+            $dtr->late_minutes = $lateAndUndertime['late_minutes'];
+            $dtr->undertime_minutes = $lateAndUndertime['undertime_minutes'];
+            $hasAnyPunches = $dtr->am_arrival !== null || $dtr->am_departure !== null || $dtr->pm_arrival !== null || $dtr->pm_departure !== null;
+            $dtr->status = $hasAnyPunches ? DailyTimeRecord::STATUS_PRESENT : DailyTimeRecord::STATUS_ABSENT;
+        } else {
+            // When justified with official business/pass slip, waive absence/tardiness
+            $dtr->late_minutes = 0;
+            $dtr->undertime_minutes = 0;
+            $dtr->status = $dtr->adjustment_reason;
+            if ($dtr->rendered_hours <= 0) {
+                $dtr->rendered_hours = 8.00;
+            }
         }
 
         $dtr->save();
@@ -393,13 +410,29 @@ class DailyTimeRecordController extends Controller
             $pmDeparture
         );
 
+        $schedule = $this->dtrService->resolveSchedule($canonicalControlNo);
+        $lateAndUndertime = $this->dtrService->calculateLateAndUndertime(
+            $amArrival,
+            $amDeparture,
+            $pmArrival,
+            $pmDeparture,
+            $schedule
+        );
+
+        $dtr->late_minutes = $lateAndUndertime['late_minutes'];
+        $dtr->undertime_minutes = $lateAndUndertime['undertime_minutes'];
+
         $hasAnyPunches = $amArrival !== null || $amDeparture !== null || $pmArrival !== null || $pmDeparture !== null;
         if ($hasAnyPunches) {
             $dtr->status = DailyTimeRecord::STATUS_PRESENT;
             $dtr->rendered_hours = $rendered > 0 ? $rendered : 8.00;
+        } else {
+            $dtr->status = DailyTimeRecord::STATUS_ABSENT;
+            $dtr->rendered_hours = 0.00;
         }
 
         // Calculate overtime minutes if applicable
+        $dtr->overtime_minutes = 0;
         if ($otArrival !== null && $otDeparture !== null) {
             try {
                 $otIn = CarbonImmutable::parse($otArrival);
@@ -407,7 +440,7 @@ class DailyTimeRecordController extends Controller
                 if ($otOut->isAfter($otIn)) {
                     $dtr->overtime_minutes = abs($otOut->diffInMinutes($otIn));
                 }
-            } catch (Throwable) {
+            } catch (\Throwable) {
                 // ignore
             }
         }

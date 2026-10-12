@@ -9,6 +9,47 @@ use Tests\TestCase;
 
 class BiometricDeviceOfficeResolutionTest extends TestCase
 {
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        \App\Models\BiometricDevice::firstOrCreate(
+            ['serial_number' => 'KMY2252000112'],
+            [
+                'device_name' => 'CHRMO',
+                'department_id' => 18,
+                'department_name' => 'City Human Resource Management Office',
+                'zkbio_area_id' => 3,
+                'is_primary' => true,
+                'status' => 'ONLINE',
+                'is_active' => true,
+            ]
+        );
+
+        \App\Models\BiometricDevice::firstOrCreate(
+            ['serial_number' => 'KMY2252000117'],
+            [
+                'device_name' => 'CICTMO',
+                'department_id' => 19,
+                'department_name' => 'City Information and Communications Technology Management Office',
+                'zkbio_area_id' => 2,
+                'is_primary' => true,
+                'status' => 'ONLINE',
+                'is_active' => true,
+            ]
+        );
+
+        \App\Models\BiometricEnrollment::firstOrCreate(
+            ['employee_control_no' => '022936'],
+            [
+                'employee_name' => 'BELLY JOE B. BASADRE',
+                'status' => \App\Models\BiometricEnrollment::STATUS_REGISTERED,
+                'enrollment_device_sn' => 'KMY2252000112',
+                'synced_devices' => ['KMY2252000112'],
+            ]
+        );
+    }
+
     protected function getHrUser(): HRAccount
     {
         $hrUser = HRAccount::first();
@@ -152,15 +193,26 @@ class BiometricDeviceOfficeResolutionTest extends TestCase
         $mockReconciliation->shouldReceive('assignEmployeeExclusivelyToArea')->andReturn(['success' => true, 'message' => 'Success']);
         $this->app->instance(\App\Services\Attendance\ZkBioTimeReconciliationService::class, $mockReconciliation);
 
+        \App\Models\BiometricEnrollment::updateOrCreate(
+            ['employee_control_no' => 'TEST_REMOVE_EMP'],
+            [
+                'employee_name' => 'Test Remove Employee',
+                'status' => \App\Models\BiometricEnrollment::STATUS_REGISTERED,
+                'synced_devices' => ['KMY2252000117'],
+            ]
+        );
+
         $service = app(BiometricTransferService::class);
-        $result = $service->removeOnDepartmentDeassignment('022936', 19);
+        $result = $service->removeOnDepartmentDeassignment('TEST_REMOVE_EMP', 19);
 
         $this->assertTrue($result['removed']);
 
         // Verify that synced_devices is cleared
-        $enrollment = \App\Models\BiometricEnrollment::query()->where('employee_control_no', '022936')->first();
+        $enrollment = \App\Models\BiometricEnrollment::query()->where('employee_control_no', 'TEST_REMOVE_EMP')->first();
         $this->assertNotNull($enrollment);
         $this->assertEmpty($enrollment->synced_devices);
+
+        $enrollment->delete();
     }
 
     public function test_hr_register_pushes_to_chrmo_device(): void
@@ -173,11 +225,39 @@ class BiometricDeviceOfficeResolutionTest extends TestCase
         \Laravel\Sanctum\Sanctum::actingAs($hrUser);
 
         $response = $this->postJson('/api/hr/biometric-registration/register', [
-            'employee_control_no' => '022936',
+            'employee_control_no' => 'TEST_REG_EMP',
             'device_serial_number' => 'KMY2252000112',
         ]);
 
         $response->assertStatus(200);
         $response->assertJsonStructure(['message', 'command_id', 'enrollment']);
+
+        \App\Models\BiometricEnrollment::where('employee_control_no', 'TEST_REG_EMP')->delete();
+        \App\Models\BiometricTransferLog::where('employee_control_no', 'TEST_REG_EMP')->delete();
+    }
+
+    public function test_hr_index_returns_not_registered_employees(): void
+    {
+        $hrUser = $this->getHrUser();
+        \Laravel\Sanctum\Sanctum::actingAs($hrUser);
+
+        $response = $this->getJson('/api/hr/biometric-registration?status=NOT_REGISTERED');
+        $response->assertStatus(200);
+        $response->assertJsonStructure([
+            'employees',
+            'total',
+            'stats' => ['total_employees', 'registered', 'pending', 'not_registered'],
+        ]);
+
+        $this->assertNotEmpty($response->json('employees'));
+        $first = $response->json('employees.0');
+        $this->assertSame('NOT REGISTERED', $first['biometric_status']);
+        $this->assertGreaterThan(0, $response->json('total'));
+        $this->assertGreaterThan(0, $response->json('stats.not_registered'));
+
+        // Case-insensitive check
+        $responseLower = $this->getJson('/api/hr/biometric-registration?status=not_registered');
+        $responseLower->assertStatus(200);
+        $this->assertNotEmpty($responseLower->json('employees'));
     }
 }

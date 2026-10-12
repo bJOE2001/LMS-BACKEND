@@ -97,6 +97,16 @@ class DtrCalculationService
             ->where('record_date', $dateStr)
             ->first();
 
+        // If this record has a manual adjustment, manual punch times take strict precedence over raw biometric logs
+        if ($existingDtr && $existingDtr->is_adjusted) {
+            $slotted['am_arrival'] = $existingDtr->am_arrival;
+            $slotted['am_departure'] = $existingDtr->am_departure;
+            $slotted['pm_arrival'] = $existingDtr->pm_arrival;
+            $slotted['pm_departure'] = $existingDtr->pm_departure;
+            $slotted['ot_arrival'] = $existingDtr->ot_arrival;
+            $slotted['ot_departure'] = $existingDtr->ot_departure;
+        }
+
         // 8. Calculate Late and Undertime Minutes (Strict 0 Grace Period)
         $lateAndUndertime = $this->calculateLateAndUndertime(
             $slotted['am_arrival'],
@@ -107,6 +117,32 @@ class DtrCalculationService
             $leaveInfo
         );
 
+        // Official business / pass slip / travel order adjustments waive absence and tardiness
+        if ($existingDtr && $existingDtr->is_adjusted && in_array($existingDtr->adjustment_reason, [
+            DailyTimeRecord::STATUS_OFFICIAL_BUSINESS,
+            DailyTimeRecord::STATUS_PASS_SLIP,
+            'TRAVEL_ORDER',
+            'CERTIFICATE_OF_APPEARANCE',
+        ], true)) {
+            $lateAndUndertime['late_minutes'] = 0;
+            $lateAndUndertime['undertime_minutes'] = 0;
+        }
+
+        // Calculate Overtime Minutes if OT punches are present or preserved from adjustment
+        if ($slotted['ot_arrival'] !== null && $slotted['ot_departure'] !== null) {
+            try {
+                $otIn = CarbonImmutable::parse($slotted['ot_arrival']);
+                $otOut = CarbonImmutable::parse($slotted['ot_departure']);
+                if ($otOut->isAfter($otIn)) {
+                    $lateAndUndertime['overtime_minutes'] = abs($otOut->diffInMinutes($otIn));
+                }
+            } catch (Throwable) {
+                // ignore
+            }
+        } elseif ($existingDtr && $existingDtr->is_adjusted && (int) ($existingDtr->overtime_minutes ?? 0) > 0) {
+            $lateAndUndertime['overtime_minutes'] = (int) $existingDtr->overtime_minutes;
+        }
+
         // 9. Calculate Rendered Hours
         $renderedHours = $this->calculateRenderedHours(
             $slotted['am_arrival'],
@@ -115,6 +151,14 @@ class DtrCalculationService
             $slotted['pm_departure'],
             $leaveInfo
         );
+
+        if ($existingDtr && $existingDtr->is_adjusted) {
+            if ($existingDtr->adjustment_reason !== 'MANUAL_OVERRIDE' && $renderedHours <= 0) {
+                $renderedHours = 8.00;
+            } elseif ($renderedHours <= 0 && (float) $existingDtr->rendered_hours > 0) {
+                $renderedHours = (float) $existingDtr->rendered_hours;
+            }
+        }
 
         $today = CarbonImmutable::today();
         $isToday = $dateObj->isSameDay($today);
@@ -270,6 +314,13 @@ class DtrCalculationService
     /**
      * Filter out accidental double taps within 2 minutes of each other.
      *
+     * Departure Window (Lunch Out 11:00-12:30, PM Out >= 16:00):
+     * If an employee taps at 11:59 and again at 12:00 (or 16:59 and 17:00),
+     * keep the LATEST punch so they are not penalized with false undertime.
+     *
+     * Arrival Window (Morning In < 11:00, Lunch In 12:31-14:00):
+     * Keep the EARLIEST punch so they receive credit for arriving on time.
+     *
      * @param  Collection<int, AttendanceRawLog>  $punches
      * @return Collection<int, AttendanceRawLog>
      */
@@ -288,6 +339,18 @@ class DtrCalculationService
             if ($lastTime === null || abs($time->diffInSeconds($lastTime)) > 120) {
                 $filtered->push($punch);
                 $lastTime = $time;
+            } else {
+                // Double tap detected (within 120 seconds)
+                $timeStr = $time->format('H:i:s');
+                $isDepartureWindow = ($timeStr >= '11:00:00' && $timeStr <= '12:30:00')
+                    || ($timeStr >= '16:00:00');
+
+                // In departure windows, prefer the latest punch to prevent false undertime
+                if ($isDepartureWindow) {
+                    $filtered->pop();
+                    $filtered->push($punch);
+                    $lastTime = $time;
+                }
             }
         }
 
@@ -347,14 +410,21 @@ class DtrCalculationService
                 // Classic 2-punch day (morning in, afternoon out)
                 $result['am_arrival'] = $t1;
                 $result['pm_departure'] = $t2;
-            } elseif ($t1 < $lunchThreshold && $t2 <= $afternoonThreshold) {
+            } elseif ($t1 < $lunchThreshold && $t2 >= '11:00:00' && $t2 <= '13:00:00') {
                 // Morning in, lunch out
                 $result['am_arrival'] = $t1;
                 $result['am_departure'] = $t2;
-            } elseif ($t1 >= $lunchThreshold && $t2 >= $departureThreshold) {
+            } elseif ($t1 >= '11:00:00' && $t2 <= '14:00:00') {
+                // Both punches during lunch window (e.g. 12:35 PM out, 1:00 PM in)
+                $result['am_departure'] = $t1;
+                $result['pm_arrival'] = $t2;
+            } elseif ($t1 > '12:30:00' && $t2 >= $departureThreshold) {
                 // Lunch in, afternoon out
                 $result['pm_arrival'] = $t1;
                 $result['pm_departure'] = $t2;
+            } elseif ($t1 < '11:00:00' && $t2 < '11:00:00') {
+                // Multiple morning arrival taps (e.g. 7:30 AM & 8:50 AM) - take earliest arrival
+                $result['am_arrival'] = $t1;
             } else {
                 $result['am_arrival'] = $t1;
                 $result['pm_departure'] = $t2;
@@ -363,39 +433,41 @@ class DtrCalculationService
             return $result;
         }
 
-        // For 3 or more punches: Assign to closest logical slots
-        foreach ($times as $time) {
-            // Slot 1: AM Arrival (between 05:00 and 10:30)
-            if ($result['am_arrival'] === null && $time <= '10:30:00') {
-                $result['am_arrival'] = $time;
-
-                continue;
-            }
-
-            // Slot 2: AM Departure / Lunch Out (between 11:00 and 12:45)
-            if ($result['am_departure'] === null && $time >= '11:00:00' && $time <= '12:45:00') {
-                $result['am_departure'] = $time;
-
-                continue;
-            }
-
-            // Slot 3: PM Arrival / Lunch In (between 12:15 and 14:00)
-            if ($result['pm_arrival'] === null && $time >= '12:15:00' && $time <= '14:00:00') {
-                if ($result['am_departure'] === null || $time > $result['am_departure']) {
-                    $result['pm_arrival'] = $time;
-
-                    continue;
-                }
-            }
-
-            // Slot 4: PM Departure (after 16:00)
-            if ($time >= '16:00:00') {
-                $result['pm_departure'] = $time;
-            }
+        // For 3 or more punches: Assign with Smart Safeguard
+        // 1. AM Arrival (earliest punch before 11:00 AM)
+        $amArrival = $times->first(fn ($t) => $t < '11:00:00');
+        if ($amArrival !== null) {
+            $result['am_arrival'] = $amArrival;
         }
 
-        // If departure was not captured in window, pick the latest punch of the day
-        if ($result['pm_departure'] === null && $count >= 3 && $times->last() > '13:30:00') {
+        // 2. Midday Lunch Window (between 11:00 and 14:00) - Smart Safeguard
+        // AM OUT (Lunch Out): 11:00 AM – 12:30 PM
+        // PM IN (Lunch In): 12:31 PM – 02:00 PM
+        $lunchOutPunches = $times->filter(fn ($t) => $t >= '11:00:00' && $t <= '12:30:00')->values();
+        $lunchInPunches = $times->filter(fn ($t) => $t > '12:30:00' && $t <= '14:00:00')->values();
+
+        if ($lunchOutPunches->isNotEmpty() && $lunchInPunches->isNotEmpty()) {
+            // Punches in both windows: First in Lunch-Out window is AM Departure, first in Lunch-In window is PM Arrival
+            $result['am_departure'] = $lunchOutPunches->first();
+            $result['pm_arrival'] = $lunchInPunches->first();
+        } elseif ($lunchOutPunches->isNotEmpty() && $lunchInPunches->isEmpty()) {
+            // Only punches in Lunch-Out window (e.g. 12:00 and 12:08, employee is currently on lunch break)
+            $result['am_departure'] = $lunchOutPunches->first();
+            $result['pm_arrival'] = null;
+        } elseif ($lunchOutPunches->isEmpty() && $lunchInPunches->count() >= 2) {
+            // Smart Safeguard: Left for lunch late (both punches after 12:30 PM, e.g. 12:35 PM out, 1:00 PM in)
+            $result['am_departure'] = $lunchInPunches[0];
+            $result['pm_arrival'] = $lunchInPunches[1];
+        } elseif ($lunchOutPunches->isEmpty() && $lunchInPunches->count() === 1) {
+            // Single punch after 12:30 PM
+            $result['pm_arrival'] = $lunchInPunches[0];
+        }
+
+        // 3. PM Departure (punches from 16:00 onwards, pick latest)
+        $pmDepartures = $times->filter(fn ($t) => $t >= '16:00:00')->values();
+        if ($pmDepartures->isNotEmpty()) {
+            $result['pm_departure'] = $pmDepartures->last();
+        } elseif ($times->last() > '13:30:00' && $times->last() !== $result['pm_arrival'] && $times->last() !== $result['am_departure']) {
             $result['pm_departure'] = $times->last();
         }
 
@@ -603,6 +675,15 @@ class DtrCalculationService
         ?string $adjustmentReason
     ): string {
         if ($isAdjusted) {
+            if ($adjustmentReason === 'MANUAL_OVERRIDE') {
+                $hasPunches = $slotted['am_arrival'] !== null
+                    || $slotted['am_departure'] !== null
+                    || $slotted['pm_arrival'] !== null
+                    || $slotted['pm_departure'] !== null;
+
+                return $hasPunches ? DailyTimeRecord::STATUS_PRESENT : DailyTimeRecord::STATUS_ABSENT;
+            }
+
             return $adjustmentReason ?: DailyTimeRecord::STATUS_OFFICIAL_BUSINESS;
         }
 
@@ -642,7 +723,7 @@ class DtrCalculationService
      * @param  array<int, string>  $variants
      * @return array{work_start_time: string, work_end_time: string, break_start_time: string, break_end_time: string}
      */
-    private function resolveSchedule(string $controlNo, array $variants = []): array
+    public function resolveSchedule(string $controlNo, array $variants = []): array
     {
         try {
             $lookupList = array_values(array_unique(array_filter([$controlNo, ...$variants])));

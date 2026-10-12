@@ -62,13 +62,64 @@ class BiometricDeviceController extends Controller
 
             // Determine live online status
             $isOnline = false;
-            $lastActivity = $dev->last_heartbeat_at;
+            $lastActivity = $zkLive?->last_activity ?? $dev->last_heartbeat_at;
+
+            $isRecent = false;
+            if ($lastActivity) {
+                try {
+                    $lastActivityCarbon = \Carbon\Carbon::parse($lastActivity);
+                    // Device sends heartbeats every 60s. If no heartbeat within 3 minutes (180s), it is OFFLINE.
+                    $isRecent = $lastActivityCarbon->diffInSeconds(now()) <= 180;
+                } catch (\Throwable) {
+                    $isRecent = false;
+                }
+            }
 
             if ($zkLive) {
-                $isOnline = ((int) $zkLive->state === 1);
-                $lastActivity = $zkLive->last_activity ?? $dev->last_heartbeat_at;
-            } elseif ($dev->last_heartbeat_at) {
-                $isOnline = $dev->is_online;
+                // Must be both reported active by ZKBio (state == 1) AND have a fresh heartbeat within 3 minutes
+                $isOnline = ((int) $zkLive->state === 1) && $isRecent;
+
+                $updates = [];
+                if (! empty($zkLive->ip_address) && $dev->ip_address !== $zkLive->ip_address) {
+                    $updates['ip_address'] = $zkLive->ip_address;
+                }
+                $liveStatus = $isOnline ? BiometricDevice::STATUS_ONLINE : BiometricDevice::STATUS_OFFLINE;
+                if ($dev->status !== $liveStatus) {
+                    $updates['status'] = $liveStatus;
+                }
+                if ($zkLive->last_activity && $dev->last_heartbeat_at !== $zkLive->last_activity) {
+                    $updates['last_heartbeat_at'] = $zkLive->last_activity;
+                }
+                if (! empty($zkLive->terminal_name) && $dev->model_name !== $zkLive->terminal_name) {
+                    $updates['model_name'] = $zkLive->terminal_name;
+                }
+                if (! empty($zkLive->fw_ver) && $dev->firmware_version !== $zkLive->fw_ver) {
+                    $updates['firmware_version'] = $zkLive->fw_ver;
+                }
+                if (isset($zkLive->user_count) && (int) $dev->device_user_count !== (int) $zkLive->user_count) {
+                    $updates['device_user_count'] = (int) $zkLive->user_count;
+                }
+                if (isset($zkLive->fp_count) && (int) $dev->device_finger_count !== (int) $zkLive->fp_count) {
+                    $updates['device_finger_count'] = (int) $zkLive->fp_count;
+                }
+                if (isset($zkLive->face_count) && (int) $dev->device_face_count !== (int) $zkLive->face_count) {
+                    $updates['device_face_count'] = (int) $zkLive->face_count;
+                }
+                if (isset($zkLive->transaction_count) && (int) $dev->device_log_count !== (int) $zkLive->transaction_count) {
+                    $updates['device_log_count'] = (int) $zkLive->transaction_count;
+                }
+                $lastSync = $zkLive->upload_time ?? $zkLive->push_time;
+                if ($lastSync && $dev->last_sync_at !== $lastSync) {
+                    $updates['last_sync_at'] = $lastSync;
+                }
+                if (! empty($updates)) {
+                    $dev->update($updates);
+                }
+            } elseif ($dev->last_heartbeat_at || $dev->status) {
+                $isOnline = $isRecent && ($dev->status === BiometricDevice::STATUS_ONLINE);
+                if ($dev->status === BiometricDevice::STATUS_ONLINE && ! $isRecent) {
+                    $dev->update(['status' => BiometricDevice::STATUS_OFFLINE]);
+                }
             }
 
             $devices[] = [
@@ -76,8 +127,9 @@ class BiometricDeviceController extends Controller
                 'device_name' => $dev->device_name,
                 'serial_number' => $dev->serial_number,
                 'ip_address' => $dev->ip_address ?: ($zkLive?->ip_address ?? null),
-                'model' => $dev->model_name ?: 'MB360',
-                'model_name' => $dev->model_name ?: 'MB360',
+                'model' => $dev->model_name ?: ($zkLive?->terminal_name ?? 'MB360'),
+                'model_name' => $dev->model_name ?: ($zkLive?->terminal_name ?? 'MB360'),
+                'firmware_version' => $dev->firmware_version ?: ($zkLive?->fw_ver ?? null),
                 'comm_key' => $dev->comm_key,
                 'department_id' => $dev->department_id,
                 'department_name' => $dev->department?->name ?? $dev->department_name,
@@ -91,8 +143,15 @@ class BiometricDeviceController extends Controller
                 'status' => $dev->is_active ? ($isOnline ? 'ONLINE' : 'OFFLINE') : 'BLOCKED',
                 'last_activity_at' => $lastActivity,
                 'last_heartbeat_at' => $lastActivity,
+                'last_sync_at' => $dev->last_sync_at ?: ($zkLive?->upload_time ?? $zkLive?->push_time),
                 'user_count' => $zkLive?->user_count ?? $dev->device_user_count,
+                'device_user_count' => $zkLive?->user_count ?? $dev->device_user_count,
                 'fingerprint_count' => $zkLive?->fp_count ?? $dev->device_finger_count,
+                'device_finger_count' => $zkLive?->fp_count ?? $dev->device_finger_count,
+                'face_count' => $zkLive?->face_count ?? $dev->device_face_count,
+                'device_face_count' => $zkLive?->face_count ?? $dev->device_face_count,
+                'log_count' => $zkLive?->transaction_count ?? $dev->device_log_count,
+                'device_log_count' => $zkLive?->transaction_count ?? $dev->device_log_count,
             ];
         }
 
@@ -104,13 +163,23 @@ class BiometricDeviceController extends Controller
                 $areaId = $zt->area_id ? (int) $zt->area_id : null;
                 $areaName = $areaId ? ($zkAreasById[$areaId] ?? "Area {$areaId}") : null;
 
+                $ztRecent = false;
+                if ($zt->last_activity) {
+                    try {
+                        $ztRecent = \Carbon\Carbon::parse($zt->last_activity)->diffInSeconds(now()) <= 180;
+                    } catch (\Throwable) {
+                        $ztRecent = false;
+                    }
+                }
+
                 $devices[] = [
                     'id' => null,
                     'device_name' => $zt->alias ?: $sn,
                     'serial_number' => $sn,
                     'ip_address' => $zt->ip_address,
-                    'model' => 'MB360',
-                    'model_name' => 'MB360',
+                    'model' => $zt->terminal_name ?: 'MB360',
+                    'model_name' => $zt->terminal_name ?: 'MB360',
+                    'firmware_version' => $zt->fw_ver ?? null,
                     'comm_key' => '0',
                     'department_id' => null,
                     'department_name' => null,
@@ -120,12 +189,19 @@ class BiometricDeviceController extends Controller
                     'zkbio_area_name' => $areaName ? "Area {$areaId} ({$areaName})" : ($areaId ? "Area {$areaId}" : null),
                     'is_primary' => false,
                     'is_active' => false,
-                    'is_online' => ((int) $zt->state === 1),
+                    'is_online' => ((int) $zt->state === 1) && $ztRecent,
                     'status' => 'PENDING_APPROVAL',
                     'last_activity_at' => $zt->last_activity,
                     'last_heartbeat_at' => $zt->last_activity,
+                    'last_sync_at' => $zt->upload_time ?? $zt->push_time,
                     'user_count' => $zt->user_count,
+                    'device_user_count' => $zt->user_count,
                     'fingerprint_count' => $zt->fp_count,
+                    'device_finger_count' => $zt->fp_count,
+                    'face_count' => $zt->face_count ?? 0,
+                    'device_face_count' => $zt->face_count ?? 0,
+                    'log_count' => $zt->transaction_count ?? 0,
+                    'device_log_count' => $zt->transaction_count ?? 0,
                 ];
             }
         }

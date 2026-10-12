@@ -9,7 +9,7 @@ use Throwable;
 
 /**
  * Service to synchronize biometric punch transactions in real time
- * between ZKBio Time (zkbiotime.dbo.iclock_transaction) and LMS (BIO_DB.dbo.tblAttendanceRawLogs).
+ * between ZKBio Time (zkbiotime.dbo.iclock_transaction) and LMS (BIO_DB.dbo.tblAttendanceLogs).
  */
 class ZkBioPunchSyncService
 {
@@ -64,7 +64,7 @@ class ZkBioPunchSyncService
                 $verifyType = is_numeric($tx->verify_type) ? (int) $tx->verify_type : 15;
                 $workCode = $tx->work_code ? trim((string) $tx->work_code) : null;
 
-                // Check if already in tblAttendanceRawLogs
+                // Check if already in tblAttendanceLogs
                 $exists = AttendanceRawLog::query()
                     ->where('biometric_pin', $pin)
                     ->where('punch_time', $punchTime)
@@ -79,7 +79,7 @@ class ZkBioPunchSyncService
                         'punch_state' => $punchState,
                         'verify_type' => $verifyType,
                         'work_code' => $workCode,
-                        'sync_source' => 'ZKBIO_REALTIME',
+                        'sync_source' => 'ZKBIO_SYNC',
                         'raw_payload' => "ID={$tx->id};SN={$deviceSn}",
                     ]);
 
@@ -132,7 +132,7 @@ class ZkBioPunchSyncService
                 BEGIN
                     SET NOCOUNT ON;
 
-                    INSERT INTO BIO_DB.dbo.tblAttendanceRawLogs (
+                    INSERT INTO BIO_DB.dbo.tblAttendanceLogs (
                         device_serial_number,
                         biometric_pin,
                         employee_control_no,
@@ -159,7 +159,7 @@ class ZkBioPunchSyncService
                         GETDATE()
                     FROM inserted i
                     WHERE NOT EXISTS (
-                        SELECT 1 FROM BIO_DB.dbo.tblAttendanceRawLogs r
+                        SELECT 1 FROM BIO_DB.dbo.tblAttendanceLogs r
                         WHERE r.biometric_pin = i.emp_code AND r.punch_time = i.punch_time
                     );
                 END;
