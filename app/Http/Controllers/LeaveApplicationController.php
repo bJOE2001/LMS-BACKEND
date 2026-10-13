@@ -7788,6 +7788,8 @@ class LeaveApplicationController extends Controller
             'previous_start_date' => $app->start_date?->toDateString() ?: ($app->resolvedSelectedDates()[0] ?? null),
             'previous_end_date' => $app->end_date?->toDateString() ?: ($app->resolvedSelectedDates()[count($app->resolvedSelectedDates()) - 1] ?? null),
             'previous_selected_dates' => $app->resolvedSelectedDates(),
+            'previous_selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
+            'previous_selected_date_half_day_portion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
             'previous_total_days' => (float) ($app->total_days ?? 0.0),
             'leave_type_id' => (int) $app->leave_type_id,
             'leave_type_name' => $leaveType->name,
@@ -11348,6 +11350,19 @@ class LeaveApplicationController extends Controller
             'previous_selected_dates' => is_array($payload['previous_selected_dates'] ?? null)
                 ? $payload['previous_selected_dates']
                 : (is_array($payload['previousSelectedDates'] ?? null) ? $payload['previousSelectedDates'] : null),
+            'previous_selected_date_pay_status' => is_array($payload['previous_selected_date_pay_status'] ?? null)
+                ? $payload['previous_selected_date_pay_status']
+                : (is_array($payload['previousSelectedDatePayStatus'] ?? null) ? $payload['previousSelectedDatePayStatus'] : null),
+            'previous_selected_date_coverage' => is_array($payload['previous_selected_date_coverage'] ?? null)
+                ? $payload['previous_selected_date_coverage']
+                : (is_array($payload['previousSelectedDateCoverage'] ?? null) ? $payload['previousSelectedDateCoverage'] : null),
+            'previous_selected_date_half_day_portion' => is_array($payload['previous_selected_date_half_day_portion'] ?? null)
+                ? $payload['previous_selected_date_half_day_portion']
+                : (is_array($payload['previousSelectedDateHalfDayPortion'] ?? null) ? $payload['previousSelectedDateHalfDayPortion'] : null),
+            'previous_pay_mode' => $this->trimNullableString($payload['previous_pay_mode'] ?? $payload['previousPayMode'] ?? null),
+            'previous_without_pay_days' => isset($payload['previous_without_pay_days'])
+                ? (float) $payload['previous_without_pay_days']
+                : (isset($payload['previousWithoutPayDays']) ? (float) $payload['previousWithoutPayDays'] : null),
             'previous_total_days' => isset($payload['previous_total_days'])
                 ? (float) $payload['previous_total_days']
                 : (isset($payload['previousTotalDays']) ? (float) $payload['previousTotalDays'] : null),

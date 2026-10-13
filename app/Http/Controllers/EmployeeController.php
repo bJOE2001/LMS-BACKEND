@@ -1324,6 +1324,7 @@ class EmployeeController extends Controller
                 'selected_dates',
                 'selected_date_pay_status',
                 'selected_date_coverage',
+                'selected_date_half_day_portion',
                 'recall_effective_date',
                 'recall_selected_dates',
                 'hr_approved_at',
@@ -1631,7 +1632,39 @@ class EmployeeController extends Controller
                         || ($origPayMode !== $payMode)
                         || ($origWithoutPayDays !== $withoutPayAmount);
 
-                    $hasLedgerUpdate = $datesChanged || $leaveTypeChanged || $creditsChanged;
+                    $currentHalfDayPortions = is_array($application->selected_date_half_day_portion)
+                        ? $application->selected_date_half_day_portion
+                        : [];
+                    $origHalfDayPortions = ! empty($firstPayload['previous_selected_date_half_day_portion']) && is_array($firstPayload['previous_selected_date_half_day_portion'])
+                        ? $firstPayload['previous_selected_date_half_day_portion']
+                        : null;
+                    if (
+                        $origHalfDayPortions === null
+                        && ! $datesChanged
+                        && ! $leaveTypeChanged
+                        && ! $creditsChanged
+                        && count($origSelectedDates) === 1
+                        && abs($origTotalDays - 0.5) < 0.001
+                    ) {
+                        $singleDateKey = (string) $origSelectedDates[0];
+                        $currPortion = strtoupper(trim((string) ($currentHalfDayPortions[$singleDateKey] ?? '')));
+                        if ($currPortion === 'PM') {
+                            $origHalfDayPortions = [$singleDateKey => 'AM'];
+                        } elseif ($currPortion === 'AM') {
+                            $origHalfDayPortions = [$singleDateKey => 'PM'];
+                        }
+                    }
+                    if ($origHalfDayPortions === null && $currentHalfDayPortions !== []) {
+                        $origHalfDayPortions = $currentHalfDayPortions;
+                    }
+
+                    $normalizedOrigPortions = is_array($origHalfDayPortions) ? $origHalfDayPortions : [];
+                    $normalizedCurrPortions = $currentHalfDayPortions;
+                    ksort($normalizedOrigPortions);
+                    ksort($normalizedCurrPortions);
+                    $halfDayPortionChanged = $normalizedOrigPortions !== $normalizedCurrPortions;
+
+                    $hasLedgerUpdate = $datesChanged || $leaveTypeChanged || $creditsChanged || $halfDayPortionChanged;
                 }
 
                 if (! $hasLedgerUpdate) {
@@ -1676,6 +1709,10 @@ class EmployeeController extends Controller
                     if ($isCancelledApp && empty($selectedDatesCandidate) && ! empty($cancelUpdateRequest?->requested_payload['selected_dates'])) {
                         $selectedDatesCandidate = $cancelUpdateRequest->requested_payload['selected_dates'];
                     }
+                    $halfDayPortionCandidate = is_array($application->selected_date_half_day_portion) ? $application->selected_date_half_day_portion : null;
+                    if ($isCancelledApp && empty($halfDayPortionCandidate) && ! empty($cancelUpdateRequest?->requested_payload['selected_date_half_day_portion']) && is_array($cancelUpdateRequest->requested_payload['selected_date_half_day_portion'])) {
+                        $halfDayPortionCandidate = $cancelUpdateRequest->requested_payload['selected_date_half_day_portion'];
+                    }
 
                     $appState = [
                         'type_id' => $typeId,
@@ -1686,6 +1723,7 @@ class EmployeeController extends Controller
                         'start_date' => $inclusiveStartDate,
                         'end_date' => $inclusiveEndDate,
                         'selected_dates' => $selectedDatesCandidate,
+                        'selected_date_half_day_portion' => $halfDayPortionCandidate,
                         'linked_vacation_leave_deducted_days' => $linkedVacationWithPayAmount,
                         'linked_forced_leave_deducted_days' => $linkedForcedWithPayAmount,
                         'linked_sick_leave_deducted_days' => $linkedSickWithPayAmount,
@@ -1795,6 +1833,7 @@ class EmployeeController extends Controller
                         'inclusive_end_date' => $origEndDate,
                         'inclusive_dates' => $origInclusiveDates,
                         'selected_dates' => $origSelectedDates,
+                        'selected_date_half_day_portion' => $origHalfDayPortions,
                         'category' => 'superseded',
                         'orig_pay_mode' => $origPayMode,
                         'orig_without_pay_days' => $origWithoutPayDays,
@@ -1828,6 +1867,7 @@ class EmployeeController extends Controller
                         'start_date' => $application->start_date?->toDateString(),
                         'end_date' => $application->end_date?->toDateString(),
                         'selected_dates' => is_array($application->selected_dates) ? $application->selected_dates : [],
+                        'selected_date_half_day_portion' => is_array($application->selected_date_half_day_portion) ? $application->selected_date_half_day_portion : null,
                         'linked_vacation_leave_deducted_days' => $linkedVacationWithPayAmount,
                         'linked_forced_leave_deducted_days' => $linkedForcedWithPayAmount,
                         'linked_sick_leave_deducted_days' => $linkedSickWithPayAmount,
@@ -2170,6 +2210,7 @@ class EmployeeController extends Controller
                     'inclusive_end_date' => $inclusiveEndDate !== '' ? $inclusiveEndDate : null,
                     'inclusive_dates' => $inclusiveDates,
                     'selected_dates' => $transaction['selected_dates'] ?? $inclusiveDates,
+                    'selected_date_half_day_portion' => $transaction['selected_date_half_day_portion'] ?? null,
                 ];
 
                 if ($mergeKey !== null) {
@@ -4537,6 +4578,7 @@ class EmployeeController extends Controller
             $inclusiveStartDate,
             $inclusiveEndDate
         );
+        $selectedDateHalfDayPortion = $state['selected_date_half_day_portion'] ?? null;
 
         $transactionDate = (string) $state['transaction_date'];
         $transactionTimestamp = (string) ($state['transaction_timestamp'] ?? $transactionDate);
@@ -4567,6 +4609,7 @@ class EmployeeController extends Controller
                     'inclusive_start_date' => $inclusiveStartDate,
                     'inclusive_end_date' => $inclusiveEndDate,
                     'inclusive_dates' => $inclusiveDates,
+                    'selected_date_half_day_portion' => $selectedDateHalfDayPortion,
                     'category' => 'deduction_with_pay',
                     'amount' => $componentAmount,
                     'balance_delta' => -$componentAmount,
@@ -4587,6 +4630,7 @@ class EmployeeController extends Controller
                 'inclusive_start_date' => $inclusiveStartDate,
                 'inclusive_end_date' => $inclusiveEndDate,
                 'inclusive_dates' => $inclusiveDates,
+                'selected_date_half_day_portion' => $selectedDateHalfDayPortion,
                 'category' => 'deduction_with_pay',
                 'amount' => $primaryWithPayAmount,
                 'balance_delta' => $isUsageOnlyOtherType ? 0.0 : -$primaryWithPayAmount,
@@ -4613,6 +4657,7 @@ class EmployeeController extends Controller
                     'inclusive_start_date' => $inclusiveStartDate,
                     'inclusive_end_date' => $inclusiveEndDate,
                     'inclusive_dates' => $inclusiveDates,
+                    'selected_date_half_day_portion' => $selectedDateHalfDayPortion,
                     'category' => 'deduction_with_pay',
                     'amount' => $linkedForcedWithPayAmount,
                     'balance_delta' => -$linkedForcedWithPayAmount,
@@ -4636,6 +4681,7 @@ class EmployeeController extends Controller
                 'inclusive_start_date' => $inclusiveStartDate,
                 'inclusive_end_date' => $inclusiveEndDate,
                 'inclusive_dates' => $inclusiveDates,
+                'selected_date_half_day_portion' => $selectedDateHalfDayPortion,
                 'category' => 'deduction_with_pay',
                 'amount' => $linkedVacationWithPayAmount,
                 'balance_delta' => -$linkedVacationWithPayAmount,
@@ -4657,6 +4703,7 @@ class EmployeeController extends Controller
                 'inclusive_start_date' => $inclusiveStartDate,
                 'inclusive_end_date' => $inclusiveEndDate,
                 'inclusive_dates' => $inclusiveDates,
+                'selected_date_half_day_portion' => $selectedDateHalfDayPortion,
                 'category' => 'deduction_with_pay',
                 'amount' => $linkedSickWithPayAmount,
                 'balance_delta' => -$linkedSickWithPayAmount,
@@ -4678,6 +4725,7 @@ class EmployeeController extends Controller
                 'inclusive_start_date' => $inclusiveStartDate,
                 'inclusive_end_date' => $inclusiveEndDate,
                 'inclusive_dates' => $inclusiveDates,
+                'selected_date_half_day_portion' => $selectedDateHalfDayPortion,
                 'category' => 'deduction_without_pay',
                 'amount' => $withoutPayAmount,
                 'balance_delta' => 0.0,
@@ -4730,6 +4778,7 @@ class EmployeeController extends Controller
                 'inclusive_end_date' => $tx['inclusive_end_date'] ?? null,
                 'inclusive_dates' => $tx['inclusive_dates'] ?? [],
                 'selected_dates' => $tx['selected_dates'] ?? ($tx['inclusive_dates'] ?? []),
+                'selected_date_half_day_portion' => $tx['selected_date_half_day_portion'] ?? null,
                 'category' => 'earned',
                 'amount' => $amount,
                 'balance_delta' => ! empty($tx['is_usage_only']) ? 0.0 : $amount,
