@@ -118,6 +118,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
     Route::prefix('attendance')->group(function () {
         Route::get('/dtr', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'departmentOverview']);
         Route::get('/dtr/employee/{controlNo}', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'employeeMonthlyDtr']);
+        Route::post('/dtr/bulk-print', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'bulkDtr']);
         Route::post('/dtr/{id}/adjust', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'adjust']);
         Route::post('/dtr/override', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'overrideTime']);
         Route::post('/dtr/recalculate', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'recalculate']);

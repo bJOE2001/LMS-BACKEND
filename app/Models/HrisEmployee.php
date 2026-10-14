@@ -28,6 +28,8 @@ class HrisEmployee
 
     private const OFFICE_TABLE = 'yOffice';
 
+    private const SERVICE_TABLE = 'xService';
+
     private const CACHE_TTL_MINUTES = 5;
 
     private const STALE_CACHE_TTL_MINUTES = 60;
@@ -270,6 +272,61 @@ class HrisEmployee
                 'lookup_count' => count($lookupValues),
             ]
         );
+    }
+
+    /**
+     * Find charges for an employee from xService for a given period or latest record.
+     */
+    public static function chargesByControlNo(string $controlNo, ?string $startDate = null, ?string $endDate = null): ?string
+    {
+        $lookupValues = self::controlNoLookupValues([$controlNo]);
+        if ($lookupValues === []) {
+            return null;
+        }
+
+        try {
+            // First attempt: Match service period overlapping the requested date range
+            if ($startDate && $endDate) {
+                $query = DB::connection(self::HR_CONNECTION)
+                    ->table(self::SERVICE_TABLE.' as xs')
+                    ->whereNotNull('xs.Charges')
+                    ->where(function ($q) use ($startDate, $endDate): void {
+                        $q->where('xs.FromDate', '<=', $endDate.' 23:59:59')
+                            ->where('xs.ToDate', '>=', $startDate.' 00:00:00');
+                    })
+                    ->orderBy('xs.FromDate', 'desc')
+                    ->selectRaw('LTRIM(RTRIM(CONVERT(VARCHAR(255), xs.Charges))) as charges');
+
+                self::applyLiteralControlNoFilter($query, 'xs.ControlNo', $lookupValues);
+
+                $charges = $query->value('charges');
+                if ($charges !== null && trim($charges) !== '') {
+                    return trim($charges);
+                }
+            }
+
+            // Fallback: Latest service record with non-empty charges
+            $fallbackQuery = DB::connection(self::HR_CONNECTION)
+                ->table(self::SERVICE_TABLE.' as xs')
+                ->whereNotNull('xs.Charges')
+                ->whereRaw("LTRIM(RTRIM(CONVERT(VARCHAR(255), xs.Charges))) <> ''")
+                ->orderBy('xs.FromDate', 'desc')
+                ->selectRaw('LTRIM(RTRIM(CONVERT(VARCHAR(255), xs.Charges))) as charges');
+
+            self::applyLiteralControlNoFilter($fallbackQuery, 'xs.ControlNo', $lookupValues);
+
+            $fallbackCharges = $fallbackQuery->value('charges');
+
+            return $fallbackCharges !== null && trim($fallbackCharges) !== '' ? trim($fallbackCharges) : null;
+        } catch (Throwable $e) {
+            self::reportFailure('chargesByControlNo', $e, [
+                'control_no' => $controlNo,
+                'start_date' => $startDate,
+                'end_date' => $endDate,
+            ]);
+
+            return null;
+        }
     }
 
     private static function orderedQuery(?bool $activeOnly = null, bool $includeOfficeAcronym = true): Builder

@@ -8,6 +8,7 @@ use App\Models\BiometricEnrollment;
 use App\Models\DailyTimeRecord;
 use App\Models\Department;
 use App\Models\DepartmentAdmin;
+use App\Models\DepartmentHead;
 use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
@@ -39,13 +40,25 @@ class DailyTimeRecordController extends Controller
         $validated = $request->validate([
             'year' => ['nullable', 'integer', 'min:2020', 'max:2099'],
             'month' => ['nullable', 'integer', 'min:1', 'max:12'],
+            'start_date' => ['nullable', 'date_format:Y-m-d'],
+            'end_date' => ['nullable', 'date_format:Y-m-d'],
         ]);
 
         $year = (int) ($validated['year'] ?? now()->year);
         $month = (int) ($validated['month'] ?? now()->month);
 
-        $startDate = CarbonImmutable::createFromDate($year, $month, 1)->startOfMonth();
-        $endDate = $startDate->endOfMonth();
+        if (! empty($validated['start_date']) && ! empty($validated['end_date'])) {
+            $startDate = CarbonImmutable::parse($validated['start_date'])->startOfDay();
+            $endDate = CarbonImmutable::parse($validated['end_date'])->startOfDay();
+            if ($startDate->isAfter($endDate)) {
+                [$startDate, $endDate] = [$endDate, $startDate];
+            }
+            $year = $startDate->year;
+            $month = $startDate->month;
+        } else {
+            $startDate = CarbonImmutable::createFromDate($year, $month, 1)->startOfMonth();
+            $endDate = $startDate->endOfMonth();
+        }
 
         $employee = HrisEmployee::findByControlNo($controlNo, true)
             ?? HrisEmployee::findByControlNo($controlNo, false);
@@ -60,7 +73,7 @@ class DailyTimeRecordController extends Controller
         // Sync any recent punches from ZKBio Time
         $this->punchSyncService->syncPunches();
 
-        // Calculate/refresh DTR for the full month
+        // Calculate/refresh DTR for the requested period
         $records = $this->dtrService->calculateForEmployeeRange(
             $canonicalControlNo,
             $startDate->format('Y-m-d'),
@@ -90,13 +103,84 @@ class DailyTimeRecordController extends Controller
             'location' => $d->location ?: 'Office',
         ]);
 
+        $charges = HrisEmployee::chargesByControlNo(
+            $canonicalControlNo,
+            $startDate->format('Y-m-d'),
+            $endDate->format('Y-m-d')
+        );
+
+        // Resolve default In-Charge signatory (Department Head)
+        $defaultInCharge = [
+            'name' => 'JOSEPH NELSON N. BRIONES',
+            'title' => 'CICTMO HEAD',
+            'control_no' => null,
+        ];
+
+        $assignment = EmployeeDepartmentAssignment::with('department.departmentHead')
+            ->where('employee_control_no', $canonicalControlNo)
+            ->first();
+
+        $dept = $assignment?->department;
+        if (! $dept && ! empty($employee->office)) {
+            $dept = Department::with('departmentHead')
+                ->where('name', $employee->office)
+                ->first();
+        }
+
+        $head = $dept?->departmentHead;
+        if ($head) {
+            $middleInitial = $head->middlename ? ' '.strtoupper(trim($head->middlename)[0]).'.' : '';
+            $headName = strtoupper(trim(($head->firstname ?? '').$middleInitial.' '.($head->surname ?? '')));
+            if ($headName === '' && ! empty($head->full_name)) {
+                $headName = strtoupper(trim($head->full_name));
+            }
+
+            $acronym = trim((string) ($dept->acronym ?? ''));
+            $title = $acronym !== '' ? $acronym.' HEAD' : ($head->position ?: 'DEPARTMENT HEAD');
+
+            $defaultInCharge = [
+                'name' => $headName ?: 'DEPARTMENT HEAD',
+                'title' => $title,
+                'control_no' => $head->control_no,
+            ];
+        }
+
+        // Active Department Heads list for modal dropdown
+        $departmentHeads = DepartmentHead::query()
+            ->with('department:id,name,acronym')
+            ->orderBy('surname')
+            ->get()
+            ->map(function ($h) {
+                $mi = $h->middlename ? ' '.strtoupper(trim($h->middlename)[0]).'.' : '';
+                $name = strtoupper(trim(($h->firstname ?? '').$mi.' '.($h->surname ?? '')));
+                if ($name === '' && ! empty($h->full_name)) {
+                    $name = strtoupper(trim($h->full_name));
+                }
+                $acronym = trim((string) ($h->department?->acronym ?? ''));
+                $title = $acronym !== '' ? $acronym.' HEAD' : ($h->position ?: 'DEPARTMENT HEAD');
+
+                return [
+                    'id' => $h->id,
+                    'control_no' => $h->control_no,
+                    'name' => $name,
+                    'title' => $title,
+                    'department' => $h->department?->name ?? $h->office ?? '',
+                    'acronym' => $acronym,
+                ];
+            })
+            ->values();
+
         return response()->json([
             'employee' => [
                 'control_no' => $canonicalControlNo,
                 'name' => trim(($employee->firstname ?? '').' '.($employee->middlename ? $employee->middlename[0].'. ' : '').($employee->surname ?? '')),
                 'office' => $employee->office ?? 'General Office',
                 'designation' => $employee->designation ?? 'Employee',
+                'charges' => $charges ?? '',
+                'in_charge' => $defaultInCharge,
             ],
+            'in_charge' => $defaultInCharge,
+            'department_heads' => $departmentHeads,
             'period' => [
                 'year' => $year,
                 'month' => $month,
@@ -108,6 +192,177 @@ class DailyTimeRecordController extends Controller
             'records' => $records,
             'summary' => $summary,
             'devices' => $devices,
+        ]);
+    }
+
+    /**
+     * Get monthly/cutoff DTR records for multiple employees formatted for bulk CSC Form 48 printing.
+     */
+    public function bulkDtr(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'control_nos' => ['required', 'array', 'min:1'],
+            'control_nos.*' => ['required', 'string'],
+            'year' => ['nullable', 'integer', 'min:2020', 'max:2099'],
+            'month' => ['nullable', 'integer', 'min:1', 'max:12'],
+            'start_date' => ['nullable', 'date_format:Y-m-d'],
+            'end_date' => ['nullable', 'date_format:Y-m-d'],
+        ]);
+
+        $year = (int) ($validated['year'] ?? now()->year);
+        $month = (int) ($validated['month'] ?? now()->month);
+
+        if (! empty($validated['start_date']) && ! empty($validated['end_date'])) {
+            $startDate = CarbonImmutable::parse($validated['start_date'])->startOfDay();
+            $endDate = CarbonImmutable::parse($validated['end_date'])->startOfDay();
+            if ($startDate->isAfter($endDate)) {
+                [$startDate, $endDate] = [$endDate, $startDate];
+            }
+            $year = $startDate->year;
+            $month = $startDate->month;
+        } else {
+            $startDate = CarbonImmutable::createFromDate($year, $month, 1)->startOfMonth();
+            $endDate = $startDate->endOfMonth();
+        }
+
+        // Sync any recent punches from ZKBio Time
+        $this->punchSyncService->syncPunches();
+
+        $devices = BiometricDevice::query()->get()->keyBy('serial_number')->map(fn ($d) => [
+            'serial_number' => $d->serial_number,
+            'device_name' => $d->device_name ?: 'Biometric Device',
+            'location' => $d->location ?: 'Office',
+        ]);
+
+        $departmentHeads = DepartmentHead::query()
+            ->with('department:id,name,acronym')
+            ->orderBy('surname')
+            ->get()
+            ->map(function ($h) {
+                $mi = $h->middlename ? ' '.strtoupper(trim($h->middlename)[0]).'.' : '';
+                $name = strtoupper(trim(($h->firstname ?? '').$mi.' '.($h->surname ?? '')));
+                if ($name === '' && ! empty($h->full_name)) {
+                    $name = strtoupper(trim($h->full_name));
+                }
+                $acronym = trim((string) ($h->department?->acronym ?? ''));
+                $title = $acronym !== '' ? $acronym.' HEAD' : ($h->position ?: 'DEPARTMENT HEAD');
+
+                return [
+                    'id' => $h->id,
+                    'control_no' => $h->control_no,
+                    'name' => $name,
+                    'title' => $title,
+                    'department' => $h->department?->name ?? $h->office ?? '',
+                    'acronym' => $acronym,
+                ];
+            })
+            ->values();
+
+        $period = [
+            'year' => $year,
+            'month' => $month,
+            'month_name' => $startDate->format('F'),
+            'start_date' => $startDate->format('Y-m-d'),
+            'end_date' => $endDate->format('Y-m-d'),
+            'days_in_month' => $startDate->daysInMonth,
+        ];
+
+        $results = [];
+
+        foreach ($validated['control_nos'] as $controlNo) {
+            $employee = HrisEmployee::findByControlNo($controlNo, true)
+                ?? HrisEmployee::findByControlNo($controlNo, false);
+            if (! $employee) {
+                continue;
+            }
+
+            $canonicalControlNo = (string) ($employee->control_no ?? $controlNo);
+
+            $records = $this->dtrService->calculateForEmployeeRange(
+                $canonicalControlNo,
+                $startDate->format('Y-m-d'),
+                $endDate->format('Y-m-d')
+            );
+
+            $daysLate = $records->filter(fn ($r) => (int) ($r->late_minutes ?? 0) > 0)->count();
+            $daysOvertime = $records->filter(fn ($r) => (int) ($r->overtime_minutes ?? 0) > 0 || ! empty($r->ot_arrival))->count();
+
+            $summary = [
+                'present_days' => $records->where('status', DailyTimeRecord::STATUS_PRESENT)->count(),
+                'absent_days' => $records->where('status', DailyTimeRecord::STATUS_ABSENT)->count(),
+                'late_days' => $daysLate,
+                'overtime_days' => $daysOvertime,
+                'total_worked_hours' => round((float) $records->sum('rendered_hours'), 1),
+                'total_late_minutes' => (int) $records->sum('late_minutes'),
+                'total_undertime_minutes' => (int) $records->sum('undertime_minutes'),
+                'total_rendered_hours' => (float) $records->sum('rendered_hours'),
+                'days_present' => $records->where('status', DailyTimeRecord::STATUS_PRESENT)->count(),
+                'days_on_leave' => $records->where('status', DailyTimeRecord::STATUS_ON_LEAVE)->count(),
+                'days_absent' => $records->where('status', DailyTimeRecord::STATUS_ABSENT)->count(),
+            ];
+
+            $charges = HrisEmployee::chargesByControlNo(
+                $canonicalControlNo,
+                $startDate->format('Y-m-d'),
+                $endDate->format('Y-m-d')
+            );
+
+            // Default signatory
+            $defaultInCharge = [
+                'name' => 'JOSEPH NELSON N. BRIONES',
+                'title' => 'CICTMO HEAD',
+                'control_no' => null,
+            ];
+
+            $assignment = EmployeeDepartmentAssignment::with('department.departmentHead')
+                ->where('employee_control_no', $canonicalControlNo)
+                ->first();
+
+            $dept = $assignment?->department;
+            if (! $dept && ! empty($employee->office)) {
+                $dept = Department::with('departmentHead')
+                    ->where('name', $employee->office)
+                    ->first();
+            }
+
+            $head = $dept?->departmentHead;
+            if ($head) {
+                $middleInitial = $head->middlename ? ' '.strtoupper(trim($head->middlename)[0]).'.' : '';
+                $headName = strtoupper(trim(($head->firstname ?? '').$middleInitial.' '.($head->surname ?? '')));
+                if ($headName === '' && ! empty($head->full_name)) {
+                    $headName = strtoupper(trim($head->full_name));
+                }
+
+                $acronym = trim((string) ($dept->acronym ?? ''));
+                $title = $acronym !== '' ? $acronym.' HEAD' : ($head->position ?: 'DEPARTMENT HEAD');
+
+                $defaultInCharge = [
+                    'name' => $headName ?: 'DEPARTMENT HEAD',
+                    'title' => $title,
+                    'control_no' => $head->control_no,
+                ];
+            }
+
+            $results[] = [
+                'employee' => [
+                    'control_no' => $canonicalControlNo,
+                    'name' => trim(($employee->firstname ?? '').' '.($employee->middlename ? $employee->middlename[0].'. ' : '').($employee->surname ?? '')),
+                    'office' => $employee->office ?? 'General Office',
+                    'designation' => $employee->designation ?? 'Employee',
+                    'charges' => $charges ?? '',
+                    'in_charge' => $defaultInCharge,
+                ],
+                'in_charge' => $defaultInCharge,
+                'records' => $records,
+                'summary' => $summary,
+            ];
+        }
+
+        return response()->json([
+            'period' => $period,
+            'department_heads' => $departmentHeads,
+            'devices' => $devices,
+            'employees_dtr' => $results,
         ]);
     }
 

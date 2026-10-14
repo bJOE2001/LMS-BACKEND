@@ -644,4 +644,9 @@ class DtrCalculationTest extends TestCase
         $this->assertSame(8.0, (float) $refreshed->rendered_hours);
         $this->assertSame(DailyTimeRecord::STATUS_PRESENT, $refreshed->status);
     }
+
+    public function test_hris_employee_charges_lookup_returns_null_for_empty_control_no(): void
+    {
+        $this->assertNull(\App\Models\HrisEmployee::chargesByControlNo(''));
+    }
 }
