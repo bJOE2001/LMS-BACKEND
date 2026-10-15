@@ -12298,7 +12298,13 @@ class LeaveApplicationController extends Controller
         $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
 
         return $this->isSickLeaveType($leaveType, $canonicalLeaveTypeId)
-            || $this->isVacationLeaveType($leaveType, $canonicalLeaveTypeId);
+            || $this->isVacationLeaveType($leaveType, $canonicalLeaveTypeId)
+            || $this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
+                $leaveType,
+                $canonicalLeaveTypeId,
+                $isMonetization,
+                $vacationLeaveTypeId
+            );
     }
 
     private function resolveSlVlCrossDeductionTargetLeaveTypeId(
@@ -12328,6 +12334,15 @@ class LeaveApplicationController extends Controller
 
         if ($this->isVacationLeaveType($leaveType, $canonicalLeaveTypeId)) {
             return $sickLeaveTypeId;
+        }
+
+        if ($this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
+            $leaveType,
+            $canonicalLeaveTypeId,
+            $isMonetization,
+            $vacationLeaveTypeId
+        )) {
+            return $vacationLeaveTypeId;
         }
 
         return null;

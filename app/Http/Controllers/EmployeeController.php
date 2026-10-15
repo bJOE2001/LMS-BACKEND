@@ -1468,7 +1468,10 @@ class EmployeeController extends Controller
                             || str_contains($actionType, 'RECALL')
                             || $requestKind === 'recall';
 
-                        return ! $isCancel && ! $isRecall;
+                        $isHrEdit = $req->isHrApplicationEditRequest()
+                            || $requestKind === 'hr_application_edit';
+
+                        return ! $isCancel && ! $isRecall && ! $isHrEdit;
                     })->sortBy(function (LeaveApplicationUpdateRequest $req): string {
                         return (string) (
                             $req->reviewed_at?->toIso8601String()
@@ -4863,7 +4866,8 @@ class EmployeeController extends Controller
                     LeaveApplication::STATUS_PENDING_HR,
                 ], true) && $application->relationLoaded('updateRequests') && $application->updateRequests->contains(function (LeaveApplicationUpdateRequest $req): bool {
                     return strtoupper(trim((string) $req->status)) === LeaveApplicationUpdateRequest::STATUS_PENDING
-                        && strtoupper(trim((string) $req->previous_status)) === LeaveApplication::STATUS_APPROVED;
+                        && strtoupper(trim((string) $req->previous_status)) === LeaveApplication::STATUS_APPROVED
+                        && ! $req->isHrApplicationEditRequest();
                 });
 
                 if ($status !== LeaveApplication::STATUS_APPROVED && ! $hasPendingApprovedUpdateRequest) {
@@ -6019,7 +6023,10 @@ class EmployeeController extends Controller
                         || str_contains($actionType, 'RECALL')
                         || $requestKind === 'recall';
 
-                    return ! $isCancel && ! $isRecall;
+                    $isHrEdit = $req->isHrApplicationEditRequest()
+                        || $requestKind === 'hr_application_edit';
+
+                    return ! $isCancel && ! $isRecall && ! $isHrEdit;
                 })->sortBy(function (LeaveApplicationUpdateRequest $req): string {
                     return (string) (
                         $req->reviewed_at?->toIso8601String()
