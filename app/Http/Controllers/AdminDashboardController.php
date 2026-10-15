@@ -3542,6 +3542,51 @@ class AdminDashboardController extends Controller
         return strcasecmp((string) ($leaveTypeName ?? ''), 'Wellness Leave') === 0;
     }
 
+    private function isSoloParentLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
+    {
+        static $leaveTypeNameCache = [];
+
+        $leaveTypeName = null;
+        if ($leaveType instanceof LeaveType) {
+            $leaveTypeName = trim((string) ($leaveType->name ?? ''));
+        } elseif ($leaveTypeId !== null && $leaveTypeId > 0) {
+            if (! array_key_exists($leaveTypeId, $leaveTypeNameCache)) {
+                $leaveTypeNameCache[$leaveTypeId] = LeaveType::query()
+                    ->whereKey((int) $leaveTypeId)
+                    ->value('name');
+            }
+
+            $resolvedName = $leaveTypeNameCache[$leaveTypeId];
+            $leaveTypeName = is_string($resolvedName) ? trim($resolvedName) : null;
+        }
+
+        return strcasecmp((string) ($leaveTypeName ?? ''), 'Solo Parent Leave') === 0;
+    }
+
+    private function isCalamityLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
+    {
+        static $leaveTypeNameCache = [];
+
+        $leaveTypeName = null;
+        if ($leaveType instanceof LeaveType) {
+            $leaveTypeName = trim((string) ($leaveType->name ?? ''));
+        } elseif ($leaveTypeId !== null && $leaveTypeId > 0) {
+            if (! array_key_exists($leaveTypeId, $leaveTypeNameCache)) {
+                $leaveTypeNameCache[$leaveTypeId] = LeaveType::query()
+                    ->whereKey((int) $leaveTypeId)
+                    ->value('name');
+            }
+
+            $resolvedName = $leaveTypeNameCache[$leaveTypeId];
+            $leaveTypeName = is_string($resolvedName) ? trim($resolvedName) : null;
+        }
+
+        $normalizedName = LeaveType::normalizeLeaveTypeName($leaveTypeName);
+
+        return str_contains($normalizedName, 'CALAMITY')
+            || str_contains($normalizedName, 'SPECIAL EMERGENCY');
+    }
+
     private function shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
         LeaveType $leaveType,
         int $leaveTypeId,
@@ -3555,7 +3600,9 @@ class AdminDashboardController extends Controller
         $canonicalLeaveTypeId = LeaveType::resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
 
         return $this->isWellnessLeaveType($leaveType, $canonicalLeaveTypeId)
-            || LeaveType::isSpecialPrivilegeType($leaveType, $canonicalLeaveTypeId);
+            || LeaveType::isSpecialPrivilegeType($leaveType, $canonicalLeaveTypeId)
+            || $this->isSoloParentLeaveType($leaveType, $canonicalLeaveTypeId)
+            || $this->isCalamityLeaveType($leaveType, $canonicalLeaveTypeId);
     }
 
     private function resolveVacationLeaveTopUpDays(
