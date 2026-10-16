@@ -177,6 +177,8 @@ class DailyTimeRecordController extends Controller
                 'office' => $employee->office ?? 'General Office',
                 'designation' => $employee->designation ?? 'Employee',
                 'charges' => $charges ?? '',
+                'employment_status' => strtoupper(trim((string) ($employee->status ?? ''))),
+                'is_contractual' => strtoupper(trim((string) ($employee->status ?? ''))) === 'CONTRACTUAL',
                 'in_charge' => $defaultInCharge,
             ],
             'in_charge' => $defaultInCharge,
@@ -350,6 +352,8 @@ class DailyTimeRecordController extends Controller
                     'office' => $employee->office ?? 'General Office',
                     'designation' => $employee->designation ?? 'Employee',
                     'charges' => $charges ?? '',
+                    'employment_status' => strtoupper(trim((string) ($employee->status ?? ''))),
+                    'is_contractual' => strtoupper(trim((string) ($employee->status ?? ''))) === 'CONTRACTUAL',
                     'in_charge' => $defaultInCharge,
                 ],
                 'in_charge' => $defaultInCharge,
@@ -461,16 +465,23 @@ class DailyTimeRecordController extends Controller
                 if ((int) ($dtr->late_minutes ?? 0) > 0) {
                     $lateCount++;
                 }
-            } elseif ($dtr->status === DailyTimeRecord::STATUS_ON_LEAVE || $dtr->status === DailyTimeRecord::STATUS_HALF_DAY) {
+            } elseif (
+                $dtr->status === DailyTimeRecord::STATUS_ON_LEAVE ||
+                $dtr->status === DailyTimeRecord::STATUS_HALF_DAY ||
+                $dtr->status === DailyTimeRecord::STATUS_ON_LEAVE_AM ||
+                $dtr->status === DailyTimeRecord::STATUS_ON_LEAVE_PM
+            ) {
                 $onLeaveCount++;
             } elseif ($dtr->status === DailyTimeRecord::STATUS_ABSENT) {
                 $absentCount++;
             }
 
             $attendanceStatus = match ($dtr->status) {
-                DailyTimeRecord::STATUS_PRESENT => ((int) ($dtr->late_minutes ?? 0) > 0 ? 'Late' : 'On Time'),
+                DailyTimeRecord::STATUS_PRESENT => ((int) ($dtr->late_minutes ?? 0) > 0 ? 'Late' : 'Present'),
                 DailyTimeRecord::STATUS_ON_LEAVE => 'On Leave',
-                DailyTimeRecord::STATUS_HALF_DAY => 'Half Day',
+                DailyTimeRecord::STATUS_ON_LEAVE_AM, 'ON_LEAVE_AM' => 'On Leave (AM)',
+                DailyTimeRecord::STATUS_ON_LEAVE_PM, 'ON_LEAVE_PM' => 'On Leave (PM)',
+                DailyTimeRecord::STATUS_HALF_DAY => 'On Leave (Half Day)',
                 DailyTimeRecord::STATUS_REST_DAY => 'Rest Day',
                 DailyTimeRecord::STATUS_ABSENT => 'Absent',
                 default => $dtr->status ?: 'Absent',
@@ -553,6 +564,15 @@ class DailyTimeRecordController extends Controller
         $account = $request->user();
         $adminId = $account?->id ?? null;
 
+        $previousPunches = [
+            'am_arrival' => $dtr->am_arrival,
+            'am_departure' => $dtr->am_departure,
+            'pm_arrival' => $dtr->pm_arrival,
+            'pm_departure' => $dtr->pm_departure,
+            'ot_arrival' => $dtr->ot_arrival,
+            'ot_departure' => $dtr->ot_departure,
+        ];
+
         $dtr->is_adjusted = true;
         $dtr->adjustment_reason = $validated['adjustment_reason'] ?? 'MANUAL_OVERRIDE';
         $dtr->adjustment_remarks = $validated['adjustment_remarks'] ?? 'Manual time override';
@@ -577,6 +597,21 @@ class DailyTimeRecordController extends Controller
         if (array_key_exists('ot_departure', $validated)) {
             $dtr->ot_departure = $this->normalizeTimeInput($validated['ot_departure']);
         }
+
+        $currentAdjusted = is_array($dtr->adjusted_slots) ? $dtr->adjusted_slots : [];
+        if ($request->has('adjusted_slots') && is_array($request->input('adjusted_slots'))) {
+            $submittedSlots = array_filter($request->input('adjusted_slots'));
+            $mergedSlots = array_values(array_unique(array_merge($currentAdjusted, $submittedSlots)));
+        } else {
+            $detectedSlots = [];
+            foreach ($previousPunches as $slotKey => $prevVal) {
+                if (array_key_exists($slotKey, $validated) && $dtr->{$slotKey} !== $prevVal && $dtr->{$slotKey} !== null) {
+                    $detectedSlots[] = $slotKey;
+                }
+            }
+            $mergedSlots = array_values(array_unique(array_merge($currentAdjusted, $detectedSlots)));
+        }
+        $dtr->adjusted_slots = ! empty($mergedSlots) ? $mergedSlots : null;
 
         if ($dtr->adjustment_reason === 'MANUAL_OVERRIDE') {
             $schedule = $this->dtrService->resolveSchedule($dtr->employee_control_no);
@@ -623,6 +658,8 @@ class DailyTimeRecordController extends Controller
             'pm_departure' => ['nullable', 'string'],
             'ot_arrival' => ['nullable', 'string'],
             'ot_departure' => ['nullable', 'string'],
+            'remark' => ['nullable', 'string', 'max:100'],
+            'adjusted_slots' => ['nullable'],
         ]);
 
         $controlNo = trim((string) $validated['employee_control_no']);
@@ -645,12 +682,53 @@ class DailyTimeRecordController extends Controller
         $account = $request->user();
         $adminId = $account?->id ?? null;
 
+        $previousPunches = [
+            'am_arrival' => $dtr->am_arrival,
+            'am_departure' => $dtr->am_departure,
+            'pm_arrival' => $dtr->pm_arrival,
+            'pm_departure' => $dtr->pm_departure,
+            'ot_arrival' => $dtr->ot_arrival,
+            'ot_departure' => $dtr->ot_departure,
+        ];
+
         $dtr->am_arrival = $amArrival;
         $dtr->am_departure = $amDeparture;
         $dtr->pm_arrival = $pmArrival;
         $dtr->pm_departure = $pmDeparture;
         $dtr->ot_arrival = $otArrival;
         $dtr->ot_departure = $otDeparture;
+
+        $rawAdjustedSlots = $request->input('adjusted_slots');
+        if (is_array($rawAdjustedSlots)) {
+            $isAssoc = array_keys($rawAdjustedSlots) !== range(0, count($rawAdjustedSlots) - 1);
+            if ($isAssoc) {
+                $filtered = array_filter($rawAdjustedSlots, fn ($v) => $v !== null && $v !== '');
+                $dtr->adjusted_slots = ! empty($filtered) ? $filtered : null;
+            } else {
+                $submittedSlots = array_values(array_filter($rawAdjustedSlots));
+                $currentAdjusted = is_array($dtr->adjusted_slots) ? array_values($dtr->adjusted_slots) : [];
+                $mergedSlots = array_values(array_unique(array_merge($currentAdjusted, $submittedSlots)));
+                $dtr->adjusted_slots = ! empty($mergedSlots) ? $mergedSlots : null;
+            }
+        } else {
+            $newPunches = [
+                'am_arrival' => $amArrival,
+                'am_departure' => $amDeparture,
+                'pm_arrival' => $pmArrival,
+                'pm_departure' => $pmDeparture,
+                'ot_arrival' => $otArrival,
+                'ot_departure' => $otDeparture,
+            ];
+            $detectedSlots = [];
+            foreach ($newPunches as $slotKey => $slotVal) {
+                if ($slotVal !== ($previousPunches[$slotKey] ?? null) && $slotVal !== null) {
+                    $detectedSlots[] = $slotKey;
+                }
+            }
+            $currentAdjusted = is_array($dtr->adjusted_slots) ? array_values($dtr->adjusted_slots) : [];
+            $mergedSlots = array_values(array_unique(array_merge($currentAdjusted, $detectedSlots)));
+            $dtr->adjusted_slots = ! empty($mergedSlots) ? $mergedSlots : null;
+        }
 
         $dtr->is_adjusted = true;
         $dtr->adjustment_reason = 'MANUAL_OVERRIDE';
@@ -677,10 +755,63 @@ class DailyTimeRecordController extends Controller
         $dtr->late_minutes = $lateAndUndertime['late_minutes'];
         $dtr->undertime_minutes = $lateAndUndertime['undertime_minutes'];
 
-        $hasAnyPunches = $amArrival !== null || $amDeparture !== null || $pmArrival !== null || $pmDeparture !== null;
-        if ($hasAnyPunches) {
+        $slotMap = is_array($dtr->adjusted_slots) && (array_keys($dtr->adjusted_slots) !== range(0, count($dtr->adjusted_slots) - 1))
+            ? $dtr->adjusted_slots
+            : [];
+
+        $amIsSpecial = in_array(strtoupper((string) ($slotMap['am_arrival'] ?? '')), ['O.F.', 'O.B.', 'OFFICIAL BUSINESS', 'ON FIELD'], true)
+            || in_array(strtoupper((string) ($slotMap['am_departure'] ?? '')), ['O.F.', 'O.B.', 'OFFICIAL BUSINESS', 'ON FIELD'], true);
+
+        $pmIsSpecial = in_array(strtoupper((string) ($slotMap['pm_arrival'] ?? '')), ['O.F.', 'O.B.', 'OFFICIAL BUSINESS', 'ON FIELD'], true)
+            || in_array(strtoupper((string) ($slotMap['pm_departure'] ?? '')), ['O.F.', 'O.B.', 'OFFICIAL BUSINESS', 'ON FIELD'], true);
+
+        if ($amIsSpecial) {
+            $dtr->late_minutes = 0;
+            $rendered += 4.00;
+        }
+        if ($pmIsSpecial) {
+            $dtr->undertime_minutes = 0;
+            $rendered += 4.00;
+        }
+
+        $hasAnyPunches = $amArrival !== null || $amDeparture !== null || $pmArrival !== null || $pmDeparture !== null || $amIsSpecial || $pmIsSpecial;
+        $remarkInput = trim((string) ($validated['remark'] ?? ''));
+
+        $hasSlotMap = ! empty($slotMap);
+
+        if ($hasSlotMap) {
+            if ($amIsSpecial && $pmIsSpecial) {
+                $dtr->status = ($slotMap['am_arrival'] ?? '') === ($slotMap['pm_arrival'] ?? '') ? ($slotMap['am_arrival'] ?? DailyTimeRecord::STATUS_OFFICIAL_BUSINESS) : 'O.F. / O.B.';
+                $dtr->adjustment_remarks = $dtr->status;
+                $dtr->rendered_hours = 8.00;
+            } elseif ($hasAnyPunches) {
+                $dtr->status = DailyTimeRecord::STATUS_PRESENT;
+                $dtr->adjustment_remarks = $remarkInput !== '' ? $remarkInput : 'Slot Override';
+                $dtr->rendered_hours = min(8.00, (float) ($rendered > 0 ? $rendered : 8.00));
+            } else {
+                $dtr->status = DailyTimeRecord::STATUS_ABSENT;
+                $dtr->rendered_hours = 0.00;
+            }
+        } elseif ($remarkInput !== '') {
+            $upperRemark = strtoupper($remarkInput);
+            $dtr->adjustment_remarks = $upperRemark;
+            if (in_array($upperRemark, ['O.B.', 'OFFICIAL BUSINESS'], true)) {
+                $dtr->status = DailyTimeRecord::STATUS_OFFICIAL_BUSINESS;
+            } elseif (in_array($upperRemark, ['O.F.', 'ON FIELD'], true)) {
+                $dtr->status = 'O.F.';
+            } elseif (in_array($upperRemark, ['RESTDAY', 'REST DAY'], true)) {
+                $dtr->status = DailyTimeRecord::STATUS_REST_DAY;
+            } elseif ($upperRemark === 'HOLIDAY') {
+                $dtr->status = DailyTimeRecord::STATUS_HOLIDAY;
+            } elseif ($upperRemark === 'ABSENT') {
+                $dtr->status = DailyTimeRecord::STATUS_ABSENT;
+            } else {
+                $dtr->status = $upperRemark;
+            }
+            $dtr->rendered_hours = $hasAnyPunches ? min(8.00, ($rendered > 0 ? (float) $rendered : 8.00)) : ($upperRemark === 'ABSENT' ? 0.00 : 8.00);
+        } elseif ($hasAnyPunches) {
             $dtr->status = DailyTimeRecord::STATUS_PRESENT;
-            $dtr->rendered_hours = $rendered > 0 ? $rendered : 8.00;
+            $dtr->rendered_hours = min(8.00, (float) ($rendered > 0 ? $rendered : 8.00));
         } else {
             $dtr->status = DailyTimeRecord::STATUS_ABSENT;
             $dtr->rendered_hours = 0.00;

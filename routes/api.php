@@ -113,6 +113,8 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
     Route::post('/leave-applications/{id}/log-print', [LeaveApplicationController::class, 'logPrint']);
     Route::get('/illnesses/options', [HRIllnessLibraryController::class, 'options']);
     Route::get('/special-privilege-reasons/options', [SpecialPrivilegeReasonController::class, 'options']);
+    Route::get('/dtr-remarks/options', [\App\Http\Controllers\Attendance\DtrRemarkController::class, 'index']);
+    Route::get('/holidays/options', [\App\Http\Controllers\Attendance\HolidayController::class, 'index']);
 
     // Attendance & Daily Time Records (DTR)
     Route::prefix('attendance')->group(function () {
@@ -270,6 +272,22 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::post('/', [HRLeaveTypeController::class, 'store']);
             Route::post('/{id}/update', [HRLeaveTypeController::class, 'update']);
             Route::post('/{id}/delete', [HRLeaveTypeController::class, 'destroy']);
+        });
+
+        // Remarks Library (for DTR Overrides)
+        Route::prefix('dtr-remarks')->group(function () {
+            Route::get('/', [\App\Http\Controllers\Attendance\DtrRemarkController::class, 'index']);
+            Route::post('/', [\App\Http\Controllers\Attendance\DtrRemarkController::class, 'store']);
+            Route::post('/{id}/update', [\App\Http\Controllers\Attendance\DtrRemarkController::class, 'update']);
+            Route::post('/{id}/delete', [\App\Http\Controllers\Attendance\DtrRemarkController::class, 'destroy']);
+        });
+
+        // Holiday Library (for Attendance & DTR Calculation)
+        Route::prefix('holidays')->group(function () {
+            Route::get('/', [\App\Http\Controllers\Attendance\HolidayController::class, 'index']);
+            Route::post('/', [\App\Http\Controllers\Attendance\HolidayController::class, 'store']);
+            Route::post('/{id}/update', [\App\Http\Controllers\Attendance\HolidayController::class, 'update']);
+            Route::post('/{id}/delete', [\App\Http\Controllers\Attendance\HolidayController::class, 'destroy']);
         });
 
         Route::middleware('hr.module:applications,receiving,releasing')->group(function () {

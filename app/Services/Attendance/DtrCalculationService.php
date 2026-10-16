@@ -6,6 +6,7 @@ use App\Models\AttendanceRawLog;
 use App\Models\DailyTimeRecord;
 use App\Models\EmployeeDepartmentAssignment;
 use App\Models\EmployeeWorkScheduleOverride;
+use App\Models\Holiday;
 use App\Models\HrisEmployee;
 use App\Models\LeaveApplication;
 use App\Models\WorkScheduleSetting;
@@ -91,6 +92,19 @@ class DtrCalculationService
         // 6. Check for Approved Leaves in LMS_DB
         $leaveInfo = $this->resolveApprovedLeave($canonicalControlNo, $dateStr, $variants);
 
+        // 6b. Check for Active Holidays in LMS_DB
+        $holiday = Holiday::query()
+            ->active()
+            ->where(function ($q) use ($dateStr, $dateObj): void {
+                $q->where('holiday_date', $dateStr)
+                    ->orWhere(function ($sub) use ($dateObj): void {
+                        $sub->where('is_recurring', true)
+                            ->whereMonth('holiday_date', $dateObj->month)
+                            ->whereDay('holiday_date', $dateObj->day);
+                    });
+            })
+            ->first();
+
         // 7. Check if existing DTR has a manual adjustment (preserve it)
         $existingDtr = DailyTimeRecord::query()
             ->whereIn('employee_control_no', $variants)
@@ -174,7 +188,8 @@ class DtrCalculationService
             $isToday,
             $isFuture,
             $existingDtr?->is_adjusted ?? false,
-            $existingDtr?->adjustment_reason
+            $existingDtr?->adjustment_reason,
+            $holiday
         );
 
         // 11. Upsert DTR in BIO_DB under canonical control number
@@ -198,12 +213,17 @@ class DtrCalculationService
             'leave_application_id' => $leaveInfo['leave_application_id'] ?? null,
         ];
 
+        if ($holiday !== null && ! ($existingDtr && $existingDtr->is_adjusted)) {
+            $payload['adjustment_remarks'] = $holiday->name;
+        }
+
         // Preserve adjustment if one already existed
         if ($existingDtr && $existingDtr->is_adjusted) {
             $payload['is_adjusted'] = true;
             $payload['adjustment_reason'] = $existingDtr->adjustment_reason;
             $payload['adjustment_remarks'] = $existingDtr->adjustment_remarks;
             $payload['adjusted_by_admin_id'] = $existingDtr->adjusted_by_admin_id;
+            $payload['adjusted_slots'] = $existingDtr->adjusted_slots;
         }
 
         $dtr = DailyTimeRecord::query()->updateOrCreate(
@@ -555,20 +575,22 @@ class DtrCalculationService
      */
     public function calculateRenderedHours(?string $amIn, ?string $amOut, ?string $pmIn, ?string $pmOut, ?array $leaveInfo = null): float
     {
+        $baseLeaveMinutes = 0;
         if ($leaveInfo !== null && $leaveInfo['is_on_leave']) {
             if ($leaveInfo['portion'] === 'whole') {
                 return self::STANDARD_WORKDAY_HOURS;
             }
             if ($leaveInfo['portion'] === 'morning' || $leaveInfo['portion'] === 'afternoon') {
                 // 4 hours credited for the approved half day, plus afternoon/morning worked
-                return 4.00;
+                $baseLeaveMinutes = 240;
             }
         }
 
-        $totalMinutes = 0;
+        $totalMinutes = $baseLeaveMinutes;
 
-        // Both AM punches present
-        if ($amIn !== null && $amOut !== null) {
+        // Both AM punches present (only count if not on morning leave)
+        $isMorningLeave = $leaveInfo !== null && $leaveInfo['is_on_leave'] && $leaveInfo['portion'] === 'morning';
+        if (! $isMorningLeave && $amIn !== null && $amOut !== null) {
             $tIn = Carbon::parse($amIn);
             $tOut = Carbon::parse($amOut);
             if ($tOut->isAfter($tIn)) {
@@ -576,8 +598,9 @@ class DtrCalculationService
             }
         }
 
-        // Both PM punches present
-        if ($pmIn !== null && $pmOut !== null) {
+        // Both PM punches present (only count if not on afternoon leave)
+        $isAfternoonLeave = $leaveInfo !== null && $leaveInfo['is_on_leave'] && $leaveInfo['portion'] === 'afternoon';
+        if (! $isAfternoonLeave && $pmIn !== null && $pmOut !== null) {
             $tIn = Carbon::parse($pmIn);
             $tOut = Carbon::parse($pmOut);
             if ($tOut->isAfter($tIn)) {
@@ -633,11 +656,22 @@ class DtrCalculationService
             $selectedCoverages = $leave->selected_date_coverage;
             $selectedPortions = $leave->selected_date_half_day_portion;
 
+            $isHalfDay = false;
             if (is_array($selectedCoverages) && isset($selectedCoverages[$dateStr])) {
-                if ($selectedCoverages[$dateStr] === 'half') {
-                    $portion = is_array($selectedPortions) && isset($selectedPortions[$dateStr])
-                        ? $selectedPortions[$dateStr]
-                        : 'morning';
+                $isHalfDay = strtolower(trim((string) $selectedCoverages[$dateStr])) === 'half';
+            } elseif ((float) ($leave->total_days ?? 0) > 0 && (float) ($leave->total_days ?? 0) <= 0.5) {
+                $isHalfDay = true;
+            }
+
+            if ($isHalfDay) {
+                $rawPortion = is_array($selectedPortions) && isset($selectedPortions[$dateStr])
+                    ? strtolower(trim((string) $selectedPortions[$dateStr]))
+                    : 'morning';
+
+                if (in_array($rawPortion, ['pm', 'afternoon', 'p', 'afternoon (pm)'], true)) {
+                    $portion = 'afternoon';
+                } else {
+                    $portion = 'morning';
                 }
             }
 
@@ -672,7 +706,8 @@ class DtrCalculationService
         bool $isToday,
         bool $isFuture,
         bool $isAdjusted,
-        ?string $adjustmentReason
+        ?string $adjustmentReason,
+        ?Holiday $holiday = null
     ): string {
         if ($isAdjusted) {
             if ($adjustmentReason === 'MANUAL_OVERRIDE') {
@@ -687,10 +722,19 @@ class DtrCalculationService
             return $adjustmentReason ?: DailyTimeRecord::STATUS_OFFICIAL_BUSINESS;
         }
 
+        if ($holiday !== null) {
+            return DailyTimeRecord::STATUS_HOLIDAY;
+        }
+
         if ($leaveInfo !== null && $leaveInfo['is_on_leave']) {
-            return $leaveInfo['portion'] === 'whole'
-                ? DailyTimeRecord::STATUS_ON_LEAVE
-                : DailyTimeRecord::STATUS_HALF_DAY;
+            if ($leaveInfo['portion'] === 'morning') {
+                return DailyTimeRecord::STATUS_ON_LEAVE_AM;
+            }
+            if ($leaveInfo['portion'] === 'afternoon') {
+                return DailyTimeRecord::STATUS_ON_LEAVE_PM;
+            }
+
+            return DailyTimeRecord::STATUS_ON_LEAVE;
         }
 
         $hasPunches = $slotted['am_arrival'] !== null
@@ -785,18 +829,46 @@ class DtrCalculationService
     }
 
     /**
-     * Build compact acronym from leave type name (e.g. Vacation Leave -> VL).
+     * Build compact acronym from leave type name (e.g. Vacation Leave -> VL, Mandatory / Forced Leave -> FL).
      */
     private function buildLeaveCode(string $leaveName): string
     {
-        $words = preg_split('/\s+/', trim($leaveName));
+        $normalized = strtoupper(trim($leaveName));
+
+        $knownCodes = [
+            'VACATION LEAVE' => 'VL',
+            'SICK LEAVE' => 'SL',
+            'MANDATORY / FORCED LEAVE' => 'FL',
+            'MANDATORY LEAVE' => 'FL',
+            'FORCED LEAVE' => 'FL',
+            'SPECIAL PRIVILEGE LEAVE' => 'SPL',
+            'MATERNITY LEAVE' => 'ML',
+            'PATERNITY LEAVE' => 'PL',
+            'SOLO PARENT LEAVE' => 'SPL',
+            'STUDY LEAVE' => 'STL',
+            'VAWC LEAVE' => 'VAWC',
+            'REHABILITATION PRIVILEGE' => 'RP',
+            'SPECIAL EMERGENCY LEAVE' => 'SEL',
+            'ADOPTION LEAVE' => 'AL',
+            'COMPENSATORY TIME-OFF' => 'CTO',
+            'COMPENSATORY OVERTIME CREDITS' => 'COC',
+        ];
+
+        if (isset($knownCodes[$normalized])) {
+            return $knownCodes[$normalized];
+        }
+
+        $clean = preg_replace('/[^\w\s]/', ' ', $normalized) ?? $normalized;
+        $words = preg_split('/\s+/', trim($clean));
         if ($words === false || count($words) === 0) {
             return 'LEAVE';
         }
 
         $code = '';
         foreach ($words as $w) {
-            $code .= strtoupper($w[0] ?? '');
+            if ($w !== '') {
+                $code .= $w[0];
+            }
         }
 
         return $code !== '' ? $code : 'LEAVE';

@@ -3140,10 +3140,9 @@ class EmployeeController extends Controller
             $transferResult = app(BiometricTransferService::class)
                 ->transferOnDepartmentAssignment($storedControlNo, (int) $admin->department_id, (int) $admin->id, $sourceDeptId);
 
-            $responseMessage = 'Employee pulled to your office successfully.';
-            if (! empty($transferResult['transferred']) && ! empty($transferResult['message'])) {
-                $responseMessage .= ' '.$transferResult['message'];
-            }
+            $responseMessage = ! empty($transferResult['transferred'])
+                ? 'Employee and biometrics successfully transferred to your office.'
+                : 'Employee pulled to your office successfully.';
 
             return response()->json([
                 'message' => $responseMessage,
@@ -3163,10 +3162,9 @@ class EmployeeController extends Controller
         $transferResult = app(BiometricTransferService::class)
             ->transferOnDepartmentAssignment($storedControlNo, (int) $admin->department_id, (int) $admin->id);
 
-        $responseMessage = 'Employee pulled to your office successfully.';
-        if (! empty($transferResult['transferred']) && ! empty($transferResult['message'])) {
-            $responseMessage .= ' '.$transferResult['message'];
-        }
+        $responseMessage = ! empty($transferResult['transferred'])
+            ? 'Employee and biometrics successfully transferred to your office.'
+            : 'Employee pulled to your office successfully.';
 
         return response()->json([
             'message' => $responseMessage,

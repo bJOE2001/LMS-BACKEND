@@ -23,6 +23,10 @@ class DailyTimeRecord extends Model
 
     public const STATUS_ON_LEAVE = 'ON_LEAVE';
 
+    public const STATUS_ON_LEAVE_AM = 'ON_LEAVE_AM';
+
+    public const STATUS_ON_LEAVE_PM = 'ON_LEAVE_PM';
+
     public const STATUS_HALF_DAY = 'HALF_DAY';
 
     public const STATUS_HOLIDAY = 'HOLIDAY';
@@ -57,6 +61,7 @@ class DailyTimeRecord extends Model
         'adjustment_reason',
         'adjustment_remarks',
         'adjusted_by_admin_id',
+        'adjusted_slots',
     ];
 
     /**
@@ -74,6 +79,7 @@ class DailyTimeRecord extends Model
             'leave_application_id' => 'integer',
             'is_adjusted' => 'boolean',
             'adjusted_by_admin_id' => 'integer',
+            'adjusted_slots' => 'array',
         ];
     }
 

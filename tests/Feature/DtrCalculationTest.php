@@ -645,8 +645,167 @@ class DtrCalculationTest extends TestCase
         $this->assertSame(DailyTimeRecord::STATUS_PRESENT, $refreshed->status);
     }
 
+    public function test_dtr_whole_day_approved_leave_sets_on_leave_status_and_8_hours(): void
+    {
+        $service = app(DtrCalculationService::class);
+
+        LeaveApplication::query()->create([
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'employee_name' => 'Test Employee',
+            'leave_type_id' => 1,
+            'start_date' => self::TEST_DATE,
+            'end_date' => self::TEST_DATE,
+            'total_days' => 1.0,
+            'status' => 'APPROVED',
+            'selected_dates' => [self::TEST_DATE],
+            'selected_date_coverage' => [self::TEST_DATE => 'whole'],
+        ]);
+
+        $dtr = $service->calculateForEmployeeDate(self::TEST_CONTROL_NO, self::TEST_DATE);
+
+        $this->assertNotNull($dtr);
+        $this->assertSame(DailyTimeRecord::STATUS_ON_LEAVE, $dtr->status);
+        $this->assertEquals(8.00, (float) $dtr->rendered_hours);
+        $this->assertSame(0, $dtr->late_minutes);
+        $this->assertSame(0, $dtr->undertime_minutes);
+    }
+
+    public function test_dtr_half_day_morning_leave_sets_on_leave_am_status_and_credits_hours(): void
+    {
+        $service = app(DtrCalculationService::class);
+
+        LeaveApplication::query()->create([
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'employee_name' => 'Test Employee',
+            'leave_type_id' => 1,
+            'start_date' => self::TEST_DATE,
+            'end_date' => self::TEST_DATE,
+            'total_days' => 0.5,
+            'status' => 'APPROVED',
+            'selected_dates' => [self::TEST_DATE],
+            'selected_date_coverage' => [self::TEST_DATE => 'half'],
+            'selected_date_half_day_portion' => [self::TEST_DATE => 'AM'],
+        ]);
+
+        // Employee punched for afternoon duty (12:55 PM In, 17:05 PM Out)
+        AttendanceRawLog::query()->create([
+            'biometric_pin' => self::TEST_CONTROL_NO,
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'punch_time' => self::TEST_DATE.' 12:55:00',
+            'punch_state' => 0,
+            'verify_type' => 15,
+            'sync_source' => 'ADMS',
+        ]);
+        AttendanceRawLog::query()->create([
+            'biometric_pin' => self::TEST_CONTROL_NO,
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'punch_time' => self::TEST_DATE.' 17:05:00',
+            'punch_state' => 1,
+            'verify_type' => 15,
+            'sync_source' => 'ADMS',
+        ]);
+
+        $dtr = $service->calculateForEmployeeDate(self::TEST_CONTROL_NO, self::TEST_DATE);
+
+        $this->assertNotNull($dtr);
+        $this->assertSame(DailyTimeRecord::STATUS_ON_LEAVE_AM, $dtr->status);
+        // 4.0 hrs (leave) + 4.0 hrs (afternoon) = 8.0 hrs
+        $this->assertEquals(8.00, (float) $dtr->rendered_hours);
+        $this->assertSame(0, $dtr->late_minutes, 'Morning tardiness must be excused');
+        $this->assertSame(0, $dtr->undertime_minutes);
+    }
+
+    public function test_dtr_half_day_afternoon_leave_sets_on_leave_pm_status_and_credits_hours(): void
+    {
+        $service = app(DtrCalculationService::class);
+
+        LeaveApplication::query()->create([
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'employee_name' => 'Test Employee',
+            'leave_type_id' => 1,
+            'start_date' => self::TEST_DATE,
+            'end_date' => self::TEST_DATE,
+            'total_days' => 0.5,
+            'status' => 'APPROVED',
+            'selected_dates' => [self::TEST_DATE],
+            'selected_date_coverage' => [self::TEST_DATE => 'half'],
+            'selected_date_half_day_portion' => [self::TEST_DATE => 'PM'],
+        ]);
+
+        // Employee punched for morning duty (07:55 AM In, 12:05 PM Out)
+        AttendanceRawLog::query()->create([
+            'biometric_pin' => self::TEST_CONTROL_NO,
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'punch_time' => self::TEST_DATE.' 07:55:00',
+            'punch_state' => 0,
+            'verify_type' => 15,
+            'sync_source' => 'ADMS',
+        ]);
+        AttendanceRawLog::query()->create([
+            'biometric_pin' => self::TEST_CONTROL_NO,
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'punch_time' => self::TEST_DATE.' 12:05:00',
+            'punch_state' => 1,
+            'verify_type' => 15,
+            'sync_source' => 'ADMS',
+        ]);
+
+        $dtr = $service->calculateForEmployeeDate(self::TEST_CONTROL_NO, self::TEST_DATE);
+
+        $this->assertNotNull($dtr);
+        $this->assertSame(DailyTimeRecord::STATUS_ON_LEAVE_PM, $dtr->status);
+        // 4.0 hrs (morning) + 4.0 hrs (leave) = 8.0 hrs
+        $this->assertEquals(8.00, (float) $dtr->rendered_hours);
+        $this->assertSame(0, $dtr->late_minutes);
+        $this->assertSame(0, $dtr->undertime_minutes, 'Afternoon undertime must be excused');
+    }
+
     public function test_hris_employee_charges_lookup_returns_null_for_empty_control_no(): void
     {
         $this->assertNull(\App\Models\HrisEmployee::chargesByControlNo(''));
+    }
+
+    public function test_recalculate_mahusay_october_30_half_day_pm_leave(): void
+    {
+        $service = app(DtrCalculationService::class);
+        $dtr = $service->calculateForEmployeeDate('011790', '2026-10-30');
+
+        $this->assertNotNull($dtr);
+        $this->assertSame(DailyTimeRecord::STATUS_ON_LEAVE_PM, $dtr->status);
+        $this->assertEquals(4.00, (float) $dtr->rendered_hours);
+        $this->assertSame('FL', $dtr->leave_type_code);
+        $this->assertSame(0, $dtr->late_minutes);
+        $this->assertSame(0, $dtr->undertime_minutes);
+    }
+
+    public function test_can_save_slot_overrides_in_adjusted_slots(): void
+    {
+        $dtr = DailyTimeRecord::query()->updateOrCreate(
+            [
+                'employee_control_no' => self::TEST_CONTROL_NO,
+                'record_date' => self::TEST_DATE,
+            ],
+            [
+                'am_arrival' => null,
+                'am_departure' => null,
+                'pm_arrival' => null,
+                'pm_departure' => null,
+                'rendered_hours' => 8.00,
+                'status' => 'OFFICIAL_BUSINESS',
+                'is_adjusted' => true,
+                'adjusted_slots' => [
+                    'am_arrival' => 'O.F.',
+                    'am_departure' => 'O.F.',
+                    'pm_arrival' => 'O.B.',
+                    'pm_departure' => 'O.B.',
+                ],
+            ]
+        );
+
+        $this->assertIsArray($dtr->adjusted_slots);
+        $this->assertSame('O.F.', $dtr->adjusted_slots['am_arrival']);
+        $this->assertSame('O.F.', $dtr->adjusted_slots['am_departure']);
+        $this->assertSame('O.B.', $dtr->adjusted_slots['pm_arrival']);
+        $this->assertSame('O.B.', $dtr->adjusted_slots['pm_departure']);
     }
 }
