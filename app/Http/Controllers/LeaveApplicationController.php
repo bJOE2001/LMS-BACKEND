@@ -692,7 +692,7 @@ class LeaveApplicationController extends Controller
         }
 
         $attachmentState = $this->resolveAttachmentStateFromRequest($request, $validated);
-        $allowSlVlCrossDeduction = $this->resolveRequestSlVlCrossDeductionFlag($request, $validated);
+        $allowSlVlCrossDeduction = false;
         $appliedAllowSlVlCrossDeduction = false;
         $linkedForcedLeaveReservedDays = 0.0;
         $linkedVacationLeaveReservedDays = 0.0;
@@ -830,17 +830,6 @@ class LeaveApplicationController extends Controller
         );
         if (LeaveType::isForcedLeaveType($leaveType, (int) $validated['leave_type_id'])) {
             $linkedVacationLeaveReservedDays = round(max($deductibleDays, 0.0), 3);
-        } elseif (! $appliedAllowSlVlCrossDeduction) {
-            $linkedVacationLeaveReservedDays = $this->resolveLeaveTypeVacationLeaveDeductionDays(
-                $leaveType,
-                (int) $validated['leave_type_id'],
-                false,
-                (float) $validated['total_days'],
-                $deductibleDays,
-                $forcedLeaveTypeId,
-                $vacationLeaveTypeId,
-                (float) ($eligibility['available_balance'] ?? 0.0)
-            );
         }
 
         $app = DB::transaction(function () use (
@@ -1773,7 +1762,7 @@ class LeaveApplicationController extends Controller
         }
 
         $attachmentState = $this->resolveAttachmentStateFromRequest($request, $validated);
-        $allowSlVlCrossDeduction = $this->resolveRequestSlVlCrossDeductionFlag($request, $validated);
+        $allowSlVlCrossDeduction = false;
         $appliedAllowSlVlCrossDeduction = false;
         $linkedForcedLeaveReservedDays = 0.0;
         $linkedVacationLeaveReservedDays = 0.0;
@@ -1911,17 +1900,6 @@ class LeaveApplicationController extends Controller
         );
         if (LeaveType::isForcedLeaveType($leaveType, (int) $validated['leave_type_id'])) {
             $linkedVacationLeaveReservedDays = round(max($deductibleDays, 0.0), 3);
-        } elseif (! $appliedAllowSlVlCrossDeduction) {
-            $linkedVacationLeaveReservedDays = $this->resolveLeaveTypeVacationLeaveDeductionDays(
-                $leaveType,
-                (int) $validated['leave_type_id'],
-                false,
-                (float) $validated['total_days'],
-                $deductibleDays,
-                $forcedLeaveTypeId,
-                $vacationLeaveTypeId,
-                (float) ($eligibility['available_balance'] ?? 0.0)
-            );
         }
 
         $app = DB::transaction(function () use (
@@ -15611,7 +15589,8 @@ class LeaveApplicationController extends Controller
         float $requestedDays,
         string $payMode = LeaveApplication::PAY_MODE_WITH_PAY,
         ?float $requestedDeductibleDays = null,
-        ?float $requestedCtoHours = null
+        ?float $requestedCtoHours = null,
+        bool $allowVacationLeaveTopUp = false
     ): array|JsonResponse {
         $leaveType = LeaveType::find($leaveTypeId);
         if (! $leaveType) {
@@ -15645,7 +15624,7 @@ class LeaveApplicationController extends Controller
         $isForcedLeaveType = LeaveType::isForcedLeaveType($leaveType, $leaveTypeId);
         $normalizedPayMode = $this->normalizePayMode($payMode);
         $requiredBalanceDays = round(max((float) ($requestedDeductibleDays ?? $requestedDays), 0.0), 3);
-        $requiresVacationLeaveTopUp = $this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
+        $requiresVacationLeaveTopUp = $allowVacationLeaveTopUp && $this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
             $leaveType,
             $leaveTypeId,
             false,
