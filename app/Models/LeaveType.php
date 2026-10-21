@@ -65,12 +65,15 @@ class LeaveType extends Model
 
     public const EMPLOYMENT_STATUS_CONTRACTUAL = 'contractual';
 
+    public const EMPLOYMENT_STATUS_TEMPORARY = 'temporary';
+
     public const EMPLOYMENT_STATUS_LABELS = [
         self::EMPLOYMENT_STATUS_REGULAR => 'Regular',
         self::EMPLOYMENT_STATUS_ELECTIVE => 'Elective',
         self::EMPLOYMENT_STATUS_CO_TERMINOUS => 'Co-Terminous',
         self::EMPLOYMENT_STATUS_CASUAL => 'Casual',
         self::EMPLOYMENT_STATUS_CONTRACTUAL => 'Contractual',
+        self::EMPLOYMENT_STATUS_TEMPORARY => 'Temporary',
     ];
 
     // ─── Scopes ──────────────────────────────────────────────────────
@@ -132,6 +135,7 @@ class LeaveType extends Model
             'CO-TERMINOUS', 'CO TERMINOUS', 'COTERMINOUS' => self::EMPLOYMENT_STATUS_CO_TERMINOUS,
             'CASUAL' => self::EMPLOYMENT_STATUS_CASUAL,
             'CONTRACTUAL' => self::EMPLOYMENT_STATUS_CONTRACTUAL,
+            'TEMPORARY' => self::EMPLOYMENT_STATUS_TEMPORARY,
             default => array_key_exists(
                 strtolower(str_replace([' ', '-'], '_', $normalizedStatus)),
                 self::EMPLOYMENT_STATUS_LABELS
