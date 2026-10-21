@@ -39,9 +39,13 @@ class HrAccessControlService
 
     public const MODULE_ACCESS_CONTROL = 'access_control';
 
+    public const PERMISSION_LEDGER_RESTORE_EDIT = 'ledger_restore_edit';
+
     public const PERMISSION_LEDGER_RESTORE_DELETE = 'ledger_restore_delete';
 
     public const PERMISSION_LEDGER_LATE_DEDUCTION_EDIT = 'ledger_late_deduction_edit';
+
+    public const PERMISSION_LEDGER_LATE_DEDUCTION_DELETE = 'ledger_late_deduction_delete';
 
     public const PERMISSION_LEDGER_ACCRUAL_EDIT = 'ledger_accrual_edit';
 
@@ -87,6 +91,11 @@ class HrAccessControlService
                 'path' => '/hr/employees',
             ],
             [
+                'key' => self::PERMISSION_LEDGER_RESTORE_EDIT,
+                'label' => 'Ledger: Edit Restored Leave',
+                'path' => '/hr/employees',
+            ],
+            [
                 'key' => self::PERMISSION_LEDGER_RESTORE_DELETE,
                 'label' => 'Ledger: Delete Restored Leave',
                 'path' => '/hr/employees',
@@ -94,6 +103,11 @@ class HrAccessControlService
             [
                 'key' => self::PERMISSION_LEDGER_LATE_DEDUCTION_EDIT,
                 'label' => 'Ledger: Edit Late Deduction',
+                'path' => '/hr/employees',
+            ],
+            [
+                'key' => self::PERMISSION_LEDGER_LATE_DEDUCTION_DELETE,
+                'label' => 'Ledger: Delete Late Deduction',
                 'path' => '/hr/employees',
             ],
             [
@@ -289,8 +303,10 @@ class HrAccessControlService
         )));
 
         $ledgerSubPermissions = [
+            self::PERMISSION_LEDGER_RESTORE_EDIT,
             self::PERMISSION_LEDGER_RESTORE_DELETE,
             self::PERMISSION_LEDGER_LATE_DEDUCTION_EDIT,
+            self::PERMISSION_LEDGER_LATE_DEDUCTION_DELETE,
             self::PERMISSION_LEDGER_ACCRUAL_EDIT,
         ];
 

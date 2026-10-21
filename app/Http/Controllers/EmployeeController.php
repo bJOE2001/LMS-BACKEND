@@ -76,6 +76,100 @@ class EmployeeController extends Controller
     }
 
     /**
+     * Get active employee options strictly scoped to a department's assigned employee records for leave signatory replacement.
+     */
+    public function officeSignatoryOptions(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'department_id' => ['nullable', 'integer'],
+            'office' => ['nullable', 'string', 'max:255'],
+            'search' => ['nullable', 'string', 'max:120'],
+            'limit' => ['nullable', 'integer', 'min:1', 'max:50'],
+        ]);
+
+        $departmentId = isset($validated['department_id']) ? (int) $validated['department_id'] : null;
+        $office = trim((string) ($validated['office'] ?? ''));
+        $search = trim((string) ($validated['search'] ?? ''));
+        $limit = max(1, min(50, (int) ($validated['limit'] ?? 25)));
+
+        $department = null;
+        if ($departmentId !== null) {
+            $department = Department::query()->active()->find($departmentId);
+        }
+        if (! $department && $office !== '') {
+            $department = Department::query()->active()
+                ->where(function ($q) use ($office) {
+                    $q->where('name', $office)
+                        ->orWhere('code', $office)
+                        ->orWhere('acronym', $office);
+                })->first();
+        }
+
+        $resolvedDepartmentId = $department?->id ? (int) $department->id : $departmentId;
+        $departmentName = $department?->name ?? ($office !== '' ? $office : null);
+
+        $employeeRows = collect();
+
+        // 1. First, fetch assigned/enrolled employee records for the department in LMS
+        if ($resolvedDepartmentId !== null && $resolvedDepartmentId > 0) {
+            $employeeRows = $this->fetchDepartmentPulledEmployeeRows(
+                $resolvedDepartmentId,
+                $search !== '' ? $search : null,
+                true
+            );
+
+            // Also ensure the DepartmentHead is included in the available assigned records
+            $headControlNo = DepartmentHead::query()
+                ->where('department_id', $resolvedDepartmentId)
+                ->value('control_no');
+
+            if ($headControlNo && ! $employeeRows->contains(fn ($r) => trim((string) ($r['control_no'] ?? '')) === trim((string) $headControlNo))) {
+                $headRows = $this->fetchHrisEmployeeRowsByControlNos(
+                    [trim((string) $headControlNo)],
+                    $search !== '' ? $search : null,
+                    false,
+                    true
+                );
+                if ($headRows->isNotEmpty()) {
+                    $employeeRows = $employeeRows->concat($headRows);
+                }
+            }
+        }
+
+        // 2. If no department assignment records exist in LMS yet, fall back to HRIS office directory
+        if ($employeeRows->isEmpty() && $departmentName) {
+            $employeeRows = $this->fetchHrisEmployeeRows(
+                $departmentName,
+                $search !== '' ? $search : null,
+                false,
+                true,
+                $limit
+            );
+        }
+
+        $employees = $employeeRows->take($limit)->map(function (array $emp): array {
+            $fullName = trim((string) ($emp['full_name'] ?? ''));
+            $designation = trim((string) ($emp['designation'] ?? ''));
+            $controlNo = trim((string) ($emp['control_no'] ?? ''));
+            $empOffice = trim((string) ($emp['office'] ?? ''));
+
+            return [
+                'control_no' => $controlNo,
+                'full_name' => $fullName,
+                'designation' => $designation,
+                'office' => $empOffice,
+                'label' => $designation !== '' ? "{$fullName} ({$designation})" : $fullName,
+            ];
+        })->values()->all();
+
+        return response()->json([
+            'employees' => $employees,
+            'office' => $departmentName,
+            'department_id' => $resolvedDepartmentId,
+        ]);
+    }
+
+    /**
      * Get the current department head for the authenticated department admin.
      */
     public function departmentHead(Request $request): JsonResponse
@@ -1086,6 +1180,9 @@ class EmployeeController extends Controller
                         $typeKey,
                         is_string($otherTypeCode) ? $otherTypeCode : null,
                     );
+                    $accrualSortTimestamp = ($isManualBalanceSource && $entry->created_at)
+                        ? (string) $entry->created_at->toIso8601String()
+                        : Carbon::parse($accrualDate)->startOfDay()->addSecond()->toIso8601String();
 
                     $transactions[] = [
                         'row_id' => 'accrual-'.(int) $entry->id,
@@ -1095,7 +1192,7 @@ class EmployeeController extends Controller
                         'leave_type_code' => $leaveTypeCode,
                         'transaction_date' => $accrualDate,
                         'sort_date' => $accrualDate,
-                        'sort_timestamp' => (string) ($entry->created_at?->toIso8601String() ?? $accrualDate),
+                        'sort_timestamp' => $accrualSortTimestamp,
                         'particulars' => $accrualParticulars,
                         'action_taken' => $actionTaken,
                         'category' => $entryCategory,
@@ -1183,6 +1280,8 @@ class EmployeeController extends Controller
                     'category' => 'earned',
                     'amount' => $restoredDays,
                     'balance_delta' => $restoredDays,
+                    'restored_days' => $restoredDays,
+                    'remarks' => $restoration->remarks,
                 ];
 
                 if ($isForcedLeaveRestoration) {
@@ -2214,6 +2313,7 @@ class EmployeeController extends Controller
                     'inclusive_dates' => $inclusiveDates,
                     'selected_dates' => $transaction['selected_dates'] ?? $inclusiveDates,
                     'selected_date_half_day_portion' => $transaction['selected_date_half_day_portion'] ?? null,
+                    'restored_days' => $transaction['restored_days'] ?? $transaction['amount'] ?? null,
                 ];
 
                 if ($mergeKey !== null) {
@@ -2229,8 +2329,13 @@ class EmployeeController extends Controller
                 }
             }
 
-            if (! empty($transaction['restoration_id']) && empty($ledgerRows[$rowIndex]['restoration_id'])) {
-                $ledgerRows[$rowIndex]['restoration_id'] = $transaction['restoration_id'];
+            if (! empty($transaction['restoration_id'])) {
+                if (empty($ledgerRows[$rowIndex]['restoration_id'])) {
+                    $ledgerRows[$rowIndex]['restoration_id'] = $transaction['restoration_id'];
+                }
+                if (empty($ledgerRows[$rowIndex]['restored_days'])) {
+                    $ledgerRows[$rowIndex]['restored_days'] = $transaction['restored_days'] ?? $transaction['amount'] ?? null;
+                }
             }
             if (! empty($transaction['target_leave_type_id']) && empty($ledgerRows[$rowIndex]['target_leave_type_id'])) {
                 $ledgerRows[$rowIndex]['target_leave_type_id'] = $transaction['target_leave_type_id'];
@@ -5391,6 +5496,34 @@ class EmployeeController extends Controller
             $restoredAmount = (float) $validated['restored_days'];
             $leaveBalance->increment('balance', $restoredAmount);
 
+            // If target is Forced Leave, also restore Vacation Leave balance
+            $trackedTypeIdsByKey = $this->resolveLedgerTrackedLeaveTypeIds();
+            $forcedLeaveTypeId = $trackedTypeIdsByKey['forced'] ?? null;
+            $isForcedLeave = LeaveType::isForcedLeaveType(null, $targetTypeId)
+                || (is_int($forcedLeaveTypeId) && $forcedLeaveTypeId > 0 && $targetTypeId === $forcedLeaveTypeId);
+
+            if ($isForcedLeave) {
+                $vacationLeaveTypeId = $trackedTypeIdsByKey['vacation'] ?? null;
+                if (is_int($vacationLeaveTypeId) && $vacationLeaveTypeId > 0 && $vacationLeaveTypeId !== $targetTypeId) {
+                    $vlBalance = LeaveBalance::query()
+                        ->whereIn('employee_control_no', $controlNoCandidates)
+                        ->where('leave_type_id', $vacationLeaveTypeId)
+                        ->first();
+
+                    if (! $vlBalance) {
+                        $vlBalance = LeaveBalance::create([
+                            'employee_control_no' => (string) $controlNo,
+                            'employee_name' => $employee->full_name ?? ($employee->firstname.' '.$employee->surname),
+                            'leave_type_id' => $vacationLeaveTypeId,
+                            'year' => $restorationYear,
+                            'balance' => 0,
+                        ]);
+                    }
+
+                    $vlBalance->increment('balance', $restoredAmount);
+                }
+            }
+
             return $restorationRecord;
         });
 
@@ -5398,6 +5531,233 @@ class EmployeeController extends Controller
             'message' => 'Leave credits restored successfully.',
             'restoration' => $restoration->load(['leaveType', 'restoredByHr']),
         ], 201);
+    }
+
+    /**
+     * Update an existing leave credit restoration record and adjust leave balance deltas (HR Admin only).
+     */
+    public function updateRestoration(Request $request, string $controlNo, int|string $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $accessControl = app(HrAccessControlService::class);
+        $canEdit = $accessControl->isAccessControlOwner($hr)
+            || $accessControl->hasModuleAccess($hr, HrAccessControlService::PERMISSION_LEDGER_RESTORE_EDIT)
+            || $accessControl->hasModuleAccess($hr, HrAccessControlService::PERMISSION_LEDGER_RESTORE_DELETE);
+
+        if (! $canEdit) {
+            return response()->json(['message' => 'You do not have permission to edit restoration records.'], 403);
+        }
+
+        $employee = HrisEmployee::findByControlNo($controlNo);
+        if (! $employee) {
+            return response()->json(['message' => 'Employee not found.'], 404);
+        }
+
+        $controlNoCandidates = $this->buildLedgerControlNoCandidates($controlNo, $employee);
+        $restoration = LeaveRestoration::query()
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->where('id', (int) $id)
+            ->first();
+
+        if (! $restoration) {
+            return response()->json(['message' => 'Restoration record not found.'], 404);
+        }
+
+        $validated = $request->validate([
+            'target_leave_type_id' => 'required|integer|exists:tblLeaveTypes,id',
+            'particulars' => 'required|string|max:500',
+            'start_date' => 'required|date',
+            'end_date' => 'nullable|date|after_or_equal:start_date',
+            'selected_dates' => 'nullable|array',
+            'selected_dates.*' => 'date',
+            'restored_days' => 'required|numeric|min:0.001|max:365',
+            'remarks' => 'nullable|string|max:500',
+        ]);
+
+        $selectedDates = array_values(array_unique(array_filter(
+            $validated['selected_dates'] ?? [],
+            static fn (mixed $val): bool => is_string($val) && trim($val) !== ''
+        )));
+        sort($selectedDates);
+
+        $startDate = $selectedDates !== []
+            ? Carbon::parse($selectedDates[0])->toDateString()
+            : Carbon::parse($validated['start_date'])->toDateString();
+        $endDate = $selectedDates !== []
+            ? Carbon::parse($selectedDates[count($selectedDates) - 1])->toDateString()
+            : (isset($validated['end_date']) && $validated['end_date'] ? Carbon::parse($validated['end_date'])->toDateString() : $startDate);
+
+        $particularsText = trim((string) $validated['particulars']);
+        $newTargetTypeId = (int) $validated['target_leave_type_id'];
+        $newRestoredDays = round((float) $validated['restored_days'], 3);
+
+        $oldTargetTypeId = (int) $restoration->target_leave_type_id;
+        $oldRestoredDays = round((float) ($restoration->restored_days ?? 0), 3);
+
+        $trackedTypeIdsByKey = $this->resolveLedgerTrackedLeaveTypeIds();
+        $forcedLeaveTypeId = $trackedTypeIdsByKey['forced'] ?? null;
+        $vacationLeaveTypeId = $trackedTypeIdsByKey['vacation'] ?? null;
+
+        $oldIsForced = LeaveType::isForcedLeaveType(null, $oldTargetTypeId)
+            || (is_int($forcedLeaveTypeId) && $forcedLeaveTypeId > 0 && $oldTargetTypeId === $forcedLeaveTypeId);
+        $newIsForced = LeaveType::isForcedLeaveType(null, $newTargetTypeId)
+            || (is_int($forcedLeaveTypeId) && $forcedLeaveTypeId > 0 && $newTargetTypeId === $forcedLeaveTypeId);
+
+        $updatedRestoration = DB::transaction(function () use (
+            $restoration,
+            $controlNo,
+            $controlNoCandidates,
+            $employee,
+            $validated,
+            $hr,
+            $startDate,
+            $endDate,
+            $selectedDates,
+            $particularsText,
+            $newTargetTypeId,
+            $newRestoredDays,
+            $oldTargetTypeId,
+            $oldRestoredDays,
+            $oldIsForced,
+            $newIsForced,
+            $vacationLeaveTypeId
+        ): LeaveRestoration {
+            $restorationYear = (int) (Carbon::parse($startDate)->year ?? now()->year);
+
+            if ($newTargetTypeId === $oldTargetTypeId) {
+                $delta = round($newRestoredDays - $oldRestoredDays, 3);
+                if (abs($delta) > 0.0001) {
+                    $leaveBalance = LeaveBalance::query()
+                        ->whereIn('employee_control_no', $controlNoCandidates)
+                        ->where('leave_type_id', $newTargetTypeId)
+                        ->first();
+
+                    if (! $leaveBalance) {
+                        $leaveBalance = LeaveBalance::create([
+                            'employee_control_no' => (string) $controlNo,
+                            'employee_name' => $employee->full_name ?? ($employee->firstname.' '.$employee->surname),
+                            'leave_type_id' => $newTargetTypeId,
+                            'year' => $restorationYear,
+                            'balance' => 0,
+                        ]);
+                    }
+
+                    $leaveBalance->balance = max(0.0, round((float) $leaveBalance->balance + $delta, 3));
+                    $leaveBalance->save();
+
+                    // If target is Forced Leave, also adjust Vacation Leave balance by the same delta
+                    if ($newIsForced && is_int($vacationLeaveTypeId) && $vacationLeaveTypeId > 0 && $vacationLeaveTypeId !== $newTargetTypeId) {
+                        $vlBalance = LeaveBalance::query()
+                            ->whereIn('employee_control_no', $controlNoCandidates)
+                            ->where('leave_type_id', $vacationLeaveTypeId)
+                            ->first();
+
+                        if (! $vlBalance) {
+                            $vlBalance = LeaveBalance::create([
+                                'employee_control_no' => (string) $controlNo,
+                                'employee_name' => $employee->full_name ?? ($employee->firstname.' '.$employee->surname),
+                                'leave_type_id' => $vacationLeaveTypeId,
+                                'year' => $restorationYear,
+                                'balance' => 0,
+                            ]);
+                        }
+
+                        $vlBalance->balance = max(0.0, round((float) $vlBalance->balance + $delta, 3));
+                        $vlBalance->save();
+                    }
+                }
+            } else {
+                // Target leave type changed: revert old type credits
+                if ($oldRestoredDays > 0.0) {
+                    $oldBalance = LeaveBalance::query()
+                        ->whereIn('employee_control_no', $controlNoCandidates)
+                        ->where('leave_type_id', $oldTargetTypeId)
+                        ->first();
+
+                    if ($oldBalance) {
+                        $oldBalance->balance = max(0.0, round((float) $oldBalance->balance - $oldRestoredDays, 3));
+                        $oldBalance->save();
+                    }
+
+                    if ($oldIsForced && is_int($vacationLeaveTypeId) && $vacationLeaveTypeId > 0 && $vacationLeaveTypeId !== $oldTargetTypeId) {
+                        $oldVlBalance = LeaveBalance::query()
+                            ->whereIn('employee_control_no', $controlNoCandidates)
+                            ->where('leave_type_id', $vacationLeaveTypeId)
+                            ->first();
+
+                        if ($oldVlBalance) {
+                            $oldVlBalance->balance = max(0.0, round((float) $oldVlBalance->balance - $oldRestoredDays, 3));
+                            $oldVlBalance->save();
+                        }
+                    }
+                }
+
+                // Add credits to new leave type
+                if ($newRestoredDays > 0.0) {
+                    $newBalance = LeaveBalance::query()
+                        ->whereIn('employee_control_no', $controlNoCandidates)
+                        ->where('leave_type_id', $newTargetTypeId)
+                        ->first();
+
+                    if (! $newBalance) {
+                        $newBalance = LeaveBalance::create([
+                            'employee_control_no' => (string) $controlNo,
+                            'employee_name' => $employee->full_name ?? ($employee->firstname.' '.$employee->surname),
+                            'leave_type_id' => $newTargetTypeId,
+                            'year' => $restorationYear,
+                            'balance' => 0,
+                        ]);
+                    }
+
+                    $newBalance->balance = max(0.0, round((float) $newBalance->balance + $newRestoredDays, 3));
+                    $newBalance->save();
+
+                    if ($newIsForced && is_int($vacationLeaveTypeId) && $vacationLeaveTypeId > 0 && $vacationLeaveTypeId !== $newTargetTypeId) {
+                        $newVlBalance = LeaveBalance::query()
+                            ->whereIn('employee_control_no', $controlNoCandidates)
+                            ->where('leave_type_id', $vacationLeaveTypeId)
+                            ->first();
+
+                        if (! $newVlBalance) {
+                            $newVlBalance = LeaveBalance::create([
+                                'employee_control_no' => (string) $controlNo,
+                                'employee_name' => $employee->full_name ?? ($employee->firstname.' '.$employee->surname),
+                                'leave_type_id' => $vacationLeaveTypeId,
+                                'year' => $restorationYear,
+                                'balance' => 0,
+                            ]);
+                        }
+
+                        $newVlBalance->balance = max(0.0, round((float) $newVlBalance->balance + $newRestoredDays, 3));
+                        $newVlBalance->save();
+                    }
+                }
+            }
+
+            // Update restoration record
+            $restoration->target_leave_type_id = $newTargetTypeId;
+            $restoration->particulars = $particularsText;
+            $restoration->start_date = $startDate;
+            $restoration->end_date = $endDate;
+            $restoration->selected_dates = $selectedDates !== [] ? $selectedDates : null;
+            $restoration->restored_days = $newRestoredDays;
+            $restoration->restored_by_hr_id = (int) $hr->id;
+            $restoration->remarks = isset($validated['remarks']) && trim((string) $validated['remarks']) !== ''
+                ? trim((string) $validated['remarks'])
+                : null;
+            $restoration->save();
+
+            return $restoration;
+        });
+
+        return response()->json([
+            'message' => 'Restoration record updated successfully.',
+            'restoration' => $updatedRestoration->fresh(['leaveType', 'restoredByHr']),
+        ]);
     }
 
     /**
@@ -5447,6 +5807,27 @@ class EmployeeController extends Controller
                     $newBalance = max(0.0, round((float) $leaveBalance->balance - $restoredDays, 3));
                     $leaveBalance->balance = $newBalance;
                     $leaveBalance->save();
+                }
+
+                // If target was Forced Leave, also deduct the restored credits back from Vacation Leave
+                $trackedTypeIdsByKey = $this->resolveLedgerTrackedLeaveTypeIds();
+                $forcedLeaveTypeId = $trackedTypeIdsByKey['forced'] ?? null;
+                $isForcedLeave = LeaveType::isForcedLeaveType(null, $targetTypeId)
+                    || (is_int($forcedLeaveTypeId) && $forcedLeaveTypeId > 0 && $targetTypeId === $forcedLeaveTypeId);
+
+                if ($isForcedLeave) {
+                    $vacationLeaveTypeId = $trackedTypeIdsByKey['vacation'] ?? null;
+                    if (is_int($vacationLeaveTypeId) && $vacationLeaveTypeId > 0 && $vacationLeaveTypeId !== $targetTypeId) {
+                        $vlBalance = LeaveBalance::query()
+                            ->whereIn('employee_control_no', $controlNoCandidates)
+                            ->where('leave_type_id', $vacationLeaveTypeId)
+                            ->first();
+
+                        if ($vlBalance) {
+                            $vlBalance->balance = max(0.0, round((float) $vlBalance->balance - $restoredDays, 3));
+                            $vlBalance->save();
+                        }
+                    }
                 }
             }
 
@@ -5754,6 +6135,64 @@ class EmployeeController extends Controller
             'message' => 'Late deduction successfully updated.',
             'deduction' => $updatedRecord->load(['leaveType', 'deductedByHr']),
         ], 200);
+    }
+
+    /**
+     * Delete a late deduction record and refund the deducted credits back to the employee's balance (HR Admin only).
+     */
+    public function deleteLateDeduction(Request $request, string $controlNo, int|string $id): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $accessControl = app(HrAccessControlService::class);
+        $canDelete = $accessControl->isAccessControlOwner($hr)
+            || $accessControl->hasModuleAccess($hr, HrAccessControlService::PERMISSION_LEDGER_LATE_DEDUCTION_DELETE)
+            || $accessControl->hasModuleAccess($hr, HrAccessControlService::PERMISSION_LEDGER_LATE_DEDUCTION_EDIT);
+
+        if (! $canDelete) {
+            return response()->json(['message' => 'You do not have permission to delete late deduction records.'], 403);
+        }
+
+        $employee = HrisEmployee::findByControlNo($controlNo);
+        if (! $employee) {
+            return response()->json(['message' => 'Employee not found.'], 404);
+        }
+
+        $controlNoCandidates = $this->buildLedgerControlNoCandidates($controlNo, $employee);
+        $lateDeduction = LateDeduction::query()
+            ->whereIn('employee_control_no', $controlNoCandidates)
+            ->where('id', (int) $id)
+            ->first();
+
+        if (! $lateDeduction) {
+            return response()->json(['message' => 'Late deduction record not found.'], 404);
+        }
+
+        $targetTypeId = (int) $lateDeduction->target_leave_type_id;
+        $deductedDays = round((float) ($lateDeduction->deducted_days ?? 0), 3);
+
+        DB::transaction(function () use ($lateDeduction, $controlNoCandidates, $targetTypeId, $deductedDays): void {
+            if ($deductedDays > 0.0) {
+                $leaveBalance = LeaveBalance::query()
+                    ->whereIn('employee_control_no', $controlNoCandidates)
+                    ->where('leave_type_id', $targetTypeId)
+                    ->first();
+
+                if ($leaveBalance) {
+                    $leaveBalance->balance = round((float) $leaveBalance->balance + $deductedDays, 3);
+                    $leaveBalance->save();
+                }
+            }
+
+            $lateDeduction->delete();
+        });
+
+        return response()->json([
+            'message' => 'Late deduction record deleted and leave balance restored successfully.',
+        ]);
     }
 
     /**

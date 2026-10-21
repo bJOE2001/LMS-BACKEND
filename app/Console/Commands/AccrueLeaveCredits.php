@@ -29,19 +29,48 @@ class AccrueLeaveCredits extends Command
     private const EXCLUDED_ACCRUAL_STATUS_KEYWORDS = ['HONORARIUM', 'CONTRACTUAL'];
 
     protected $signature = 'leave:accrue
-        {--date= : Override accrual date (Y-m-d) for testing}
+        {--controlno= : Optional ControlNo of a specific employee to accrue}
+        {--date= : Override accrual date (MM-DD-YYYY) for testing}
+        {--force : Force accrual even if already accrued for the month}
         {--hr-timeout=0 : Optional SQL Server login/query timeout in seconds for live HRIS lookup (0 = no forced timeout)}';
 
     protected $description = 'Accrue monthly leave credits for ACCRUED leave types (run on 1st of month)';
 
     public function handle(): int
     {
+        $targetControlNo = $this->option('controlno') ? trim((string) $this->option('controlno')) : null;
+        $force = (bool) $this->option('force');
         $dateStr = $this->option('date');
-        $now = $dateStr ? Carbon::parse($dateStr) : Carbon::now();
+
+        if ($dateStr !== null && trim((string) $dateStr) !== '') {
+            $parsedDate = null;
+            foreach (['m-d-Y', 'm/d/Y', 'Y-m-d'] as $format) {
+                try {
+                    $parsed = Carbon::createFromFormat($format, trim((string) $dateStr));
+                    if ($parsed !== false) {
+                        $parsedDate = $parsed->startOfDay();
+                        break;
+                    }
+                } catch (Throwable) {
+                    // Try next format
+                }
+            }
+
+            if (! $parsedDate) {
+                $this->error("Invalid date format [{$dateStr}]. Date must be in MM-DD-YYYY format (e.g. 10-01-2026).");
+
+                return self::FAILURE;
+            }
+
+            $now = $parsedDate;
+        } else {
+            $now = Carbon::now();
+        }
+
         $accrualMonth = $now->format('Y-m');
         $hrTimeout = max(0, (int) ($this->option('hr-timeout') ?? 0));
 
-        $this->info("Running leave accrual for month: {$accrualMonth}");
+        $this->info("Running leave accrual for date: {$now->format('m-d-Y')}".($targetControlNo !== null ? " (Employee: {$targetControlNo})" : ''));
 
         $accruedTypes = LeaveType::accrued()
             ->whereNotNull('accrual_rate')
@@ -54,7 +83,7 @@ class AccrueLeaveCredits extends Command
             return self::SUCCESS;
         }
 
-        $employeeDirectory = $this->buildEmployeeDirectory($hrTimeout);
+        $employeeDirectory = $this->buildEmployeeDirectory($hrTimeout, $targetControlNo);
         if ($employeeDirectory['employees'] === []) {
             $this->warn('No employee records found. Nothing to accrue.');
 
@@ -87,9 +116,20 @@ class AccrueLeaveCredits extends Command
                 $this->line("  {$type->name}: provisioned {$provisioned} missing balance(s)");
             }
 
-            $balances = LeaveBalance::query()
-                ->where('leave_type_id', $type->id)
-                ->get();
+            $balancesQuery = LeaveBalance::query()
+                ->where('leave_type_id', $type->id);
+
+            if ($targetControlNo !== null && $targetControlNo !== '') {
+                $normalizedControlNo = $this->normalizeControlNo($targetControlNo);
+                $balancesQuery->where(function ($q) use ($targetControlNo, $normalizedControlNo): void {
+                    $q->where('employee_control_no', $targetControlNo);
+                    if ($normalizedControlNo !== null && $normalizedControlNo !== $targetControlNo) {
+                        $q->orWhere('employee_control_no', $normalizedControlNo);
+                    }
+                });
+            }
+
+            $balances = $balancesQuery->get();
 
             foreach ($balances as $balance) {
                 if (! $this->balanceIsEligibleForTypeAccrual($balance, $type, $employeeDirectory['lookup'])) {
@@ -97,7 +137,11 @@ class AccrueLeaveCredits extends Command
                 }
 
                 // Prevent double accrual for same month
-                if ($balance->last_accrual_date && $balance->last_accrual_date->format('Y-m') === $accrualMonth) {
+                if (! $force && $balance->last_accrual_date && $balance->last_accrual_date->format('Y-m') === $accrualMonth) {
+                    if ($targetControlNo !== null && $targetControlNo !== '') {
+                        $this->line("  {$type->name}: already accrued for month {$balance->last_accrual_date->format('m-Y')} on {$balance->last_accrual_date->format('m-d-Y')}. Use --force to override.");
+                    }
+
                     continue;
                 }
 
@@ -110,7 +154,7 @@ class AccrueLeaveCredits extends Command
                 $accrualRate = (float) $type->accrual_rate;
                 $finalAccrual = $cscLeaveCreditService->computeMonthlyAccrual($lwopDays, $accrualRate);
 
-                DB::transaction(function () use ($balance, $type, $now, $employeeDirectory, $finalAccrual): void {
+                DB::transaction(function () use ($balance, $type, $now, $employeeDirectory, $finalAccrual, $targetControlNo): void {
                     $employeeName = $this->resolveEmployeeNameForBalance($balance, $employeeDirectory['lookup']);
                     $leaveTypeName = trim((string) ($balance->leave_type_name ?? $type->name ?? ''));
 
@@ -133,7 +177,7 @@ class AccrueLeaveCredits extends Command
                         [
                             'leave_balance_id' => $balance->id,
                             'accrual_date' => $now->toDateString(),
-                            'source' => 'AUTOMATED',
+                            'source' => $targetControlNo !== null ? 'MANUAL' : 'AUTOMATED',
                         ],
                         [
                             'employee_control_no' => trim((string) ($balance->employee_control_no ?? '')) ?: null,
@@ -143,6 +187,10 @@ class AccrueLeaveCredits extends Command
                         ]
                     );
                 });
+
+                if ($targetControlNo !== null && $targetControlNo !== '') {
+                    $this->info("  {$type->name}: +{$finalAccrual} credits (new balance: {$balance->balance})");
+                }
 
                 $totalAccrued++;
             }
@@ -162,12 +210,12 @@ class AccrueLeaveCredits extends Command
      *     lookup: array<string, array{name: string, status: mixed}>
      * }
      */
-    private function buildEmployeeDirectory(int $hrTimeout): array
+    private function buildEmployeeDirectory(int $hrTimeout, ?string $targetControlNo = null): array
     {
         $employees = [];
         $lookup = [];
 
-        $records = $this->resolveAccrualEmployeeRecords($hrTimeout);
+        $records = $this->resolveAccrualEmployeeRecords($hrTimeout, $targetControlNo);
 
         foreach ($records as $employee) {
             if (! is_object($employee)) {
@@ -175,6 +223,10 @@ class AccrueLeaveCredits extends Command
             }
 
             if (! $this->isEmployeeEligibleForAccrual($employee)) {
+                if ($targetControlNo !== null) {
+                    $this->warn("Employee [{$targetControlNo}] status [{$employee->status}] is not eligible for leave accrual.");
+                }
+
                 continue;
             }
 
@@ -208,13 +260,42 @@ class AccrueLeaveCredits extends Command
         ];
     }
 
-    private function resolveAccrualEmployeeRecords(int $hrTimeout): Collection
+    private function resolveAccrualEmployeeRecords(int $hrTimeout, ?string $targetControlNo = null): Collection
     {
         if ($hrTimeout > 0) {
             $this->configureHrTimeout($hrTimeout);
             $this->line("Trying live HRIS with {$hrTimeout}s timeout.");
         } else {
             $this->line('Trying live HRIS with no forced timeout.');
+        }
+
+        if ($targetControlNo !== null && $targetControlNo !== '') {
+            try {
+                $employee = HrisEmployee::findByControlNo($targetControlNo, true);
+            } catch (Throwable $exception) {
+                report($exception);
+                $this->warn("Live HRIS lookup failed for ControlNo [{$targetControlNo}].");
+
+                return collect();
+            }
+
+            if (! $employee) {
+                try {
+                    $inactiveEmployee = HrisEmployee::findByControlNo($targetControlNo, false);
+                } catch (Throwable) {
+                    $inactiveEmployee = null;
+                }
+
+                if ($inactiveEmployee) {
+                    $this->warn("Employee with ControlNo [{$targetControlNo}] found in HRIS but is marked INACTIVE.");
+                } else {
+                    $this->warn("Employee with ControlNo [{$targetControlNo}] not found in active HRIS records.");
+                }
+
+                return collect();
+            }
+
+            return collect([$employee]);
         }
 
         try {
@@ -321,8 +402,14 @@ class AccrueLeaveCredits extends Command
             return 0;
         }
 
-        $existingEmployeeControlNos = LeaveBalance::query()
-            ->where('leave_type_id', $type->id)
+        $existingQuery = LeaveBalance::query()
+            ->where('leave_type_id', $type->id);
+
+        if (count($employeeControlNos) <= 1000) {
+            $existingQuery->whereIn('employee_control_no', $employeeControlNos);
+        }
+
+        $existingEmployeeControlNos = $existingQuery
             ->pluck('employee_control_no')
             ->map(static fn (mixed $employeeControlNo): string => trim((string) $employeeControlNo))
             ->filter(static fn (string $employeeControlNo): bool => $employeeControlNo !== '')

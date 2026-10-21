@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Controllers\Concerns\FiltersEmployeeControlNos;
 use App\Models\COCApplication;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
@@ -21,6 +22,8 @@ use Illuminate\Http\Request;
  */
 class HRDashboardController extends Controller
 {
+    use FiltersEmployeeControlNos;
+
     /**
      * Dashboard data: leave-focused charts plus summary counts for leave + COC applications.
      */
@@ -910,7 +913,7 @@ class HRDashboardController extends Controller
         foreach (
             LeaveBalance::query()
                 ->whereIn('leave_type_id', array_keys($leaveTypeIds))
-                ->whereIn('employee_control_no', array_keys($candidateControlNos))
+                ->tap(fn ($query) => $this->whereInEmployeeControlNos($query, array_keys($candidateControlNos)))
                 ->get(['leave_type_id', 'employee_control_no', 'balance']) as $balance
         ) {
             $leaveTypeId = (int) ($balance->leave_type_id ?? 0);
@@ -1062,7 +1065,7 @@ class HRDashboardController extends Controller
             $query->where(function ($q) use ($dept, $departmentControlNoCandidates) {
                 $q->when(
                     $departmentControlNoCandidates !== [],
-                    fn ($nestedQuery) => $nestedQuery->whereIn('employee_control_no', $departmentControlNoCandidates),
+                    fn ($nestedQuery) => $this->whereInEmployeeControlNos($nestedQuery, $departmentControlNoCandidates),
                     fn ($nestedQuery) => $nestedQuery->whereRaw('1 = 0')
                 )
                     ->orWhereHas('applicantAdmin.department', fn ($sq) => $sq->where('name', $dept));
