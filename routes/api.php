@@ -96,6 +96,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
     // Shared LMS account routes
     Route::get('/departments', [EmployeeController::class, 'departments']);
     Route::get('/employees', [EmployeeController::class, 'index']);
+    Route::get('/office-signatory-options', [EmployeeController::class, 'officeSignatoryOptions']);
     Route::get('/city-administrator', [EmployeeController::class, 'cityAdministrator']);
     Route::get('/city-mayor', [EmployeeController::class, 'cityMayor']);
     Route::get('/city-vice-mayor', [EmployeeController::class, 'cityViceMayor']);
@@ -195,9 +196,11 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::get('/employees/{controlNo}/leave-credits-ledger', [EmployeeController::class, 'leaveCreditsLedger']);
             Route::get('/employees/{controlNo}/coc-cto-ledger', [EmployeeController::class, 'cocCtoLedger']);
             Route::post('/employees/{controlNo}/restore-leave-credits', [EmployeeController::class, 'restoreLeaveCredits']);
+            Route::post('/employees/{controlNo}/restore-leave-credits/{id}/update', [EmployeeController::class, 'updateRestoration']);
             Route::post('/employees/{controlNo}/restore-leave-credits/{id}/delete', [EmployeeController::class, 'deleteRestoration']);
             Route::post('/employees/{controlNo}/deduct-late-leave', [EmployeeController::class, 'deductLateLeave']);
             Route::post('/employees/{controlNo}/late-deductions/{id}/update', [EmployeeController::class, 'updateLateDeduction']);
+            Route::post('/employees/{controlNo}/late-deductions/{id}/delete', [EmployeeController::class, 'deleteLateDeduction']);
             // Leave balance management
             Route::get('/leave-balances/available-types', [HRLeaveBalanceImportController::class, 'availableTypes']);
             Route::post('/leave-balances', [HRLeaveBalanceImportController::class, 'store']);
