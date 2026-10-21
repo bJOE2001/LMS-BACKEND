@@ -20,6 +20,11 @@ use App\Models\LeaveType;
 use App\Models\Notification;
 use App\Services\CocLedgerService;
 use App\Services\HrAccessControlService;
+use App\Services\Leave\LeaveCalculationService;
+use App\Services\Leave\LeaveCertificationService;
+use App\Services\Leave\LeaveCreditService;
+use App\Services\Leave\LeaveEligibilityService;
+use App\Services\Leave\LeaveWorkflowService;
 use App\Services\LeaveApplicationDocumentVerificationService;
 use App\Services\SmsGatewayService;
 use App\Services\WorkScheduleService;
@@ -51,11 +56,11 @@ class LeaveApplicationController extends Controller
 
     private const APPROVED_LEAVE_REQUEST_MIN_WORKING_DAYS_BEFORE_START = 5;
 
-    private const TERMINAL_LEAVE_ESTIMATE_FACTOR = 0.0478087;
+    private const TERMINAL_LEAVE_ESTIMATE_FACTOR = LeaveCertificationService::TERMINAL_LEAVE_ESTIMATE_FACTOR;
 
-    private const TERMINAL_LEAVE_AMOUNT_PRECISION = 12;
+    private const TERMINAL_LEAVE_AMOUNT_PRECISION = LeaveCertificationService::TERMINAL_LEAVE_AMOUNT_PRECISION;
 
-    private const CERTIFICATION_SELECTED_LEAVE_TYPE_BUCKET = 'selected_leave_type';
+    private const CERTIFICATION_SELECTED_LEAVE_TYPE_BUCKET = LeaveCertificationService::CERTIFICATION_SELECTED_LEAVE_TYPE_BUCKET;
 
     private const HR_APPLICATION_EDIT_REQUEST_KIND = LeaveApplicationUpdateRequest::REQUEST_KIND_HR_EDIT;
 
@@ -71,41 +76,61 @@ class LeaveApplicationController extends Controller
         'spl_specify',
     ];
 
-    private const QUEUE_GROUP_PENDING = 'PENDING';
+    private const QUEUE_GROUP_PENDING = LeaveWorkflowService::QUEUE_GROUP_PENDING;
 
-    private const QUEUE_GROUP_APPROVED = 'APPROVED';
+    private const QUEUE_GROUP_APPROVED = LeaveWorkflowService::QUEUE_GROUP_APPROVED;
 
-    private const QUEUE_GROUP_REJECTED = 'REJECTED';
+    private const QUEUE_GROUP_REJECTED = LeaveWorkflowService::QUEUE_GROUP_REJECTED;
 
-    private const QUEUE_GROUP_RECALLED = 'RECALLED';
+    private const QUEUE_GROUP_RECALLED = LeaveWorkflowService::QUEUE_GROUP_RECALLED;
 
-    private const QUEUE_GROUP_OTHER = 'OTHER';
+    private const QUEUE_GROUP_OTHER = LeaveWorkflowService::QUEUE_GROUP_OTHER;
 
-    private const QUEUE_GROUP_PRIORITY = [
-        self::QUEUE_GROUP_PENDING => 0,
-        self::QUEUE_GROUP_APPROVED => 1,
-        self::QUEUE_GROUP_REJECTED => 2,
-        self::QUEUE_GROUP_RECALLED => 3,
-        self::QUEUE_GROUP_OTHER => 4,
-    ];
+    private const QUEUE_GROUP_PRIORITY = LeaveWorkflowService::QUEUE_GROUP_PRIORITY;
 
-    private const QUEUE_STAGE_PRIORITY = [
-        'PENDING_LATE_HR' => 1,
-        'PENDING_HR_RECEIVE' => 2,
-        'PENDING_HR_REVIEW' => 3,
-        'PENDING_HR_CLASSIFICATION' => 4,
-        'PENDING_ADMIN' => 5,
-        'PENDING_ADMIN_REVIEW' => 6,
-        'PENDING_CMO_CBMO_REVIEW' => 7,
-        'PENDING_RELEASE' => 8,
-        'PENDING' => 9,
-    ];
+    private const QUEUE_STAGE_PRIORITY = LeaveWorkflowService::QUEUE_STAGE_PRIORITY;
 
-    private const QUEUE_NON_PENDING_STAGE_PRIORITY = 999;
+    private const QUEUE_NON_PENDING_STAGE_PRIORITY = LeaveWorkflowService::QUEUE_NON_PENDING_STAGE_PRIORITY;
 
     public function __construct(
-        private LeaveApplicationDocumentVerificationService $documentVerificationService
-    ) {}
+        private LeaveApplicationDocumentVerificationService $documentVerificationService,
+        private ?LeaveCalculationService $leaveCalculationService = null,
+        private ?LeaveEligibilityService $leaveEligibilityService = null,
+        private ?LeaveCertificationService $leaveCertificationService = null,
+        private ?LeaveCreditService $leaveCreditService = null,
+        private ?LeaveWorkflowService $leaveWorkflowService = null
+    ) {
+        $this->leaveCalculationService = $this->leaveCalculationService ?? app(LeaveCalculationService::class);
+        $this->leaveEligibilityService = $this->leaveEligibilityService ?? app(LeaveEligibilityService::class);
+        $this->leaveCertificationService = $this->leaveCertificationService ?? app(LeaveCertificationService::class);
+        $this->leaveCreditService = $this->leaveCreditService ?? app(LeaveCreditService::class);
+        $this->leaveWorkflowService = $this->leaveWorkflowService ?? app(LeaveWorkflowService::class);
+    }
+
+    private function leaveWorkflowService(): LeaveWorkflowService
+    {
+        return $this->leaveWorkflowService ??= app(LeaveWorkflowService::class);
+    }
+
+    private function leaveCalculationService(): LeaveCalculationService
+    {
+        return $this->leaveCalculationService ??= app(LeaveCalculationService::class);
+    }
+
+    private function leaveEligibilityService(): LeaveEligibilityService
+    {
+        return $this->leaveEligibilityService ??= app(LeaveEligibilityService::class);
+    }
+
+    private function leaveCertificationService(): LeaveCertificationService
+    {
+        return $this->leaveCertificationService ??= app(LeaveCertificationService::class);
+    }
+
+    private function leaveCreditService(): LeaveCreditService
+    {
+        return $this->leaveCreditService ??= app(LeaveCreditService::class);
+    }
 
     private function workScheduleService(): WorkScheduleService
     {
@@ -137,15 +162,7 @@ class LeaveApplicationController extends Controller
 
     private function hasLeaveApplicationCertificationCreditsSnapshotColumn(): bool
     {
-        static $resolved = false;
-        static $hasColumn = false;
-
-        if (! $resolved) {
-            $hasColumn = Schema::hasColumn('tblLeaveApplications', 'certification_leave_credits_snapshot');
-            $resolved = true;
-        }
-
-        return $hasColumn;
+        return $this->leaveCertificationService()->hasLeaveApplicationCertificationCreditsSnapshotColumn();
     }
     // ─── Employee: List own applications ──────────────────────────────
 
@@ -981,21 +998,11 @@ class LeaveApplicationController extends Controller
             $performedById = (int) ($app->employee_control_no ?: 1);
         }
 
-        DB::transaction(function () use ($app, $remarks, $performedById): void {
-            $app->update([
-                'status' => LeaveApplication::STATUS_CANCELLED,
-                'remarks' => $remarks,
-            ]);
-
-            LeaveApplicationLog::create([
-                'leave_application_id' => $app->id,
-                'action' => LeaveApplicationLog::ACTION_EMPLOYEE_CANCELLED,
-                'performed_by_type' => LeaveApplicationLog::PERFORMER_EMPLOYEE,
-                'performed_by_id' => $performedById,
-                'remarks' => $remarks,
-                'created_at' => now(),
-            ]);
-        });
+        $this->leaveWorkflowService()->employeeCancelPendingApplication(
+            $app,
+            $performedById,
+            $remarks
+        );
 
         $employeeName = trim(($employee->firstname ?? '').' '.($employee->surname ?? ''));
         if ($employeeName === '') {
@@ -1140,53 +1147,15 @@ class LeaveApplicationController extends Controller
             $performedById = (int) ($app->employee_control_no ?: 1);
         }
 
-        DB::transaction(function () use ($app, $remarksLine, $performedById, $requestedUpdatePayload, $requestReason): void {
-            $existingRemarks = trim((string) ($app->remarks ?? ''));
-            $updatedRemarks = $existingRemarks === ''
-                ? $remarksLine
-                : "{$existingRemarks}\n{$remarksLine}";
-
-            $app->update([
-                'status' => LeaveApplication::STATUS_PENDING_ADMIN,
-                'remarks' => $updatedRemarks,
-            ]);
-
-            $pendingRequest = LeaveApplicationUpdateRequest::query()
-                ->where('leave_application_id', (int) $app->id)
-                ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
-                ->whereRaw('UPPER(LTRIM(RTRIM(previous_status))) = ?', [LeaveApplication::STATUS_APPROVED])
-                ->latest('id')
-                ->first();
-
-            $requestPayload = [
-                'employee_control_no' => $this->resolveLeaveApplicationUpdateEmployeeControlNo($app),
-                'employee_name' => $this->resolveLeaveApplicationUpdateEmployeeName($app),
-                'requested_payload' => $requestedUpdatePayload,
-                'requested_reason' => $requestReason !== '' ? $requestReason : null,
-                'previous_status' => LeaveApplication::STATUS_APPROVED,
-                'requested_by_control_no' => (string) ($app->employee_control_no ?? ''),
-                'requested_at' => now(),
-            ];
-
-            if ($pendingRequest) {
-                $pendingRequest->update($requestPayload);
-            } else {
-                LeaveApplicationUpdateRequest::create(array_merge($requestPayload, [
-                    'leave_application_id' => (int) $app->id,
-                    'status' => LeaveApplicationUpdateRequest::STATUS_PENDING,
-                ]));
-            }
-
-            // Reuse SUBMITTED action because current log schema has no dedicated CANCEL_REQUESTED enum.
-            LeaveApplicationLog::create([
-                'leave_application_id' => $app->id,
-                'action' => LeaveApplicationLog::ACTION_SUBMITTED,
-                'performed_by_type' => LeaveApplicationLog::PERFORMER_EMPLOYEE,
-                'performed_by_id' => $performedById,
-                'remarks' => $remarksLine,
-                'created_at' => now(),
-            ]);
-        });
+        $this->leaveWorkflowService()->submitApprovedLeaveCancellationRequest(
+            $app,
+            $requestedUpdatePayload,
+            $remarksLine,
+            $requestReason,
+            $performedById,
+            $this->resolveLeaveApplicationUpdateEmployeeControlNo($app),
+            $this->resolveLeaveApplicationUpdateEmployeeName($app)
+        );
 
         $employeeName = trim(($employee->firstname ?? '').' '.($employee->surname ?? ''));
         if ($employeeName === '') {
@@ -2243,43 +2212,12 @@ class LeaveApplicationController extends Controller
 
     private function isCancelledForHrQueue(LeaveApplication $application): bool
     {
-        if ($application->status === LeaveApplication::STATUS_CANCELLED) {
-            return true;
-        }
-
-        if ($this->isCancelledRemark($application->remarks)) {
-            return true;
-        }
-
-        if ($application->relationLoaded('logs')) {
-            return $application->logs
-                ->filter(fn ($log) => $log instanceof LeaveApplicationLog)
-                ->contains(fn (LeaveApplicationLog $log): bool => $this->isCancelledRemark($log->remarks));
-        }
-
-        return false;
+        return $this->leaveWorkflowService()->isCancelledForHrQueue($application);
     }
 
     private function isRejectedBeforeHrQueue(LeaveApplication $application): bool
     {
-        if ($application->status !== LeaveApplication::STATUS_REJECTED) {
-            return false;
-        }
-
-        if ((int) ($application->hr_id ?? 0) > 0) {
-            return false;
-        }
-
-        if ($application->relationLoaded('logs')) {
-            return ! $application->logs
-                ->filter(fn ($log) => $log instanceof LeaveApplicationLog)
-                ->contains(
-                    fn (LeaveApplicationLog $log): bool => $log->action === LeaveApplicationLog::ACTION_HR_REJECTED
-                        && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
-                );
-        }
-
-        return true;
+        return $this->leaveWorkflowService()->isRejectedBeforeHrQueue($application);
     }
 
     public function adminShow(Request $request, int $id): JsonResponse
@@ -2365,44 +2303,13 @@ class LeaveApplicationController extends Controller
         $isPendingApprovedUpdateRequest = $this->hasPendingApprovedUpdateRequest($app);
         $pendingApprovedActionType = $this->resolvePendingApprovedUpdateActionType($app);
 
-        DB::transaction(function () use (
+        $this->leaveWorkflowService()->adminApproveApplication(
             $app,
             $admin,
-            $request,
+            $request->input('remarks'),
             $isPendingApprovedUpdateRequest,
             $pendingApprovedActionType
-        ) {
-            $updateAttributes = [
-                'status' => LeaveApplication::STATUS_PENDING_HR,
-                'admin_id' => $admin->id,
-                'remarks' => $request->input('remarks'),
-            ];
-            if (! $isPendingApprovedUpdateRequest) {
-                $updateAttributes['admin_approved_at'] = now();
-            }
-
-            $app->update($updateAttributes);
-
-            $logRemarks = $request->input('remarks');
-            if ($this->trimNullableString($logRemarks) === null && $isPendingApprovedUpdateRequest) {
-                $logRemarks = $pendingApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
-                    ? 'Approved leave cancellation request and forwarded to HR.'
-                    : (
-                        $pendingApprovedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
-                            ? 'Approved leave recall request and forwarded to HR.'
-                            : 'Approved leave update request and forwarded to HR.'
-                    );
-            }
-
-            LeaveApplicationLog::create([
-                'leave_application_id' => $app->id,
-                'action' => LeaveApplicationLog::ACTION_ADMIN_APPROVED,
-                'performed_by_type' => LeaveApplicationLog::PERFORMER_ADMIN,
-                'performed_by_id' => $admin->id,
-                'remarks' => $logRemarks,
-                'created_at' => now(),
-            ]);
-        });
+        );
 
         // Notify the employee that admin approved
         $app->load(['leaveType']);
@@ -2496,25 +2403,8 @@ class LeaveApplicationController extends Controller
         }
 
         $remarks = $request->input('remarks');
-        $status = $this->adminRejectStatusForRemarks($remarks);
-        $action = $this->adminRejectLogActionForRemarks($remarks);
-
-        DB::transaction(function () use ($app, $admin, $remarks, $status, $action): void {
-            $app->update([
-                'status' => $status,
-                'admin_id' => $admin->id,
-                'remarks' => $remarks,
-            ]);
-
-            LeaveApplicationLog::create([
-                'leave_application_id' => $app->id,
-                'action' => $action,
-                'performed_by_type' => LeaveApplicationLog::PERFORMER_ADMIN,
-                'performed_by_id' => $admin->id,
-                'remarks' => $remarks,
-                'created_at' => now(),
-            ]);
-        });
+        $rejectionResult = $this->leaveWorkflowService()->adminRejectApplication($app, $admin, $remarks);
+        $status = $rejectionResult['status'];
 
         // Notify the employee that admin rejected
         $app->load('leaveType');
@@ -2844,73 +2734,13 @@ class LeaveApplicationController extends Controller
         $fromDate = $validated['from_date'] ?? null;
         $toDate = $validated['to_date'] ?? null;
 
-        $updatesTable = (new LeaveApplicationUpdateRequest)->getTable();
-        $appsTable = (new LeaveApplication)->getTable();
-        $logsTable = (new LeaveApplicationLog)->getTable();
-
-        $approvedCancelCondition = function ($q) use ($updatesTable, $appsTable, $logsTable): void {
-            $q->where(function ($sub): void {
-                $sub->where('remarks', 'LIKE', '%approved leave cancellation%')
-                    ->orWhere('remarks', 'LIKE', '%Cancelled via approved%');
-            })->orWhereExists(function ($reqQuery) use ($updatesTable, $appsTable): void {
-                $reqQuery->select(\Illuminate\Support\Facades\DB::raw(1))
-                    ->from("{$updatesTable} as req")
-                    ->whereColumn('req.leave_application_id', "{$appsTable}.id")
-                    ->where('req.status', LeaveApplicationUpdateRequest::STATUS_APPROVED)
-                    ->where(function ($sub): void {
-                        $sub->where('req.requested_payload', 'LIKE', '%REQUEST_CANCEL%')
-                            ->orWhere('req.requested_payload', 'LIKE', '%REQUEST_CANCELLATION%')
-                            ->orWhere('req.requested_payload', 'LIKE', '%"cancel_leave":true%')
-                            ->orWhere('req.requested_payload', 'LIKE', '%"request_kind":"cancel"%');
-                    });
-            })->orWhereExists(function ($logQuery) use ($logsTable, $appsTable): void {
-                $logQuery->select(\Illuminate\Support\Facades\DB::raw(1))
-                    ->from("{$logsTable} as log")
-                    ->whereColumn('log.leave_application_id', "{$appsTable}.id")
-                    ->where('log.action', LeaveApplicationLog::ACTION_HR_APPROVED)
-                    ->where('log.remarks', 'LIKE', '%cancel%');
-            });
-        };
-
-        $baseQuery = LeaveApplication::query()
-            ->where('status', LeaveApplication::STATUS_CANCELLED);
-
-        if ($searchTokens !== []) {
-            $baseQuery->where(function ($q) use ($searchTokens): void {
-                foreach ($searchTokens as $token) {
-                    $likeToken = "%{$token}%";
-                    $q->where(function ($sub) use ($likeToken): void {
-                        $sub->where('id', 'like', $likeToken)
-                            ->orWhere('employee_control_no', 'like', $likeToken)
-                            ->orWhere('employee_name', 'like', $likeToken)
-                            ->orWhere('total_days', 'like', $likeToken)
-                            ->orWhere('remarks', 'like', $likeToken)
-                            ->orWhereHas('applicantAdmin', function ($qAdmin) use ($likeToken): void {
-                                $qAdmin->where('full_name', 'like', $likeToken)
-                                    ->orWhereHas('department', function ($qDept) use ($likeToken): void {
-                                        $qDept->where('name', 'like', $likeToken);
-                                    });
-                            })
-                            ->orWhereHas('leaveType', function ($qType) use ($likeToken): void {
-                                $qType->where('name', 'like', $likeToken);
-                            });
-                    });
-                }
-            });
-        }
-
-        if ($department !== '') {
-            $baseQuery->whereHas('applicantAdmin.department', function ($q) use ($department): void {
-                $q->where('name', $department);
-            });
-        }
-
-        if ($fromDate && $toDate) {
-            $baseQuery->where(function ($q) use ($fromDate, $toDate): void {
-                $q->whereBetween('updated_at', [$fromDate.' 00:00:00', $toDate.' 23:59:59'])
-                    ->orWhereBetween('created_at', [$fromDate.' 00:00:00', $toDate.' 23:59:59']);
-            });
-        }
+        $approvedCancelCondition = $this->leaveWorkflowService()->getApprovedCancellationCondition();
+        $baseQuery = $this->leaveWorkflowService()->buildCancelledApplicationsBaseQuery(
+            $searchTokens,
+            $department,
+            $fromDate,
+            $toDate
+        );
 
         $totalAll = (clone $baseQuery)->count();
         $totalApproved = (clone $baseQuery)->where($approvedCancelCondition)->count();
@@ -2998,73 +2828,13 @@ class LeaveApplicationController extends Controller
         $fromDate = $validated['from_date'] ?? null;
         $toDate = $validated['to_date'] ?? null;
 
-        $updatesTable = (new LeaveApplicationUpdateRequest)->getTable();
-        $appsTable = (new LeaveApplication)->getTable();
-        $logsTable = (new LeaveApplicationLog)->getTable();
-
-        $approvedCancelCondition = function ($q) use ($updatesTable, $appsTable, $logsTable): void {
-            $q->where(function ($sub): void {
-                $sub->where('remarks', 'LIKE', '%approved leave cancellation%')
-                    ->orWhere('remarks', 'LIKE', '%Cancelled via approved%');
-            })->orWhereExists(function ($reqQuery) use ($updatesTable, $appsTable): void {
-                $reqQuery->select(\Illuminate\Support\Facades\DB::raw(1))
-                    ->from("{$updatesTable} as req")
-                    ->whereColumn('req.leave_application_id', "{$appsTable}.id")
-                    ->where('req.status', LeaveApplicationUpdateRequest::STATUS_APPROVED)
-                    ->where(function ($sub): void {
-                        $sub->where('req.requested_payload', 'LIKE', '%REQUEST_CANCEL%')
-                            ->orWhere('req.requested_payload', 'LIKE', '%REQUEST_CANCELLATION%')
-                            ->orWhere('req.requested_payload', 'LIKE', '%"cancel_leave":true%')
-                            ->orWhere('req.requested_payload', 'LIKE', '%"request_kind":"cancel"%');
-                    });
-            })->orWhereExists(function ($logQuery) use ($logsTable, $appsTable): void {
-                $logQuery->select(\Illuminate\Support\Facades\DB::raw(1))
-                    ->from("{$logsTable} as log")
-                    ->whereColumn('log.leave_application_id', "{$appsTable}.id")
-                    ->where('log.action', LeaveApplicationLog::ACTION_HR_APPROVED)
-                    ->where('log.remarks', 'LIKE', '%cancel%');
-            });
-        };
-
-        $query = LeaveApplication::query()
-            ->where('status', LeaveApplication::STATUS_CANCELLED);
-
-        if ($searchTokens !== []) {
-            $query->where(function ($q) use ($searchTokens): void {
-                foreach ($searchTokens as $token) {
-                    $likeToken = "%{$token}%";
-                    $q->where(function ($sub) use ($likeToken): void {
-                        $sub->where('id', 'like', $likeToken)
-                            ->orWhere('employee_control_no', 'like', $likeToken)
-                            ->orWhere('employee_name', 'like', $likeToken)
-                            ->orWhere('total_days', 'like', $likeToken)
-                            ->orWhere('remarks', 'like', $likeToken)
-                            ->orWhereHas('applicantAdmin', function ($qAdmin) use ($likeToken): void {
-                                $qAdmin->where('full_name', 'like', $likeToken)
-                                    ->orWhereHas('department', function ($qDept) use ($likeToken): void {
-                                        $qDept->where('name', 'like', $likeToken);
-                                    });
-                            })
-                            ->orWhereHas('leaveType', function ($qType) use ($likeToken): void {
-                                $qType->where('name', 'like', $likeToken);
-                            });
-                    });
-                }
-            });
-        }
-
-        if ($department !== '') {
-            $query->whereHas('applicantAdmin.department', function ($q) use ($department): void {
-                $q->where('name', $department);
-            });
-        }
-
-        if ($fromDate && $toDate) {
-            $query->where(function ($q) use ($fromDate, $toDate): void {
-                $q->whereBetween('updated_at', [$fromDate.' 00:00:00', $toDate.' 23:59:59'])
-                    ->orWhereBetween('created_at', [$fromDate.' 00:00:00', $toDate.' 23:59:59']);
-            });
-        }
+        $approvedCancelCondition = $this->leaveWorkflowService()->getApprovedCancellationCondition();
+        $query = $this->leaveWorkflowService()->buildCancelledApplicationsBaseQuery(
+            $searchTokens,
+            $department,
+            $fromDate,
+            $toDate
+        );
 
         if ($tab === 'APPROVED_CANCELLATION') {
             $query->where($approvedCancelCondition);
@@ -3118,41 +2888,7 @@ class LeaveApplicationController extends Controller
      */
     private function resolveApplicationCancellationType(LeaveApplication $app): string
     {
-        if ($app->relationLoaded('updateRequests')) {
-            $approvedCancelRequest = $app->updateRequests->first(function (LeaveApplicationUpdateRequest $req): bool {
-                if ($req->status !== LeaveApplicationUpdateRequest::STATUS_APPROVED) {
-                    return false;
-                }
-                $payload = $req->requested_payload;
-                $actionType = is_array($payload) ? ($payload['action_type'] ?? '') : '';
-                $cancelLeave = is_array($payload) ? (bool) ($payload['cancel_leave'] ?? false) : false;
-                $requestKind = is_array($payload) ? ($payload['request_kind'] ?? '') : '';
-
-                return $actionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
-                    || $cancelLeave
-                    || $requestKind === 'cancel';
-            });
-            if ($approvedCancelRequest !== null) {
-                return 'APPROVED_CANCELLATION';
-            }
-        }
-
-        $remarks = trim((string) ($app->remarks ?? ''));
-        if (preg_match('/(?:approved\s+leave\s+cancellation|cancelled\s+via\s+approved)/i', $remarks)) {
-            return 'APPROVED_CANCELLATION';
-        }
-
-        if ($app->relationLoaded('logs')) {
-            $hasHrApprovedCancel = $app->logs->contains(function (LeaveApplicationLog $log): bool {
-                return $log->action === LeaveApplicationLog::ACTION_HR_APPROVED
-                    && preg_match('/cancel/i', (string) ($log->remarks ?? ''));
-            });
-            if ($hasHrApprovedCancel) {
-                return 'APPROVED_CANCELLATION';
-            }
-        }
-
-        return 'EMPLOYEE_CANCELLED';
+        return $this->leaveWorkflowService()->resolveApplicationCancellationType($app);
     }
 
     /**
@@ -3162,67 +2898,7 @@ class LeaveApplicationController extends Controller
      */
     private function resolveApplicationCancellationDetails(LeaveApplication $app, string $type): array
     {
-        $date = null;
-        $actor = '';
-        $reason = '';
-
-        if ($type === 'APPROVED_CANCELLATION') {
-            if ($app->relationLoaded('updateRequests')) {
-                $approvedReq = $app->updateRequests->first(function (LeaveApplicationUpdateRequest $req): bool {
-                    return $req->status === LeaveApplicationUpdateRequest::STATUS_APPROVED;
-                });
-                if ($approvedReq) {
-                    $date = $approvedReq->reviewed_at?->toIso8601String() ?? $approvedReq->updated_at?->toIso8601String();
-                    $reason = (string) ($approvedReq->requested_reason ?? '');
-                    if ($approvedReq->relationLoaded('reviewedByHr') && $approvedReq->reviewedByHr) {
-                        $actor = (string) ($approvedReq->reviewedByHr->name ?? $approvedReq->reviewedByHr->username ?? 'HR Admin');
-                    } else {
-                        $actor = 'HR Admin';
-                    }
-                }
-            }
-            if (! $date && $app->relationLoaded('logs')) {
-                $hrLog = $app->logs->first(function (LeaveApplicationLog $log): bool {
-                    return $log->action === LeaveApplicationLog::ACTION_HR_APPROVED;
-                });
-                if ($hrLog) {
-                    $date = $hrLog->created_at?->toIso8601String();
-                }
-            }
-        } else {
-            if ($app->relationLoaded('logs')) {
-                $empLog = $app->logs->first(function (LeaveApplicationLog $log): bool {
-                    return $log->action === LeaveApplicationLog::ACTION_EMPLOYEE_CANCELLED;
-                });
-                if ($empLog) {
-                    $date = $empLog->created_at?->toIso8601String();
-                    $actor = 'Employee';
-                }
-            }
-        }
-
-        if (! $date) {
-            $date = $app->updated_at?->toIso8601String() ?? $app->created_at?->toIso8601String();
-        }
-
-        if ($reason === '') {
-            $remarks = (string) ($app->remarks ?? '');
-            if (preg_match('/(?:Reason:\s*|Cancelled by employee:\s*|Cancellation request submitted by employee\.\s*Reason:\s*)(.+)$/i', $remarks, $matches)) {
-                $reason = trim($matches[1]);
-            } elseif ($remarks !== '') {
-                $reason = $remarks;
-            }
-        }
-
-        if ($actor === '') {
-            $actor = $type === 'APPROVED_CANCELLATION' ? 'HR / Department Admin' : 'Employee';
-        }
-
-        return [
-            'date' => $date,
-            'actor' => $actor,
-            'reason' => $reason,
-        ];
+        return $this->leaveWorkflowService()->resolveApplicationCancellationDetails($app, $type);
     }
 
     /**
@@ -3499,235 +3175,72 @@ class LeaveApplicationController extends Controller
         array $searchTokens,
         string $employmentType
     ): bool {
-        $employee = $this->resolveApplicationEmployee($application);
-
-        if (
-            $employmentType !== ''
-            && LeaveType::normalizeEmploymentStatusKey($employee?->status) !== $employmentType
-        ) {
-            return false;
-        }
-
-        if ($searchTokens === []) {
-            return true;
-        }
-
-        $queueMeta = $this->resolveLeaveHrQueueMeta($application);
-        $selectedDates = collect($application->resolvedSelectedDates() ?? [])
-            ->flatMap(fn (string $date): array => [
-                $date,
-                \Carbon\CarbonImmutable::parse($date)->format('F j Y'),
-            ])
-            ->all();
-        $searchableValues = [
-            'application',
-            $application->id,
-            $application->employee_control_no,
-            $application->employee_name,
-            $application->applicantAdmin?->full_name,
-            $this->formatEmployeeFullName($employee),
-            $employee?->office,
-            $employee?->officeAcronym,
-            $application->applicantAdmin?->department?->name,
-            $application->leaveType?->name,
-            $application->status,
-            $this->statusToFrontend((string) $application->status),
-            $queueMeta['group_status'] ?? null,
-            $queueMeta['stage_key'] ?? null,
-            $this->hrQueueStageSearchLabel((string) ($queueMeta['stage_key'] ?? '')),
-            $application->total_days,
-            self::formatDays($application->total_days),
-            $application->created_at?->toDateString(),
-            $application->created_at?->format('F j Y'),
-            $application->start_date?->toDateString(),
-            $application->start_date?->format('F j Y'),
-            $application->end_date?->toDateString(),
-            $application->end_date?->format('F j Y'),
-            ...$selectedDates,
-        ];
-        $haystack = $this->normalizeHrApplicationSearchValue(implode(' ', array_filter(
-            $searchableValues,
-            static fn (mixed $value): bool => $value !== null && $value !== ''
-        )));
-
-        foreach ($searchTokens as $searchToken) {
-            if (! str_contains($haystack, $searchToken)) {
-                return false;
-            }
-        }
-
-        return true;
+        return $this->leaveWorkflowService()->matchesHrApplicationFilters(
+            $application,
+            $searchTokens,
+            $employmentType,
+            fn ($app) => $this->resolveApplicationEmployee($app),
+            fn ($app) => $this->resolveLeaveHrQueueMeta($app)
+        );
     }
 
     private function normalizeHrApplicationSearchValue(mixed $value): string
     {
-        $normalized = mb_strtolower(trim((string) ($value ?? '')));
-        $normalized = preg_replace('/[^a-z0-9]+/u', ' ', $normalized);
-
-        return is_string($normalized) ? trim($normalized) : '';
+        return $this->leaveWorkflowService()->normalizeHrApplicationSearchValue($value);
     }
 
     private function hrQueueStageSearchLabel(string $stageKey): string
     {
-        return match ($stageKey) {
-            'PENDING_ADMIN', 'PENDING_ADMIN_REVIEW' => 'Department Recommendation',
-            'PENDING_HR_RECEIVE' => 'Pending Receive Pending Update Receive',
-            'PENDING_HR_REVIEW' => 'CHRMO Certification Pending Update Review',
-            'PENDING_CMO_CBMO_REVIEW' => 'CMO CVMO Review',
-            'PENDING_RELEASE' => 'Pending Release Pending Update Release',
-            default => '',
-        };
+        return $this->leaveWorkflowService()->hrQueueStageSearchLabel($stageKey);
     }
 
     private function hasHrReceivedForQueue(LeaveApplication $application): bool
     {
-        $cycleRequestedAt = $this->hasPendingApprovedUpdateRequest($application)
-            ? $this->resolvePendingApprovedUpdateCycleRequestedAt($application)
-            : null;
-
-        return $this->resolveLatestHrActionLogForCycle(
+        return $this->leaveWorkflowService()->hasHrReceivedForQueue(
             $application,
-            LeaveApplicationLog::ACTION_HR_RECEIVED,
-            $cycleRequestedAt
-        ) instanceof LeaveApplicationLog;
+            fn ($app) => $this->hasPendingApprovedUpdateRequest($app),
+            fn ($app) => $this->resolvePendingApprovedUpdateCycleRequestedAt($app)
+        );
     }
 
     private function hasHrReleasedForQueue(LeaveApplication $application): bool
     {
-        return $this->resolveLatestHrActionLogForCycle(
+        return $this->leaveWorkflowService()->hasHrReleasedForQueue(
             $application,
-            LeaveApplicationLog::ACTION_HR_RELEASED,
-            $this->resolveLatestApprovedUpdateCycleRequestedAt($application)
-        ) instanceof LeaveApplicationLog;
+            fn ($app) => $this->resolveLatestApprovedUpdateCycleRequestedAt($app)
+        );
     }
 
     private function hasCmoCbmoReviewedForQueue(LeaveApplication $application): bool
     {
-        return $this->resolveLatestHrActionLogForCycle(
+        return $this->leaveWorkflowService()->hasCmoCbmoReviewedForQueue(
             $application,
-            LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED,
-            $this->resolveLatestApprovedUpdateCycleRequestedAt($application)
-        ) instanceof LeaveApplicationLog;
+            fn ($app) => $this->resolveLatestApprovedUpdateCycleRequestedAt($app)
+        );
     }
 
     private function resolveLeaveQueueCreatedTimestamp(LeaveApplication $application): int
     {
-        $createdAt = $application->created_at;
-        if ($createdAt instanceof \DateTimeInterface) {
-            return (int) $createdAt->getTimestamp();
-        }
-
-        $rawCreatedAt = trim((string) ($createdAt ?? ''));
-        if ($rawCreatedAt !== '') {
-            $parsed = strtotime($rawCreatedAt);
-            if ($parsed !== false) {
-                return (int) $parsed;
-            }
-        }
-
-        return PHP_INT_MAX;
+        return $this->leaveWorkflowService()->resolveLeaveQueueCreatedTimestamp($application);
     }
 
     private function resolveLeaveHrQueueMeta(LeaveApplication $application): array
     {
-        $rawStatus = strtoupper(trim((string) ($application->status ?? '')));
-        $groupStatus = self::QUEUE_GROUP_OTHER;
-        $stageKey = '';
-
-        if ($rawStatus === LeaveApplication::STATUS_PENDING_HR) {
-            $groupStatus = self::QUEUE_GROUP_PENDING;
-            $stageKey = $this->hasHrReceivedForQueue($application)
-                ? 'PENDING_HR_REVIEW'
-                : 'PENDING_HR_RECEIVE';
-        } elseif ($rawStatus === LeaveApplication::STATUS_PENDING_ADMIN) {
-            $groupStatus = self::QUEUE_GROUP_PENDING;
-            $stageKey = $this->hasPendingApprovedUpdateRequest($application)
-                ? 'PENDING_ADMIN_REVIEW'
-                : 'PENDING_ADMIN';
-        } elseif ($rawStatus === LeaveApplication::STATUS_APPROVED) {
-            if ($this->hasHrReleasedForQueue($application)) {
-                $groupStatus = self::QUEUE_GROUP_APPROVED;
-            } elseif (! $this->hasCmoCbmoReviewedForQueue($application)) {
-                $groupStatus = self::QUEUE_GROUP_PENDING;
-                $stageKey = 'PENDING_CMO_CBMO_REVIEW';
-            } else {
-                $groupStatus = self::QUEUE_GROUP_PENDING;
-                $stageKey = 'PENDING_RELEASE';
-            }
-        } elseif ($rawStatus === LeaveApplication::STATUS_REJECTED) {
-            $groupStatus = self::QUEUE_GROUP_REJECTED;
-        } elseif ($rawStatus === LeaveApplication::STATUS_RECALLED) {
-            $groupStatus = self::QUEUE_GROUP_RECALLED;
-        } elseif (str_contains($rawStatus, 'PENDING')) {
-            $groupStatus = self::QUEUE_GROUP_PENDING;
-            $stageKey = 'PENDING';
-        }
-
-        $groupPriority = self::QUEUE_GROUP_PRIORITY[$groupStatus] ?? self::QUEUE_GROUP_PRIORITY[self::QUEUE_GROUP_OTHER];
-        $stagePriority = $groupStatus === self::QUEUE_GROUP_PENDING
-            ? (self::QUEUE_STAGE_PRIORITY[$stageKey !== '' ? $stageKey : 'PENDING'] ?? self::QUEUE_STAGE_PRIORITY['PENDING'])
-            : self::QUEUE_NON_PENDING_STAGE_PRIORITY;
-
-        return [
-            'group_status' => $groupStatus,
-            'group_priority' => $groupPriority,
-            'stage_key' => $stageKey,
-            'stage_priority' => $stagePriority,
-            'created_at_timestamp' => $this->resolveLeaveQueueCreatedTimestamp($application),
-        ];
+        return $this->leaveWorkflowService()->resolveLeaveHrQueueMeta(
+            $application,
+            fn (LeaveApplication $app) => $this->hasHrReceivedForQueue($app),
+            fn (LeaveApplication $app) => $this->hasHrReleasedForQueue($app),
+            fn (LeaveApplication $app) => $this->hasCmoCbmoReviewedForQueue($app),
+            fn (LeaveApplication $app) => $this->hasPendingApprovedUpdateRequest($app)
+        );
     }
 
     private function sortLeaveApplicationsForHrQueue(Collection $applications): Collection
     {
-        return $applications
-            ->sort(function (LeaveApplication $left, LeaveApplication $right): int {
-                $leftQueueMeta = $this->resolveLeaveHrQueueMeta($left);
-                $rightQueueMeta = $this->resolveLeaveHrQueueMeta($right);
-                $leftGroupStatus = (string) $leftQueueMeta['group_status'];
-                $rightGroupStatus = (string) $rightQueueMeta['group_status'];
-
-                $groupPriorityDiff = ((int) $leftQueueMeta['group_priority']) <=> ((int) $rightQueueMeta['group_priority']);
-                if ($groupPriorityDiff !== 0) {
-                    return $groupPriorityDiff;
-                }
-
-                if (
-                    $leftGroupStatus === self::QUEUE_GROUP_PENDING
-                    && $rightGroupStatus === self::QUEUE_GROUP_PENDING
-                ) {
-                    $stagePriorityDiff = ((int) $leftQueueMeta['stage_priority']) <=> ((int) $rightQueueMeta['stage_priority']);
-                    if ($stagePriorityDiff !== 0) {
-                        return $stagePriorityDiff;
-                    }
-                }
-
-                $createdAtDiff = ((int) $leftQueueMeta['created_at_timestamp']) <=> ((int) $rightQueueMeta['created_at_timestamp']);
-                if ($createdAtDiff !== 0) {
-                    $isLifoGroup = in_array($leftGroupStatus, [
-                        self::QUEUE_GROUP_APPROVED,
-                        self::QUEUE_GROUP_REJECTED,
-                        self::QUEUE_GROUP_RECALLED,
-                    ], true)
-                        && $leftGroupStatus === $rightGroupStatus;
-
-                    return $isLifoGroup ? (-1 * $createdAtDiff) : $createdAtDiff;
-                }
-
-                $idDiff = ((int) ($left->id ?? 0)) <=> ((int) ($right->id ?? 0));
-                if ($idDiff === 0) {
-                    return 0;
-                }
-
-                $isLifoGroup = in_array($leftGroupStatus, [
-                    self::QUEUE_GROUP_APPROVED,
-                    self::QUEUE_GROUP_REJECTED,
-                    self::QUEUE_GROUP_RECALLED,
-                ], true)
-                    && $leftGroupStatus === $rightGroupStatus;
-
-                return $isLifoGroup ? (-1 * $idDiff) : $idDiff;
-            })
-            ->values();
+        return $this->leaveWorkflowService()->sortLeaveApplicationsForHrQueue(
+            $applications,
+            fn (LeaveApplication $app) => $this->resolveLeaveHrQueueMeta($app)
+        );
     }
 
     public function hrShow(Request $request, int $id): JsonResponse
@@ -4576,29 +4089,18 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
-        $receivedLog = $app->logs->first(
-            fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
-                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        $wasNewlyReceived = $this->leaveWorkflowService()->confirmHardCopyReceipt(
+            $app,
+            $hr,
+            $request->input('remarks')
         );
-
-        if (! $receivedLog) {
-            LeaveApplicationLog::create([
-                'leave_application_id' => $app->id,
-                'action' => LeaveApplicationLog::ACTION_HR_RECEIVED,
-                'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
-                'performed_by_id' => $hr->id,
-                'remarks' => $request->input('remarks') ?: 'Received hard copy leave application form.',
-                'created_at' => now(),
-            ]);
-            $app->load('logs');
-        }
 
         $actorDirectory = $this->buildWorkflowActorDirectory([$app]);
 
         return response()->json([
-            'message' => $receivedLog
-                ? 'Hard-copy receipt was already confirmed for this application.'
-                : 'Hard-copy receipt confirmed.',
+            'message' => $wasNewlyReceived
+                ? 'Hard-copy receipt confirmed.'
+                : 'Hard-copy receipt was already confirmed for this application.',
             'application' => $this->formatErmsApplication($app, $actorDirectory),
         ]);
     }
@@ -4660,49 +4162,22 @@ class LeaveApplicationController extends Controller
             ], 422);
         }
 
-        $releasedLog = $app->logs->first(
-            fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_RELEASED
-                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        $releaseResult = $this->leaveWorkflowService()->confirmHardCopyRelease(
+            $app,
+            $hr,
+            $request->input('remarks')
         );
 
-        if (! $releasedLog) {
-            $receivedLog = $app->logs->first(
-                fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
-                    && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
-            );
-
-            if (! $receivedLog) {
-                return response()->json([
-                    'message' => 'Cannot mark as released before confirming receipt of the hard-copy application.',
-                ], 422);
-            }
-
-            $cmoCbmoReviewedLog = $app->logs->first(
-                fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED
-                    && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
-            );
-
-            if (! $cmoCbmoReviewedLog) {
-                return response()->json([
-                    'message' => 'Cannot mark as released before completing CMO/CVMO review.',
-                ], 422);
-            }
-
-            LeaveApplicationLog::create([
-                'leave_application_id' => $app->id,
-                'action' => LeaveApplicationLog::ACTION_HR_RELEASED,
-                'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
-                'performed_by_id' => $hr->id,
-                'remarks' => $request->input('remarks') ?: 'Released hard copy leave application form.',
-                'created_at' => now(),
-            ]);
-            $app->load('logs');
+        if (! $releaseResult['ok']) {
+            return response()->json([
+                'message' => $releaseResult['message'],
+            ], 422);
         }
 
         $actorDirectory = $this->buildWorkflowActorDirectory([$app]);
 
         return response()->json([
-            'message' => $releasedLog
+            'message' => $releaseResult['already_released']
                 ? 'Hard-copy release was already confirmed for this application.'
                 : 'Hard-copy release confirmed.',
             'application' => $this->formatErmsApplication($app, $actorDirectory),
@@ -4724,43 +4199,18 @@ class LeaveApplicationController extends Controller
         }
 
         $cycleRequestedAt = $this->resolveCurrentHrDocumentCycleRequestedAt($app);
-        $releasedLog = $this->resolveLatestHrActionLogForCycle(
-            $app,
-            LeaveApplicationLog::ACTION_HR_RELEASED,
-            $cycleRequestedAt
-        );
-        if ($releasedLog instanceof LeaveApplicationLog) {
+        $undoResult = $this->leaveWorkflowService()->undoHardCopyReceipt($app, $cycleRequestedAt);
+
+        if (! $undoResult['ok']) {
             return response()->json([
-                'message' => 'Cannot undo receipt after release. Undo the release first.',
+                'message' => $undoResult['message'],
             ], 422);
-        }
-
-        $reviewedLog = $this->resolveLatestHrActionLogForCycle(
-            $app,
-            LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED,
-            $cycleRequestedAt
-        );
-        if ($reviewedLog instanceof LeaveApplicationLog) {
-            return response()->json([
-                'message' => 'Cannot undo receipt after CMO/CVMO review has been completed.',
-            ], 422);
-        }
-
-        $receivedLog = $this->resolveLatestHrActionLogForCycle(
-            $app,
-            LeaveApplicationLog::ACTION_HR_RECEIVED,
-            $cycleRequestedAt
-        );
-
-        if ($receivedLog instanceof LeaveApplicationLog) {
-            $receivedLog->delete();
-            $app->load('logs');
         }
 
         $actorDirectory = $this->buildWorkflowActorDirectory([$app]);
 
         return response()->json([
-            'message' => $receivedLog instanceof LeaveApplicationLog
+            'message' => $undoResult['was_undone']
                 ? 'Hard-copy receipt was undone.'
                 : 'Hard-copy receipt is not currently confirmed for this application.',
             'application' => $this->formatErmsApplication($app, $actorDirectory),
@@ -4781,21 +4231,15 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Leave application not found.'], 404);
         }
 
-        $releasedLog = $this->resolveLatestHrActionLogForCycle(
+        $wasUndone = $this->leaveWorkflowService()->undoHardCopyRelease(
             $app,
-            LeaveApplicationLog::ACTION_HR_RELEASED,
             $this->resolveCurrentHrDocumentCycleRequestedAt($app)
         );
-
-        if ($releasedLog instanceof LeaveApplicationLog) {
-            $releasedLog->delete();
-            $app->load('logs');
-        }
 
         $actorDirectory = $this->buildWorkflowActorDirectory([$app]);
 
         return response()->json([
-            'message' => $releasedLog instanceof LeaveApplicationLog
+            'message' => $wasUndone
                 ? 'Hard-copy release was undone.'
                 : 'Hard-copy release is not currently confirmed for this application.',
             'application' => $this->formatErmsApplication($app, $actorDirectory),
@@ -4823,45 +4267,26 @@ class LeaveApplicationController extends Controller
             return response()->json(['message' => 'Leave application not found.'], 404);
         }
 
-        if ($app->status !== LeaveApplication::STATUS_APPROVED) {
+        $reviewResult = $this->leaveWorkflowService()->confirmCmoCbmoReview(
+            $app,
+            $hr,
+            $request->input('remarks')
+        );
+
+        if (! $reviewResult['ok']) {
             return response()->json([
-                'message' => "Cannot complete CMO/CVMO review: application status is '{$app->status}'.",
+                'message' => $reviewResult['message'],
             ], 422);
         }
 
-        $receivedLog = $app->logs->first(
-            fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
-                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
-        );
-
-        if (! $receivedLog) {
-            return response()->json([
-                'message' => 'Cannot complete CMO/CVMO review before confirming receipt of the hard-copy application.',
-            ], 422);
-        }
-
-        $reviewedLog = $app->logs->first(
-            fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED
-                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
-        );
-
-        if (! $reviewedLog) {
-            LeaveApplicationLog::create([
-                'leave_application_id' => $app->id,
-                'action' => LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED,
-                'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
-                'performed_by_id' => $hr->id,
-                'remarks' => $request->input('remarks') ?: 'CMO/CVMO review completed.',
-                'created_at' => now(),
-            ]);
-            $app->load('logs');
+        if (! $reviewResult['already_reviewed']) {
             $this->smsGatewayService()->sendLeaveReadyForReleaseMessage($app);
         }
 
         $actorDirectory = $this->buildWorkflowActorDirectory([$app]);
 
         return response()->json([
-            'message' => $reviewedLog
+            'message' => $reviewResult['already_reviewed']
                 ? 'CMO/CVMO review was already completed for this application.'
                 : 'CMO/CVMO review completed.',
             'application' => $this->formatErmsApplication($app, $actorDirectory),
@@ -5477,192 +4902,20 @@ class LeaveApplicationController extends Controller
         }
 
         if ($needsDeduction && ! (bool) $app->is_monetization) {
-            if ($app->employee_control_no) {
-                // Lock the selected leave type balance before approval to catch stale balances.
-                $deductTypeId = $this->resolveCanonicalLeaveTypeId((int) $app->leave_type_id)
-                    ?? (int) $app->leave_type_id;
-
-                $balance = $this->findPreferredEmployeeLeaveBalanceRecord(
-                    (string) $app->employee_control_no,
-                    $deductTypeId
-                );
-                $currentBalance = $balance ? (float) $balance->balance : 0.0;
-                if ($isForcedLeaveApplication) {
-                    $requiredVacationLeaveDays = round(max($daysToDeduct, 0.0), 3);
-                    $requiredPrimaryLeaveDays = 0.0;
-                } elseif ($usesVacationLeaveTopUpForScheduleExcess) {
-                    $requiredVacationLeaveDays = round(max($daysToDeduct - max($currentBalance, 0.0), 0.0), 3);
-                    $requiredPrimaryLeaveDays = round(max($daysToDeduct - $requiredVacationLeaveDays, 0.0), 3);
-                }
-
-                if (
-                    ! $usesVacationLeaveTopUpForScheduleExcess
-                    && $requiredPrimaryLeaveDays > 0.0
-                    && (! $balance || (float) $balance->balance < $requiredPrimaryLeaveDays)
-                ) {
-                    if ($usesVacationLeaveTopUpForScheduleExcess) {
-                        return $this->buildInsufficientPrimaryLeaveBalanceResponse(
-                            $leaveType,
-                            $currentBalance,
-                            $requiredPrimaryLeaveDays,
-                            true
-                        );
-                    }
-
-                    $label = $app->is_monetization ? 'monetization' : 'leave';
-
-                    return response()->json([
-                        'message' => "Insufficient leave balance for {$label}. Current: "
-                            .self::formatDays($currentBalance)
-                            .', Requested: '
-                            .self::formatDays($requiredPrimaryLeaveDays)
-                        .'.',
-                    ], 422);
-                }
-
-                if ($isForcedLeaveApplication && $vacationLeaveTypeId === null) {
-                    return $this->buildRequiredForcedLeaveVacationBalanceResponse(0.0);
-                }
-
-                if (($requiredVacationLeaveDays > 0.0 || $isForcedLeaveApplication) && $vacationLeaveTypeId !== null) {
-                    $vacationBalance = $this->findPreferredEmployeeLeaveBalanceRecord(
-                        (string) $app->employee_control_no,
-                        $vacationLeaveTypeId
-                    );
-                    $currentVacationBalance = $vacationBalance ? (float) $vacationBalance->balance : 0.0;
-                    if ($isForcedLeaveApplication && $currentVacationBalance <= 0.0) {
-                        return $this->buildRequiredForcedLeaveVacationBalanceResponse($currentVacationBalance);
-                    }
-
-                    if ($currentVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
-                        if ($usesVacationLeaveTopUpForScheduleExcess) {
-                            return $this->buildInsufficientVacationLeaveTopUpResponse(
-                                $leaveType,
-                                $currentVacationBalance,
-                                $requiredVacationLeaveDays
-                            );
-                        }
-
-                        return $this->buildInsufficientLinkedVacationLeaveBalanceResponse(
-                            $leaveType,
-                            $currentVacationBalance,
-                            $requiredVacationLeaveDays
-                        );
-                    }
-                }
-
-                if ($requiredLinkedSickLeaveDays > 0.0) {
-                    $sickLeaveTypeId = $this->resolveSickLeaveTypeId();
-                    $sickBalance = $sickLeaveTypeId !== null
-                        ? $this->findPreferredEmployeeLeaveBalanceRecord(
-                            (string) $app->employee_control_no,
-                            $sickLeaveTypeId
-                        )
-                        : null;
-                    $currentSickBalance = $sickBalance ? (float) $sickBalance->balance : 0.0;
-                    if ($currentSickBalance + 1e-9 < $requiredLinkedSickLeaveDays) {
-                        return response()->json([
-                            'message' => 'Insufficient Sick Leave balance for leave approval.'
-                                .' Current: '.self::formatDays($currentSickBalance)
-                                .', Required: '.self::formatDays($requiredLinkedSickLeaveDays).'.',
-                        ], 422);
-                    }
-                }
-            } elseif ($app->applicant_admin_id) {
-                $balance = $this->findAdminEmployeeLeaveBalance(
-                    (int) $app->applicant_admin_id,
-                    (int) $app->leave_type_id
-                );
-                $currentBalance = $balance ? (float) $balance->balance : 0.0;
-                if ($isForcedLeaveApplication) {
-                    $requiredVacationLeaveDays = round(max($daysToDeduct, 0.0), 3);
-                    $requiredPrimaryLeaveDays = 0.0;
-                } elseif ($usesVacationLeaveTopUpForScheduleExcess) {
-                    $requiredVacationLeaveDays = round(max($daysToDeduct - max($currentBalance, 0.0), 0.0), 3);
-                    $requiredPrimaryLeaveDays = round(max($daysToDeduct - $requiredVacationLeaveDays, 0.0), 3);
-                }
-
-                if (
-                    ! $usesVacationLeaveTopUpForScheduleExcess
-                    && $requiredPrimaryLeaveDays > 0.0
-                    && (! $balance || (float) $balance->balance < $requiredPrimaryLeaveDays)
-                ) {
-                    if ($usesVacationLeaveTopUpForScheduleExcess) {
-                        return $this->buildInsufficientPrimaryLeaveBalanceResponse(
-                            $leaveType,
-                            $currentBalance,
-                            $requiredPrimaryLeaveDays,
-                            true
-                        );
-                    }
-
-                    return response()->json([
-                        'message' => 'Insufficient leave balance. Current: '
-                            .self::formatDays($currentBalance)
-                            .', Requested: '
-                            .self::formatDays($requiredPrimaryLeaveDays)
-                        .'.',
-                    ], 422);
-                }
-
-                if ($isForcedLeaveApplication && $vacationLeaveTypeId === null) {
-                    return $this->buildRequiredForcedLeaveVacationBalanceResponse(0.0);
-                }
-
-                if (($requiredVacationLeaveDays > 0.0 || $isForcedLeaveApplication) && $vacationLeaveTypeId !== null) {
-                    $vacationBalance = $this->findAdminEmployeeLeaveBalance(
-                        (int) $app->applicant_admin_id,
-                        $vacationLeaveTypeId
-                    );
-                    $currentVacationBalance = $vacationBalance ? (float) $vacationBalance->balance : 0.0;
-                    if ($isForcedLeaveApplication && $currentVacationBalance <= 0.0) {
-                        return $this->buildRequiredForcedLeaveVacationBalanceResponse($currentVacationBalance);
-                    }
-
-                    if ($currentVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
-                        if ($usesVacationLeaveTopUpForScheduleExcess) {
-                            return $this->buildInsufficientVacationLeaveTopUpResponse(
-                                $leaveType,
-                                $currentVacationBalance,
-                                $requiredVacationLeaveDays
-                            );
-                        }
-
-                        return $this->buildInsufficientLinkedVacationLeaveBalanceResponse(
-                            $leaveType,
-                            $currentVacationBalance,
-                            $requiredVacationLeaveDays
-                        );
-                    }
-                }
-
-                if ($requiredLinkedSickLeaveDays > 0.0) {
-                    $sickLeaveTypeId = $this->resolveSickLeaveTypeId();
-                    $sickBalance = $sickLeaveTypeId !== null
-                        ? $this->findAdminEmployeeLeaveBalance(
-                            (int) $app->applicant_admin_id,
-                            $sickLeaveTypeId
-                        )
-                        : null;
-                    $currentSickBalance = $sickBalance ? (float) $sickBalance->balance : 0.0;
-                    if ($currentSickBalance + 1e-9 < $requiredLinkedSickLeaveDays) {
-                        return response()->json([
-                            'message' => 'Insufficient Sick Leave balance for leave approval.'
-                                .' Current: '.self::formatDays($currentSickBalance)
-                                .', Required: '.self::formatDays($requiredLinkedSickLeaveDays).'.',
-                        ], 422);
-                    }
-                }
-
-                if ($app->is_monetization) {
-                    $monetizationBalanceRestriction = $this->validateMonetizationBalanceRules(
-                        (float) $balance->balance,
-                        (float) ($app->total_days ?? 0.0)
-                    );
-                    if ($monetizationBalanceRestriction instanceof JsonResponse) {
-                        return $monetizationBalanceRestriction;
-                    }
-                }
+            $balanceValidationResponse = $this->leaveCreditService()->validateApprovalLeaveBalances(
+                $app,
+                $leaveType,
+                $daysToDeduct,
+                $isForcedLeaveApplication,
+                $usesVacationLeaveTopUpForScheduleExcess,
+                $requiredPrimaryLeaveDays,
+                $requiredVacationLeaveDays,
+                $requiredLinkedSickLeaveDays,
+                $vacationLeaveTypeId,
+                fn (float $bal, float $req) => $this->validateMonetizationBalanceRules($bal, $req)
+            );
+            if ($balanceValidationResponse instanceof JsonResponse) {
+                return $balanceValidationResponse;
             }
         }
 
@@ -5761,159 +5014,19 @@ class LeaveApplicationController extends Controller
                 ], 422);
             }
 
-            if ($app->employee_control_no) {
-                if ($isCtoDeduction) {
-                    $this->syncEmployeeCtoBalance((string) $app->employee_control_no);
-                }
-
-                $currentBalance = (float) (
-                    $this->findPreferredEmployeeLeaveBalanceRecord(
-                        (string) $app->employee_control_no,
-                        (int) $app->leave_type_id
-                    )?->balance ?? 0
-                );
-                if ($isForcedLeaveApplication) {
-                    $requiredVacationLeaveDays = round(max($daysToDeduct, 0.0), 3);
-                    $requiredPrimaryLeaveDays = 0.0;
-                } elseif ($usesVacationLeaveTopUpForScheduleExcess) {
-                    $requiredVacationLeaveDays = round(max($daysToDeduct - max($currentBalance, 0.0), 0.0), 3);
-                    $requiredPrimaryLeaveDays = round(max($daysToDeduct - $requiredVacationLeaveDays, 0.0), 3);
-                }
-
-                if ($isForcedLeaveApplication && $vacationLeaveTypeId === null) {
-                    return $this->buildRequiredForcedLeaveVacationBalanceResponse(0.0);
-                }
-
-                if (($shouldDeductVacationLeave || $isForcedLeaveApplication) && $vacationLeaveTypeId !== null && ($requiredVacationLeaveDays > 0.0 || $isForcedLeaveApplication)) {
-                    $currentVacationBalance = (float) (
-                        $this->findPreferredEmployeeLeaveBalanceRecord(
-                            (string) $app->employee_control_no,
-                            $vacationLeaveTypeId
-                        )?->balance ?? 0.0
-                    );
-                    if ($isForcedLeaveApplication && $currentVacationBalance <= 0.0) {
-                        return $this->buildRequiredForcedLeaveVacationBalanceResponse($currentVacationBalance);
-                    }
-
-                    if ($currentVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
-                        if ($usesVacationLeaveTopUpForScheduleExcess) {
-                            return $this->buildInsufficientVacationLeaveTopUpResponse(
-                                $leaveType,
-                                $currentVacationBalance,
-                                $requiredVacationLeaveDays
-                            );
-                        }
-
-                        return response()->json([
-                            'message' => 'Insufficient Vacation Leave balance for Mandatory / Forced Leave approval.'
-                                .' Current: '.self::formatDays($currentVacationBalance)
-                                .', Required: '.self::formatDays($requiredVacationLeaveDays).'.',
-                        ], 422);
-                    }
-                }
-
-                if ($requiredLinkedSickLeaveDays > 0.0) {
-                    $sickLeaveTypeId = $this->resolveSickLeaveTypeId();
-                    $currentSickBalance = $sickLeaveTypeId !== null
-                        ? (float) (
-                            $this->findPreferredEmployeeLeaveBalanceRecord(
-                                (string) $app->employee_control_no,
-                                $sickLeaveTypeId
-                            )?->balance ?? 0.0
-                        )
-                        : 0.0;
-                    if ($currentSickBalance + 1e-9 < $requiredLinkedSickLeaveDays) {
-                        return response()->json([
-                            'message' => 'Insufficient Sick Leave balance for leave approval.'
-                                .' Current: '.self::formatDays($currentSickBalance)
-                                .', Required: '.self::formatDays($requiredLinkedSickLeaveDays).'.',
-                        ], 422);
-                    }
-                }
-
-                $label = $app->is_monetization ? 'monetization' : 'leave';
-
-                return response()->json([
-                    'message' => "Insufficient leave balance for {$label}. Current: "
-                        .self::formatDays($currentBalance)
-                        .', Requested: '
-                        .self::formatDays($requiredPrimaryLeaveDays)
-                        .'.',
-                ], 422);
-            }
-
-            $currentBalance = (float) (
-                $this->findAdminEmployeeLeaveBalance(
-                    (int) $app->applicant_admin_id,
-                    (int) $app->leave_type_id
-                )?->balance ?? 0
+            return $this->leaveCreditService()->resolveApprovalBalanceConflictResponse(
+                $app,
+                $leaveType,
+                $daysToDeduct,
+                $isForcedLeaveApplication,
+                $shouldDeductVacationLeave,
+                $usesVacationLeaveTopUpForScheduleExcess,
+                $requiredPrimaryLeaveDays,
+                $requiredVacationLeaveDays,
+                $requiredLinkedSickLeaveDays,
+                $vacationLeaveTypeId,
+                $isCtoDeduction
             );
-            if ($isForcedLeaveApplication) {
-                $requiredVacationLeaveDays = round(max($daysToDeduct, 0.0), 3);
-                $requiredPrimaryLeaveDays = 0.0;
-            } elseif ($usesVacationLeaveTopUpForScheduleExcess) {
-                $requiredVacationLeaveDays = round(max($daysToDeduct - max($currentBalance, 0.0), 0.0), 3);
-                $requiredPrimaryLeaveDays = round(max($daysToDeduct - $requiredVacationLeaveDays, 0.0), 3);
-            }
-
-            if ($isForcedLeaveApplication && $vacationLeaveTypeId === null) {
-                return $this->buildRequiredForcedLeaveVacationBalanceResponse(0.0);
-            }
-
-            if (($shouldDeductVacationLeave || $isForcedLeaveApplication) && $vacationLeaveTypeId !== null && ($requiredVacationLeaveDays > 0.0 || $isForcedLeaveApplication)) {
-                $currentVacationBalance = (float) (
-                    $this->findAdminEmployeeLeaveBalance(
-                        (int) $app->applicant_admin_id,
-                        $vacationLeaveTypeId
-                    )?->balance ?? 0.0
-                );
-                if ($isForcedLeaveApplication && $currentVacationBalance <= 0.0) {
-                    return $this->buildRequiredForcedLeaveVacationBalanceResponse($currentVacationBalance);
-                }
-
-                if ($currentVacationBalance + 1e-9 < $requiredVacationLeaveDays) {
-                    if ($usesVacationLeaveTopUpForScheduleExcess) {
-                        return $this->buildInsufficientVacationLeaveTopUpResponse(
-                            $leaveType,
-                            $currentVacationBalance,
-                            $requiredVacationLeaveDays
-                        );
-                    }
-
-                    return response()->json([
-                        'message' => 'Insufficient Vacation Leave balance for Mandatory / Forced Leave approval.'
-                            .' Current: '.self::formatDays($currentVacationBalance)
-                            .', Required: '.self::formatDays($requiredVacationLeaveDays).'.',
-                    ], 422);
-                }
-            }
-
-            if ($requiredLinkedSickLeaveDays > 0.0) {
-                $sickLeaveTypeId = $this->resolveSickLeaveTypeId();
-                $currentSickBalance = $sickLeaveTypeId !== null
-                    ? (float) (
-                        $this->findAdminEmployeeLeaveBalance(
-                            (int) $app->applicant_admin_id,
-                            $sickLeaveTypeId
-                        )?->balance ?? 0.0
-                    )
-                    : 0.0;
-                if ($currentSickBalance + 1e-9 < $requiredLinkedSickLeaveDays) {
-                    return response()->json([
-                        'message' => 'Insufficient Sick Leave balance for leave approval.'
-                            .' Current: '.self::formatDays($currentSickBalance)
-                            .', Required: '.self::formatDays($requiredLinkedSickLeaveDays).'.',
-                    ], 422);
-                }
-            }
-
-            return response()->json([
-                'message' => 'Insufficient leave balance. Current: '
-                    .self::formatDays($currentBalance)
-                    .', Requested: '
-                    .self::formatDays($requiredPrimaryLeaveDays)
-                    .'.',
-            ], 422);
         }
 
         if ($isCtoDeduction && $app->employee_control_no) {
@@ -5963,22 +5076,7 @@ class LeaveApplicationController extends Controller
             return $this->hrRejectPendingUpdateRequest($request, $app, $hr);
         }
 
-        DB::transaction(function () use ($app, $hr, $request) {
-            $app->update([
-                'status' => LeaveApplication::STATUS_REJECTED,
-                'hr_id' => $hr->id,
-                'remarks' => $request->input('remarks'),
-            ]);
-
-            LeaveApplicationLog::create([
-                'leave_application_id' => $app->id,
-                'action' => LeaveApplicationLog::ACTION_HR_REJECTED,
-                'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
-                'performed_by_id' => $hr->id,
-                'remarks' => $request->input('remarks'),
-                'created_at' => now(),
-            ]);
-        });
+        $this->leaveWorkflowService()->hrRejectApplication($app, $hr, $request->input('remarks'));
 
         // Notify the applicant that HR rejected
         $app->load('leaveType');
@@ -6048,200 +5146,15 @@ class LeaveApplicationController extends Controller
         ?LeaveApplicationUpdateRequest $pendingUpdateRequest = null,
         mixed $pendingReviewRemarks = null
     ): JsonResponse {
-        if ((bool) $app->is_monetization) {
-            return response()->json([
-                'message' => 'Monetization requests cannot be recalled.',
-            ], 422);
-        }
-
-        $allowedStatuses = $pendingUpdateRequest instanceof LeaveApplicationUpdateRequest
-            ? [LeaveApplication::STATUS_PENDING_HR, LeaveApplication::STATUS_APPROVED]
-            : [LeaveApplication::STATUS_APPROVED];
-        if (! in_array($app->status, $allowedStatuses, true)) {
-            return response()->json([
-                'message' => $pendingUpdateRequest instanceof LeaveApplicationUpdateRequest
-                    ? "Cannot approve recall request: application status is '{$app->status}'."
-                    : "Cannot recall: application status is '{$app->status}', expected 'APPROVED'.",
-            ], 422);
-        }
-
-        $leaveType = $app->leaveType ?? LeaveType::find((int) $app->leave_type_id);
-        if (! $leaveType) {
-            return response()->json([
-                'message' => 'Selected leave type is no longer available.',
-            ], 422);
-        }
-        $app->setRelation('leaveType', $leaveType);
-
-        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
-        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
-        $normalizedLeaveTypeName = strtolower(trim((string) $leaveType->name));
-        $isRecallableLeaveType = ($forcedLeaveTypeId !== null && (int) $app->leave_type_id === $forcedLeaveTypeId)
-            || ($vacationLeaveTypeId !== null && (int) $app->leave_type_id === $vacationLeaveTypeId)
-            || in_array($normalizedLeaveTypeName, ['mandatory / forced leave', 'vacation leave'], true);
-
-        if (! $isRecallableLeaveType) {
-            return response()->json([
-                'message' => 'Only Vacation Leave and Mandatory / Forced Leave applications can be recalled.',
-            ], 422);
-        }
-
-        $selectedRecallDateKeys = $this->resolveValidatedRecallSelectedDateKeys(
+        return $this->leaveWorkflowService()->executeHrRecall(
             $app,
-            $requestedRecallDates
+            $hr,
+            $reason,
+            $requestedRecallDates,
+            $pendingUpdateRequest,
+            $pendingReviewRemarks,
+            fn (LeaveApplication $freshApp) => $this->formatApplication($freshApp)
         );
-        if ($selectedRecallDateKeys === null || $selectedRecallDateKeys === []) {
-            return response()->json([
-                'message' => 'Selected recall dates must match the application leave dates.',
-            ], 422);
-        }
-        $existingRecallDateKeys = $this->resolveEffectiveStoredRecallDateKeys($app);
-        $mergedRecallDateKeys = $this->normalizeRecallDateKeys(array_merge(
-            $existingRecallDateKeys,
-            $selectedRecallDateKeys
-        ));
-        $applicationDateKeys = $this->normalizeRecallDateKeys($app->resolvedSelectedDates() ?? []);
-        $isFullyRecalled = $applicationDateKeys !== []
-            && count(array_intersect($applicationDateKeys, $mergedRecallDateKeys)) >= count($applicationDateKeys);
-        $effectiveRecallDate = \Carbon\CarbonImmutable::parse($selectedRecallDateKeys[0])->startOfDay();
-
-        $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
-        $deductsBalance = $this->applicationDeductsEmployeeBalance(
-            (bool) $app->is_monetization,
-            $leaveType,
-            $normalizedPayMode
-        );
-        $recallDetails = $deductsBalance
-            ? $this->resolveRecallRestorableDetails($app, $selectedRecallDateKeys)
-            : ['days' => 0.0, 'dates' => []];
-        $daysToRestore = round((float) ($recallDetails['days'] ?? 0.0), 3);
-
-        $applicationDeductibleDays = $this->resolveApplicationDeductibleDays($app);
-        $primaryRestoreDays = min(
-            $daysToRestore,
-            $this->resolveStoredPrimaryLeaveDeduction(
-                $app,
-                $leaveType,
-                $applicationDeductibleDays
-            )
-        );
-        $linkedForcedRestoreDays = min(
-            $daysToRestore,
-            $this->resolveStoredLinkedForcedLeaveDeduction(
-                $app,
-                $leaveType,
-                $applicationDeductibleDays
-            )
-        );
-        $linkedVacationRestoreDays = min(
-            $daysToRestore,
-            $this->resolveStoredLinkedVacationLeaveDeduction(
-                $app,
-                $leaveType,
-                $applicationDeductibleDays
-            )
-        );
-        $recallRemarks = $reason !== ''
-            ? "Recalled by HR: {$reason}"
-            : 'Recalled by HR';
-
-        $balanceConflictError = 'HR_RECALL_BALANCE_CONFLICT';
-
-        try {
-            DB::transaction(function () use (
-                $app,
-                $hr,
-                $primaryRestoreDays,
-                $linkedForcedRestoreDays,
-                $linkedVacationRestoreDays,
-                $forcedLeaveTypeId,
-                $vacationLeaveTypeId,
-                $recallRemarks,
-                $effectiveRecallDate,
-                $mergedRecallDateKeys,
-                $isFullyRecalled,
-                $pendingUpdateRequest,
-                $pendingReviewRemarks
-            ): void {
-                if ($primaryRestoreDays > 0.0) {
-                    $this->restoreApplicationBalance($app, (int) $app->leave_type_id, $primaryRestoreDays);
-                }
-
-                if ($linkedForcedRestoreDays > 0.0 && $forcedLeaveTypeId !== null) {
-                    $this->restoreApplicationBalance($app, $forcedLeaveTypeId, $linkedForcedRestoreDays);
-                }
-
-                if ($linkedVacationRestoreDays > 0.0 && $vacationLeaveTypeId !== null) {
-                    $this->restoreApplicationBalance($app, $vacationLeaveTypeId, $linkedVacationRestoreDays);
-                }
-
-                $updatePayload = [
-                    'status' => $isFullyRecalled
-                        ? LeaveApplication::STATUS_RECALLED
-                        : LeaveApplication::STATUS_APPROVED,
-                    'hr_id' => $hr->id,
-                    'recall_effective_date' => $effectiveRecallDate->toDateString(),
-                    'recall_selected_dates' => $mergedRecallDateKeys,
-                ];
-                if ($isFullyRecalled) {
-                    $updatePayload['remarks'] = $recallRemarks;
-                }
-
-                $app->update($updatePayload);
-
-                if ($pendingUpdateRequest instanceof LeaveApplicationUpdateRequest) {
-                    $pendingUpdateRequest->update([
-                        'status' => LeaveApplicationUpdateRequest::STATUS_APPROVED,
-                        'reviewed_by_hr_id' => $hr->id,
-                        'reviewed_at' => now(),
-                        'review_remarks' => $this->trimNullableString($pendingReviewRemarks),
-                    ]);
-                }
-
-                LeaveApplicationLog::create([
-                    'leave_application_id' => $app->id,
-                    'action' => LeaveApplicationLog::ACTION_HR_RECALLED,
-                    'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
-                    'performed_by_id' => $hr->id,
-                    'remarks' => $recallRemarks,
-                    'created_at' => now(),
-                ]);
-            });
-        } catch (\RuntimeException $exception) {
-            if ($exception->getMessage() !== $balanceConflictError) {
-                throw $exception;
-            }
-
-            return response()->json([
-                'message' => 'Unable to recall the application due to leave balance mismatch. Please refresh and try again.',
-            ], 409);
-        }
-
-        $app->loadMissing('applicantAdmin', 'leaveType');
-        if ($app->applicant_admin_id && $app->applicantAdmin) {
-            Notification::send(
-                $app->applicantAdmin,
-                Notification::TYPE_LEAVE_CANCELLED,
-                $pendingUpdateRequest instanceof LeaveApplicationUpdateRequest
-                    ? 'Recall Request Approved by HR'
-                    : 'Leave Recalled by HR',
-                $pendingUpdateRequest instanceof LeaveApplicationUpdateRequest
-                    ? "Your {$app->leaveType->name} recall request was approved by HR.".($reason !== '' ? " Reason: {$reason}" : '')
-                    : "Your {$app->leaveType->name} application was recalled by HR.".($reason !== '' ? " Reason: {$reason}" : ''),
-                $app->id
-            );
-        }
-
-        return response()->json([
-            'message' => $pendingUpdateRequest instanceof LeaveApplicationUpdateRequest
-                ? ($isFullyRecalled
-                    ? 'Recall request approved by HR. Application recalled.'
-                    : 'Recall request approved by HR. Selected leave dates were recalled.')
-                : ($isFullyRecalled
-                    ? 'Application recalled by HR.'
-                    : 'Selected leave dates recalled by HR.'),
-            'application' => $this->formatApplication($app->fresh(['leaveType', 'applicantAdmin'])),
-        ]);
     }
 
     // ─── Admin: List department employees for apply-leave form ────────
@@ -6859,14 +5772,7 @@ class LeaveApplicationController extends Controller
      */
     private function statusToFrontend(string $status): string
     {
-        return match ($status) {
-            LeaveApplication::STATUS_PENDING_ADMIN => 'Pending Admin',
-            LeaveApplication::STATUS_PENDING_HR => 'Pending HR',
-            LeaveApplication::STATUS_APPROVED => 'Approved',
-            LeaveApplication::STATUS_REJECTED => 'Rejected',
-            LeaveApplication::STATUS_RECALLED => 'Recalled',
-            default => $status,
-        };
+        return $this->leaveWorkflowService()->statusToFrontend($status);
     }
 
     /**
@@ -6875,10 +5781,7 @@ class LeaveApplicationController extends Controller
      */
     private static function formatDays($days): string
     {
-        $num = (float) $days;
-        $display = ($num == (int) $num) ? (int) $num : $num;
-
-        return $display.' '.($num == 1 ? 'day' : 'days');
+        return LeaveWorkflowService::formatDays($days);
     }
 
     private function findEmployeeByControlNo(string $controlNo): ?object
@@ -7228,62 +6131,22 @@ class LeaveApplicationController extends Controller
 
     private function resolveCanonicalLeaveTypeId(?int $leaveTypeId): ?int
     {
-        return LeaveType::resolveCanonicalLeaveTypeId($leaveTypeId);
+        return $this->leaveCreditService()->resolveCanonicalLeaveTypeId($leaveTypeId);
     }
 
     private function resolveBalanceLookupLeaveTypeIds(int $leaveTypeId): array
     {
-        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
-        if ($canonicalLeaveTypeId <= 0) {
-            return [];
-        }
-
-        if (LeaveType::isSpecialPrivilegeType(null, $canonicalLeaveTypeId)) {
-            $relatedLeaveTypeIds = LeaveType::resolveSpecialPrivilegeRelatedTypeIds();
-            if ($relatedLeaveTypeIds !== []) {
-                return $relatedLeaveTypeIds;
-            }
-        }
-
-        return [$canonicalLeaveTypeId];
+        return $this->leaveCreditService()->resolveBalanceLookupLeaveTypeIds($leaveTypeId);
     }
 
     private function shouldPreferLeaveBalanceRecord(LeaveBalance $candidate, LeaveBalance $current): bool
     {
-        $candidateUpdatedAt = $candidate->updated_at?->timestamp ?? 0;
-        $currentUpdatedAt = $current->updated_at?->timestamp ?? 0;
-
-        if ($candidateUpdatedAt !== $currentUpdatedAt) {
-            return $candidateUpdatedAt > $currentUpdatedAt;
-        }
-
-        return (int) $candidate->id > (int) $current->id;
+        return $this->leaveCreditService()->shouldPreferLeaveBalanceRecord($candidate, $current);
     }
 
     private function mapLeaveBalancesByCanonicalTypeId(iterable $balances): array
     {
-        $mappedBalances = [];
-
-        foreach ($balances as $balance) {
-            if (! $balance instanceof LeaveBalance) {
-                continue;
-            }
-
-            $typeId = (int) ($balance->leave_type_id ?? 0);
-            if ($typeId <= 0) {
-                continue;
-            }
-
-            $canonicalTypeId = $this->resolveCanonicalLeaveTypeId($typeId) ?? $typeId;
-            if (
-                ! array_key_exists($canonicalTypeId, $mappedBalances)
-                || $this->shouldPreferLeaveBalanceRecord($balance, $mappedBalances[$canonicalTypeId])
-            ) {
-                $mappedBalances[$canonicalTypeId] = $balance;
-            }
-        }
-
-        return $mappedBalances;
+        return $this->leaveCreditService()->mapLeaveBalancesByCanonicalTypeId($balances);
     }
 
     private function findPreferredEmployeeLeaveBalanceRecord(
@@ -7291,42 +6154,31 @@ class LeaveApplicationController extends Controller
         int $leaveTypeId,
         bool $lockForUpdate = false
     ): ?LeaveBalance {
-        $lookupLeaveTypeIds = $this->resolveBalanceLookupLeaveTypeIds($leaveTypeId);
-        if ($lookupLeaveTypeIds === []) {
-            return null;
-        }
-
-        $query = $this->queryLeaveBalancesByEmployeeControlNo($employeeControlNo)
-            ->whereIn('leave_type_id', $lookupLeaveTypeIds)
-            ->orderByDesc('updated_at')
-            ->orderByDesc('id');
-
-        if ($lockForUpdate) {
-            $query->lockForUpdate();
-        }
-
-        return $query->first();
+        return $this->leaveCreditService()->findPreferredEmployeeLeaveBalanceRecord(
+            $employeeControlNo,
+            $leaveTypeId,
+            $lockForUpdate,
+            fn (string $c) => $this->controlNoCandidates($c)
+        );
     }
 
     private function queryLeaveBalancesByEmployeeControlNo(string $employeeControlNo)
     {
-        $candidateEmployeeIds = $this->controlNoCandidates($employeeControlNo);
-        if ($candidateEmployeeIds === []) {
-            return LeaveBalance::query()->whereRaw('1 = 0');
-        }
-
-        return LeaveBalance::query()
-            ->whereIn('employee_control_no', $candidateEmployeeIds);
+        return $this->leaveCreditService()->queryLeaveBalancesByEmployeeControlNo(
+            $employeeControlNo,
+            fn (string $c) => $this->controlNoCandidates($c)
+        );
     }
 
     private function findAdminEmployeeLeaveBalance(int $adminId, int $leaveTypeId, bool $lockForUpdate = false): ?LeaveBalance
     {
-        $employeeControlNo = $this->findAdminEmployeeControlNo($adminId);
-        if ($employeeControlNo === null) {
-            return null;
-        }
-
-        return $this->findPreferredEmployeeLeaveBalanceRecord($employeeControlNo, $leaveTypeId, $lockForUpdate);
+        return $this->leaveCreditService()->findAdminEmployeeLeaveBalance(
+            $adminId,
+            $leaveTypeId,
+            $lockForUpdate,
+            fn (int $id) => $this->findAdminEmployeeControlNo($id),
+            fn (string $c) => $this->controlNoCandidates($c)
+        );
     }
 
     private function restoreApplicationBalance(
@@ -7334,41 +6186,13 @@ class LeaveApplicationController extends Controller
         int $restoreLeaveTypeId,
         float $daysToRestore
     ): void {
-        $restoreLeaveTypeId = $this->resolveCanonicalLeaveTypeId($restoreLeaveTypeId) ?? $restoreLeaveTypeId;
-        $restoreAmount = round(max($daysToRestore, 0.0), 3);
-        if ($restoreLeaveTypeId <= 0 || $restoreAmount <= 0.0) {
-            return;
-        }
-
-        if ($app->employee_control_no) {
-            $balance = $this->findPreferredEmployeeLeaveBalanceRecord(
-                (string) $app->employee_control_no,
-                $restoreLeaveTypeId,
-                true
-            );
-
-            if (! $balance) {
-                throw new \RuntimeException('HR_RECALL_BALANCE_CONFLICT');
-            }
-
-            $balance->increment('balance', $restoreAmount);
-
-            return;
-        }
-
-        if ($app->applicant_admin_id) {
-            $balance = $this->findAdminEmployeeLeaveBalance(
-                (int) $app->applicant_admin_id,
-                $restoreLeaveTypeId,
-                true
-            );
-
-            if (! $balance) {
-                throw new \RuntimeException('HR_RECALL_BALANCE_CONFLICT');
-            }
-
-            $balance->increment('balance', $restoreAmount);
-        }
+        $this->leaveCreditService()->restoreApplicationBalance(
+            $app,
+            $restoreLeaveTypeId,
+            $daysToRestore,
+            fn (string $c) => $this->controlNoCandidates($c),
+            fn (int $id) => $this->findAdminEmployeeControlNo($id)
+        );
     }
 
     private function formatErmsEmployeeContext(object $employee): array
@@ -7431,29 +6255,16 @@ class LeaveApplicationController extends Controller
         LeaveType $leaveType,
         bool $skipEventBasedReuseRule = false
     ): ?JsonResponse {
-        $configuredRuleRestriction = $this->assertEmployeeCanUseConfiguredLeaveTypeRule(
+        return $this->leaveEligibilityService()->assertEmployeeCanApplyForLeaveType(
             $employee,
             $leaveType,
-            'This leave type is not available for the selected employee status.'
+            $skipEventBasedReuseRule
         );
-        if ($configuredRuleRestriction instanceof JsonResponse) {
-            return $configuredRuleRestriction;
-        }
-
-        if ($skipEventBasedReuseRule) {
-            return null;
-        }
-
-        return $this->assertEmployeeCanReuseEventBasedLeaveType($employee, $leaveType);
     }
 
     private function assertEmployeeCanAccessLeaveTypeBalance(object $employee, LeaveType $leaveType): ?JsonResponse
     {
-        return $this->assertEmployeeCanUseConfiguredLeaveTypeRule(
-            $employee,
-            $leaveType,
-            'This leave type balance is not available for the selected employee status.'
-        );
+        return $this->leaveEligibilityService()->assertEmployeeCanAccessLeaveTypeBalance($employee, $leaveType);
     }
 
     private function assertEmployeeCanUseConfiguredLeaveTypeRule(
@@ -7461,159 +6272,51 @@ class LeaveApplicationController extends Controller
         LeaveType $leaveType,
         string $fallbackMessage
     ): ?JsonResponse {
-        if (! $this->employeeHasResolvedEmploymentStatus($employee)) {
-            return null;
-        }
-
-        if ($leaveType->allowsEmploymentStatus($employee->status ?? null)) {
-            return null;
-        }
-
-        $statusLabel = $this->formatEmploymentStatusLabel($employee->status ?? null) ?? 'selected';
-        $allowedStatusLabels = $leaveType->allowedStatusLabels();
-        $message = $allowedStatusLabels !== []
-            ? sprintf(
-                '%s is only available for %s.',
-                $leaveType->name,
-                implode(', ', $allowedStatusLabels)
-            )
-            : sprintf(
-                '%s is not available for %s employees.',
-                $leaveType->name,
-                $statusLabel
-            );
-
-        if (trim($message) === '') {
-            $message = $fallbackMessage;
-        }
-
-        return response()->json([
-            'message' => $message,
-            'errors' => [
-                'leave_type_id' => [$message],
-            ],
-        ], 422);
+        return $this->leaveEligibilityService()->assertEmployeeCanUseConfiguredLeaveTypeRule(
+            $employee,
+            $leaveType,
+            $fallbackMessage
+        );
     }
 
     private function assertEmployeeCanReuseEventBasedLeaveType(object $employee, LeaveType $leaveType): ?JsonResponse
     {
-        if (! $this->shouldEnforceEventBasedMaxDaysReuseRule($leaveType)) {
-            return null;
-        }
-
-        $activeApprovedApplication = $this->findActiveApprovedEventBasedLeaveApplication($employee, (int) $leaveType->id);
-        if (! $activeApprovedApplication instanceof LeaveApplication) {
-            return null;
-        }
-
-        $activeThroughDate = $this->resolveApplicationLastLeaveDate($activeApprovedApplication);
-        if ($activeThroughDate === null) {
-            return null;
-        }
-
-        $message = sprintf(
-            '%s cannot be filed again until the current approved leave period ends on %s.',
-            $leaveType->name,
-            $activeThroughDate
-        );
-
-        return response()->json([
-            'message' => $message,
-            'errors' => [
-                'leave_type_id' => [$message],
-            ],
-            'active_approved_application_id' => (int) $activeApprovedApplication->id,
-            'active_through_date' => $activeThroughDate,
-        ], 422);
+        return $this->leaveEligibilityService()->assertEmployeeCanReuseEventBasedLeaveType($employee, $leaveType);
     }
 
     private function shouldEnforceEventBasedMaxDaysReuseRule(LeaveType $leaveType): bool
     {
-        $category = strtoupper(trim((string) ($leaveType->category ?? '')));
-        $maxDays = round((float) ($leaveType->max_days ?? 0), 2);
-
-        return $category === LeaveType::CATEGORY_EVENT && $maxDays > 0.0;
+        return $this->leaveEligibilityService()->shouldEnforceEventBasedMaxDaysReuseRule($leaveType);
     }
 
     private function findActiveApprovedEventBasedLeaveApplication(object $employee, int $leaveTypeId): ?LeaveApplication
     {
-        $employeeControlNo = $this->resolveEmployeeControlNoForLeaveTypeRule($employee);
-        if ($employeeControlNo === null || $leaveTypeId <= 0) {
-            return null;
-        }
-
-        $controlNoCandidates = $this->controlNoCandidates($employeeControlNo);
-        if ($controlNoCandidates === []) {
-            return null;
-        }
-
-        $lookupLeaveTypeIds = $this->resolveBalanceLookupLeaveTypeIds($leaveTypeId);
-        if ($lookupLeaveTypeIds === []) {
-            $lookupLeaveTypeIds = [$leaveTypeId];
-        }
-
-        $today = now()->toDateString();
-
-        return LeaveApplication::query()
-            ->whereIn('employee_control_no', $controlNoCandidates)
-            ->whereIn('leave_type_id', $lookupLeaveTypeIds)
-            ->where('status', LeaveApplication::STATUS_APPROVED)
-            ->orderByDesc('end_date')
-            ->orderByDesc('id')
-            ->get()
-            ->first(function (LeaveApplication $application) use ($today): bool {
-                $lastLeaveDate = $this->resolveApplicationLastLeaveDate($application);
-
-                return $lastLeaveDate !== null && $lastLeaveDate >= $today;
-            });
+        return $this->leaveEligibilityService()->findActiveApprovedEventBasedLeaveApplication($employee, $leaveTypeId);
     }
 
     private function resolveEmployeeControlNoForLeaveTypeRule(object $employee): ?string
     {
-        $rawControlNo = trim((string) (
-            $employee->control_no
-            ?? $employee->employee_control_no
-            ?? $employee->erms_control_no
-            ?? ''
-        ));
-
-        return $rawControlNo !== '' ? $rawControlNo : null;
+        return $this->leaveEligibilityService()->resolveEmployeeControlNoForLeaveTypeRule($employee);
     }
 
     private function resolveApplicationLastLeaveDate(LeaveApplication $application): ?string
     {
-        $resolvedSelectedDates = $application->resolvedSelectedDates();
-        if (is_array($resolvedSelectedDates) && $resolvedSelectedDates !== []) {
-            $lastSelectedDate = max($resolvedSelectedDates);
-            $normalizedLastSelectedDate = $this->resolveIsoDate($lastSelectedDate);
-            if ($normalizedLastSelectedDate !== null) {
-                return $normalizedLastSelectedDate->toDateString();
-            }
-        }
-
-        $endDate = $application->end_date?->toDateString();
-        if (is_string($endDate) && $endDate !== '') {
-            return $endDate;
-        }
-
-        $startDate = $application->start_date?->toDateString();
-
-        return is_string($startDate) && $startDate !== '' ? $startDate : null;
+        return $this->leaveEligibilityService()->resolveApplicationLastLeaveDate($application);
     }
 
     private function employeeHasResolvedEmploymentStatus(object $employee): bool
     {
-        return $this->resolveEmploymentStatusKey($employee->status ?? null) !== null;
+        return $this->leaveEligibilityService()->employeeHasResolvedEmploymentStatus($employee);
     }
 
     private function resolveEmploymentStatusKey(?string $status): ?string
     {
-        return LeaveType::normalizeEmploymentStatusKey($status);
+        return $this->leaveEligibilityService()->resolveEmploymentStatusKey($status);
     }
 
     private function formatEmploymentStatusLabel(?string $status): ?string
     {
-        return LeaveType::formatEmploymentStatusLabel($status) ?? $this->trimNullableString($status);
+        return $this->leaveEligibilityService()->formatEmploymentStatusLabel($status);
     }
 
     private function normalizeDetailsOfLeavePayload(mixed $value): ?array
@@ -8115,7 +6818,7 @@ class LeaveApplicationController extends Controller
 
     private function isHrApplicationEditRequestRecord(LeaveApplicationUpdateRequest $editRequest): bool
     {
-        return $editRequest->isHrApplicationEditRequest();
+        return $this->leaveWorkflowService()->isHrApplicationEditRequestRecord($editRequest);
     }
 
     private function isHrApplicationEditWorkflowLog(LeaveApplicationLog $log): bool
@@ -8804,14 +7507,7 @@ class LeaveApplicationController extends Controller
 
     private function ermsStatusLabel(string $status): string
     {
-        return match ($status) {
-            LeaveApplication::STATUS_PENDING_ADMIN, LeaveApplication::STATUS_PENDING_HR => 'Pending',
-            LeaveApplication::STATUS_APPROVED => 'Approved',
-            LeaveApplication::STATUS_REJECTED => 'Rejected',
-            LeaveApplication::STATUS_RECALLED => 'Recalled',
-            LeaveApplication::STATUS_CANCELLED => 'Cancelled',
-            default => 'Pending',
-        };
+        return $this->leaveWorkflowService()->ermsStatusLabel($status);
     }
 
     private function resolveEmployeeDisplayName(LeaveApplication $app): string
@@ -8836,41 +7532,12 @@ class LeaveApplicationController extends Controller
 
     private function adminCanManageApplication(DepartmentAdmin $admin, LeaveApplication $app): bool
     {
-        $admin->loadMissing('department');
-        $app->loadMissing('applicantAdmin.department');
-
-        $employeeControlNo = trim((string) ($app->employee_control_no ?? ''));
-        if ($employeeControlNo !== '') {
-            $latestAssignedDepartmentId = $this->resolveLatestAssignedDepartmentIdForControlNo($employeeControlNo);
-            if ($latestAssignedDepartmentId !== null) {
-                return (int) $latestAssignedDepartmentId === (int) ($admin->department_id ?? 0);
-            }
-
-            $applicationEmployee = $this->resolveApplicationEmployee($app);
-            if (($applicationEmployee?->office ?? null) === $admin->department?->name) {
-                return true;
-            }
-
-            return false;
-        }
-
-        if ((int) ($app->admin_id ?? 0) > 0 && (int) $app->admin_id === (int) $admin->id) {
-            return true;
-        }
-
-        if ((int) ($app->admin_id ?? 0) > 0) {
-            $reviewingAdminDepartmentId = DepartmentAdmin::query()
-                ->whereKey((int) $app->admin_id)
-                ->value('department_id');
-            if ((int) ($reviewingAdminDepartmentId ?? 0) > 0
-                && (int) $reviewingAdminDepartmentId === (int) ($admin->department_id ?? 0)
-            ) {
-                return true;
-            }
-        }
-
-        return (int) ($app->applicantAdmin?->department_id ?? 0) > 0
-            && (int) $app->applicantAdmin->department_id === (int) ($admin->department_id ?? 0);
+        return $this->leaveWorkflowService()->adminCanManageApplication(
+            $admin,
+            $app,
+            fn (string $controlNo) => $this->resolveLatestAssignedDepartmentIdForControlNo($controlNo),
+            fn (LeaveApplication $application) => $this->resolveApplicationEmployee($application)
+        );
     }
 
     private function resolveLeaveApplicationUpdateEmployeeControlNo(LeaveApplication $app): ?string
@@ -8906,18 +7573,7 @@ class LeaveApplicationController extends Controller
 
     private function normalizeControlNo(mixed $value): string
     {
-        $normalized = trim((string) ($value ?? ''));
-        if ($normalized === '') {
-            return '';
-        }
-
-        if (preg_match('/^\d+$/', $normalized)) {
-            $normalized = ltrim($normalized, '0');
-
-            return $normalized !== '' ? $normalized : '0';
-        }
-
-        return $normalized;
+        return $this->leaveEligibilityService()->normalizeControlNo($value);
     }
 
     private function isDepartmentHeadRecord(?string $controlNo): bool
@@ -8940,86 +7596,16 @@ class LeaveApplicationController extends Controller
 
     private function formatEmployeeFullName(?object $employee): string
     {
-        if (! is_object($employee)) {
-            return '';
-        }
-
-        return trim(implode(' ', array_filter([
-            trim((string) ($employee->firstname ?? $employee->first_name ?? '')),
-            trim((string) ($employee->middlename ?? $employee->middle_name ?? '')),
-            trim((string) ($employee->surname ?? $employee->last_name ?? '')),
-            trim((string) ($employee->suffix ?? '')),
-        ], static fn (string $part): bool => $part !== '')));
+        return LeaveWorkflowService::formatEmployeeFullName($employee);
     }
 
     private function buildWorkflowActorDirectory(iterable $applications): array
     {
-        $adminIds = [];
-        $hrIds = [];
-        $employeeNamesByControlNo = [];
-
-        foreach ($applications as $application) {
-            if (! $application instanceof LeaveApplication) {
-                continue;
-            }
-
-            if ($application->admin_id) {
-                $adminIds[] = (int) $application->admin_id;
-            }
-
-            if ($application->hr_id) {
-                $hrIds[] = (int) $application->hr_id;
-            }
-
-            $employeeControlNo = $this->normalizeControlNo($application->employee_control_no);
-            if ($employeeControlNo !== '') {
-                $employeeName = $this->formatEmployeeFullName($this->resolveApplicationEmployee($application));
-                if ($employeeName === '') {
-                    $employeeName = trim((string) ($application->applicantAdmin?->full_name ?? ''));
-                }
-                if ($employeeName !== '') {
-                    $employeeNamesByControlNo[$employeeControlNo] = $employeeName;
-                }
-            }
-
-            if (! $application->relationLoaded('logs')) {
-                continue;
-            }
-
-            foreach ($application->logs as $log) {
-                if (! $log instanceof LeaveApplicationLog || ! $log->performed_by_id) {
-                    continue;
-                }
-
-                $performerType = strtoupper((string) $log->performed_by_type);
-                if ($performerType === LeaveApplicationLog::PERFORMER_ADMIN) {
-                    $adminIds[] = (int) $log->performed_by_id;
-                } elseif ($performerType === LeaveApplicationLog::PERFORMER_HR) {
-                    $hrIds[] = (int) $log->performed_by_id;
-                }
-            }
-        }
-
-        $adminIds = array_values(array_unique(array_filter($adminIds)));
-        $hrIds = array_values(array_unique(array_filter($hrIds)));
-
-        $adminNamesById = DepartmentAdmin::query()
-            ->whereIn('id', $adminIds)
-            ->pluck('full_name', 'id')
-            ->map(fn ($name) => trim((string) $name))
-            ->all();
-
-        $hrNamesById = HRAccount::query()
-            ->whereIn('id', $hrIds)
-            ->pluck('full_name', 'id')
-            ->map(fn ($name) => trim((string) $name))
-            ->all();
-
-        return [
-            'admin' => $adminNamesById,
-            'hr' => $hrNamesById,
-            'employee' => $employeeNamesByControlNo,
-        ];
+        return $this->leaveWorkflowService()->buildWorkflowActorDirectory(
+            $applications,
+            fn ($app) => $this->resolveApplicationEmployee($app),
+            fn ($val) => $this->normalizeControlNo($val)
+        );
     }
 
     private function resolveWorkflowPerformerName(
@@ -9027,138 +7613,47 @@ class LeaveApplicationController extends Controller
         array $actorDirectory,
         string $fallbackEmployeeName = ''
     ): ?string {
-        if (! $log) {
-            return null;
-        }
-
-        $performerType = strtoupper((string) $log->performed_by_type);
-        $performerId = (int) $log->performed_by_id;
-        if ($performerId <= 0) {
-            return null;
-        }
-
-        if ($performerType === LeaveApplicationLog::PERFORMER_ADMIN) {
-            return $actorDirectory['admin'][$performerId] ?? null;
-        }
-
-        if ($performerType === LeaveApplicationLog::PERFORMER_HR) {
-            return $actorDirectory['hr'][$performerId] ?? null;
-        }
-
-        if ($performerType === LeaveApplicationLog::PERFORMER_EMPLOYEE) {
-            $controlNo = $this->normalizeControlNo($performerId);
-
-            return $actorDirectory['employee'][$controlNo] ?? ($fallbackEmployeeName !== '' ? $fallbackEmployeeName : null);
-        }
-
-        return null;
+        return $this->leaveWorkflowService()->resolveWorkflowPerformerName(
+            $log,
+            $actorDirectory,
+            $fallbackEmployeeName,
+            fn ($val) => $this->normalizeControlNo($val)
+        );
     }
 
     private function isCancelledRemark(mixed $remarks): bool
     {
-        return (bool) preg_match('/^cancelled\b/i', trim((string) ($remarks ?? '')));
+        return $this->leaveWorkflowService()->isCancelledRemark($remarks);
     }
 
     private function adminRejectStatusForRemarks(mixed $remarks): string
     {
-        return $this->isCancelledRemark($remarks)
-            ? LeaveApplication::STATUS_CANCELLED
-            : LeaveApplication::STATUS_REJECTED;
+        return $this->leaveWorkflowService()->adminRejectStatusForRemarks($remarks);
     }
 
     private function adminRejectLogActionForRemarks(mixed $remarks): string
     {
-        return $this->isCancelledRemark($remarks)
-            ? LeaveApplicationLog::ACTION_ADMIN_CANCELLED
-            : LeaveApplicationLog::ACTION_ADMIN_REJECTED;
+        return $this->leaveWorkflowService()->adminRejectLogActionForRemarks($remarks);
     }
 
     private function isAdminCancellationLog(LeaveApplicationLog $log): bool
     {
-        $performerType = strtoupper((string) $log->performed_by_type);
-
-        if ($log->action === LeaveApplicationLog::ACTION_ADMIN_CANCELLED) {
-            return true;
-        }
-
-        return $log->action === LeaveApplicationLog::ACTION_ADMIN_REJECTED
-            && $performerType === LeaveApplicationLog::PERFORMER_ADMIN
-            && $this->isCancelledRemark($log->remarks);
+        return $this->leaveWorkflowService()->isAdminCancellationLog($log);
     }
 
     private function isEmployeeCancellationLog(LeaveApplicationLog $log): bool
     {
-        $performerType = strtoupper((string) $log->performed_by_type);
-
-        if ($log->action === LeaveApplicationLog::ACTION_EMPLOYEE_CANCELLED) {
-            return true;
-        }
-
-        return $log->action === LeaveApplicationLog::ACTION_ADMIN_REJECTED
-            && $performerType === LeaveApplicationLog::PERFORMER_EMPLOYEE
-            && $this->isCancelledRemark($log->remarks);
+        return $this->leaveWorkflowService()->isEmployeeCancellationLog($log);
     }
 
     private function extractCancellationReason(mixed $remarks): ?string
     {
-        $normalizedRemarks = trim((string) ($remarks ?? ''));
-        if ($normalizedRemarks === '' || ! $this->isCancelledRemark($normalizedRemarks)) {
-            return null;
-        }
-
-        if (preg_match('/^cancelled(?:\s+via\s+[a-z0-9 _-]+)?\s*:\s*(.+)$/i', $normalizedRemarks, $matches)) {
-            $reason = trim((string) ($matches[1] ?? ''));
-
-            return $reason !== '' ? $reason : null;
-        }
-
-        return null;
+        return $this->leaveWorkflowService()->extractCancellationReason($remarks);
     }
 
     private function mapWorkflowLogStage(LeaveApplicationLog $log): string
     {
-        $remarks = trim((string) ($log->remarks ?? ''));
-        $performerType = strtoupper((string) $log->performed_by_type);
-
-        if ($log->action === LeaveApplicationLog::ACTION_SUBMITTED && preg_match('/^edit requested\b/i', $remarks)) {
-            return 'employee requested edit';
-        }
-
-        if ($log->action === LeaveApplicationLog::ACTION_SUBMITTED && preg_match('/^cancellation request submitted by employee\b/i', $remarks)) {
-            return 'employee requested cancellation';
-        }
-
-        if ($this->isAdminCancellationLog($log)) {
-            return 'department admin cancelled';
-        }
-
-        if ($this->isEmployeeCancellationLog($log)) {
-            return 'employee cancelled';
-        }
-
-        return match ($log->action) {
-            LeaveApplicationLog::ACTION_SUBMITTED => match ($performerType) {
-                LeaveApplicationLog::PERFORMER_ADMIN => 'department admin submitted',
-                LeaveApplicationLog::PERFORMER_HR => 'hr submitted',
-                default => 'employee submitted',
-            },
-            LeaveApplicationLog::ACTION_ADMIN_APPROVED => 'department admin approved',
-            LeaveApplicationLog::ACTION_ADMIN_REJECTED => 'department admin rejected',
-            LeaveApplicationLog::ACTION_ADMIN_CANCELLED => 'department admin cancelled',
-            LeaveApplicationLog::ACTION_EMPLOYEE_CANCELLED => 'employee cancelled',
-            LeaveApplicationLog::ACTION_HR_APPROVED => 'hr approved',
-            LeaveApplicationLog::ACTION_HR_REJECTED => 'hr rejected',
-            LeaveApplicationLog::ACTION_HR_RECALLED => 'hr recalled',
-            LeaveApplicationLog::ACTION_HR_RECEIVED => 'received application',
-            LeaveApplicationLog::ACTION_HR_PAY_STATUS_OVERRIDDEN => 'hr updated pay status',
-            LeaveApplicationLog::ACTION_HR_APPLICATION_EDITED => 'hr edited application',
-            LeaveApplicationLog::ACTION_HR_APPLICATION_EDIT_REQUESTED => 'hr requested application edit',
-            LeaveApplicationLog::ACTION_HR_APPLICATION_EDIT_REQUEST_APPROVED => 'hr approved application edit request',
-            LeaveApplicationLog::ACTION_HR_APPLICATION_EDIT_REQUEST_REJECTED => 'hr rejected application edit request',
-            LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED => 'cmo/cvmo reviewed',
-            LeaveApplicationLog::ACTION_HR_RELEASED => 'released application',
-            default => strtolower(str_replace('_', ' ', (string) $log->action)),
-        };
+        return $this->leaveWorkflowService()->mapWorkflowLogStage($log);
     }
 
     private function formatErmsApplication(LeaveApplication $app, array $actorDirectory): array
@@ -9177,48 +7672,20 @@ class LeaveApplicationController extends Controller
         }
         $office = $resolvedEmployee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
 
-        $logs = $app->relationLoaded('logs')
-            ? $app->logs->sortBy(fn (LeaveApplicationLog $log) => $log->created_at?->timestamp ?? 0)->values()
-            : collect();
-
-        $submittedLog = $logs->first(
-            fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_SUBMITTED
+        $milestoneLogs = $this->leaveWorkflowService()->resolveApplicationMilestoneLogs(
+            $app,
+            fn ($r) => $this->isCancelledRemark($r)
         );
-        $adminApprovedLog = $logs->first(
-            fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_ADMIN_APPROVED
-        );
-        $hrApprovedLog = $logs->first(
-            fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_APPROVED
-        );
-        $hrReceivedLog = $logs->last(
-            fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
-                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
-        );
-        $cmoCbmoReviewedLog = $logs->last(
-            fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED
-                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
-        );
-        $hrReleasedLog = $logs->last(
-            fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_RELEASED
-                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
-        );
-        $hrRecalledLog = $logs->first(
-            fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_RECALLED
-                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
-        );
-        $adminRejectedLog = $logs->first(
-            fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_ADMIN_REJECTED
-                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_ADMIN
-        );
-        $hrRejectedLog = $logs->first(
-            fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_REJECTED
-                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
-        );
-        $cancelledLog = $logs->last(
-            fn (LeaveApplicationLog $log) => $this->isCancelledRemark($log->remarks)
-                || $this->isAdminCancellationLog($log)
-                || $this->isEmployeeCancellationLog($log)
-        );
+        $submittedLog = $milestoneLogs['submitted'];
+        $adminApprovedLog = $milestoneLogs['admin_approved'];
+        $hrApprovedLog = $milestoneLogs['hr_approved'];
+        $hrReceivedLog = $milestoneLogs['hr_received'];
+        $cmoCbmoReviewedLog = $milestoneLogs['cmo_cbmo_reviewed'];
+        $hrReleasedLog = $milestoneLogs['hr_released'];
+        $hrRecalledLog = $milestoneLogs['hr_recalled'];
+        $adminRejectedLog = $milestoneLogs['admin_rejected'];
+        $hrRejectedLog = $milestoneLogs['hr_rejected'];
+        $cancelledLog = $milestoneLogs['cancelled'];
 
         $filedBy = $this->resolveWorkflowPerformerName($submittedLog, $actorDirectory, $employeeName);
         if (! $filedBy && $app->applicant_admin_id && $app->applicantAdmin) {
@@ -9513,31 +7980,13 @@ class LeaveApplicationController extends Controller
 
     private function buildRequestedLeaveCancellationPayload(LeaveApplication $app, string $requestReason = ''): array
     {
-        $leaveTypeId = $this->resolveCanonicalLeaveTypeId((int) ($app->leave_type_id ?? 0))
-            ?? (int) ($app->leave_type_id ?? 0);
-
-        return $this->withRequestedLeaveActionType([
-            'leave_type_id' => $leaveTypeId > 0 ? $leaveTypeId : null,
-            'leave_type_name' => $this->trimNullableString($app->leaveType?->name ?? null),
-            'start_date' => $app->start_date?->toDateString(),
-            'end_date' => $app->end_date?->toDateString(),
-            'selected_dates' => $app->resolvedSelectedDates(),
-            'selected_date_pay_status' => is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null,
-            'selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
-            'selected_date_half_day_portion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
-            'total_days' => round((float) ($app->total_days ?? 0), 2),
-            'deductible_days' => $this->resolveApplicationDeductibleDays($app),
-            'allow_sl_vl_cross_deduction' => (bool) ($app->allow_sl_vl_cross_deduction ?? false),
-            'reason' => $this->trimNullableString($requestReason) ?? $this->trimNullableString($app->reason ?? null),
-            'details_of_leave' => $this->trimNullableString($app->details_of_leave ?? null),
-            'cancel_reason' => $this->trimNullableString($requestReason),
-            'commutation' => $this->trimNullableString($app->commutation ?? null) ?? 'Not Requested',
-            'pay_mode' => $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization),
-            'is_monetization' => (bool) $app->is_monetization,
-            'attachment_required' => (bool) ($app->attachment_required ?? false),
-            'attachment_submitted' => (bool) ($app->attachment_submitted ?? false),
-            'attachment_reference' => $this->trimNullableString($app->attachment_reference ?? null),
-        ], LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL);
+        return $this->leaveWorkflowService()->buildRequestedLeaveCancellationPayload(
+            $app,
+            $requestReason,
+            fn ($id) => $this->resolveCanonicalLeaveTypeId($id),
+            fn ($a) => $this->resolveApplicationDeductibleDays($a),
+            fn ($mode, $isMonetization) => $this->normalizePayMode($mode, $isMonetization)
+        );
     }
 
     private function buildRequestedLeaveRecallPayload(
@@ -9545,33 +7994,15 @@ class LeaveApplicationController extends Controller
         string $requestReason = '',
         array $selectedRecallDateKeys = []
     ): array {
-        $leaveTypeId = $this->resolveCanonicalLeaveTypeId((int) ($app->leave_type_id ?? 0))
-            ?? (int) ($app->leave_type_id ?? 0);
-        $normalizedRecallDateKeys = $this->normalizeRecallDateKeys($selectedRecallDateKeys);
-
-        return $this->withRequestedLeaveActionType([
-            'leave_type_id' => $leaveTypeId > 0 ? $leaveTypeId : null,
-            'leave_type_name' => $this->trimNullableString($app->leaveType?->name ?? null),
-            'start_date' => $app->start_date?->toDateString(),
-            'end_date' => $app->end_date?->toDateString(),
-            'selected_dates' => $app->resolvedSelectedDates(),
-            'selected_date_pay_status' => is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null,
-            'selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
-            'selected_date_half_day_portion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
-            'total_days' => round((float) ($app->total_days ?? 0), 2),
-            'deductible_days' => $this->resolveApplicationDeductibleDays($app),
-            'allow_sl_vl_cross_deduction' => (bool) ($app->allow_sl_vl_cross_deduction ?? false),
-            'reason' => $this->trimNullableString($requestReason) ?? $this->trimNullableString($app->reason ?? null),
-            'recall_reason' => $this->trimNullableString($requestReason),
-            'recall_selected_dates' => $normalizedRecallDateKeys,
-            'details_of_leave' => $this->trimNullableString($app->details_of_leave ?? null),
-            'commutation' => $this->trimNullableString($app->commutation ?? null) ?? 'Not Requested',
-            'pay_mode' => $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization),
-            'is_monetization' => (bool) $app->is_monetization,
-            'attachment_required' => (bool) ($app->attachment_required ?? false),
-            'attachment_submitted' => (bool) ($app->attachment_submitted ?? false),
-            'attachment_reference' => $this->trimNullableString($app->attachment_reference ?? null),
-        ], LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL);
+        return $this->leaveWorkflowService()->buildRequestedLeaveRecallPayload(
+            $app,
+            $requestReason,
+            $selectedRecallDateKeys,
+            fn ($id) => $this->resolveCanonicalLeaveTypeId($id),
+            fn ($a) => $this->resolveApplicationDeductibleDays($a),
+            fn ($mode, $isMonetization) => $this->normalizePayMode($mode, $isMonetization),
+            fn ($dates) => $this->normalizeRecallDateKeys($dates)
+        );
     }
 
     private function buildRequestedLeaveUpdatePayload(Request $request, array $validated, LeaveApplication $app): array|JsonResponse
@@ -9915,14 +8346,10 @@ class LeaveApplicationController extends Controller
 
     private function hasPendingApprovedUpdateRequest(LeaveApplication $app): bool
     {
-        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
-        if (($pendingUpdateMeta['payload'] ?? null) === null) {
-            return false;
-        }
-
-        $previousStatus = strtoupper(trim((string) ($pendingUpdateMeta['previous_status'] ?? '')));
-
-        return $previousStatus === LeaveApplication::STATUS_APPROVED;
+        return $this->leaveWorkflowService()->hasPendingApprovedUpdateRequest(
+            $app,
+            fn ($a) => $this->resolvePendingUpdateMeta($a)
+        );
     }
 
     /**
@@ -9930,29 +8357,7 @@ class LeaveApplicationController extends Controller
      */
     private function resolveEffectiveLeaveStartDate(LeaveApplication $app): ?\Carbon\CarbonImmutable
     {
-        $candidateDate = null;
-        if (! empty($app->selected_dates) && is_array($app->selected_dates)) {
-            $sortedDates = collect($app->selected_dates)->filter()->sort()->values();
-            if ($sortedDates->isNotEmpty()) {
-                $candidateDate = (string) $sortedDates->first();
-            }
-        }
-
-        if (! $candidateDate && $app->start_date) {
-            $candidateDate = $app->start_date instanceof \DateTimeInterface
-                ? $app->start_date->format('Y-m-d')
-                : (string) $app->start_date;
-        }
-
-        if (! $candidateDate) {
-            return null;
-        }
-
-        try {
-            return \Carbon\CarbonImmutable::parse($candidateDate)->startOfDay();
-        } catch (\Throwable) {
-            return null;
-        }
+        return $this->leaveEligibilityService()->resolveEffectiveLeaveStartDate($app);
     }
 
     /**
@@ -9961,184 +8366,57 @@ class LeaveApplicationController extends Controller
      */
     private function validateApprovedLeaveRequestLeadTime(LeaveApplication $app, string $actionLabel = 'cancel'): ?JsonResponse
     {
-        if ($app->status !== LeaveApplication::STATUS_APPROVED) {
-            return null;
-        }
-
-        if ((bool) $app->is_monetization) {
-            return null;
-        }
-
-        $startDate = $this->resolveEffectiveLeaveStartDate($app);
-        if (! $startDate) {
-            return null;
-        }
-
-        $today = \Carbon\CarbonImmutable::today();
-        $workingDaysBeforeStart = $this->countWorkingDaysFromFiledDateBeforeDate($today, $startDate);
-
-        if ($workingDaysBeforeStart < self::APPROVED_LEAVE_REQUEST_MIN_WORKING_DAYS_BEFORE_START) {
-            $actionVerb = strtolower($actionLabel) === 'update' ? 'edit or update' : 'cancel';
-
-            return response()->json([
-                'message' => "Requests to {$actionVerb} an approved leave application must be submitted at least ".self::APPROVED_LEAVE_REQUEST_MIN_WORKING_DAYS_BEFORE_START.' working days before the leave date. Please contact the HR.',
-            ], 422);
-        }
-
-        return null;
+        return $this->leaveEligibilityService()->validateApprovedLeaveRequestLeadTime($app, $actionLabel);
     }
 
     private function shouldPresentApprovedWhilePendingUpdate(
         LeaveApplication $app,
         bool $hasPendingApprovedUpdateRequest
     ): bool {
-        if (! $hasPendingApprovedUpdateRequest) {
-            return false;
-        }
-
-        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
-        $previousStatus = strtoupper(trim((string) ($pendingUpdateMeta['previous_status'] ?? '')));
-        if ($previousStatus !== LeaveApplication::STATUS_APPROVED) {
-            return false;
-        }
-
-        return in_array($app->status, [
-            LeaveApplication::STATUS_PENDING_ADMIN,
-            LeaveApplication::STATUS_PENDING_HR,
-        ], true);
+        return $this->leaveWorkflowService()->shouldPresentApprovedWhilePendingUpdate(
+            $app,
+            $hasPendingApprovedUpdateRequest,
+            fn ($a) => $this->resolvePendingUpdateMeta($a)
+        );
     }
 
     private function normalizeRequestedLeaveActionTypeToken(mixed $value): string
     {
-        $normalized = strtoupper(trim((string) ($value ?? '')));
-        $normalized = str_replace([' ', '-'], '_', $normalized);
-
-        if (
-            in_array($normalized, [
-                LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL,
-                'RECALL',
-                'RECALL_REQUEST',
-                'LEAVE_RECALL_REQUEST',
-            ], true)
-        ) {
-            return LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL;
-        }
-
-        if (
-            in_array($normalized, [
-                LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL,
-                'CANCEL',
-                'REQUEST_CANCELLATION',
-                'REQUEST_CANCELATION',
-                'CANCEL_REQUEST',
-            ], true)
-        ) {
-            return LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL;
-        }
-
-        if (
-            in_array($normalized, [
-                self::HR_APPLICATION_EDIT_REQUEST_KIND,
-                'HR_EDIT',
-                'HR_APPLICATION_EDIT_REQUEST',
-            ], true)
-        ) {
-            return self::HR_APPLICATION_EDIT_REQUEST_KIND;
-        }
-
-        return LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE;
+        return $this->leaveWorkflowService()->normalizeRequestedLeaveActionTypeToken($value);
     }
 
     private function resolveUpdateRequestActionTypeFromPayload(mixed $payload): string
     {
-        if (is_string($payload)) {
-            $decoded = json_decode($payload, true);
-            if (json_last_error() === JSON_ERROR_NONE) {
-                $payload = $decoded;
-            }
-        }
-
-        if (! is_array($payload)) {
-            return LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE;
-        }
-
-        $flagValues = [
-            $payload['cancel_leave'] ?? null,
-            $payload['request_cancel'] ?? null,
-            $payload['is_cancel_request'] ?? null,
-        ];
-        foreach ($flagValues as $value) {
-            if ($value === true || $value === 1 || $value === '1' || $value === 'true') {
-                return LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL;
-            }
-        }
-        $recallFlagValues = [
-            $payload['recall_leave'] ?? null,
-            $payload['request_recall'] ?? null,
-            $payload['is_recall_request'] ?? null,
-        ];
-        foreach ($recallFlagValues as $value) {
-            if ($value === true || $value === 1 || $value === '1' || $value === 'true') {
-                return LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL;
-            }
-        }
-
-        $actionType = $this->normalizeRequestedLeaveActionTypeToken(
-            $payload['action_type']
-            ?? $payload['request_type']
-            ?? $payload['request_kind']
-            ?? $payload['mode']
-            ?? ''
-        );
-
-        return $actionType;
+        return $this->leaveWorkflowService()->resolveUpdateRequestActionTypeFromPayload($payload);
     }
 
     private function withRequestedLeaveActionType(array $payload, string $actionType): array
     {
-        $normalizedActionType = $this->normalizeRequestedLeaveActionTypeToken($actionType);
-        $requestKind = $normalizedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
-            ? 'cancel'
-            : ($normalizedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL ? 'recall' : 'update');
-
-        return array_merge($payload, [
-            'action_type' => $normalizedActionType,
-            'request_kind' => $requestKind,
-            'cancel_leave' => $normalizedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL,
-            'recall_leave' => $normalizedActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL,
-        ]);
+        return $this->leaveWorkflowService()->withRequestedLeaveActionType($payload, $actionType);
     }
 
     private function resolvePendingApprovedUpdateActionType(LeaveApplication $app): string
     {
-        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
-
-        return $this->resolveUpdateRequestActionTypeFromPayload($pendingUpdateMeta['payload'] ?? null);
+        return $this->leaveWorkflowService()->resolvePendingApprovedUpdateActionType(
+            $app,
+            fn ($a) => $this->resolvePendingUpdateMeta($a)
+        );
     }
 
     private function resolveLatestApprovedUpdateActionType(LeaveApplication $app): string
     {
-        $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
-        $latestStatus = strtoupper(trim((string) ($latestUpdateMeta['status'] ?? '')));
-        $previousStatus = strtoupper(trim((string) ($latestUpdateMeta['previous_status'] ?? '')));
-
-        if (
-            $latestStatus !== LeaveApplicationUpdateRequest::STATUS_APPROVED
-            || $previousStatus !== LeaveApplication::STATUS_APPROVED
-        ) {
-            return LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE;
-        }
-
-        return $this->resolveUpdateRequestActionTypeFromPayload($latestUpdateMeta['payload'] ?? null);
+        return $this->leaveWorkflowService()->resolveLatestApprovedUpdateActionType(
+            $app,
+            fn ($a) => $this->resolveLatestUpdateMeta($a)
+        );
     }
 
     private function isPendingApprovedUpdateRequest(LeaveApplication $app): bool
     {
-        if ($app->status !== LeaveApplication::STATUS_PENDING_HR) {
-            return false;
-        }
-
-        return $this->hasPendingApprovedUpdateRequest($app);
+        return $this->leaveWorkflowService()->isPendingApprovedUpdateRequest(
+            $app,
+            fn ($a) => $this->hasPendingApprovedUpdateRequest($a)
+        );
     }
 
     private function isPendingReceive(LeaveApplication $app): bool
@@ -10597,61 +8875,28 @@ class LeaveApplicationController extends Controller
         }
 
         try {
-            DB::transaction(function () use (
+            $this->leaveWorkflowService()->hrApprovePendingCancellationRequest(
                 $app,
                 $hr,
-                $request,
-                $pendingUpdateRequest,
-                $sourceLeaveType,
-                $sourceDeductibleDays,
-                $sourceDeductsBalance,
-                $cancelRemarks,
-                $balanceConflictError
-            ): void {
-                if ($sourceDeductsBalance && $sourceDeductibleDays > 0.0) {
-                    $this->refundApplicationTrackedDeductions(
-                        $app,
-                        $sourceLeaveType,
-                        $sourceDeductibleDays,
-                        $balanceConflictError
-                    );
+                $request->input('remarks'),
+                $pendingUpdateRequest instanceof LeaveApplicationUpdateRequest ? $pendingUpdateRequest : null,
+                $cancelReason,
+                refundCallback: function () use ($app, $sourceLeaveType, $sourceDeductibleDays, $sourceDeductsBalance, $balanceConflictError): void {
+                    if ($sourceDeductsBalance && $sourceDeductibleDays > 0.0) {
+                        $this->refundApplicationTrackedDeductions(
+                            $app,
+                            $sourceLeaveType,
+                            $sourceDeductibleDays,
+                            $balanceConflictError
+                        );
+                    }
+                },
+                ctoSyncCallback: function () use ($app): void {
+                    if ($app->employee_control_no) {
+                        $this->syncEmployeeCtoBalance((string) $app->employee_control_no, true);
+                    }
                 }
-
-                $app->update([
-                    'status' => LeaveApplication::STATUS_CANCELLED,
-                    'hr_id' => $hr->id,
-                    'hr_approved_at' => now(),
-                    'remarks' => $cancelRemarks,
-                    'deductible_days' => 0,
-                ]);
-
-                if ($app->employee_control_no) {
-                    $this->syncEmployeeCtoBalance((string) $app->employee_control_no, true);
-                }
-
-                if ($pendingUpdateRequest instanceof LeaveApplicationUpdateRequest) {
-                    $pendingUpdateRequest->update([
-                        'status' => LeaveApplicationUpdateRequest::STATUS_APPROVED,
-                        'reviewed_by_hr_id' => $hr->id,
-                        'reviewed_at' => now(),
-                        'review_remarks' => $request->input('remarks'),
-                    ]);
-                }
-
-                $hrLogRemarks = $this->trimNullableString($request->input('remarks'));
-                $hrLogRemarks = $hrLogRemarks !== null
-                    ? "Cancelled via approved leave cancellation request: {$hrLogRemarks}"
-                    : $cancelRemarks;
-
-                LeaveApplicationLog::create([
-                    'leave_application_id' => $app->id,
-                    'action' => LeaveApplicationLog::ACTION_HR_APPROVED,
-                    'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
-                    'performed_by_id' => $hr->id,
-                    'remarks' => $hrLogRemarks,
-                    'created_at' => now(),
-                ]);
-            });
+            );
         } catch (\RuntimeException $exception) {
             if ($exception->getMessage() !== $balanceConflictError) {
                 throw $exception;
@@ -10681,45 +8926,14 @@ class LeaveApplicationController extends Controller
             $previousStatus = LeaveApplication::STATUS_APPROVED;
         }
 
-        DB::transaction(function () use (
+        $this->leaveWorkflowService()->hrRejectPendingUpdateRequest(
             $app,
-            $request,
             $hr,
+            $request->input('remarks'),
+            $pendingUpdateRequest instanceof LeaveApplicationUpdateRequest ? $pendingUpdateRequest : null,
             $previousStatus,
-            $pendingUpdateRequest,
             $pendingActionType
-        ): void {
-            $app->update([
-                'status' => $previousStatus,
-                'remarks' => $request->input('remarks'),
-            ]);
-
-            if ($pendingUpdateRequest instanceof LeaveApplicationUpdateRequest) {
-                $pendingUpdateRequest->update([
-                    'status' => LeaveApplicationUpdateRequest::STATUS_REJECTED,
-                    'reviewed_by_hr_id' => $hr->id,
-                    'reviewed_at' => now(),
-                    'review_remarks' => $request->input('remarks'),
-                ]);
-            }
-
-            LeaveApplicationLog::create([
-                'leave_application_id' => $app->id,
-                'action' => LeaveApplicationLog::ACTION_HR_REJECTED,
-                'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
-                'performed_by_id' => $hr->id,
-                'remarks' => $request->input('remarks') ?: (
-                    $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
-                        ? 'Rejected leave cancellation request.'
-                        : (
-                            $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
-                                ? 'Rejected leave recall request.'
-                                : 'Rejected leave update request.'
-                        )
-                ),
-                'created_at' => now(),
-            ]);
-        });
+        );
 
         $app = $app->fresh(['leaveType', 'applicantAdmin']);
 
@@ -10749,45 +8963,14 @@ class LeaveApplicationController extends Controller
             $previousStatus = LeaveApplication::STATUS_APPROVED;
         }
 
-        DB::transaction(function () use (
+        $this->leaveWorkflowService()->adminRejectPendingUpdateRequest(
             $app,
-            $request,
             $admin,
+            $request->input('remarks'),
+            $pendingUpdateRequest instanceof LeaveApplicationUpdateRequest ? $pendingUpdateRequest : null,
             $previousStatus,
-            $pendingUpdateRequest,
             $pendingActionType
-        ): void {
-            $app->update([
-                'status' => $previousStatus,
-                'admin_id' => $admin->id,
-                'remarks' => $request->input('remarks'),
-            ]);
-
-            if ($pendingUpdateRequest instanceof LeaveApplicationUpdateRequest) {
-                $pendingUpdateRequest->update([
-                    'status' => LeaveApplicationUpdateRequest::STATUS_REJECTED,
-                    'reviewed_at' => now(),
-                    'review_remarks' => $request->input('remarks'),
-                ]);
-            }
-
-            LeaveApplicationLog::create([
-                'leave_application_id' => $app->id,
-                'action' => LeaveApplicationLog::ACTION_ADMIN_REJECTED,
-                'performed_by_type' => LeaveApplicationLog::PERFORMER_ADMIN,
-                'performed_by_id' => $admin->id,
-                'remarks' => $request->input('remarks') ?: (
-                    $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL
-                        ? 'Rejected leave cancellation request.'
-                        : (
-                            $pendingActionType === LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL
-                                ? 'Rejected leave recall request.'
-                                : 'Rejected leave update request.'
-                        )
-                ),
-                'created_at' => now(),
-            ]);
-        });
+        );
 
         $app = $app->fresh(['leaveType', 'applicantAdmin']);
 
@@ -10805,87 +8988,37 @@ class LeaveApplicationController extends Controller
 
     private function cleanRequestLinesFromRemarks(?string $remarks): ?string
     {
-        if ($remarks === null || trim($remarks) === '') {
-            return null;
-        }
-
-        $lines = explode("\n", $remarks);
-        $filtered = array_filter($lines, static function (string $line): bool {
-            $trimmed = trim($line);
-            if ($trimmed === '') {
-                return false;
-            }
-            if (preg_match('/^(?:Cancellation|Edit|Update|Recall)\s+request\s+submitted\b/i', $trimmed)) {
-                return false;
-            }
-
-            return true;
-        });
-
-        $result = implode("\n", array_map('trim', $filtered));
-
-        return $result !== '' ? $result : null;
+        return $this->leaveWorkflowService()->cleanRequestLinesFromRemarks($remarks);
     }
 
     private function getPendingApprovedUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
     {
-        if (! $app->id) {
-            return null;
-        }
-
-        if ($app->relationLoaded('updateRequests')) {
-            $record = $app->updateRequests
-                ->filter(fn ($item) => $item instanceof LeaveApplicationUpdateRequest)
-                ->sortByDesc(fn (LeaveApplicationUpdateRequest $item) => (int) $item->id)
-                ->first(function (LeaveApplicationUpdateRequest $item): bool {
-                    return strtoupper(trim((string) $item->status)) === LeaveApplicationUpdateRequest::STATUS_PENDING
-                        && ! $this->isHrApplicationEditRequestRecord($item);
-                });
-
-            return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
-        }
-
-        $record = LeaveApplicationUpdateRequest::query()
-            ->where('leave_application_id', (int) $app->id)
-            ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
-            ->latest('id')
-            ->get()
-            ->first(fn (LeaveApplicationUpdateRequest $item): bool => ! $this->isHrApplicationEditRequestRecord($item));
-
-        return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
+        return $this->leaveWorkflowService()->getPendingApprovedUpdateRequestRecord($app);
     }
 
     private function resolvePendingApprovedUpdateCycleRequestedAt(LeaveApplication $app): ?\DateTimeInterface
     {
-        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
-        $requestedAt = $pendingUpdateMeta['requested_at'] ?? null;
-
-        return $requestedAt instanceof \DateTimeInterface ? $requestedAt : null;
+        return $this->leaveWorkflowService()->resolvePendingApprovedUpdateCycleRequestedAt(
+            $app,
+            fn ($a) => $this->resolvePendingUpdateMeta($a)
+        );
     }
 
     private function resolveLatestApprovedUpdateCycleRequestedAt(LeaveApplication $app): ?\DateTimeInterface
     {
-        $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
-        $latestStatus = strtoupper(trim((string) ($latestUpdateMeta['status'] ?? '')));
-        $requestedAt = $latestUpdateMeta['requested_at'] ?? null;
-
-        if (
-            $latestStatus !== LeaveApplicationUpdateRequest::STATUS_APPROVED
-            || ! $requestedAt instanceof \DateTimeInterface
-        ) {
-            return null;
-        }
-
-        return $requestedAt;
+        return $this->leaveWorkflowService()->resolveLatestApprovedUpdateCycleRequestedAt(
+            $app,
+            fn ($a) => $this->resolveLatestUpdateMeta($a)
+        );
     }
 
     private function resolveCurrentHrDocumentCycleRequestedAt(LeaveApplication $app): ?\DateTimeInterface
     {
-        if ($this->isPendingApprovedUpdateRequest($app)) {
-            return $this->resolvePendingApprovedUpdateCycleRequestedAt($app);
-        }
-
-        return $this->resolveLatestApprovedUpdateCycleRequestedAt($app);
+        return $this->leaveWorkflowService()->resolveCurrentHrDocumentCycleRequestedAt(
+            $app,
+            fn ($a) => $this->resolvePendingUpdateMeta($a),
+            fn ($a) => $this->resolveLatestUpdateMeta($a)
+        );
     }
 
     private function resolveLatestHrActionLogForCycle(
@@ -10893,43 +9026,7 @@ class LeaveApplicationController extends Controller
         string $action,
         ?\DateTimeInterface $cycleRequestedAt = null
     ): ?LeaveApplicationLog {
-        $logs = $app->relationLoaded('logs')
-            ? $app->logs
-            : $app->logs()->get();
-
-        if (! $logs instanceof Collection || $logs->isEmpty()) {
-            return null;
-        }
-
-        $cycleRequestedTimestamp = $cycleRequestedAt?->getTimestamp();
-        $log = $logs
-            ->filter(function (mixed $entry) use ($action, $cycleRequestedTimestamp): bool {
-                if (! $entry instanceof LeaveApplicationLog) {
-                    return false;
-                }
-
-                if (
-                    $entry->action !== $action
-                    || strtoupper((string) $entry->performed_by_type) !== LeaveApplicationLog::PERFORMER_HR
-                ) {
-                    return false;
-                }
-
-                if ($cycleRequestedTimestamp === null) {
-                    return true;
-                }
-
-                $entryTimestamp = $entry->created_at?->getTimestamp();
-                if ($entryTimestamp === null) {
-                    return false;
-                }
-
-                return $entryTimestamp >= $cycleRequestedTimestamp;
-            })
-            ->sortByDesc(fn (LeaveApplicationLog $entry) => $entry->created_at?->getTimestamp() ?? PHP_INT_MIN)
-            ->first();
-
-        return $log instanceof LeaveApplicationLog ? $log : null;
+        return $this->leaveWorkflowService()->resolveLatestHrActionLogForCycle($app, $action, $cycleRequestedAt);
     }
 
     private function resolvePendingUpdateMeta(LeaveApplication $app): array
@@ -10960,28 +9057,7 @@ class LeaveApplicationController extends Controller
 
     private function getLatestUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
     {
-        if (! $app->id) {
-            return null;
-        }
-
-        if ($app->relationLoaded('updateRequests')) {
-            $record = $app->updateRequests
-                ->filter(fn ($item) => $item instanceof LeaveApplicationUpdateRequest)
-                ->sortByDesc(fn (LeaveApplicationUpdateRequest $item) => (int) $item->id)
-                ->first(function (LeaveApplicationUpdateRequest $item): bool {
-                    return ! $this->isHrApplicationEditRequestRecord($item);
-                });
-
-            return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
-        }
-
-        $record = LeaveApplicationUpdateRequest::query()
-            ->where('leave_application_id', (int) $app->id)
-            ->latest('id')
-            ->get()
-            ->first(fn (LeaveApplicationUpdateRequest $item): bool => ! $this->isHrApplicationEditRequestRecord($item));
-
-        return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
+        return $this->leaveWorkflowService()->getLatestUpdateRequestRecord($app);
     }
 
     private function resolveLatestUpdateMeta(LeaveApplication $app): array
@@ -11353,49 +9429,16 @@ class LeaveApplicationController extends Controller
         float $sourceDeductibleDays,
         string $balanceConflictError
     ): void {
-        $employeeControlNo = $this->resolveApplicationBalanceOwnerControlNo($app);
-        if ($employeeControlNo === null) {
-            throw new \RuntimeException($balanceConflictError);
-        }
-
-        if ((bool) $app->is_monetization) {
-            foreach ($this->resolveStoredMonetizationLeaveCreditComponents($app, $sourceLeaveType) as $component) {
-                $this->incrementEmployeeLeaveBalance(
-                    $employeeControlNo,
-                    (int) $component['leave_type_id'],
-                    (float) $component['days']
-                );
-            }
-
-            return;
-        }
-
-        $primaryRefundDays = $this->resolveStoredPrimaryLeaveDeduction(
+        $this->leaveCreditService()->refundApplicationTrackedDeductions(
             $app,
             $sourceLeaveType,
-            $sourceDeductibleDays
+            $sourceDeductibleDays,
+            $balanceConflictError,
+            fn (int $adminId) => $this->findAdminEmployeeControlNo($adminId),
+            fn (string $c) => $this->controlNoCandidates($c),
+            fn (LeaveApplication $a, ?LeaveType $lt = null) => $this->resolveStoredMonetizationLeaveCreditComponents($a, $lt),
+            fn (string $c) => $this->findEmployeeByControlNo($c)
         );
-        if ((int) $app->leave_type_id > 0 && $primaryRefundDays > 0.0) {
-            $this->incrementEmployeeLeaveBalance($employeeControlNo, (int) $app->leave_type_id, $primaryRefundDays);
-        }
-
-        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
-        $linkedForcedRefundDays = $this->resolveStoredLinkedForcedLeaveDeduction($app, $sourceLeaveType, $sourceDeductibleDays);
-        if ($forcedLeaveTypeId !== null && $linkedForcedRefundDays > 0.0) {
-            $this->incrementEmployeeLeaveBalance($employeeControlNo, $forcedLeaveTypeId, $linkedForcedRefundDays);
-        }
-
-        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
-        $linkedVacationRefundDays = $this->resolveStoredLinkedVacationLeaveDeduction($app, $sourceLeaveType, $sourceDeductibleDays);
-        if ($vacationLeaveTypeId !== null && $linkedVacationRefundDays > 0.0) {
-            $this->incrementEmployeeLeaveBalance($employeeControlNo, $vacationLeaveTypeId, $linkedVacationRefundDays);
-        }
-
-        $sickLeaveTypeId = $this->resolveSickLeaveTypeId();
-        $linkedSickRefundDays = $this->resolveStoredLinkedSickLeaveDeduction($app);
-        if ($sickLeaveTypeId !== null && $linkedSickRefundDays > 0.0) {
-            $this->incrementEmployeeLeaveBalance($employeeControlNo, $sickLeaveTypeId, $linkedSickRefundDays);
-        }
     }
 
     private function deductApplicationTrackedBalances(
@@ -11413,239 +9456,26 @@ class LeaveApplicationController extends Controller
         string $balanceConflictError,
         bool $preferStoredSlVlCrossDeductionBreakdown = false
     ): array {
-        $employeeControlNo = $this->resolveApplicationBalanceOwnerControlNo($app);
-        if ($employeeControlNo === null) {
-            throw new \RuntimeException($balanceConflictError);
-        }
-
-        $primaryLeaveTypeId = $this->resolveCanonicalLeaveTypeId($primaryLeaveTypeId) ?? $primaryLeaveTypeId;
-        $normalizedDaysToDeduct = round(max($daysToDeduct, 0.0), 3);
-        if ($primaryLeaveTypeId <= 0 || $normalizedDaysToDeduct <= 0.0) {
-            return [
-                'linked_forced_leave_deducted_days' => 0.0,
-                'linked_vacation_leave_deducted_days' => 0.0,
-                'linked_sick_leave_deducted_days' => 0.0,
-            ];
-        }
-        $isForcedLeaveApplication = ! (bool) $app->is_monetization
-            && $forcedLeaveTypeId !== null
-            && $primaryLeaveTypeId === $forcedLeaveTypeId;
-
-        if ((bool) $app->is_monetization) {
-            foreach ($this->resolveStoredMonetizationLeaveCreditComponents($app) as $component) {
-                $balance = $this->lockEmployeeLeaveBalance($employeeControlNo, (int) $component['leave_type_id']);
-                $componentDays = round(max((float) $component['days'], 0.0), 3);
-                if (! $balance || (float) $balance->balance + 1e-9 < $componentDays) {
-                    throw new \RuntimeException($balanceConflictError);
-                }
-
-                if ($componentDays > 0.0) {
-                    $balance->decrement('balance', $componentDays);
-                }
-            }
-
-            return [
-                'linked_forced_leave_deducted_days' => 0.0,
-                'linked_vacation_leave_deducted_days' => 0.0,
-                'linked_sick_leave_deducted_days' => 0.0,
-            ];
-        }
-
-        $resolvedRequestedTotalDays = round(
-            max((float) ($requestedTotalDays ?? $app->total_days ?? $normalizedDaysToDeduct), 0.0),
-            2
-        );
-        $primaryLeaveType = $app->leaveType;
-        if (
-            ! $primaryLeaveType instanceof LeaveType
-            || (int) ($this->resolveCanonicalLeaveTypeId((int) $primaryLeaveType->id) ?? (int) $primaryLeaveType->id) !== $primaryLeaveTypeId
-        ) {
-            $primaryLeaveType = LeaveType::query()->find($primaryLeaveTypeId);
-        }
-
-        $primaryDaysToDeduct = $this->resolvePrimaryLeaveTrackedDeductionDays(
-            $primaryLeaveType,
+        return $this->leaveCreditService()->deductApplicationTrackedBalances(
+            $app,
             $primaryLeaveTypeId,
-            (bool) $app->is_monetization,
-            $resolvedRequestedTotalDays,
-            $normalizedDaysToDeduct,
+            $daysToDeduct,
+            $requestedTotalDays,
+            $isCtoDeduction,
+            $shouldDeductForcedLeave,
             $forcedLeaveTypeId,
-            $vacationLeaveTypeId
+            $shouldDeductVacationLeave,
+            $vacationLeaveTypeId,
+            $allowSlVlCrossDeduction,
+            $sickLeaveTypeId,
+            $balanceConflictError,
+            $preferStoredSlVlCrossDeductionBreakdown,
+            fn (int $adminId) => $this->findAdminEmployeeControlNo($adminId),
+            fn (string $c) => $this->controlNoCandidates($c),
+            fn (LeaveApplication $a) => $this->resolveStoredMonetizationLeaveCreditComponents($a),
+            fn (string $c) => $this->findEmployeeByControlNo($c),
+            fn (array $d, ?array $c, float $t, ?string $e) => $this->resolveDateCoverageWeights($d, $c, $t, $e)
         );
-        $linkedVacationLeaveRequiredDays = $shouldDeductVacationLeave && $primaryLeaveType instanceof LeaveType
-            ? $this->resolveLeaveTypeVacationLeaveDeductionDays(
-                $primaryLeaveType,
-                $primaryLeaveTypeId,
-                (bool) $app->is_monetization,
-                $resolvedRequestedTotalDays,
-                $normalizedDaysToDeduct,
-                $forcedLeaveTypeId,
-                $vacationLeaveTypeId
-            )
-            : 0.0;
-        $usesVacationLeaveTopUpForScheduleExcess = $shouldDeductVacationLeave
-            && $vacationLeaveTypeId !== null
-            && $primaryLeaveType instanceof LeaveType
-            && $this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
-                $primaryLeaveType,
-                $primaryLeaveTypeId,
-                (bool) $app->is_monetization,
-                $vacationLeaveTypeId
-            );
-
-        if ($isCtoDeduction) {
-            $this->syncEmployeeCtoBalance($employeeControlNo, true);
-        }
-
-        $primaryBalance = $this->lockEmployeeLeaveBalance($employeeControlNo, $primaryLeaveTypeId);
-        $vacationBalance = null;
-        $sickBalance = null;
-        $linkedSickLeaveRequiredDays = 0.0;
-        $storedSlVlCrossDeductionBreakdown = $preferStoredSlVlCrossDeductionBreakdown
-            ? $this->resolveStoredSlVlCrossDeductionBreakdown($app, $primaryLeaveType, $normalizedDaysToDeduct)
-            : null;
-        if ($usesVacationLeaveTopUpForScheduleExcess) {
-            $primaryAvailable = $primaryBalance ? max((float) $primaryBalance->balance, 0.0) : 0.0;
-            $primaryDaysToDeduct = round(min($normalizedDaysToDeduct, $primaryAvailable), 3);
-            $linkedVacationLeaveRequiredDays = round(max($normalizedDaysToDeduct - $primaryDaysToDeduct, 0.0), 3);
-        } elseif (is_array($storedSlVlCrossDeductionBreakdown)) {
-            $primaryDaysToDeduct = (float) ($storedSlVlCrossDeductionBreakdown['primary_deduction_days'] ?? $primaryDaysToDeduct);
-            $linkedVacationLeaveRequiredDays = (float) ($storedSlVlCrossDeductionBreakdown['linked_vacation_deduction_days'] ?? 0.0);
-            $linkedSickLeaveRequiredDays = (float) ($storedSlVlCrossDeductionBreakdown['linked_sick_deduction_days'] ?? 0.0);
-        } elseif ($primaryLeaveType instanceof LeaveType && $allowSlVlCrossDeduction) {
-            $linkedPrimaryAvailable = $primaryBalance ? max((float) $primaryBalance->balance, 0.0) : 0.0;
-            $linkedLeaveTypeId = $this->resolveSlVlCrossDeductionTargetLeaveTypeId(
-                $primaryLeaveType,
-                $primaryLeaveTypeId,
-                (bool) $app->is_monetization,
-                $allowSlVlCrossDeduction,
-                $sickLeaveTypeId,
-                $vacationLeaveTypeId
-            );
-            $linkedAvailable = 0.0;
-            if ($linkedLeaveTypeId !== null) {
-                if ($vacationLeaveTypeId !== null && $linkedLeaveTypeId === $vacationLeaveTypeId) {
-                    $vacationBalance = $this->lockEmployeeLeaveBalance($employeeControlNo, $vacationLeaveTypeId);
-                    $linkedAvailable = $vacationBalance ? max((float) $vacationBalance->balance, 0.0) : 0.0;
-                } elseif ($sickLeaveTypeId !== null && $linkedLeaveTypeId === $sickLeaveTypeId) {
-                    $sickBalance = $this->lockEmployeeLeaveBalance($employeeControlNo, $sickLeaveTypeId);
-                    $linkedAvailable = $sickBalance ? max((float) $sickBalance->balance, 0.0) : 0.0;
-                }
-            }
-
-            $crossDeductionBreakdown = $this->resolveSlVlCrossDeductionBreakdown(
-                $primaryLeaveType,
-                $primaryLeaveTypeId,
-                (bool) $app->is_monetization,
-                $normalizedDaysToDeduct,
-                $allowSlVlCrossDeduction,
-                $sickLeaveTypeId,
-                $vacationLeaveTypeId,
-                $linkedPrimaryAvailable,
-                $linkedAvailable,
-                $app->resolvedSelectedDates(),
-                is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null,
-                is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
-                $resolvedRequestedTotalDays,
-                $employeeControlNo
-            );
-            $primaryDaysToDeduct = (float) ($crossDeductionBreakdown['primary_deduction_days'] ?? $primaryDaysToDeduct);
-            $linkedVacationLeaveRequiredDays = (float) ($crossDeductionBreakdown['linked_vacation_deduction_days'] ?? 0.0);
-            $linkedSickLeaveRequiredDays = (float) ($crossDeductionBreakdown['linked_sick_deduction_days'] ?? 0.0);
-        }
-        if ($isForcedLeaveApplication) {
-            $forcedAvailable = $primaryBalance ? max((float) $primaryBalance->balance, 0.0) : 0.0;
-            if ($forcedAvailable <= 0.0) {
-                throw new \RuntimeException($balanceConflictError);
-            }
-
-            $linkedVacationLeaveRequiredDays = $normalizedDaysToDeduct;
-            $primaryDaysToDeduct = 0.0;
-
-            if ($vacationLeaveTypeId === null) {
-                throw new \RuntimeException($balanceConflictError);
-            }
-
-            $vacationBalance ??= $this->lockEmployeeLeaveBalance($employeeControlNo, $vacationLeaveTypeId);
-            $availableVacationBalance = $vacationBalance ? max((float) $vacationBalance->balance, 0.0) : 0.0;
-            if ($availableVacationBalance <= 0.0) {
-                throw new \RuntimeException($balanceConflictError);
-            }
-        }
-
-        if (
-            ! $usesVacationLeaveTopUpForScheduleExcess
-            && $primaryDaysToDeduct > 0.0
-            && (
-                ! $primaryBalance
-                || (float) $primaryBalance->balance + 1e-9 < $primaryDaysToDeduct
-            )
-        ) {
-            throw new \RuntimeException($balanceConflictError);
-        }
-
-        if ($isCtoDeduction) {
-            return [
-                'linked_forced_leave_deducted_days' => 0.0,
-                'linked_vacation_leave_deducted_days' => 0.0,
-                'linked_sick_leave_deducted_days' => 0.0,
-            ];
-        }
-
-        if ($primaryBalance && $primaryDaysToDeduct > 0.0) {
-            $primaryBalance->decrement('balance', $primaryDaysToDeduct);
-        }
-
-        $linkedForcedLeaveDeductedDays = 0.0;
-        if (($shouldDeductForcedLeave || $isForcedLeaveApplication) && $forcedLeaveTypeId !== null) {
-            $forcedBalance = $isForcedLeaveApplication && $primaryLeaveTypeId === $forcedLeaveTypeId
-                ? $primaryBalance
-                : $this->lockEmployeeLeaveBalance($employeeControlNo, $forcedLeaveTypeId);
-            $forcedAvailable = $forcedBalance ? max((float) $forcedBalance->balance, 0.0) : 0.0;
-            $forcedLeaveDeductionBaseDays = $isForcedLeaveApplication
-                ? $normalizedDaysToDeduct
-                : $primaryDaysToDeduct;
-            $linkedForcedLeaveDeductedDays = round(min(max($forcedLeaveDeductionBaseDays, 0.0), $forcedAvailable), 3);
-
-            if ($forcedBalance && $linkedForcedLeaveDeductedDays > 0.0) {
-                $forcedBalance->decrement('balance', $linkedForcedLeaveDeductedDays);
-            }
-        }
-
-        $linkedVacationLeaveDeductedDays = 0.0;
-        if (
-            $this->shouldApplyLinkedVacationLeaveDeduction(
-                $shouldDeductVacationLeave,
-                $allowSlVlCrossDeduction,
-                $linkedVacationLeaveRequiredDays
-            )
-            && $vacationLeaveTypeId !== null
-        ) {
-            $vacationBalance ??= $this->lockEmployeeLeaveBalance($employeeControlNo, $vacationLeaveTypeId);
-            if (! $vacationBalance || (float) $vacationBalance->balance < $linkedVacationLeaveRequiredDays) {
-                throw new \RuntimeException($balanceConflictError);
-            }
-
-            $vacationBalance->decrement('balance', $linkedVacationLeaveRequiredDays);
-            $linkedVacationLeaveDeductedDays = $linkedVacationLeaveRequiredDays;
-        }
-
-        $linkedSickLeaveDeductedDays = 0.0;
-        if ($sickLeaveTypeId !== null && $linkedSickLeaveRequiredDays > 0.0) {
-            $sickBalance ??= $this->lockEmployeeLeaveBalance($employeeControlNo, $sickLeaveTypeId);
-            if (! $sickBalance || (float) $sickBalance->balance < $linkedSickLeaveRequiredDays) {
-                throw new \RuntimeException($balanceConflictError);
-            }
-
-            $sickBalance->decrement('balance', $linkedSickLeaveRequiredDays);
-            $linkedSickLeaveDeductedDays = $linkedSickLeaveRequiredDays;
-        }
-
-        return [
-            'linked_forced_leave_deducted_days' => $linkedForcedLeaveDeductedDays,
-            'linked_vacation_leave_deducted_days' => $linkedVacationLeaveDeductedDays,
-            'linked_sick_leave_deducted_days' => $linkedSickLeaveDeductedDays,
-        ];
     }
 
     private function shouldApplyLinkedVacationLeaveDeduction(
@@ -11653,70 +9483,44 @@ class LeaveApplicationController extends Controller
         bool $allowSlVlCrossDeduction,
         float $linkedVacationLeaveRequiredDays
     ): bool {
-        if (round(max($linkedVacationLeaveRequiredDays, 0.0), 3) <= 0.0) {
-            return false;
-        }
-
-        return $shouldDeductVacationLeave || $allowSlVlCrossDeduction;
+        return $this->leaveCreditService()->shouldApplyLinkedVacationLeaveDeduction(
+            $shouldDeductVacationLeave,
+            $allowSlVlCrossDeduction,
+            $linkedVacationLeaveRequiredDays
+        );
     }
 
     private function resolveApplicationBalanceOwnerControlNo(LeaveApplication $app): ?string
     {
-        $directControlNo = trim((string) ($app->employee_control_no ?? ''));
-        if ($directControlNo !== '') {
-            return $directControlNo;
-        }
-
-        if ($app->applicant_admin_id) {
-            return $this->findAdminEmployeeControlNo((int) $app->applicant_admin_id);
-        }
-
-        return null;
+        return $this->leaveCreditService()->resolveApplicationBalanceOwnerControlNo(
+            $app,
+            fn (int $adminId) => $this->findAdminEmployeeControlNo($adminId)
+        );
     }
 
     private function lockEmployeeLeaveBalance(string $employeeControlNo, int $leaveTypeId): ?LeaveBalance
     {
-        return $this->findPreferredEmployeeLeaveBalanceRecord($employeeControlNo, $leaveTypeId, true);
+        return $this->leaveCreditService()->lockEmployeeLeaveBalance(
+            $employeeControlNo,
+            $leaveTypeId,
+            fn (string $c) => $this->controlNoCandidates($c)
+        );
     }
 
     private function incrementEmployeeLeaveBalance(string $employeeControlNo, int $leaveTypeId, float $daysToAdd): void
     {
-        $leaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
-        $normalizedDaysToAdd = round(max($daysToAdd, 0.0), 3);
-        if ($leaveTypeId <= 0 || $normalizedDaysToAdd <= 0.0) {
-            return;
-        }
-
-        $balance = $this->lockEmployeeLeaveBalance($employeeControlNo, $leaveTypeId);
-        if (! $balance) {
-            $employee = $this->findEmployeeByControlNo($employeeControlNo);
-            $leaveType = LeaveType::query()->find($leaveTypeId);
-
-            $balance = LeaveBalance::query()->create([
-                'employee_control_no' => trim((string) ($employee?->control_no ?? $employeeControlNo)),
-                'employee_name' => $employee ? $this->formatEmployeeNameForBalance($employee) : null,
-                'leave_type_id' => $leaveTypeId,
-                'leave_type_name' => $leaveType?->name,
-                'balance' => 0,
-                'year' => (int) now()->year,
-            ]);
-        }
-
-        $balance->increment('balance', $normalizedDaysToAdd);
+        $this->leaveCreditService()->incrementEmployeeLeaveBalance(
+            $employeeControlNo,
+            $leaveTypeId,
+            $daysToAdd,
+            fn (string $c) => $this->controlNoCandidates($c),
+            fn (string $c) => $this->findEmployeeByControlNo($c)
+        );
     }
 
     private function formatEmployeeNameForBalance(?object $employee): ?string
     {
-        if (! $employee) {
-            return null;
-        }
-
-        $surname = trim((string) ($employee->surname ?? ''));
-        $firstname = trim((string) ($employee->firstname ?? ''));
-        $middlename = trim((string) ($employee->middlename ?? ''));
-        $fullName = trim(implode(', ', array_filter([$surname, trim($firstname.' '.$middlename)])));
-
-        return $fullName !== '' ? $fullName : null;
+        return $this->leaveCreditService()->formatEmployeeNameForBalance($employee);
     }
 
     private function resolveStoredPrimaryLeaveDeduction(
@@ -11724,50 +9528,11 @@ class LeaveApplicationController extends Controller
         ?LeaveType $sourceLeaveType,
         float $fallbackDeductibleDays
     ): float {
-        $normalizedFallbackDeductibleDays = round(max($fallbackDeductibleDays, 0.0), 3);
-        $leaveTypeId = $this->resolveCanonicalLeaveTypeId((int) $app->leave_type_id)
-            ?? (int) $app->leave_type_id;
-        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
-        if (
-            ! (bool) $app->is_monetization
-            && $forcedLeaveTypeId !== null
-            && $leaveTypeId === $forcedLeaveTypeId
-        ) {
-            return 0.0;
-        }
-
-        if (! $sourceLeaveType instanceof LeaveType) {
-            return $normalizedFallbackDeductibleDays;
-        }
-
-        if ((bool) ($app->allow_sl_vl_cross_deduction ?? false)) {
-            $linkedVacationRefundDays = $this->resolveStoredLinkedVacationLeaveDeduction(
-                $app,
-                $sourceLeaveType,
-                $fallbackDeductibleDays
-            );
-            $linkedSickRefundDays = $this->resolveStoredLinkedSickLeaveDeduction($app);
-
-            return round(max($normalizedFallbackDeductibleDays - $linkedVacationRefundDays - $linkedSickRefundDays, 0.0), 3);
-        }
-
-        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
-        if (! $this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
-            $sourceLeaveType,
-            $leaveTypeId,
-            (bool) $app->is_monetization,
-            $vacationLeaveTypeId
-        )) {
-            return $normalizedFallbackDeductibleDays;
-        }
-
-        $linkedVacationRefundDays = $this->resolveStoredLinkedVacationLeaveDeduction(
+        return $this->leaveCreditService()->resolveStoredPrimaryLeaveDeduction(
             $app,
             $sourceLeaveType,
             $fallbackDeductibleDays
         );
-
-        return round(max($normalizedFallbackDeductibleDays - $linkedVacationRefundDays, 0.0), 3);
     }
 
     /**
@@ -11782,30 +9547,11 @@ class LeaveApplicationController extends Controller
         ?LeaveType $sourceLeaveType,
         float $fallbackDeductibleDays
     ): ?array {
-        if (
-            (bool) $app->is_monetization
-            || ! (bool) ($app->allow_sl_vl_cross_deduction ?? false)
-            || (
-                $app->linked_vacation_leave_deducted_days === null
-                && $app->linked_sick_leave_deducted_days === null
-            )
-        ) {
-            return null;
-        }
-
-        return [
-            'primary_deduction_days' => $this->resolveStoredPrimaryLeaveDeduction(
-                $app,
-                $sourceLeaveType,
-                $fallbackDeductibleDays
-            ),
-            'linked_vacation_deduction_days' => $this->resolveStoredLinkedVacationLeaveDeduction(
-                $app,
-                $sourceLeaveType,
-                $fallbackDeductibleDays
-            ),
-            'linked_sick_deduction_days' => $this->resolveStoredLinkedSickLeaveDeduction($app),
-        ];
+        return $this->leaveCreditService()->resolveStoredSlVlCrossDeductionBreakdown(
+            $app,
+            $sourceLeaveType,
+            $fallbackDeductibleDays
+        );
     }
 
     private function resolveStoredLinkedForcedLeaveDeduction(
@@ -11813,21 +9559,11 @@ class LeaveApplicationController extends Controller
         ?LeaveType $sourceLeaveType,
         float $fallbackDeductibleDays
     ): float {
-        if ($app->linked_forced_leave_deducted_days !== null) {
-            return round(max((float) $app->linked_forced_leave_deducted_days, 0.0), 3);
-        }
-
-        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
-        if (! $sourceLeaveType || ! $this->shouldLeaveTypeDeductForcedLeave(
+        return $this->leaveCreditService()->resolveStoredLinkedForcedLeaveDeduction(
+            $app,
             $sourceLeaveType,
-            (int) $app->leave_type_id,
-            (bool) $app->is_monetization,
-            $forcedLeaveTypeId
-        )) {
-            return 0.0;
-        }
-
-        return round(max($fallbackDeductibleDays, 0.0), 3);
+            $fallbackDeductibleDays
+        );
     }
 
     private function resolveStoredLinkedVacationLeaveDeduction(
@@ -11835,77 +9571,26 @@ class LeaveApplicationController extends Controller
         ?LeaveType $sourceLeaveType,
         float $fallbackDeductibleDays
     ): float {
-        if ($app->linked_vacation_leave_deducted_days !== null) {
-            return round(max((float) $app->linked_vacation_leave_deducted_days, 0.0), 3);
-        }
-
-        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
-        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
-        if (! $sourceLeaveType || ! $this->shouldLeaveTypeDeductVacationLeave(
+        return $this->leaveCreditService()->resolveStoredLinkedVacationLeaveDeduction(
+            $app,
             $sourceLeaveType,
-            (int) $app->leave_type_id,
-            (bool) $app->is_monetization,
-            $forcedLeaveTypeId,
-            $vacationLeaveTypeId
-        )) {
-            return 0.0;
-        }
-
-        return $this->resolveLeaveTypeVacationLeaveDeductionDays(
-            $sourceLeaveType,
-            (int) $app->leave_type_id,
-            (bool) $app->is_monetization,
-            round((float) ($app->total_days ?? $fallbackDeductibleDays), 3),
-            $fallbackDeductibleDays,
-            $forcedLeaveTypeId,
-            $vacationLeaveTypeId
+            $fallbackDeductibleDays
         );
     }
 
     private function resolveStoredLinkedSickLeaveDeduction(LeaveApplication $app): float
     {
-        if ($app->linked_sick_leave_deducted_days === null) {
-            return 0.0;
-        }
-
-        return round(max((float) $app->linked_sick_leave_deducted_days, 0.0), 3);
+        return $this->leaveCreditService()->resolveStoredLinkedSickLeaveDeduction($app);
     }
 
     private function resolveCtoLeaveTypeId(): ?int
     {
-        static $resolved = false;
-        static $cachedValue = null;
-
-        if ($resolved) {
-            return $cachedValue;
-        }
-
-        $value = LeaveType::query()
-            ->whereRaw('LOWER(LTRIM(RTRIM(name))) = ?', ['cto leave'])
-            ->value('id');
-
-        $cachedValue = $value !== null ? (int) $value : null;
-        $resolved = true;
-
-        return $cachedValue;
+        return $this->leaveCreditService()->resolveCtoLeaveTypeId();
     }
 
     private function isCtoLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
     {
-        $ctoLeaveTypeId = $this->resolveCtoLeaveTypeId();
-        if ($ctoLeaveTypeId === null) {
-            return false;
-        }
-
-        if ($leaveType instanceof LeaveType && (int) $leaveType->id === $ctoLeaveTypeId) {
-            return true;
-        }
-
-        if ($leaveTypeId !== null && (int) $leaveTypeId === $ctoLeaveTypeId) {
-            return true;
-        }
-
-        return false;
+        return $this->leaveCreditService()->isCtoLeaveType($leaveType, $leaveTypeId);
     }
 
     private function syncEmployeeCtoBalance(
@@ -11913,60 +9598,13 @@ class LeaveApplicationController extends Controller
         bool $lockForUpdate = false,
         ?\Carbon\CarbonImmutable $asOfDate = null
     ): ?float {
-        $ctoLeaveTypeId = $this->resolveCtoLeaveTypeId();
-        if ($ctoLeaveTypeId === null) {
-            return null;
-        }
-
-        $controlNoCandidates = $this->controlNoCandidates($employeeControlNo);
-        if ($controlNoCandidates === []) {
-            return null;
-        }
-
-        $effectiveBalance = round(max(
-            $this->cocLedgerService()->getAvailableDays($employeeControlNo, $ctoLeaveTypeId, $asOfDate),
-            0.0
-        ), 3);
-
-        $query = LeaveBalance::query()
-            ->whereIn('employee_control_no', $controlNoCandidates)
-            ->where('leave_type_id', $ctoLeaveTypeId);
-
-        if ($lockForUpdate) {
-            $query->lockForUpdate();
-        }
-
-        $balance = $query->first();
-
-        if (! $balance && $effectiveBalance <= 0) {
-            return 0.0;
-        }
-
-        if (! $balance) {
-            $canonicalControlNo = trim((string) ($this->findEmployeeByControlNo($employeeControlNo)?->control_no ?? $employeeControlNo));
-            if ($canonicalControlNo === '') {
-                return $effectiveBalance;
-            }
-
-            $balance = LeaveBalance::query()->create([
-                'employee_control_no' => $canonicalControlNo,
-                'leave_type_id' => $ctoLeaveTypeId,
-                'balance' => $effectiveBalance,
-                'year' => (int) now()->year,
-            ]);
-
-            return (float) $balance->balance;
-        }
-
-        if (round((float) $balance->balance, 3) !== $effectiveBalance) {
-            $balance->balance = $effectiveBalance;
-            if (! $balance->year) {
-                $balance->year = (int) now()->year;
-            }
-            $balance->save();
-        }
-
-        return $effectiveBalance;
+        return $this->leaveCreditService()->syncEmployeeCtoBalance(
+            $employeeControlNo,
+            $lockForUpdate,
+            $asOfDate,
+            fn (string $c) => $this->controlNoCandidates($c),
+            fn (string $c) => $this->findEmployeeByControlNo($c)
+        );
     }
 
     private function computeEmployeeCtoAvailableBalance(
@@ -11974,14 +9612,11 @@ class LeaveApplicationController extends Controller
         int $ctoLeaveTypeId,
         ?\Carbon\CarbonImmutable $asOfDate = null
     ): float {
-        if ($ctoLeaveTypeId <= 0) {
-            return 0.0;
-        }
-
-        return round(max(
-            $this->cocLedgerService()->getAvailableDays($employeeControlNo, $ctoLeaveTypeId, $asOfDate),
-            0.0
-        ), 3);
+        return $this->leaveCreditService()->computeEmployeeCtoAvailableBalance(
+            $employeeControlNo,
+            $ctoLeaveTypeId,
+            $asOfDate
+        );
     }
 
     private function resolveCocExpiryDate(\Carbon\CarbonImmutable $creditedOn): \Carbon\CarbonImmutable
@@ -11991,66 +9626,32 @@ class LeaveApplicationController extends Controller
 
     private function resolveForcedLeaveTypeId(): ?int
     {
-        return LeaveType::resolveForcedLeaveTypeId();
+        return $this->leaveCreditService()->resolveForcedLeaveTypeId();
     }
 
     private function resolveVacationLeaveTypeId(): ?int
     {
-        $value = LeaveType::query()
-            ->whereRaw('LOWER(name) = ?', ['vacation leave'])
-            ->value('id');
-
-        return $value !== null ? (int) $value : null;
+        return $this->leaveCreditService()->resolveVacationLeaveTypeId();
     }
 
     private function resolveSickLeaveTypeId(): ?int
     {
-        $value = LeaveType::query()
-            ->whereRaw('LOWER(name) = ?', ['sick leave'])
-            ->value('id');
-
-        return $value !== null ? (int) $value : null;
+        return $this->leaveCreditService()->resolveSickLeaveTypeId();
     }
 
     private function resolveTerminalLeaveTypeId(): ?int
     {
-        $value = LeaveType::query()
-            ->whereRaw('LOWER(name) = ?', ['terminal leave'])
-            ->value('id');
-
-        return $value !== null ? (int) $value : null;
+        return $this->leaveCreditService()->resolveTerminalLeaveTypeId();
     }
 
     private function isTerminalLeaveTypeId(?int $leaveTypeId): bool
     {
-        if ($leaveTypeId === null || $leaveTypeId <= 0) {
-            return false;
-        }
-
-        $terminalLeaveTypeId = $this->resolveTerminalLeaveTypeId();
-        if ($terminalLeaveTypeId === null) {
-            return false;
-        }
-
-        $resolvedLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
-
-        return $resolvedLeaveTypeId === $terminalLeaveTypeId;
+        return $this->leaveCreditService()->isTerminalLeaveTypeId($leaveTypeId);
     }
 
     private function shouldDeductForcedLeaveWithVacation(LeaveApplication $app, ?int $forcedLeaveTypeId): bool
     {
-        $leaveType = $app->leaveType;
-        if (! $leaveType instanceof LeaveType) {
-            $leaveType = LeaveType::query()->find((int) $app->leave_type_id);
-        }
-
-        return $leaveType instanceof LeaveType
-            && $this->shouldLeaveTypeDeductForcedLeave(
-                $leaveType,
-                (int) $app->leave_type_id,
-                (bool) $app->is_monetization,
-                $forcedLeaveTypeId
-            );
+        return $this->leaveCreditService()->shouldDeductForcedLeaveWithVacation($app, $forcedLeaveTypeId);
     }
 
     private function shouldDeductVacationLeaveWithForced(
@@ -12058,19 +9659,11 @@ class LeaveApplicationController extends Controller
         ?int $forcedLeaveTypeId,
         ?int $vacationLeaveTypeId
     ): bool {
-        $leaveType = $app->leaveType;
-        if (! $leaveType instanceof LeaveType) {
-            $leaveType = LeaveType::query()->find((int) $app->leave_type_id);
-        }
-
-        return $leaveType instanceof LeaveType
-            && $this->shouldLeaveTypeDeductVacationLeave(
-                $leaveType,
-                (int) $app->leave_type_id,
-                (bool) $app->is_monetization,
-                $forcedLeaveTypeId,
-                $vacationLeaveTypeId
-            );
+        return $this->leaveCreditService()->shouldDeductVacationLeaveWithForced(
+            $app,
+            $forcedLeaveTypeId,
+            $vacationLeaveTypeId
+        );
     }
 
     private function shouldLeaveTypeDeductForcedLeave(
@@ -12079,15 +9672,12 @@ class LeaveApplicationController extends Controller
         bool $isMonetization,
         ?int $forcedLeaveTypeId
     ): bool {
-        if ($forcedLeaveTypeId === null || $isMonetization) {
-            return false;
-        }
-
-        if ($leaveTypeId === $forcedLeaveTypeId) {
-            return false;
-        }
-
-        return strcasecmp(trim((string) ($leaveType->name ?? '')), 'Vacation Leave') === 0;
+        return $this->leaveCreditService()->shouldLeaveTypeDeductForcedLeave(
+            $leaveType,
+            $leaveTypeId,
+            $isMonetization,
+            $forcedLeaveTypeId
+        );
     }
 
     private function resolveLeaveTypeForcedLeaveDeductionDays(
@@ -12097,59 +9687,33 @@ class LeaveApplicationController extends Controller
         float $deductibleDays,
         ?int $forcedLeaveTypeId
     ): float {
-        if (! $this->shouldLeaveTypeDeductForcedLeave(
+        return $this->leaveCreditService()->resolveLeaveTypeForcedLeaveDeductionDays(
             $leaveType,
             $leaveTypeId,
             $isMonetization,
+            $deductibleDays,
             $forcedLeaveTypeId
-        )) {
-            return 0.0;
-        }
-
-        return round(max($deductibleDays, 0.0), 3);
+        );
     }
 
     private function isWellnessLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
     {
-        return strcasecmp((string) ($this->resolveLeaveTypePolicyName($leaveType, $leaveTypeId) ?? ''), 'Wellness Leave') === 0;
+        return $this->leaveCreditService()->isWellnessLeaveType($leaveType, $leaveTypeId);
     }
 
     private function isSoloParentLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
     {
-        return strcasecmp((string) ($this->resolveLeaveTypePolicyName($leaveType, $leaveTypeId) ?? ''), 'Solo Parent Leave') === 0;
+        return $this->leaveCreditService()->isSoloParentLeaveType($leaveType, $leaveTypeId);
     }
 
     private function isCalamityLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
     {
-        $normalizedName = LeaveType::normalizeLeaveTypeName(
-            $this->resolveLeaveTypePolicyName($leaveType, $leaveTypeId)
-        );
-
-        return str_contains($normalizedName, 'CALAMITY')
-            || str_contains($normalizedName, 'SPECIAL EMERGENCY');
+        return $this->leaveCreditService()->isCalamityLeaveType($leaveType, $leaveTypeId);
     }
 
     private function resolveLeaveTypePolicyName(?LeaveType $leaveType = null, ?int $leaveTypeId = null): ?string
     {
-        static $leaveTypeNameCache = [];
-
-        if ($leaveType instanceof LeaveType) {
-            return trim((string) ($leaveType->name ?? '')) ?: null;
-        }
-
-        if ($leaveTypeId === null || $leaveTypeId <= 0) {
-            return null;
-        }
-
-        if (! array_key_exists($leaveTypeId, $leaveTypeNameCache)) {
-            $leaveTypeNameCache[$leaveTypeId] = LeaveType::query()
-                ->whereKey((int) $leaveTypeId)
-                ->value('name');
-        }
-
-        $resolvedName = $leaveTypeNameCache[$leaveTypeId];
-
-        return is_string($resolvedName) ? trim($resolvedName) : null;
+        return $this->leaveCreditService()->resolveLeaveTypePolicyName($leaveType, $leaveTypeId);
     }
 
     private function shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
@@ -12158,16 +9722,12 @@ class LeaveApplicationController extends Controller
         bool $isMonetization,
         ?int $vacationLeaveTypeId
     ): bool {
-        if ($vacationLeaveTypeId === null || $isMonetization) {
-            return false;
-        }
-
-        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
-
-        return $this->isWellnessLeaveType($leaveType, $canonicalLeaveTypeId)
-            || LeaveType::isSpecialPrivilegeType($leaveType, $canonicalLeaveTypeId)
-            || $this->isSoloParentLeaveType($leaveType, $canonicalLeaveTypeId)
-            || $this->isCalamityLeaveType($leaveType, $canonicalLeaveTypeId);
+        return $this->leaveCreditService()->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
+            $leaveType,
+            $leaveTypeId,
+            $isMonetization,
+            $vacationLeaveTypeId
+        );
     }
 
     private function resolveLeaveTypeVacationLeaveDeductionDays(
@@ -12180,44 +9740,16 @@ class LeaveApplicationController extends Controller
         ?int $vacationLeaveTypeId,
         ?float $primaryAvailableDays = null
     ): float {
-        $normalizedDeductibleDays = round(max($deductibleDays, 0.0), 3);
-        if ($normalizedDeductibleDays <= 0.0) {
-            return 0.0;
-        }
-
-        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
-        if (! $this->shouldLeaveTypeDeductVacationLeave(
+        return $this->leaveCreditService()->resolveLeaveTypeVacationLeaveDeductionDays(
             $leaveType,
-            $canonicalLeaveTypeId,
+            $leaveTypeId,
             $isMonetization,
+            $requestedTotalDays,
+            $deductibleDays,
             $forcedLeaveTypeId,
-            $vacationLeaveTypeId
-        )) {
-            return 0.0;
-        }
-
-        if ($forcedLeaveTypeId !== null && $canonicalLeaveTypeId === $forcedLeaveTypeId) {
-            return $normalizedDeductibleDays;
-        }
-
-        if (! $this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
-            $leaveType,
-            $canonicalLeaveTypeId,
-            $isMonetization,
-            $vacationLeaveTypeId
-        )) {
-            return 0.0;
-        }
-
-        $normalizedRequestedTotalDays = round(max($requestedTotalDays, 0.0), 3);
-        $scheduleExcessDays = round(max($normalizedDeductibleDays - $normalizedRequestedTotalDays, 0.0), 3);
-        if ($primaryAvailableDays !== null) {
-            $shortageDays = round(max($normalizedDeductibleDays - max($primaryAvailableDays, 0.0), 0.0), 3);
-
-            return max($scheduleExcessDays, $shortageDays);
-        }
-
-        return $scheduleExcessDays;
+            $vacationLeaveTypeId,
+            $primaryAvailableDays
+        );
     }
 
     private function resolvePrimaryLeaveTrackedDeductionDays(
@@ -12229,36 +9761,15 @@ class LeaveApplicationController extends Controller
         ?int $forcedLeaveTypeId,
         ?int $vacationLeaveTypeId
     ): float {
-        $normalizedDeductibleDays = round(max($deductibleDays, 0.0), 3);
-        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
-        if (! $isMonetization && $forcedLeaveTypeId !== null && $canonicalLeaveTypeId === $forcedLeaveTypeId) {
-            return 0.0;
-        }
-
-        if (! $leaveType instanceof LeaveType) {
-            return $normalizedDeductibleDays;
-        }
-
-        if (! $this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
+        return $this->leaveCreditService()->resolvePrimaryLeaveTrackedDeductionDays(
             $leaveType,
-            $canonicalLeaveTypeId,
-            $isMonetization,
-            $vacationLeaveTypeId
-        )) {
-            return $normalizedDeductibleDays;
-        }
-
-        $linkedVacationLeaveDays = $this->resolveLeaveTypeVacationLeaveDeductionDays(
-            $leaveType,
-            $canonicalLeaveTypeId,
+            $leaveTypeId,
             $isMonetization,
             $requestedTotalDays,
-            $normalizedDeductibleDays,
+            $deductibleDays,
             $forcedLeaveTypeId,
             $vacationLeaveTypeId
         );
-
-        return round(max($normalizedDeductibleDays - $linkedVacationLeaveDays, 0.0), 3);
     }
 
     private function shouldLeaveTypeAllowSlVlCrossDeduction(
@@ -12269,20 +9780,14 @@ class LeaveApplicationController extends Controller
         ?int $sickLeaveTypeId,
         ?int $vacationLeaveTypeId
     ): bool {
-        if (! $allowSlVlCrossDeduction || $isMonetization || $sickLeaveTypeId === null || $vacationLeaveTypeId === null) {
-            return false;
-        }
-
-        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
-
-        return $this->isSickLeaveType($leaveType, $canonicalLeaveTypeId)
-            || $this->isVacationLeaveType($leaveType, $canonicalLeaveTypeId)
-            || $this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
-                $leaveType,
-                $canonicalLeaveTypeId,
-                $isMonetization,
-                $vacationLeaveTypeId
-            );
+        return $this->leaveCreditService()->shouldLeaveTypeAllowSlVlCrossDeduction(
+            $leaveType,
+            $leaveTypeId,
+            $isMonetization,
+            $allowSlVlCrossDeduction,
+            $sickLeaveTypeId,
+            $vacationLeaveTypeId
+        );
     }
 
     private function resolveSlVlCrossDeductionTargetLeaveTypeId(
@@ -12293,37 +9798,14 @@ class LeaveApplicationController extends Controller
         ?int $sickLeaveTypeId,
         ?int $vacationLeaveTypeId
     ): ?int {
-        if (! $this->shouldLeaveTypeAllowSlVlCrossDeduction(
+        return $this->leaveCreditService()->resolveSlVlCrossDeductionTargetLeaveTypeId(
             $leaveType,
             $leaveTypeId,
             $isMonetization,
             $allowSlVlCrossDeduction,
             $sickLeaveTypeId,
             $vacationLeaveTypeId
-        )) {
-            return null;
-        }
-
-        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
-
-        if ($this->isSickLeaveType($leaveType, $canonicalLeaveTypeId)) {
-            return $vacationLeaveTypeId;
-        }
-
-        if ($this->isVacationLeaveType($leaveType, $canonicalLeaveTypeId)) {
-            return $sickLeaveTypeId;
-        }
-
-        if ($this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
-            $leaveType,
-            $canonicalLeaveTypeId,
-            $isMonetization,
-            $vacationLeaveTypeId
-        )) {
-            return $vacationLeaveTypeId;
-        }
-
-        return null;
+        );
     }
 
     /**
@@ -12338,135 +9820,16 @@ class LeaveApplicationController extends Controller
         float $primaryAvailableDays,
         ?string $employeeControlNo = null
     ): ?array {
-        if (! is_array($selectedDates) || $selectedDates === []) {
-            return null;
-        }
-
-        $normalizedDeductibleDays = round(max($deductibleDays, 0.0), 3);
-        if ($normalizedDeductibleDays <= 0.0) {
-            return [
-                'primary_deduction_days' => 0.0,
-                'linked_deduction_days' => 0.0,
-            ];
-        }
-
-        $normalizedRequestedTotalDays = round(max($requestedTotalDays, 0.0), 3);
-        $compactedPayStatus = $this->compactSelectedDatePayStatusMap(
-            is_array($selectedDatePayStatus) ? $selectedDatePayStatus : null,
+        return $this->leaveCreditService()->resolveSlVlCrossDeductionDateWeightBreakdown(
             $selectedDates,
-            LeaveApplication::PAY_MODE_WITH_PAY
+            $selectedDatePayStatus,
+            $selectedDateCoverage,
+            $requestedTotalDays,
+            $deductibleDays,
+            $primaryAvailableDays,
+            $employeeControlNo,
+            fn ($dates, $cov, $reqDays, $ctrlNo) => $this->resolveDateCoverageWeights($dates, $cov, $reqDays, $ctrlNo)
         );
-        $normalizedEmployeeControlNo = trim((string) ($employeeControlNo ?? ''));
-        if ($normalizedEmployeeControlNo !== '') {
-            $coverageWeights = $this->resolveDateCoverageWeights(
-                $selectedDates,
-                is_array($selectedDateCoverage) ? $selectedDateCoverage : null,
-                $normalizedRequestedTotalDays,
-                $normalizedEmployeeControlNo
-            );
-        } else {
-            $coverageMap = is_array($selectedDateCoverage) ? $selectedDateCoverage : [];
-            $hasCoverageOverrides = $coverageMap !== [];
-            $defaultWholeDayWeight = 1.0;
-            $defaultHalfDayWeight = 0.5;
-            $defaultCoverageWeight = $defaultWholeDayWeight;
-            $dateCount = count($selectedDates);
-            if ($dateCount > 0) {
-                $halfMatch = abs(($dateCount * $defaultHalfDayWeight) - $normalizedRequestedTotalDays) < 0.00001;
-                $wholeMatch = abs(((float) $dateCount) - $normalizedRequestedTotalDays) < 0.00001;
-                if ($halfMatch) {
-                    $defaultCoverageWeight = $defaultHalfDayWeight;
-                } elseif (! $wholeMatch) {
-                    $defaultCoverageWeight = round(max(min(
-                        $normalizedRequestedTotalDays / $dateCount,
-                        $defaultWholeDayWeight
-                    ), $defaultHalfDayWeight), 3);
-                }
-            }
-
-            $coverageWeights = [];
-            foreach ($selectedDates as $rawDate) {
-                $dateKey = $this->normalizeDateKey($rawDate) ?? trim((string) $rawDate);
-                if ($dateKey === '') {
-                    continue;
-                }
-
-                $hasCoverageValue = array_key_exists($dateKey, $coverageMap);
-                $coverage = strtolower(trim((string) ($coverageMap[$dateKey] ?? '')));
-                if ($coverage === 'half') {
-                    $coverageWeights[$dateKey] = $defaultHalfDayWeight;
-
-                    continue;
-                }
-
-                if ($coverage === 'whole') {
-                    $coverageWeights[$dateKey] = $defaultWholeDayWeight;
-
-                    continue;
-                }
-
-                if ($hasCoverageOverrides && ! $hasCoverageValue) {
-                    $coverageWeights[$dateKey] = $defaultWholeDayWeight;
-
-                    continue;
-                }
-
-                $coverageWeights[$dateKey] = $defaultCoverageWeight;
-            }
-        }
-
-        $remainingPrimaryDays = round(max($primaryAvailableDays, 0.0), 3);
-        $remainingDeductibleDays = $normalizedDeductibleDays;
-        $primaryDeductionDays = 0.0;
-        $linkedDeductionDays = 0.0;
-
-        foreach ($selectedDates as $rawDate) {
-            if ($remainingDeductibleDays <= 1e-9) {
-                break;
-            }
-
-            $dateKey = $this->normalizeDateKey($rawDate) ?? trim((string) $rawDate);
-            if ($dateKey === '') {
-                continue;
-            }
-
-            $effectiveStatus = $compactedPayStatus[$dateKey] ?? LeaveApplication::PAY_MODE_WITH_PAY;
-            $resolvedPayMode = $this->resolvePayModeFromStatusValue($effectiveStatus) ?? LeaveApplication::PAY_MODE_WITH_PAY;
-            if ($resolvedPayMode !== LeaveApplication::PAY_MODE_WITH_PAY) {
-                continue;
-            }
-
-            $dateWeight = round(min(
-                max((float) ($coverageWeights[$dateKey] ?? 1.0), 0.0),
-                $remainingDeductibleDays
-            ), 3);
-            if ($dateWeight <= 0.0) {
-                continue;
-            }
-
-            $usedFromPrimary = round(min($dateWeight, $remainingPrimaryDays), 3);
-            $usedFromLinked = round(max($dateWeight - $usedFromPrimary, 0.0), 3);
-
-            $primaryDeductionDays = round($primaryDeductionDays + $usedFromPrimary, 3);
-            $remainingPrimaryDays = round(max($remainingPrimaryDays - $usedFromPrimary, 0.0), 3);
-            $linkedDeductionDays = round($linkedDeductionDays + $usedFromLinked, 3);
-
-            $remainingDeductibleDays = round(max($remainingDeductibleDays - $dateWeight, 0.0), 3);
-        }
-
-        if ($remainingDeductibleDays > 0.001) {
-            $fallbackPrimaryDeductionDays = round(min($remainingPrimaryDays, $remainingDeductibleDays), 3);
-            $primaryDeductionDays = round($primaryDeductionDays + $fallbackPrimaryDeductionDays, 3);
-            $linkedDeductionDays = round(
-                $linkedDeductionDays + max($remainingDeductibleDays - $fallbackPrimaryDeductionDays, 0.0),
-                3
-            );
-        }
-
-        return [
-            'primary_deduction_days' => round(max($primaryDeductionDays, 0.0), 3),
-            'linked_deduction_days' => round(max($linkedDeductionDays, 0.0), 3),
-        ];
     }
 
     /**
@@ -12488,65 +9851,23 @@ class LeaveApplicationController extends Controller
         ?float $requestedTotalDays = null,
         ?string $employeeControlNo = null
     ): array {
-        $normalizedDeductibleDays = round(max($deductibleDays, 0.0), 3);
-        $baseBreakdown = [
-            'primary_deduction_days' => $normalizedDeductibleDays,
-            'linked_vacation_deduction_days' => 0.0,
-            'linked_sick_deduction_days' => 0.0,
-        ];
-
-        if (! $leaveType instanceof LeaveType || $normalizedDeductibleDays <= 0.0) {
-            return $baseBreakdown;
-        }
-
-        $linkedLeaveTypeId = $this->resolveSlVlCrossDeductionTargetLeaveTypeId(
+        return $this->leaveCreditService()->resolveSlVlCrossDeductionBreakdown(
             $leaveType,
             $leaveTypeId,
             $isMonetization,
+            $deductibleDays,
             $allowSlVlCrossDeduction,
             $sickLeaveTypeId,
-            $vacationLeaveTypeId
-        );
-        if ($linkedLeaveTypeId === null) {
-            return $baseBreakdown;
-        }
-
-        $normalizedPrimaryAvailableDays = round(max($primaryAvailableDays, 0.0), 3);
-        $normalizedLinkedAvailableDays = round(max($linkedAvailableDays, 0.0), 3);
-        $dateWeightBreakdown = $this->resolveSlVlCrossDeductionDateWeightBreakdown(
+            $vacationLeaveTypeId,
+            $primaryAvailableDays,
+            $linkedAvailableDays,
             $selectedDates,
             $selectedDatePayStatus,
             $selectedDateCoverage,
-            (float) ($requestedTotalDays ?? $normalizedDeductibleDays),
-            $normalizedDeductibleDays,
-            $normalizedPrimaryAvailableDays,
-            $employeeControlNo
+            $requestedTotalDays,
+            $employeeControlNo,
+            fn ($dates, $cov, $reqDays, $ctrlNo) => $this->resolveDateCoverageWeights($dates, $cov, $reqDays, $ctrlNo)
         );
-        if ($dateWeightBreakdown !== null) {
-            $primaryDeductionDays = round(max((float) ($dateWeightBreakdown['primary_deduction_days'] ?? 0.0), 0.0), 3);
-            $linkedDeductionDays = round(max((float) ($dateWeightBreakdown['linked_deduction_days'] ?? 0.0), 0.0), 3);
-        } else {
-            $primaryDeductionDays = round(min($normalizedDeductibleDays, $normalizedPrimaryAvailableDays), 3);
-            $linkedDeductionDays = round(max($normalizedDeductibleDays - $primaryDeductionDays, 0.0), 3);
-        }
-
-        $breakdown = [
-            'primary_deduction_days' => $primaryDeductionDays,
-            'linked_vacation_deduction_days' => 0.0,
-            'linked_sick_deduction_days' => 0.0,
-        ];
-
-        if ($linkedDeductionDays <= 0.0 || $linkedDeductionDays > $normalizedLinkedAvailableDays + 1e-9) {
-            return $breakdown;
-        }
-
-        if ($linkedLeaveTypeId === $vacationLeaveTypeId) {
-            $breakdown['linked_vacation_deduction_days'] = $linkedDeductionDays;
-        } elseif ($linkedLeaveTypeId === $sickLeaveTypeId) {
-            $breakdown['linked_sick_deduction_days'] = $linkedDeductionDays;
-        }
-
-        return $breakdown;
     }
 
     private function resolveAvailableSlVlCrossDeductionBalanceForControlNo(
@@ -12556,27 +9877,14 @@ class LeaveApplicationController extends Controller
         bool $isMonetization,
         bool $allowSlVlCrossDeduction
     ): float {
-        if (! $leaveType instanceof LeaveType) {
-            return 0.0;
-        }
-
-        $sickLeaveTypeId = $this->resolveSickLeaveTypeId();
-        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
-        $linkedLeaveTypeId = $this->resolveSlVlCrossDeductionTargetLeaveTypeId(
+        return $this->leaveCreditService()->resolveAvailableSlVlCrossDeductionBalanceForControlNo(
+            $employeeControlNo,
             $leaveType,
             $leaveTypeId,
             $isMonetization,
             $allowSlVlCrossDeduction,
-            $sickLeaveTypeId,
-            $vacationLeaveTypeId
+            fn ($ctrlNo) => $this->resolveCandidateEmployeeControlNumbers($ctrlNo)
         );
-        if ($linkedLeaveTypeId === null) {
-            return 0.0;
-        }
-
-        $balance = $this->findPreferredEmployeeLeaveBalanceRecord($employeeControlNo, $linkedLeaveTypeId);
-
-        return round(max((float) ($balance?->balance ?? 0.0), 0.0), 3);
     }
 
     private function shouldLeaveTypeDeductVacationLeave(
@@ -12586,63 +9894,23 @@ class LeaveApplicationController extends Controller
         ?int $forcedLeaveTypeId,
         ?int $vacationLeaveTypeId
     ): bool {
-        if ($vacationLeaveTypeId === null || $isMonetization) {
-            return false;
-        }
-
-        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
-        if ($forcedLeaveTypeId !== null && $canonicalLeaveTypeId === $forcedLeaveTypeId) {
-            return true;
-        }
-
-        return $this->shouldLeaveTypeUseVacationLeaveTopUpForScheduleExcess(
+        return $this->leaveCreditService()->shouldLeaveTypeDeductVacationLeave(
             $leaveType,
-            $canonicalLeaveTypeId,
+            $leaveTypeId,
             $isMonetization,
+            $forcedLeaveTypeId,
             $vacationLeaveTypeId
         );
     }
 
     private function isSickLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
     {
-        static $leaveTypeNameCache = [];
-
-        $leaveTypeName = null;
-        if ($leaveType instanceof LeaveType) {
-            $leaveTypeName = trim((string) ($leaveType->name ?? ''));
-        } elseif ($leaveTypeId !== null && $leaveTypeId > 0) {
-            if (! array_key_exists($leaveTypeId, $leaveTypeNameCache)) {
-                $leaveTypeNameCache[$leaveTypeId] = LeaveType::query()
-                    ->whereKey((int) $leaveTypeId)
-                    ->value('name');
-            }
-
-            $resolvedName = $leaveTypeNameCache[$leaveTypeId];
-            $leaveTypeName = is_string($resolvedName) ? trim($resolvedName) : null;
-        }
-
-        return strcasecmp((string) ($leaveTypeName ?? ''), 'Sick Leave') === 0;
+        return $this->leaveCreditService()->isSickLeaveType($leaveType, $leaveTypeId);
     }
 
     private function isVacationLeaveType(?LeaveType $leaveType = null, ?int $leaveTypeId = null): bool
     {
-        static $leaveTypeNameCache = [];
-
-        $leaveTypeName = null;
-        if ($leaveType instanceof LeaveType) {
-            $leaveTypeName = trim((string) ($leaveType->name ?? ''));
-        } elseif ($leaveTypeId !== null && $leaveTypeId > 0) {
-            if (! array_key_exists($leaveTypeId, $leaveTypeNameCache)) {
-                $leaveTypeNameCache[$leaveTypeId] = LeaveType::query()
-                    ->whereKey((int) $leaveTypeId)
-                    ->value('name');
-            }
-
-            $resolvedName = $leaveTypeNameCache[$leaveTypeId];
-            $leaveTypeName = is_string($resolvedName) ? trim($resolvedName) : null;
-        }
-
-        return strcasecmp((string) ($leaveTypeName ?? ''), 'Vacation Leave') === 0;
+        return $this->leaveCreditService()->isVacationLeaveType($leaveType, $leaveTypeId);
     }
 
     /**
@@ -12918,49 +10186,17 @@ class LeaveApplicationController extends Controller
 
     private function validateMonetizationLeaveTypeEligibility(?LeaveType $leaveType, string $errorKey = 'leave_type_id'): ?JsonResponse
     {
-        $isEligibleMonetizationType = $leaveType instanceof LeaveType
-            && (
-                $this->isVacationLeaveType($leaveType, (int) $leaveType->id)
-                || $this->isSickLeaveType($leaveType, (int) $leaveType->id)
-            );
-
-        if (! $isEligibleMonetizationType) {
-            return response()->json([
-                'message' => 'Monetization is only allowed for Vacation Leave or Sick Leave.',
-                'errors' => [
-                    $errorKey => ['Monetization is only allowed for Vacation Leave or Sick Leave.'],
-                ],
-            ], 422);
-        }
-
-        return null;
+        return $this->leaveEligibilityService()->validateMonetizationLeaveTypeEligibility($leaveType, $errorKey);
     }
 
     private function validateMonetizationRequestMinimum(float $requestedDays, string $errorKey = 'total_days'): ?JsonResponse
     {
-        $normalizedRequestedDays = round(max($requestedDays, 0.0), 3);
-        if ($normalizedRequestedDays + 1e-9 < LeaveApplication::MONETIZATION_MINIMUM_REQUEST_DAYS) {
-            $minimumDays = self::formatDays(LeaveApplication::MONETIZATION_MINIMUM_REQUEST_DAYS);
-
-            return response()->json([
-                'message' => "A minimum of {$minimumDays} is required for monetization.",
-                'errors' => [
-                    $errorKey => ["A minimum of {$minimumDays} is required for monetization."],
-                ],
-            ], 422);
-        }
-
-        return null;
+        return $this->leaveEligibilityService()->validateMonetizationRequestMinimum($requestedDays, $errorKey);
     }
 
     private function validateMonetizationPolicyRules(?LeaveType $leaveType, float $requestedDays): ?JsonResponse
     {
-        $eligibilityRestriction = $this->validateMonetizationLeaveTypeEligibility($leaveType);
-        if ($eligibilityRestriction instanceof JsonResponse) {
-            return $eligibilityRestriction;
-        }
-
-        return $this->validateMonetizationRequestMinimum($requestedDays);
+        return $this->leaveEligibilityService()->validateMonetizationPolicyRules($leaveType, $requestedDays);
     }
 
     private function validateMonetizationBalanceRules(
@@ -12968,43 +10204,7 @@ class LeaveApplicationController extends Controller
         float $requestedDays,
         string $errorKey = 'total_days'
     ): ?JsonResponse {
-        $normalizedCurrentBalance = round(max($currentBalance, 0.0), 3);
-        $normalizedRequestedDays = round(max($requestedDays, 0.0), 3);
-        $requiredMinimumBalance = LeaveApplication::MONETIZATION_MINIMUM_VACATION_LEAVE_BALANCE_DAYS;
-
-        if ($normalizedCurrentBalance + 1e-9 < $requiredMinimumBalance) {
-            return response()->json([
-                'message' => 'At least '
-                    .self::formatDays($requiredMinimumBalance)
-                    .' of leave credits are required to apply monetization.',
-                'errors' => [
-                    $errorKey => [
-                        'At least '
-                        .self::formatDays($requiredMinimumBalance)
-                        .' of leave credits are required. Current balance: '
-                        .self::formatDays($normalizedCurrentBalance)
-                        .'.',
-                    ],
-                ],
-            ], 422);
-        }
-
-        if ($normalizedRequestedDays > $normalizedCurrentBalance + 1e-9) {
-            return response()->json([
-                'message' => 'Requested monetization days exceed available leave credits.',
-                'errors' => [
-                    $errorKey => [
-                        'Requested monetization days ('
-                        .self::formatDays($normalizedRequestedDays)
-                        .') exceed available leave credits ('
-                        .self::formatDays($normalizedCurrentBalance)
-                        .').',
-                    ],
-                ],
-            ], 422);
-        }
-
-        return null;
+        return $this->leaveEligibilityService()->validateMonetizationBalanceRules($currentBalance, $requestedDays, $errorKey);
     }
 
     private function resolveMonetizationApprovalAvailableBalance(
@@ -13519,42 +10719,17 @@ class LeaveApplicationController extends Controller
         ?string $absenceStartDate = null,
         ?string $absenceEndDate = null
     ): string {
-        [$startDate, $lastAbsentDate] = $this->resolveSickLeaveAbsenceDateRange($selectedDates);
-        if ($absenceStartDate !== null) {
-            $startDate = $this->resolveIsoDate($absenceStartDate) ?? $startDate;
-        }
-        if ($absenceEndDate !== null) {
-            $lastAbsentDate = $this->resolveIsoDate($absenceEndDate) ?? $lastAbsentDate;
-        }
-        if (! $startDate || ! $lastAbsentDate) {
-            return LeaveApplication::PAY_MODE_WITH_PAY;
-        }
-
-        $filedDate = $this->resolvePolicyFilingDate($filedAt);
-        if ($filedDate->lt($startDate)) {
-            return LeaveApplication::PAY_MODE_WITH_PAY;
-        }
-
-        $workingDaysElapsed = $this->countWorkingDaysFromNextDay($lastAbsentDate, $filedDate);
-
-        return $workingDaysElapsed <= 5
-            ? LeaveApplication::PAY_MODE_WITH_PAY
-            : LeaveApplication::PAY_MODE_WITHOUT_PAY;
+        return $this->leaveEligibilityService()->resolveSickLeavePayModeFromFilingWindow(
+            $selectedDates,
+            $filedAt,
+            $absenceStartDate,
+            $absenceEndDate
+        );
     }
 
     private function hasWithoutPaySelectedDates(?array $selectedDatePayStatus): bool
     {
-        if (! is_array($selectedDatePayStatus) || $selectedDatePayStatus === []) {
-            return false;
-        }
-
-        foreach ($selectedDatePayStatus as $status) {
-            if ($this->resolvePayModeFromStatusValue($status) === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
-                return true;
-            }
-        }
-
-        return false;
+        return $this->leaveEligibilityService()->hasWithoutPaySelectedDates($selectedDatePayStatus);
     }
 
     private function validateCtoAvailmentPolicy(
@@ -13563,62 +10738,12 @@ class LeaveApplicationController extends Controller
         ?array $selectedDateCoverage,
         mixed $filedAt = null
     ): ?JsonResponse {
-        $normalizedDateKeys = $this->normalizeSelectedDateKeys($selectedDates);
-        if ($normalizedDateKeys === []) {
-            return response()->json([
-                'message' => 'CTO applications require at least one selected availment date.',
-                'errors' => [
-                    'selected_dates' => ['CTO applications require at least one selected availment date.'],
-                ],
-            ], 422);
-        }
-
-        $coverageTotalDays = $this->computeCoverageDayTotal($normalizedDateKeys, $selectedDateCoverage);
-        if (abs($coverageTotalDays - round(max($totalDays, 0.0), 2)) > 0.01) {
-            return response()->json([
-                'message' => 'CTO applications must use whole-day or half-day blocks only.',
-                'errors' => [
-                    'total_days' => ['CTO applications must use whole-day or half-day blocks only.'],
-                ],
-            ], 422);
-        }
-
-        $firstAvailmentDate = $this->resolveIsoDate($normalizedDateKeys[0]);
-        if ($firstAvailmentDate === null) {
-            return response()->json([
-                'message' => 'The first CTO availment date is invalid.',
-                'errors' => [
-                    'selected_dates' => ['The first CTO availment date is invalid.'],
-                ],
-            ], 422);
-        }
-
-        $filedDate = $this->resolvePolicyFilingDate($filedAt);
-        $workingDaysBeforeAvailment = $this->countWorkingDaysFromFiledDateBeforeDate($filedDate, $firstAvailmentDate);
-        if ($workingDaysBeforeAvailment < self::CTO_MIN_WORKING_DAYS_BEFORE_AVAILMENT) {
-            $message = 'CTO applications must be submitted at least '
-                .self::CTO_MIN_WORKING_DAYS_BEFORE_AVAILMENT
-                .' working days before the first availment date.';
-
-            return response()->json([
-                'message' => $message,
-                'errors' => [
-                    'start_date' => [$message],
-                ],
-            ], 422);
-        }
-
-        $maxConsecutiveDays = $this->calculateMaxConsecutiveDateSpan($normalizedDateKeys);
-        if ($maxConsecutiveDays > 5) {
-            return response()->json([
-                'message' => 'CTO may only be availed for up to 5 consecutive days per application.',
-                'errors' => [
-                    'selected_dates' => ['CTO may only be availed for up to 5 consecutive days per application.'],
-                ],
-            ], 422);
-        }
-
-        return null;
+        return $this->leaveEligibilityService()->validateCtoAvailmentPolicy(
+            $totalDays,
+            $selectedDates,
+            $selectedDateCoverage,
+            $filedAt
+        );
     }
 
     private function validateVacationLeaveAdvanceFilingPolicy(
@@ -13630,259 +10755,59 @@ class LeaveApplicationController extends Controller
         ?LeaveType $leaveType = null,
         bool $enforceAdvanceFiling = true
     ): ?JsonResponse {
-        if ($allowPayStatusOverride) {
-            return null;
-        }
-
-        $normalizedDateKeys = $this->normalizeSelectedDateKeys($selectedDates);
-        if ($normalizedDateKeys === []) {
-            return null;
-        }
-
-        $filedDate = $this->resolvePolicyFilingDate($filedAt);
-        $normalizedFiledDate = $filedDate->startOfDay();
-
-        $shortNoticeDates = [];
-        $latePastDates = [];
-
-        foreach ($normalizedDateKeys as $dateKey) {
-            $availmentDate = $this->resolveIsoDate($dateKey);
-            if ($availmentDate === null) {
-                continue;
-            }
-
-            $normalizedAvailmentDate = $availmentDate->startOfDay();
-
-            $isWithPay = false;
-            if (is_array($selectedDatePayStatus) && array_key_exists($dateKey, $selectedDatePayStatus)) {
-                $statusVal = $selectedDatePayStatus[$dateKey];
-                $resolvedMode = $this->resolvePayModeFromStatusValue($statusVal);
-                if ($resolvedMode !== null) {
-                    $isWithPay = $resolvedMode === LeaveApplication::PAY_MODE_WITH_PAY;
-                } else {
-                    $isWithPay = $statusVal === true || $statusVal === LeaveApplication::PAY_MODE_WITH_PAY;
-                }
-            } else {
-                $isWithPay = $this->normalizePayMode($payMode, false) === LeaveApplication::PAY_MODE_WITH_PAY;
-            }
-
-            if ($normalizedAvailmentDate->lt($normalizedFiledDate)) {
-                if ($isWithPay) {
-                    $latePastDates[] = $availmentDate->format('M j, Y');
-                }
-            } elseif ($enforceAdvanceFiling) {
-                $workingDaysBeforeAvailment = $this->countWorkingDaysFromFiledDateBeforeDate($filedDate, $availmentDate);
-
-                if ($workingDaysBeforeAvailment < self::VL_MIN_WORKING_DAYS_BEFORE_AVAILMENT) {
-                    if ($isWithPay) {
-                        $shortNoticeDates[] = $availmentDate->format('M j, Y');
-                    }
-                }
-            }
-        }
-
-        if (count($shortNoticeDates) > 0 && count($latePastDates) > 0) {
-            $allFormattedDates = implode(', ', array_merge($latePastDates, $shortNoticeDates));
-            $typeName = $leaveType?->name ?? 'Leave';
-            $message = "{$typeName} for past dates or applied less than "
-                .self::VL_MIN_WORKING_DAYS_BEFORE_AVAILMENT
-                ." working days prior to the intended leave date must be filed as Without Pay (WOP). Please change the pay status for: {$allFormattedDates}.";
-
-            return response()->json([
-                'message' => $message,
-                'errors' => [
-                    'selected_date_pay_status' => [$message],
-                ],
-            ], 422);
-        }
-
-        if (count($shortNoticeDates) > 0) {
-            $formattedDates = implode(', ', $shortNoticeDates);
-            $typeName = $leaveType?->name ?? 'Leave';
-            $message = "{$typeName} applied less than "
-                .self::VL_MIN_WORKING_DAYS_BEFORE_AVAILMENT
-                ." working days prior to the intended leave date must be filed as Without Pay (WOP). Please change the pay status for: {$formattedDates}.";
-
-            return response()->json([
-                'message' => $message,
-                'errors' => [
-                    'selected_date_pay_status' => [$message],
-                ],
-            ], 422);
-        }
-
-        if (count($latePastDates) > 0) {
-            $formattedDates = implode(', ', $latePastDates);
-            $typeName = $leaveType?->name ?? 'Leave';
-            $message = "{$typeName} for past dates must be filed as Without Pay (WOP). Please change the pay status for: {$formattedDates}.";
-
-            return response()->json([
-                'message' => $message,
-                'errors' => [
-                    'selected_date_pay_status' => [$message],
-                ],
-            ], 422);
-        }
-
-        return null;
+        return $this->leaveEligibilityService()->validateVacationLeaveAdvanceFilingPolicy(
+            $selectedDates,
+            $selectedDatePayStatus,
+            $payMode,
+            $filedAt,
+            $allowPayStatusOverride,
+            $leaveType,
+            $enforceAdvanceFiling
+        );
     }
 
     private function resolveCtoDeductedHours(float $deductibleDays): float
     {
-        return round(max($deductibleDays, 0.0) * self::CTO_STANDARD_DAY_HOURS, 2);
+        return $this->leaveCalculationService()->resolveCtoDeductedHours($deductibleDays);
     }
 
     private function resolveSickLeaveAbsenceDateRange(?array $selectedDates): array
     {
-        if (! is_array($selectedDates) || $selectedDates === []) {
-            return [null, null];
-        }
-
-        $earliest = null;
-        $latest = null;
-
-        foreach ($selectedDates as $rawDate) {
-            $dateKey = trim((string) $rawDate);
-            if ($dateKey === '') {
-                continue;
-            }
-
-            try {
-                $parsed = \Carbon\CarbonImmutable::parse($dateKey)->startOfDay();
-            } catch (\Throwable) {
-                continue;
-            }
-
-            if ($earliest === null || $parsed->lt($earliest)) {
-                $earliest = $parsed;
-            }
-
-            if ($latest === null || $parsed->gt($latest)) {
-                $latest = $parsed;
-            }
-        }
-
-        return [$earliest, $latest];
+        return $this->leaveEligibilityService()->resolveSickLeaveAbsenceDateRange($selectedDates);
     }
 
     private function resolveIsoDate(?string $rawDate): ?\Carbon\CarbonImmutable
     {
-        $raw = trim((string) ($rawDate ?? ''));
-        if ($raw === '') {
-            return null;
-        }
-
-        try {
-            return \Carbon\CarbonImmutable::parse($raw)->startOfDay();
-        } catch (\Throwable) {
-            return null;
-        }
+        return $this->leaveEligibilityService()->resolveIsoDate($rawDate);
     }
 
     private function resolvePolicyFilingDate(mixed $filedAt = null): \Carbon\CarbonImmutable
     {
-        if ($filedAt instanceof \DateTimeInterface) {
-            return \Carbon\CarbonImmutable::instance($filedAt)->startOfDay();
-        }
-
-        $raw = trim((string) ($filedAt ?? ''));
-        if ($raw !== '') {
-            try {
-                return \Carbon\CarbonImmutable::parse($raw)->startOfDay();
-            } catch (\Throwable) {
-                // Fall back to now() when parsing fails.
-            }
-        }
-
-        return \Carbon\CarbonImmutable::now()->startOfDay();
+        return $this->leaveEligibilityService()->resolvePolicyFilingDate($filedAt);
     }
 
     private function countWorkingDaysFromNextDay(
         \Carbon\CarbonImmutable $lastAbsentDate,
         \Carbon\CarbonImmutable $filedDate
     ): int {
-        if ($filedDate->lte($lastAbsentDate)) {
-            return 0;
-        }
-
-        $count = 0;
-        $cursor = $lastAbsentDate->addDay()->startOfDay();
-        $end = $filedDate->startOfDay();
-
-        while ($cursor->lte($end)) {
-            if ($cursor->isWeekday()) {
-                $count++;
-            }
-
-            $cursor = $cursor->addDay();
-        }
-
-        return $count;
+        return $this->leaveEligibilityService()->countWorkingDaysFromNextDay($lastAbsentDate, $filedDate);
     }
 
     private function normalizeSelectedDateKeys(?array $selectedDates): array
     {
-        if (! is_array($selectedDates) || $selectedDates === []) {
-            return [];
-        }
-
-        $normalized = [];
-        foreach ($selectedDates as $rawDate) {
-            $dateKey = $this->normalizeDateKey($rawDate);
-            if ($dateKey === null) {
-                $dateKey = trim((string) $rawDate);
-            }
-            if ($dateKey === '') {
-                continue;
-            }
-
-            $normalized[$dateKey] = true;
-        }
-
-        $normalizedKeys = array_keys($normalized);
-        sort($normalizedKeys);
-
-        return $normalizedKeys;
+        return $this->leaveEligibilityService()->normalizeSelectedDateKeys($selectedDates);
     }
 
     private function computeCoverageDayTotal(array $selectedDateKeys, ?array $selectedDateCoverage): float
     {
-        if ($selectedDateKeys === []) {
-            return 0.0;
-        }
-
-        $normalizedCoverage = $this->compactSelectedDateCoverageMap($selectedDateCoverage, $selectedDateKeys);
-        $total = 0.0;
-        foreach ($selectedDateKeys as $dateKey) {
-            $coverage = strtolower(trim((string) ($normalizedCoverage[$dateKey] ?? 'whole')));
-            $total += $coverage === 'half' ? 0.5 : 1.0;
-        }
-
-        return round($total, 2);
+        return $this->leaveEligibilityService()->computeCoverageDayTotal($selectedDateKeys, $selectedDateCoverage);
     }
 
     private function countWorkingDaysFromFiledDateBeforeDate(
         \Carbon\CarbonImmutable $filedDate,
         \Carbon\CarbonImmutable $targetDate
     ): int {
-        $normalizedFiledDate = $filedDate->startOfDay();
-        $normalizedTargetDate = $targetDate->startOfDay();
-        if ($normalizedTargetDate->lte($normalizedFiledDate)) {
-            return 0;
-        }
-
-        $workingDays = 0;
-        $cursor = $normalizedFiledDate;
-
-        while ($cursor->lt($normalizedTargetDate)) {
-            if ($cursor->isWeekday()) {
-                $workingDays++;
-            }
-
-            $cursor = $cursor->addDay();
-        }
-
-        return $workingDays;
+        return $this->leaveEligibilityService()->countWorkingDaysFromFiledDateBeforeDate($filedDate, $targetDate);
     }
 
     private function nextDate(\Carbon\CarbonImmutable $date): \Carbon\CarbonImmutable
@@ -13892,46 +10817,7 @@ class LeaveApplicationController extends Controller
 
     private function calculateMaxConsecutiveDateSpan(array $selectedDateKeys): int
     {
-        if ($selectedDateKeys === []) {
-            return 0;
-        }
-
-        $parsedDates = [];
-        foreach ($selectedDateKeys as $dateKey) {
-            $parsed = $this->resolveIsoDate($dateKey);
-            if ($parsed === null) {
-                continue;
-            }
-
-            $parsedDates[] = $parsed->startOfDay();
-        }
-
-        if ($parsedDates === []) {
-            return 0;
-        }
-
-        usort(
-            $parsedDates,
-            static fn (\Carbon\CarbonImmutable $left, \Carbon\CarbonImmutable $right): int => $left->getTimestamp() <=> $right->getTimestamp()
-        );
-
-        $maxStreak = 1;
-        $currentStreak = 1;
-
-        for ($index = 1, $count = count($parsedDates); $index < $count; $index++) {
-            $expectedNextDate = $this->nextDate($parsedDates[$index - 1]);
-            if ($parsedDates[$index]->equalTo($expectedNextDate)) {
-                $currentStreak++;
-            } else {
-                $currentStreak = 1;
-            }
-
-            if ($currentStreak > $maxStreak) {
-                $maxStreak = $currentStreak;
-            }
-        }
-
-        return $maxStreak;
+        return $this->leaveEligibilityService()->calculateMaxConsecutiveDateSpan($selectedDateKeys);
     }
 
     private function buildSickLeavePayStatusOverrides(
@@ -14758,86 +11644,12 @@ class LeaveApplicationController extends Controller
         ?array $selectedDateHalfDayPortion,
         ?array $selectedDates
     ): ?array {
-        if (! is_array($selectedDateHalfDayPortion) || $selectedDateHalfDayPortion === []) {
-            return null;
-        }
-
-        $dateSet = [];
-        $selectedDateLookup = [];
-        if (is_array($selectedDates)) {
-            foreach ($selectedDates as $index => $rawDate) {
-                $rawKey = trim((string) $rawDate);
-                if ($rawKey === '') {
-                    continue;
-                }
-
-                $dateKey = $this->normalizeDateKey($rawDate);
-                if ($dateKey === null) {
-                    $dateKey = $rawKey;
-                }
-
-                $dateSet[$dateKey] = true;
-                $selectedDateLookup[(string) $index] = $dateKey;
-                $selectedDateLookup[$rawKey] = $dateKey;
-            }
-        }
-        $restrictToSelectedDates = $dateSet !== [];
-
-        $compacted = [];
-        foreach ($selectedDateHalfDayPortion as $rawDate => $rawPortion) {
-            $rawKey = trim((string) $rawDate);
-            $dateKey = $this->normalizeDateKey($rawDate);
-            if ($dateKey === null && $rawKey !== '' && array_key_exists($rawKey, $selectedDateLookup)) {
-                $dateKey = $selectedDateLookup[$rawKey];
-            }
-            if ($dateKey === null) {
-                $dateKey = $rawKey;
-            }
-            if ($dateKey === '') {
-                continue;
-            }
-
-            if ($restrictToSelectedDates && ! array_key_exists($dateKey, $dateSet)) {
-                continue;
-            }
-
-            $portion = $this->normalizeSelectedDateHalfDayPortionValue($rawPortion);
-            if ($portion === null) {
-                continue;
-            }
-
-            $compacted[$dateKey] = $portion;
-        }
-
-        if ($compacted === []) {
-            return null;
-        }
-
-        ksort($compacted);
-
-        return $compacted;
+        return $this->leaveCalculationService()->compactSelectedDateHalfDayPortionMap($selectedDateHalfDayPortion, $selectedDates);
     }
 
     private function mergeSelectedDateHalfDayPortionMaps(?array $primaryMap, ?array $fallbackMap): ?array
     {
-        $resolvedMap = [];
-        if (is_array($fallbackMap) && $fallbackMap !== []) {
-            $resolvedMap = $fallbackMap;
-        }
-
-        if (is_array($primaryMap) && $primaryMap !== []) {
-            foreach ($primaryMap as $dateKey => $portion) {
-                $resolvedMap[$dateKey] = $portion;
-            }
-        }
-
-        if ($resolvedMap === []) {
-            return null;
-        }
-
-        ksort($resolvedMap);
-
-        return $resolvedMap;
+        return $this->leaveCalculationService()->mergeSelectedDateHalfDayPortionMaps($primaryMap, $fallbackMap);
     }
 
     private function synchronizeSelectedDateCoverageMetadata(
@@ -14845,34 +11657,7 @@ class LeaveApplicationController extends Controller
         ?array $selectedDateHalfDayPortion,
         ?array $selectedDates
     ): array {
-        $resolvedCoverage = $this->compactSelectedDateCoverageMap($selectedDateCoverage, $selectedDates);
-        $resolvedHalfDayPortion = $this->compactSelectedDateHalfDayPortionMap($selectedDateHalfDayPortion, $selectedDates);
-
-        if (is_array($resolvedHalfDayPortion) && $resolvedHalfDayPortion !== []) {
-            $coverageMap = is_array($resolvedCoverage) ? $resolvedCoverage : [];
-            foreach (array_keys($resolvedHalfDayPortion) as $dateKey) {
-                $coverageMap[$dateKey] = 'half';
-            }
-            ksort($coverageMap);
-            $resolvedCoverage = $coverageMap === [] ? null : $coverageMap;
-        }
-
-        if (is_array($resolvedHalfDayPortion) && $resolvedHalfDayPortion !== []) {
-            foreach ($resolvedHalfDayPortion as $dateKey => $portion) {
-                if (($resolvedCoverage[$dateKey] ?? null) !== 'half') {
-                    unset($resolvedHalfDayPortion[$dateKey]);
-                }
-            }
-
-            if ($resolvedHalfDayPortion === []) {
-                $resolvedHalfDayPortion = null;
-            }
-        }
-
-        return [
-            'selectedDateCoverage' => $resolvedCoverage,
-            'selectedDateHalfDayPortion' => $resolvedHalfDayPortion,
-        ];
+        return $this->leaveCalculationService()->synchronizeSelectedDateCoverageMetadata($selectedDateCoverage, $selectedDateHalfDayPortion, $selectedDates);
     }
 
     private function compactSelectedDatePayStatusMap(
@@ -14880,143 +11665,14 @@ class LeaveApplicationController extends Controller
         ?array $selectedDates,
         string $payMode
     ): ?array {
-        if (! is_array($selectedDatePayStatus) || $selectedDatePayStatus === []) {
-            return null;
-        }
-
-        $defaultMode = $this->normalizePayMode($payMode, false);
-        $dateSet = [];
-        $selectedDateLookup = [];
-        if (is_array($selectedDates)) {
-            foreach ($selectedDates as $index => $rawDate) {
-                $rawKey = trim((string) $rawDate);
-                if ($rawKey === '') {
-                    continue;
-                }
-
-                $dateKey = $this->normalizeDateKey($rawDate);
-                if ($dateKey === null) {
-                    $dateKey = $rawKey;
-                }
-
-                $dateSet[$dateKey] = true;
-                $selectedDateLookup[(string) $index] = $dateKey;
-                $selectedDateLookup[$rawKey] = $dateKey;
-            }
-        }
-        $restrictToSelectedDates = $dateSet !== [];
-
-        $compacted = [];
-        foreach ($selectedDatePayStatus as $rawDate => $rawStatus) {
-            $rawKey = trim((string) $rawDate);
-            $dateKey = $this->normalizeDateKey($rawDate);
-            if ($dateKey === null && $rawKey !== '' && array_key_exists($rawKey, $selectedDateLookup)) {
-                $dateKey = $selectedDateLookup[$rawKey];
-            }
-            if ($dateKey === null) {
-                $dateKey = $rawKey;
-            }
-            if ($dateKey === '') {
-                continue;
-            }
-
-            if ($restrictToSelectedDates && ! array_key_exists($dateKey, $dateSet)) {
-                continue;
-            }
-
-            $resolvedMode = $this->resolvePayModeFromStatusValue($rawStatus);
-            if ($resolvedMode === null) {
-                continue;
-            }
-
-            if ($restrictToSelectedDates && $resolvedMode === $defaultMode) {
-                continue;
-            }
-
-            $compacted[$dateKey] = $resolvedMode;
-        }
-
-        if ($compacted === []) {
-            return null;
-        }
-
-        ksort($compacted);
-
-        return $compacted;
+        return $this->leaveCalculationService()->compactSelectedDatePayStatusMap($selectedDatePayStatus, $selectedDates, $payMode);
     }
 
     private function compactSelectedDateCoverageMap(
         ?array $selectedDateCoverage,
         ?array $selectedDates
     ): ?array {
-        if (! is_array($selectedDateCoverage) || $selectedDateCoverage === []) {
-            return null;
-        }
-
-        $dateSet = [];
-        $selectedDateLookup = [];
-        if (is_array($selectedDates)) {
-            foreach ($selectedDates as $index => $rawDate) {
-                $rawKey = trim((string) $rawDate);
-                if ($rawKey === '') {
-                    continue;
-                }
-
-                $dateKey = $this->normalizeDateKey($rawDate);
-                if ($dateKey === null) {
-                    $dateKey = $rawKey;
-                }
-
-                $dateSet[$dateKey] = true;
-                $selectedDateLookup[(string) $index] = $dateKey;
-                $selectedDateLookup[$rawKey] = $dateKey;
-            }
-        }
-        $restrictToSelectedDates = $dateSet !== [];
-
-        $compacted = [];
-        foreach ($selectedDateCoverage as $rawDate => $rawCoverage) {
-            $rawKey = trim((string) $rawDate);
-            $dateKey = $this->normalizeDateKey($rawDate);
-            if ($dateKey === null && $rawKey !== '' && array_key_exists($rawKey, $selectedDateLookup)) {
-                $dateKey = $selectedDateLookup[$rawKey];
-            }
-            if ($dateKey === null) {
-                $dateKey = $rawKey;
-            }
-            if ($dateKey === '') {
-                continue;
-            }
-
-            if ($restrictToSelectedDates && ! array_key_exists($dateKey, $dateSet)) {
-                continue;
-            }
-
-            $coverage = strtolower(trim((string) $rawCoverage));
-            if ($coverage === 'half') {
-                $compacted[$dateKey] = 'half';
-
-                continue;
-            }
-
-            if (! $restrictToSelectedDates && $coverage === 'whole') {
-                $compacted[$dateKey] = 'whole';
-
-                continue;
-            }
-
-            if ($restrictToSelectedDates) {
-                continue;
-            }
-        }
-
-        if ($compacted === []) {
-            return null;
-        }
-
-        ksort($compacted);
-
-        return $compacted;
+        return $this->leaveCalculationService()->compactSelectedDateCoverageMap($selectedDateCoverage, $selectedDates);
     }
 
     private function computeDeductibleDays(
@@ -15028,407 +11684,72 @@ class LeaveApplicationController extends Controller
         string $payMode,
         ?string $employeeControlNo = null
     ): float {
-        $normalizedTotalDays = round(max($totalDays, 0.0), 3);
-        if ($normalizedTotalDays <= 0) {
-            return 0.0;
-        }
-
-        if ($isMonetization) {
-            return $normalizedTotalDays;
-        }
-
-        $normalizedPayMode = $this->normalizePayMode($payMode, false);
-
-        $resolvedDates = [];
-        $selectedDateLookup = [];
-        if (is_array($selectedDates)) {
-            foreach ($selectedDates as $index => $rawDate) {
-                $rawKey = trim((string) $rawDate);
-                if ($rawKey === '') {
-                    continue;
-                }
-
-                $dateKey = $this->normalizeDateKey($rawDate);
-                if ($dateKey === null) {
-                    $dateKey = $rawKey;
-                }
-
-                $resolvedDates[] = $dateKey;
-                $selectedDateLookup[(string) $index] = $dateKey;
-                $selectedDateLookup[$rawKey] = $dateKey;
-            }
-        }
-        $resolvedDates = array_values(array_unique($resolvedDates));
-        sort($resolvedDates);
-
-        $payStatusMap = [];
-        if (is_array($selectedDatePayStatus)) {
-            foreach ($selectedDatePayStatus as $rawDate => $status) {
-                $rawKey = trim((string) $rawDate);
-                $dateKey = $this->normalizeDateKey($rawDate);
-                if ($dateKey === null && $rawKey !== '' && array_key_exists($rawKey, $selectedDateLookup)) {
-                    $dateKey = $selectedDateLookup[$rawKey];
-                }
-                if ($dateKey === null) {
-                    $dateKey = $rawKey;
-                }
-                if ($dateKey === '') {
-                    continue;
-                }
-                $payStatusMap[$dateKey] = $status;
-            }
-        }
-
-        $coverageMap = [];
-        if (is_array($selectedDateCoverage)) {
-            foreach ($selectedDateCoverage as $rawDate => $coverage) {
-                $rawKey = trim((string) $rawDate);
-                $dateKey = $this->normalizeDateKey($rawDate);
-                if ($dateKey === null && $rawKey !== '' && array_key_exists($rawKey, $selectedDateLookup)) {
-                    $dateKey = $selectedDateLookup[$rawKey];
-                }
-                if ($dateKey === null) {
-                    $dateKey = $rawKey;
-                }
-                if ($dateKey === '') {
-                    continue;
-                }
-                $coverageMap[$dateKey] = $coverage;
-            }
-        }
-        $hasCoverageOverrides = $coverageMap !== [];
-
-        if ($resolvedDates === []) {
-            $resolvedDates = array_values(array_unique(array_merge(
-                array_keys($payStatusMap),
-                array_keys($coverageMap)
-            )));
-            sort($resolvedDates);
-        }
-
-        if ($resolvedDates === []) {
-            return $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $normalizedTotalDays;
-        }
-
-        $defaultWholeDayWeight = $this->workScheduleService()->resolveCoverageDeductionDays('whole', $employeeControlNo);
-        $defaultHalfDayWeight = $this->workScheduleService()->resolveCoverageDeductionDays('half', $employeeControlNo);
-        $defaultCoverageWeight = $defaultWholeDayWeight;
-        $dateCount = count($resolvedDates);
-        if ($dateCount > 0) {
-            $halfMatch = abs(($dateCount * $defaultHalfDayWeight) - $normalizedTotalDays) < 0.00001;
-            $wholeMatch = abs(((float) $dateCount) - $normalizedTotalDays) < 0.00001;
-            if ($halfMatch) {
-                $defaultCoverageWeight = $defaultHalfDayWeight;
-            } elseif (! $wholeMatch) {
-                $defaultCoverageWeight = round(max(min($normalizedTotalDays / $dateCount, $defaultWholeDayWeight), $defaultHalfDayWeight), 3);
-            }
-        }
-
-        $weightedTotal = 0.0;
-        $weightedPaid = 0.0;
-        foreach ($resolvedDates as $dateKey) {
-            $hasCoverageValue = array_key_exists($dateKey, $coverageMap);
-            $coverage = $hasCoverageValue ? strtolower(trim((string) ($coverageMap[$dateKey] ?? ''))) : '';
-            if ($coverage === 'half') {
-                $weight = $defaultHalfDayWeight;
-            } elseif ($coverage === 'whole') {
-                $weight = $defaultWholeDayWeight;
-            } elseif ($hasCoverageOverrides) {
-                // Stored coverage maps are sparse (half-day overrides only), so missing keys mean whole-day.
-                $weight = $defaultWholeDayWeight;
-            } else {
-                $weight = $defaultCoverageWeight;
-            }
-
-            $weightedTotal += $weight;
-
-            $status = $payStatusMap[$dateKey] ?? $normalizedPayMode;
-            $resolvedMode = $this->resolvePayModeFromStatusValue($status);
-            $effectiveMode = $resolvedMode ?? $normalizedPayMode;
-            if ($effectiveMode === LeaveApplication::PAY_MODE_WITH_PAY) {
-                $weightedPaid += $weight;
-            }
-        }
-
-        if ($weightedTotal <= 0.0) {
-            return $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $normalizedTotalDays;
-        }
-
-        return round(max($weightedPaid, 0.0), 3);
+        return $this->leaveCalculationService()->computeDeductibleDays(
+            $totalDays,
+            $selectedDates,
+            $selectedDatePayStatus,
+            $selectedDateCoverage,
+            $isMonetization,
+            $payMode,
+            $employeeControlNo
+        );
     }
 
     private function resolveApplicationDeductibleDays(LeaveApplication $app): float
     {
-        $totalDays = round((float) ($app->total_days ?? 0), 3);
-        if ($totalDays <= 0) {
-            return 0.0;
-        }
-
-        if (LeaveType::isForcedLeaveType($app->leaveType, (int) $app->leave_type_id) && $app->deductible_days === null) {
-            return $totalDays;
-        }
-
-        if ($app->deductible_days !== null) {
-            $stored = round((float) $app->deductible_days, 3);
-            if ($stored < 0) {
-                return 0.0;
-            }
-
-            return $stored;
-        }
-
-        if ((bool) $app->is_monetization) {
-            return $totalDays;
-        }
-
-        $storedCtoHours = round((float) ($app->cto_deducted_hours ?? 0), 2);
-        if ($storedCtoHours > 0 && $this->isCtoLeaveType($app->leaveType, (int) $app->leave_type_id)) {
-            return round($storedCtoHours / self::CTO_STANDARD_DAY_HOURS, 3);
-        }
-
-        return $this->normalizePayMode($app->pay_mode ?? null, false) === LeaveApplication::PAY_MODE_WITHOUT_PAY
-            ? 0.0
-            : $totalDays;
+        return $this->leaveCalculationService()->resolveApplicationDeductibleDays($app);
     }
 
     private function resolveApplicationCtoDeductedHours(LeaveApplication $app): float
     {
-        $storedHours = round((float) ($app->cto_deducted_hours ?? 0), 2);
-        if ($storedHours > 0) {
-            return $storedHours;
-        }
-
-        if (! $this->isCtoLeaveType($app->leaveType, (int) $app->leave_type_id)) {
-            return 0.0;
-        }
-
-        return $this->resolveCtoDeductedHours($this->resolveApplicationDeductibleDays($app));
+        return $this->leaveCalculationService()->resolveApplicationCtoDeductedHours($app);
     }
 
     private function resolveRecallRestorableDetails(
         LeaveApplication $app,
         array $selectedRecallDateKeys = []
     ): array {
-        $deductibleDays = $this->resolveApplicationDeductibleDays($app);
-        if ($deductibleDays <= 0.0) {
-            return ['days' => 0.0, 'dates' => []];
-        }
-
-        if ((bool) $app->is_monetization) {
-            return ['days' => $deductibleDays, 'dates' => []];
-        }
-
-        $selectedDates = $app->resolvedSelectedDates();
-        if (! is_array($selectedDates) || $selectedDates === []) {
-            return ['days' => $deductibleDays, 'dates' => []];
-        }
-
-        $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, false);
-        $normalizedPayStatus = $this->compactSelectedDatePayStatusMap(
-            is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null,
-            $selectedDates,
-            $normalizedPayMode
-        );
-        $normalizedCoverage = $this->compactSelectedDateCoverageMap(
-            is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
-            $selectedDates
-        );
-        $coverageWeights = $this->resolveDateCoverageWeights(
-            $selectedDates,
-            $normalizedCoverage,
-            round((float) ($app->total_days ?? 0), 3),
-            (string) ($app->employee_control_no ?? '')
-        );
-
-        $selectedRecallDateSet = array_fill_keys(
-            $this->normalizeRecallDateKeys($selectedRecallDateKeys),
-            true
-        );
-        if ($selectedRecallDateSet === []) {
-            return ['days' => 0.0, 'dates' => []];
-        }
-
-        $restorableDays = 0.0;
-        $restorableDateKeys = [];
-
-        foreach ($selectedDates as $rawDate) {
-            $dateKey = $this->normalizeDateKey($rawDate);
-            if ($dateKey === null) {
-                $dateKey = trim((string) $rawDate);
-            }
-            if ($dateKey === '' || ! isset($selectedRecallDateSet[$dateKey])) {
-                continue;
-            }
-
-            $weight = round(max((float) ($coverageWeights[$dateKey] ?? 1.0), 0.0), 3);
-            if ($weight <= 0.0) {
-                continue;
-            }
-
-            $effectiveMode = $normalizedPayStatus[$dateKey] ?? $normalizedPayMode;
-            $resolvedMode = $this->resolvePayModeFromStatusValue($effectiveMode) ?? $normalizedPayMode;
-            if ($resolvedMode !== LeaveApplication::PAY_MODE_WITH_PAY) {
-                continue;
-            }
-
-            $restorableDays += $weight;
-            $restorableDateKeys[] = $dateKey;
-        }
-
-        $restorableDays = round(max($restorableDays, 0.0), 3);
-        if ($restorableDays > $deductibleDays) {
-            $restorableDays = $deductibleDays;
-        }
-
-        $restorableDateKeys = array_values(array_unique(array_filter($restorableDateKeys)));
-        sort($restorableDateKeys);
-
-        return [
-            'days' => $restorableDays,
-            'dates' => $restorableDateKeys,
-        ];
+        return $this->leaveWorkflowService()->resolveRecallRestorableDetails($app, $selectedRecallDateKeys);
     }
 
     private function resolveValidatedRecallSelectedDateKeys(
         LeaveApplication $app,
         array $requestedDates = []
     ): ?array {
-        $allowedDateKeys = $this->resolveRecallSelectedDateKeys($app);
-        $requestedDateKeys = $this->normalizeRecallDateKeys($requestedDates);
-
-        if ($requestedDateKeys === []) {
-            return null;
-        }
-
-        if ($allowedDateKeys === []) {
-            return null;
-        }
-
-        $allowedDateSet = array_fill_keys($allowedDateKeys, true);
-        foreach ($requestedDateKeys as $dateKey) {
-            if (! isset($allowedDateSet[$dateKey])) {
-                return null;
-            }
-        }
-
-        return $requestedDateKeys;
+        return $this->leaveWorkflowService()->resolveValidatedRecallSelectedDateKeys(
+            $app,
+            $requestedDates,
+            fn ($a) => $this->resolveLatestUpdateMeta($a)
+        );
     }
 
     private function resolveRecallSelectedDateKeys(LeaveApplication $app): array
     {
-        $selectedDates = $app->resolvedSelectedDates();
-        if (! is_array($selectedDates) || $selectedDates === []) {
-            return [];
-        }
-
-        $storedRecallDateSet = array_fill_keys(
-            $this->resolveEffectiveStoredRecallDateKeys($app),
-            true
+        return $this->leaveWorkflowService()->resolveRecallSelectedDateKeys(
+            $app,
+            fn ($a) => $this->resolveLatestUpdateMeta($a)
         );
-
-        $normalizedDateKeys = [];
-        foreach ($selectedDates as $rawDate) {
-            $dateKey = $this->normalizeDateKey($rawDate);
-            if ($dateKey === null) {
-                $dateKey = trim((string) $rawDate);
-            }
-            if ($dateKey === '') {
-                continue;
-            }
-            if (isset($storedRecallDateSet[$dateKey])) {
-                continue;
-            }
-
-            $normalizedDateKeys[] = $dateKey;
-        }
-
-        $normalizedDateKeys = array_values(array_unique($normalizedDateKeys));
-        sort($normalizedDateKeys);
-
-        return $normalizedDateKeys;
     }
 
     private function resolveEffectiveStoredRecallDateKeys(LeaveApplication $app): array
     {
-        $storedRecallDateKeys = $this->normalizeRecallDateKeys(
-            is_array($app->recall_selected_dates) ? $app->recall_selected_dates : []
+        return $this->leaveWorkflowService()->resolveEffectiveStoredRecallDateKeys(
+            $app,
+            fn ($a) => $this->resolveLatestUpdateMeta($a)
         );
-        if ($storedRecallDateKeys === []) {
-            return [];
-        }
-
-        $selectedDateKeys = $this->normalizeRecallDateKeys(
-            is_array($app->resolvedSelectedDates()) ? $app->resolvedSelectedDates() : []
-        );
-        if ($selectedDateKeys === []) {
-            return $storedRecallDateKeys;
-        }
-
-        $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
-        $latestUpdateStatus = strtoupper(trim((string) ($latestUpdateMeta['status'] ?? '')));
-        $latestUpdateReviewedAt = $latestUpdateMeta['reviewed_at'] ?? null;
-        $latestRecallLoggedAt = $this->resolveLatestRecallLoggedAt($app);
-
-        if (
-            $latestUpdateStatus === LeaveApplicationUpdateRequest::STATUS_APPROVED
-            && $latestUpdateReviewedAt instanceof \DateTimeInterface
-            && $latestRecallLoggedAt instanceof \DateTimeInterface
-            && $latestUpdateReviewedAt->getTimestamp() > $latestRecallLoggedAt->getTimestamp()
-        ) {
-            $selectedDateSet = array_fill_keys($selectedDateKeys, true);
-            $storedRecallDateKeys = array_values(array_filter(
-                $storedRecallDateKeys,
-                static fn (string $dateKey): bool => ! isset($selectedDateSet[$dateKey])
-            ));
-        }
-
-        $storedRecallDateKeys = array_values(array_unique($storedRecallDateKeys));
-        sort($storedRecallDateKeys);
-
-        return $storedRecallDateKeys;
     }
 
     private function resolveLatestRecallLoggedAt(LeaveApplication $app): ?\DateTimeInterface
     {
-        $logs = $app->relationLoaded('logs')
-            ? $app->logs
-            : $app->logs()->get();
-
-        if (! $logs instanceof Collection || $logs->isEmpty()) {
-            return null;
-        }
-
-        $latestRecallLog = $logs
-            ->filter(fn (mixed $entry): bool => $entry instanceof LeaveApplicationLog
-                && $entry->action === LeaveApplicationLog::ACTION_HR_RECALLED)
-            ->sortByDesc(fn (LeaveApplicationLog $entry) => $entry->created_at?->getTimestamp() ?? PHP_INT_MIN)
-            ->first();
-
-        return $latestRecallLog instanceof LeaveApplicationLog
-            ? $latestRecallLog->created_at
-            : null;
+        return $this->leaveWorkflowService()->resolveLatestRecallLoggedAt($app);
     }
 
     private function normalizeRecallDateKeys(array $rawDates): array
     {
-        $normalizedDateKeys = [];
-
-        foreach ($rawDates as $rawDate) {
-            $dateKey = $this->normalizeDateKey($rawDate);
-            if ($dateKey === null) {
-                $dateKey = trim((string) $rawDate);
-            }
-            if ($dateKey === '') {
-                continue;
-            }
-
-            $normalizedDateKeys[] = $dateKey;
-        }
-
-        $normalizedDateKeys = array_values(array_unique($normalizedDateKeys));
-        sort($normalizedDateKeys);
-
-        return $normalizedDateKeys;
+        return $this->leaveWorkflowService()->normalizeRecallDateKeys(
+            $rawDates,
+            fn ($d) => $this->normalizeDateKey($d)
+        );
     }
 
     private function applicationDeductsEmployeeBalance(
@@ -15436,15 +11757,7 @@ class LeaveApplicationController extends Controller
         ?LeaveType $leaveType,
         mixed $payMode
     ): bool {
-        if ($isMonetization) {
-            return true;
-        }
-
-        if ($this->normalizePayMode($payMode, false) === LeaveApplication::PAY_MODE_WITHOUT_PAY) {
-            return false;
-        }
-
-        return (bool) ($leaveType?->is_credit_based);
+        return $this->leaveCreditService()->applicationDeductsEmployeeBalance($isMonetization, $leaveType, $payMode);
     }
 
     private function validateNoDuplicateLeaveDates(
@@ -15854,35 +12167,12 @@ class LeaveApplicationController extends Controller
         float $requiredBalanceDays,
         bool $requiresVacationLeaveTopUp = false
     ): JsonResponse {
-        $message = $requiresVacationLeaveTopUp
-            ? "Insufficient {$leaveType->name} balance. Available {$leaveType->name} is "
-                .self::formatDays($availableBalance)
-                .', but '
-                .self::formatDays($requiredBalanceDays)
-                .' is required before Vacation Leave can cover the schedule-based excess deduction.'
-            : "Insufficient {$leaveType->name} balance. Available {$leaveType->name} is "
-                .self::formatDays($availableBalance)
-                .', but '
-                .self::formatDays($requiredBalanceDays)
-                .' is required.';
-
-        return response()->json([
-            'message' => $message,
-            'errors' => [
-                'leave_type_id' => [$message],
-                'available_leave_balance' => [
-                    'Available '
-                    .$leaveType->name
-                    .' is '
-                    .self::formatDays($availableBalance)
-                    .', but '
-                    .self::formatDays($requiredBalanceDays)
-                    .' is required.',
-                ],
-            ],
-            'available_balance' => $availableBalance,
-            'required_balance_days' => $requiredBalanceDays,
-        ], 422);
+        return $this->leaveCreditService()->buildInsufficientPrimaryLeaveBalanceResponse(
+            $leaveType,
+            $availableBalance,
+            $requiredBalanceDays,
+            $requiresVacationLeaveTopUp
+        );
     }
 
     private function buildInsufficientVacationLeaveTopUpResponse(
@@ -15890,28 +12180,11 @@ class LeaveApplicationController extends Controller
         float $availableVacationBalance,
         float $requiredVacationLeaveDays
     ): JsonResponse {
-        $message = 'Insufficient Vacation Leave balance to cover the schedule-based excess deduction for '
-            .$leaveType->name
-            .'.';
-
-        return response()->json([
-            'message' => $message,
-            'errors' => [
-                'leave_type_id' => [
-                    $leaveType->name
-                    .' needs Vacation Leave to cover the schedule-based excess deduction.',
-                ],
-                'vacation_leave_balance' => [
-                    'Available Vacation Leave is '
-                    .self::formatDays($availableVacationBalance)
-                    .', but '
-                    .self::formatDays($requiredVacationLeaveDays)
-                    .' is required.',
-                ],
-            ],
-            'available_vacation_leave_days' => $availableVacationBalance,
-            'required_vacation_leave_days' => $requiredVacationLeaveDays,
-        ], 422);
+        return $this->leaveCreditService()->buildInsufficientVacationLeaveTopUpResponse(
+            $leaveType,
+            $availableVacationBalance,
+            $requiredVacationLeaveDays
+        );
     }
 
     private function buildInsufficientLinkedVacationLeaveBalanceResponse(
@@ -15919,41 +12192,16 @@ class LeaveApplicationController extends Controller
         float $availableVacationBalance,
         float $requiredVacationLeaveDays
     ): JsonResponse {
-        $isForcedLeave = strcasecmp(trim((string) $leaveType->name), 'Mandatory / Forced Leave') === 0;
-        $message = $isForcedLeave
-            ? 'Insufficient Vacation Leave balance to apply Mandatory / Forced Leave.'
-            : 'Insufficient Vacation Leave balance for '.$leaveType->name.'.';
-        $leaveTypeError = $isForcedLeave
-            ? 'Mandatory / Forced Leave requires enough Vacation Leave balance.'
-            : $leaveType->name.' requires matching Vacation Leave balance.';
-
-        return response()->json([
-            'message' => $message,
-            'errors' => [
-                'leave_type_id' => [$leaveTypeError],
-                'vacation_leave_balance' => [
-                    'Available Vacation Leave is '
-                    .self::formatDays($availableVacationBalance)
-                    .', but '
-                    .self::formatDays($requiredVacationLeaveDays)
-                    .' is required.',
-                ],
-            ],
-            'available_vacation_leave_days' => $availableVacationBalance,
-            'required_vacation_leave_days' => $requiredVacationLeaveDays,
-        ], 422);
+        return $this->leaveCreditService()->buildInsufficientLinkedVacationLeaveBalanceResponse(
+            $leaveType,
+            $availableVacationBalance,
+            $requiredVacationLeaveDays
+        );
     }
 
     private function buildRequiredForcedLeaveVacationBalanceResponse(float $availableVacationBalance): JsonResponse
     {
-        return response()->json([
-            'message' => 'Mandatory / Forced Leave requires available Vacation Leave balance.',
-            'errors' => [
-                'leave_type_id' => ['Mandatory / Forced Leave requires available Vacation Leave balance.'],
-                'vacation_leave_balance' => ['Available Vacation Leave must be greater than 0.'],
-            ],
-            'available_vacation_leave_days' => round(max($availableVacationBalance, 0.0), 3),
-        ], 422);
+        return $this->leaveCreditService()->buildRequiredForcedLeaveVacationBalanceResponse($availableVacationBalance);
     }
 
     private function resolveEmployeeLeaveBalanceSnapshot(string $employeeControlNo, int $leaveTypeId): array
@@ -16025,73 +12273,12 @@ class LeaveApplicationController extends Controller
         int $leaveTypeId,
         ?int $exceptAppId = null
     ): float {
-        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
-        if ($canonicalLeaveTypeId <= 0) {
-            return 0.0;
-        }
-
-        $controlNoCandidates = $this->controlNoCandidates($employeeControlNo);
-        if ($controlNoCandidates === []) {
-            return 0.0;
-        }
-
-        $query = LeaveApplication::query()
-            ->with('leaveType')
-            ->whereIn('status', [
-                LeaveApplication::STATUS_PENDING_ADMIN,
-                LeaveApplication::STATUS_PENDING_HR,
-            ]);
-
-        if ($exceptAppId !== null && $exceptAppId > 0) {
-            $query->where('id', '<>', $exceptAppId);
-        }
-
-        $pendingApplications = $query
-            ->where(function ($query): void {
-                $query->where('is_monetization', true)
-                    ->orWhereRaw(
-                        'UPPER(LTRIM(RTRIM(COALESCE(pay_mode, ?)))) <> ?',
-                        [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY]
-                    );
-            })
-            ->whereIn('employee_control_no', $controlNoCandidates)
-            ->get();
-
-        if ($pendingApplications->isEmpty()) {
-            return 0.0;
-        }
-
-        $forcedLeaveTypeId = $this->resolveForcedLeaveTypeId();
-        $vacationLeaveTypeId = $this->resolveVacationLeaveTypeId();
-        $sickLeaveTypeId = $this->resolveSickLeaveTypeId();
-        $pendingReservedDays = 0.0;
-
-        foreach ($pendingApplications as $pendingApplication) {
-            $applicationLeaveType = $pendingApplication->leaveType
-                ?? LeaveType::query()->find((int) $pendingApplication->leave_type_id);
-            if (! $applicationLeaveType instanceof LeaveType) {
-                continue;
-            }
-
-            $applicationLeaveTypeId = $this->resolveCanonicalLeaveTypeId((int) $pendingApplication->leave_type_id)
-                ?? (int) $pendingApplication->leave_type_id;
-            $applicationDeductibleDays = $this->resolveApplicationDeductibleDays($pendingApplication);
-            $applicationTotalDays = round((float) ($pendingApplication->total_days ?? $applicationDeductibleDays), 3);
-
-            $pendingReservedDays += $this->resolvePendingReservedDaysContributionForTrackedLeaveType(
-                $pendingApplication,
-                $applicationLeaveType,
-                $applicationLeaveTypeId,
-                $canonicalLeaveTypeId,
-                $applicationTotalDays,
-                $applicationDeductibleDays,
-                $forcedLeaveTypeId,
-                $vacationLeaveTypeId,
-                $sickLeaveTypeId
-            );
-        }
-
-        return round(max($pendingReservedDays, 0.0), 3);
+        return $this->leaveCreditService()->resolvePendingReservedDaysForTrackedLeaveType(
+            $employeeControlNo,
+            $leaveTypeId,
+            $exceptAppId,
+            fn (string $controlNo) => $this->controlNoCandidates($controlNo)
+        );
     }
 
     private function resolvePendingReservedDaysContributionForTrackedLeaveType(
@@ -16105,40 +12292,17 @@ class LeaveApplicationController extends Controller
         ?int $vacationLeaveTypeId,
         ?int $sickLeaveTypeId
     ): float {
-        if ($targetLeaveTypeId <= 0) {
-            return 0.0;
-        }
-
-        $primaryReservedDays = $this->resolveStoredPrimaryLeaveDeduction(
+        return $this->leaveCreditService()->resolvePendingReservedDaysContributionForTrackedLeaveType(
             $app,
             $applicationLeaveType,
-            $applicationDeductibleDays
+            $applicationLeaveTypeId,
+            $targetLeaveTypeId,
+            $applicationTotalDays,
+            $applicationDeductibleDays,
+            $forcedLeaveTypeId,
+            $vacationLeaveTypeId,
+            $sickLeaveTypeId
         );
-        if ($applicationLeaveTypeId === $targetLeaveTypeId) {
-            return $primaryReservedDays;
-        }
-
-        if ($forcedLeaveTypeId !== null && $targetLeaveTypeId === $forcedLeaveTypeId) {
-            return $this->resolveStoredLinkedForcedLeaveDeduction(
-                $app,
-                $applicationLeaveType,
-                $applicationDeductibleDays
-            );
-        }
-
-        if ($vacationLeaveTypeId !== null && $targetLeaveTypeId === $vacationLeaveTypeId) {
-            return $this->resolveStoredLinkedVacationLeaveDeduction(
-                $app,
-                $applicationLeaveType,
-                $applicationDeductibleDays
-            );
-        }
-
-        if ($sickLeaveTypeId !== null && $targetLeaveTypeId === $sickLeaveTypeId) {
-            return $this->resolveStoredLinkedSickLeaveDeduction($app);
-        }
-
-        return 0.0;
     }
 
     private function formatApplication(LeaveApplication $app, ?array $actorDirectory = null): array
@@ -16230,36 +12394,12 @@ class LeaveApplicationController extends Controller
             fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_RELEASED
                 && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
         );
-        $statusHistory = $logs
-            ->map(function (LeaveApplicationLog $log) use ($actorDirectory, $applicantName): array {
-                $actorName = $actorDirectory ? $this->resolveWorkflowPerformerName($log, $actorDirectory, $applicantName) : null;
-                if (! $actorName) {
-                    $performerType = strtoupper((string) $log->performed_by_type);
-                    if ($performerType === LeaveApplicationLog::PERFORMER_EMPLOYEE) {
-                        $actorName = $applicantName ?: 'Employee';
-                    } elseif ($performerType === LeaveApplicationLog::PERFORMER_ADMIN) {
-                        $actorName = 'Department Admin';
-                    } elseif ($performerType === LeaveApplicationLog::PERFORMER_HR) {
-                        $actorName = 'HR Admin';
-                    }
-                }
-
-                return [
-                    'id' => (int) $log->id,
-                    'leave_application_id' => (int) $log->leave_application_id,
-                    'action' => $log->action,
-                    'stage' => $this->mapWorkflowLogStage($log),
-                    'performed_by_type' => strtoupper((string) $log->performed_by_type),
-                    'performed_by_id' => $log->performed_by_id !== null ? (int) $log->performed_by_id : null,
-                    'actor_name' => $actorName,
-                    'action_by_name' => $actorName,
-                    'action_by' => $actorName,
-                    'remarks' => $log->remarks,
-                    'created_at' => $log->created_at?->toIso8601String(),
-                ];
-            })
-            ->values()
-            ->all();
+        $statusHistory = $this->leaveWorkflowService()->buildWorkflowStatusHistory(
+            $logs,
+            $actorDirectory,
+            $applicantName,
+            fn ($val) => $this->normalizeControlNo($val)
+        );
 
         $effectiveRecallDateKeys = $this->resolveEffectiveStoredRecallDateKeys($app);
 
@@ -16985,166 +13125,53 @@ class LeaveApplicationController extends Controller
 
     private function getApplicationLeaveBalanceSnapshot(LeaveApplication $app): array
     {
-        static $balanceSnapshotCache = [];
-        static $ctoSyncedControlNos = [];
-
-        $lookupControlNo = $this->resolveApplicationBalanceLookupControlNo($app);
-        if ($lookupControlNo === null) {
-            return [];
-        }
-
-        if (! array_key_exists($lookupControlNo, $ctoSyncedControlNos)) {
-            $this->syncEmployeeCtoBalance($lookupControlNo);
-            $ctoSyncedControlNos[$lookupControlNo] = true;
-        }
-
-        if (array_key_exists($lookupControlNo, $balanceSnapshotCache)) {
-            return $balanceSnapshotCache[$lookupControlNo];
-        }
-
-        $controlNoCandidates = $this->controlNoCandidates($lookupControlNo);
-        if ($controlNoCandidates === []) {
-            $balanceSnapshotCache[$lookupControlNo] = [];
-
-            return [];
-        }
-
-        $snapshot = collect($this->mapLeaveBalancesByCanonicalTypeId(LeaveBalance::query()
-            ->with('leaveType')
-            ->whereIn('employee_control_no', $controlNoCandidates)
-            ->get()))
-            ->sortBy(fn (LeaveBalance $balance) => strtolower(trim((string) ($balance->leaveType?->name ?? ''))))
-            ->values()
-            ->map(function (LeaveBalance $balance) use ($lookupControlNo, $app): array {
-                $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId((int) $balance->leave_type_id) ?? (int) $balance->leave_type_id;
-                $rawBalance = (float) $balance->balance;
-                $pendingReservedDays = $this->resolvePendingReservedDaysForTrackedLeaveType(
-                    $lookupControlNo,
-                    $canonicalLeaveTypeId,
-                    (int) $app->id
-                );
-                $availableBalance = max(round($rawBalance - $pendingReservedDays, 3), 0.0);
-
-                return [
-                    'leave_type_id' => $canonicalLeaveTypeId,
-                    'leave_type_name' => LeaveType::canonicalizeLeaveTypeName($balance->leaveType?->name ?? 'Unknown') ?? 'Unknown',
-                    'balance' => $availableBalance,
-                    'current_balance' => $rawBalance,
-                    'available_balance' => $availableBalance,
-                    'pending_reserved_days' => $pendingReservedDays,
-                    'year' => $balance->year !== null ? (int) $balance->year : null,
-                    'updated_at' => $balance->updated_at?->toIso8601String(),
-                ];
-            })
-            ->values()
-            ->all();
-
-        $balanceSnapshotCache[$lookupControlNo] = $snapshot;
-
-        return $snapshot;
+        return $this->leaveCreditService()->getApplicationLeaveBalanceSnapshot(
+            $app,
+            fn (LeaveApplication $a) => $this->resolveApplicationBalanceLookupControlNo($a),
+            fn (string $controlNo) => $this->controlNoCandidates($controlNo),
+            fn (string $controlNo) => $this->resolveEmployeeRecordByControlNo($controlNo)
+        );
     }
 
     private function getFreshApplicationLeaveBalanceSnapshot(LeaveApplication $app, bool $syncCtoBalance = true): array
     {
-        $lookupControlNo = $this->resolveApplicationBalanceLookupControlNo($app);
-        if ($lookupControlNo === null) {
-            return [];
-        }
-
-        if ($syncCtoBalance) {
-            $this->syncEmployeeCtoBalance($lookupControlNo);
-        }
-
-        $controlNoCandidates = $this->controlNoCandidates($lookupControlNo);
-        if ($controlNoCandidates === []) {
-            return [];
-        }
-
-        return collect($this->mapLeaveBalancesByCanonicalTypeId(LeaveBalance::query()
-            ->with('leaveType')
-            ->whereIn('employee_control_no', $controlNoCandidates)
-            ->get()))
-            ->sortBy(fn (LeaveBalance $balance) => strtolower(trim((string) ($balance->leaveType?->name ?? ''))))
-            ->values()
-            ->map(fn (LeaveBalance $balance) => [
-                'leave_type_id' => $this->resolveCanonicalLeaveTypeId((int) $balance->leave_type_id) ?? (int) $balance->leave_type_id,
-                'leave_type_name' => LeaveType::canonicalizeLeaveTypeName($balance->leaveType?->name ?? 'Unknown') ?? 'Unknown',
-                'balance' => (float) $balance->balance,
-                'year' => $balance->year !== null ? (int) $balance->year : null,
-                'updated_at' => $balance->updated_at?->toIso8601String(),
-            ])
-            ->values()
-            ->all();
+        return $this->leaveCreditService()->getFreshApplicationLeaveBalanceSnapshot(
+            $app,
+            $syncCtoBalance,
+            fn (LeaveApplication $a) => $this->resolveApplicationBalanceLookupControlNo($a),
+            fn (string $controlNo) => $this->controlNoCandidates($controlNo),
+            fn (string $controlNo) => $this->resolveEmployeeRecordByControlNo($controlNo)
+        );
     }
 
     private function lockCertificationLeaveCreditsSnapshot(LeaveApplication $app): void
     {
-        if (! $this->hasLeaveApplicationCertificationCreditsSnapshotColumn()) {
-            return;
-        }
-
-        $app->loadMissing('leaveType');
-        $leaveBalanceSnapshot = $this->getFreshApplicationLeaveBalanceSnapshot($app, false);
-        $snapshot = $this->buildCertificationLeaveCredits($app, $leaveBalanceSnapshot);
-        $snapshot['as_of_date'] = $app->hr_approved_at?->format('F j, Y') ?? now()->format('F j, Y');
-
-        $normalizedSnapshot = $this->normalizeCertificationLeaveCreditsPayload($snapshot, $app);
-        if ($normalizedSnapshot === null) {
-            return;
-        }
-
-        $encodedSnapshot = json_encode($normalizedSnapshot, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-        if ($encodedSnapshot === false) {
-            return;
-        }
-
-        LeaveApplication::query()
-            ->whereKey((int) $app->id)
-            ->update([
-                'certification_leave_credits_snapshot' => $encodedSnapshot,
-            ]);
-
-        $app->setAttribute('certification_leave_credits_snapshot', $normalizedSnapshot);
+        $this->leaveCertificationService()->lockCertificationLeaveCreditsSnapshot(
+            $app,
+            null,
+            fn (LeaveApplication $a) => $this->getFreshApplicationLeaveBalanceSnapshot($a, false),
+            fn (LeaveApplication $a, ?LeaveType $lt, float $days) => $this->resolveStoredPrimaryLeaveDeduction($a, $lt, $days),
+            fn (LeaveApplication $a) => $this->resolveStoredMonetizationLeaveCreditComponents($a),
+            fn (LeaveApplication $a) => $this->hasPendingApprovedUpdateRequest($a)
+        );
     }
 
     private function resolveApplicationBalanceLookupControlNo(LeaveApplication $app): ?string
     {
-        $directControlNo = trim((string) ($app->employee_control_no ?? ''));
-        if ($directControlNo !== '') {
-            return $directControlNo;
-        }
-
-        $resolvedEmployee = $this->resolveApplicationEmployee($app);
-        $employeeControlNo = trim((string) ($resolvedEmployee?->control_no ?? ''));
-
-        return $employeeControlNo !== '' ? $employeeControlNo : null;
+        return $this->leaveCertificationService()->resolveApplicationBalanceLookupControlNo(
+            $app,
+            fn (LeaveApplication $a) => $this->resolveApplicationEmployee($a)
+        );
     }
 
     private function findLeaveTypeBalanceInSnapshot(array $snapshot, int $leaveTypeId): ?float
     {
-        if ($leaveTypeId <= 0 || $snapshot === []) {
-            return null;
-        }
-
-        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
-        foreach ($snapshot as $entry) {
-            if ((int) ($entry['leave_type_id'] ?? 0) === $canonicalLeaveTypeId) {
-                return (float) ($entry['balance'] ?? 0.0);
-            }
-        }
-
-        return null;
+        return $this->leaveCertificationService()->findLeaveTypeBalanceInSnapshot($snapshot, $leaveTypeId);
     }
 
     private function findLeaveTypeBalanceByNameInSnapshot(array $snapshot, string $leaveTypeName): float
     {
-        foreach ($snapshot as $entry) {
-            if (strcasecmp((string) ($entry['leave_type_name'] ?? ''), $leaveTypeName) === 0) {
-                return $this->roundLeaveCreditValue((float) ($entry['balance'] ?? 0.0));
-            }
-        }
-
-        return 0.0;
+        return $this->leaveCertificationService()->findLeaveTypeBalanceByNameInSnapshot($snapshot, $leaveTypeName);
     }
 
     private function resolveTerminalLeaveEstimatedAmount(
@@ -17152,185 +13179,55 @@ class LeaveApplicationController extends Controller
         float $vacationLeaveBalance,
         float $sickLeaveBalance
     ): ?float {
-        if ($monthlyRate === null || $monthlyRate <= 0) {
-            return null;
-        }
-
-        return round(
-            ($vacationLeaveBalance + $sickLeaveBalance)
-                * $monthlyRate
-                * self::TERMINAL_LEAVE_ESTIMATE_FACTOR,
-            self::TERMINAL_LEAVE_AMOUNT_PRECISION
+        return $this->leaveCertificationService()->resolveTerminalLeaveEstimatedAmount(
+            $monthlyRate,
+            $vacationLeaveBalance,
+            $sickLeaveBalance
         );
     }
 
     private function roundLeaveCreditValue(float $value): float
     {
-        return round(max($value, 0.0), 3);
+        return $this->leaveCertificationService()->roundLeaveCreditValue($value);
     }
 
     private function resolveCertificationLeaveCredits(LeaveApplication $app, array $leaveBalanceSnapshot = []): array
     {
-        $storedSnapshot = $this->resolveStoredCertificationLeaveCreditsSnapshot($app);
-        $storedSnapshotNeedsRefresh = $storedSnapshot !== null
-            && $this->shouldRefreshStoredCertificationLeaveCreditsSnapshot($app, $storedSnapshot);
-
-        if ($storedSnapshot !== null && ! $storedSnapshotNeedsRefresh) {
-            return $storedSnapshot;
-        }
-
-        $reconstructedSnapshot = $this->reconstructApprovedCertificationLeaveCredits($app, $leaveBalanceSnapshot);
-        if ($reconstructedSnapshot !== null) {
-            $this->persistCertificationLeaveCreditsSnapshot($app, $reconstructedSnapshot);
-
-            return $reconstructedSnapshot;
-        }
-
-        if ($storedSnapshot !== null) {
-            return $storedSnapshotNeedsRefresh
-                ? $this->buildCertificationLeaveCredits($app, $leaveBalanceSnapshot)
-                : $storedSnapshot;
-        }
-
-        return $this->buildCertificationLeaveCredits($app, $leaveBalanceSnapshot);
+        return $this->leaveCertificationService()->resolveCertificationLeaveCredits(
+            $app,
+            $leaveBalanceSnapshot,
+            fn (LeaveApplication $a) => $this->getApplicationLeaveBalanceSnapshot($a),
+            fn (string $controlNo) => $this->controlNoCandidates($controlNo),
+            fn (LeaveApplication $a, ?LeaveType $lt, float $days) => $this->resolveStoredPrimaryLeaveDeduction($a, $lt, $days),
+            fn (LeaveApplication $a) => $this->resolveStoredMonetizationLeaveCreditComponents($a),
+            fn (LeaveApplication $a) => $this->hasPendingApprovedUpdateRequest($a)
+        );
     }
 
     private function resolveStoredCertificationLeaveCreditsSnapshot(LeaveApplication $app): ?array
     {
-        if (! $this->hasLeaveApplicationCertificationCreditsSnapshotColumn()) {
-            return null;
-        }
-
-        $rawSnapshot = $app->certification_leave_credits_snapshot ?? null;
-        if (is_string($rawSnapshot)) {
-            $decodedSnapshot = json_decode($rawSnapshot, true);
-            $rawSnapshot = json_last_error() === JSON_ERROR_NONE ? $decodedSnapshot : null;
-        }
-
-        if (! is_array($rawSnapshot)) {
-            return null;
-        }
-
-        return $this->normalizeCertificationLeaveCreditsPayload($rawSnapshot, $app);
+        return $this->leaveCertificationService()->resolveStoredCertificationLeaveCreditsSnapshot($app);
     }
 
     private function normalizeCertificationLeaveCreditsPayload(array $payload, LeaveApplication $app): ?array
     {
-        $vacation = $this->normalizeCertificationLeaveCreditsBucket($payload['vacation'] ?? null);
-        $sick = $this->normalizeCertificationLeaveCreditsBucket($payload['sick'] ?? null);
-        if ($vacation === null || $sick === null) {
-            return null;
-        }
-
-        $asOfDate = $this->trimNullableString($payload['as_of_date'] ?? null)
-            ?? $app->hr_approved_at?->format('F j, Y')
-            ?? $app->created_at?->format('F j, Y')
-            ?? now()->format('F j, Y');
-
-        $normalizedPayload = [
-            'vacation' => $vacation,
-            'sick' => $sick,
-            'as_of_date' => $asOfDate,
-        ];
-
-        foreach ($payload as $key => $bucket) {
-            if (in_array($key, ['vacation', 'sick', 'as_of_date'], true)) {
-                continue;
-            }
-
-            $normalizedBucket = $this->normalizeCertificationLeaveCreditsBucket($bucket);
-            if ($normalizedBucket === null) {
-                continue;
-            }
-
-            $normalizedPayload[(string) $key] = $normalizedBucket;
-        }
-
-        return $normalizedPayload;
+        return $this->leaveCertificationService()->normalizeCertificationLeaveCreditsPayload($payload, $app);
     }
 
     private function normalizeCertificationLeaveCreditsBucket(mixed $bucket): ?array
     {
-        if (! is_array($bucket)) {
-            return null;
-        }
-
-        $totalEarned = $this->roundLeaveCreditValue((float) ($bucket['total_earned'] ?? 0.0));
-        $lessThisApplication = $this->roundLeaveCreditValue((float) ($bucket['less_this_application'] ?? 0.0));
-        $balance = $this->roundLeaveCreditValue((float) ($bucket['balance'] ?? 0.0));
-        $balanceAfterApplication = $this->roundLeaveCreditValue(
-            (float) (
-                $bucket['balance_after_application']
-                ?? $bucket['balance']
-                ?? max($balance - $lessThisApplication, 0.0)
-            )
-        );
-
-        $normalizedBucket = [
-            'total_earned' => $totalEarned,
-            'less_this_application' => $lessThisApplication,
-            'balance' => $balance,
-            'balance_after_application' => $balanceAfterApplication,
-        ];
-
-        $leaveTypeName = LeaveType::canonicalizeLeaveTypeName(
-            $this->trimNullableString($bucket['leave_type_name'] ?? null)
-        );
-        if ($leaveTypeName !== null) {
-            $normalizedBucket['leave_type_name'] = $leaveTypeName;
-        }
-
-        $leaveTypeId = (int) ($bucket['leave_type_id'] ?? 0);
-        if ($leaveTypeId > 0) {
-            $normalizedBucket['leave_type_id'] = $leaveTypeId;
-        }
-
-        return $normalizedBucket;
+        return $this->leaveCertificationService()->normalizeCertificationLeaveCreditsBucket($bucket);
     }
 
     private function shouldRefreshStoredCertificationLeaveCreditsSnapshot(
         LeaveApplication $app,
         array $snapshot
     ): bool {
-        if (strtoupper(trim((string) ($app->status ?? ''))) !== LeaveApplication::STATUS_APPROVED) {
-            return false;
-        }
-
-        $vacationBucket = $snapshot['vacation'] ?? null;
-        $sickBucket = $snapshot['sick'] ?? null;
-        if (! is_array($vacationBucket) || ! is_array($sickBucket)) {
-            return true;
-        }
-
-        $expectedDeductions = $this->resolveCertificationLeaveDeductionsByType($app);
-        $selectedLeaveTypeDeduction = $this->resolveSelectedCertificationLeaveTypeDeduction($app);
-        if ($selectedLeaveTypeDeduction !== null) {
-            $selectedBucket = $snapshot[self::CERTIFICATION_SELECTED_LEAVE_TYPE_BUCKET] ?? null;
-            if (! is_array($selectedBucket)) {
-                return true;
-            }
-
-            $storedSelectedLeaveTypeName = LeaveType::canonicalizeLeaveTypeName(
-                $this->trimNullableString($selectedBucket['leave_type_name'] ?? null)
-            );
-            if ($storedSelectedLeaveTypeName !== (string) $selectedLeaveTypeDeduction['leave_type_name']) {
-                return true;
-            }
-
-            if ($this->certificationLeaveCreditsBucketNeedsRefresh(
-                $selectedBucket,
-                (float) $selectedLeaveTypeDeduction['less_this_application']
-            )) {
-                return true;
-            }
-        }
-
-        return $this->certificationLeaveCreditsBucketNeedsRefresh(
-            $vacationBucket,
-            (float) ($expectedDeductions['vacation'] ?? 0.0)
-        ) || $this->certificationLeaveCreditsBucketNeedsRefresh(
-            $sickBucket,
-            (float) ($expectedDeductions['sick'] ?? 0.0)
+        return $this->leaveCertificationService()->shouldRefreshStoredCertificationLeaveCreditsSnapshot(
+            $app,
+            $snapshot,
+            fn (LeaveApplication $a, ?LeaveType $lt, float $days) => $this->resolveStoredPrimaryLeaveDeduction($a, $lt, $days),
+            fn (LeaveApplication $a) => $this->resolveStoredMonetizationLeaveCreditComponents($a)
         );
     }
 
@@ -17338,223 +13235,33 @@ class LeaveApplicationController extends Controller
         array $bucket,
         float $expectedLessThisApplication
     ): bool {
-        $normalizedExpectedLessThisApplication = $this->roundLeaveCreditValue($expectedLessThisApplication);
-        $storedLessThisApplication = $this->roundLeaveCreditValue(
-            (float) ($bucket['less_this_application'] ?? 0.0)
+        return $this->leaveCertificationService()->certificationLeaveCreditsBucketNeedsRefresh(
+            $bucket,
+            $expectedLessThisApplication
         );
-        if (abs($storedLessThisApplication - $normalizedExpectedLessThisApplication) > 0.0005) {
-            return true;
-        }
-
-        $storedBalanceAfterApplication = $this->roundLeaveCreditValue(
-            (float) (
-                $bucket['balance_after_application']
-                ?? $bucket['balance']
-                ?? 0.0
-            )
-        );
-        $storedTotalEarned = $this->roundLeaveCreditValue((float) ($bucket['total_earned'] ?? 0.0));
-        $expectedTotalEarned = $this->roundLeaveCreditValue(
-            $storedBalanceAfterApplication + $normalizedExpectedLessThisApplication
-        );
-
-        return abs($storedTotalEarned - $expectedTotalEarned) > 0.0005;
     }
 
     private function reconstructApprovedCertificationLeaveCredits(
         LeaveApplication $app,
         array $leaveBalanceSnapshot = []
     ): ?array {
-        if (strtoupper(trim((string) ($app->status ?? ''))) !== LeaveApplication::STATUS_APPROVED) {
-            return null;
-        }
-
-        $referenceDateTime = $app->hr_approved_at ?? $app->created_at;
-        if ($referenceDateTime === null) {
-            return null;
-        }
-
-        $employeeControlNo = trim((string) ($app->employee_control_no ?? ''));
-        if ($employeeControlNo === '') {
-            return null;
-        }
-
-        $snapshot = $leaveBalanceSnapshot !== []
-            ? $leaveBalanceSnapshot
-            : $this->getApplicationLeaveBalanceSnapshot($app);
-
-        $currentVacationBalance = $this->findLeaveTypeBalanceByNameInSnapshot($snapshot, 'Vacation Leave');
-        $currentSickBalance = $this->findLeaveTypeBalanceByNameInSnapshot($snapshot, 'Sick Leave');
-        $selectedLeaveTypeDeduction = $this->resolveSelectedCertificationLeaveTypeDeduction($app);
-
-        $laterApprovedApplications = LeaveApplication::query()
-            ->with('leaveType:id,name,is_credit_based')
-            ->where('status', LeaveApplication::STATUS_APPROVED)
-            ->whereIn('employee_control_no', $this->controlNoCandidates($employeeControlNo))
-            ->where(function ($query) use ($referenceDateTime, $app): void {
-                $query->where('hr_approved_at', '>', $referenceDateTime)
-                    ->orWhere(function ($sameTimeQuery) use ($referenceDateTime, $app): void {
-                        $sameTimeQuery->where('hr_approved_at', '=', $referenceDateTime)
-                            ->where('id', '>', (int) $app->id);
-                    });
-            })
-            ->get([
-                'id',
-                'leave_type_id',
-                'total_days',
-                'deductible_days',
-                'linked_vacation_leave_deducted_days',
-                'linked_sick_leave_deducted_days',
-                'pay_mode',
-                'is_monetization',
-                'monetization_leave_credits',
-                'status',
-                'hr_approved_at',
-            ]);
-
-        $laterVacationDeductions = 0.0;
-        $laterSickDeductions = 0.0;
-        $laterSelectedLeaveTypeDeductions = 0.0;
-        foreach ($laterApprovedApplications as $laterApplication) {
-            if (! $laterApplication instanceof LeaveApplication) {
-                continue;
-            }
-
-            $laterDeductions = $this->resolveCertificationLeaveDeductionsByType($laterApplication);
-            $laterVacationDeductions += (float) ($laterDeductions['vacation'] ?? 0.0);
-            $laterSickDeductions += (float) ($laterDeductions['sick'] ?? 0.0);
-
-            if ($selectedLeaveTypeDeduction === null) {
-                continue;
-            }
-
-            $laterSelectedLeaveTypeDeduction = $this->resolveSelectedCertificationLeaveTypeDeduction($laterApplication);
-            if (
-                $laterSelectedLeaveTypeDeduction !== null
-                && strcasecmp(
-                    (string) $laterSelectedLeaveTypeDeduction['leave_type_name'],
-                    (string) $selectedLeaveTypeDeduction['leave_type_name']
-                ) === 0
-            ) {
-                $laterSelectedLeaveTypeDeductions += (float) $laterSelectedLeaveTypeDeduction['less_this_application'];
-            }
-        }
-
-        $appDeductions = $this->resolveCertificationLeaveDeductionsByType($app);
-        $vacationLessThisApplication = (float) ($appDeductions['vacation'] ?? 0.0);
-        $sickLessThisApplication = (float) ($appDeductions['sick'] ?? 0.0);
-
-        $vacationBalanceAfterApplication = $this->roundLeaveCreditValue(
-            $currentVacationBalance + $this->roundLeaveCreditValue($laterVacationDeductions)
+        return $this->leaveCertificationService()->reconstructApprovedCertificationLeaveCredits(
+            $app,
+            $leaveBalanceSnapshot,
+            fn (LeaveApplication $a) => $this->getApplicationLeaveBalanceSnapshot($a),
+            fn (string $controlNo) => $this->controlNoCandidates($controlNo),
+            fn (LeaveApplication $a, ?LeaveType $lt, float $days) => $this->resolveStoredPrimaryLeaveDeduction($a, $lt, $days),
+            fn (LeaveApplication $a) => $this->resolveStoredMonetizationLeaveCreditComponents($a)
         );
-        $sickBalanceAfterApplication = $this->roundLeaveCreditValue(
-            $currentSickBalance + $this->roundLeaveCreditValue($laterSickDeductions)
-        );
-
-        $vacationTotalEarned = $this->roundLeaveCreditValue(
-            $vacationBalanceAfterApplication + $vacationLessThisApplication
-        );
-        $sickTotalEarned = $this->roundLeaveCreditValue(
-            $sickBalanceAfterApplication + $sickLessThisApplication
-        );
-
-        $snapshotPayload = [
-            'vacation' => [
-                'total_earned' => $vacationTotalEarned,
-                'less_this_application' => $vacationLessThisApplication,
-                'balance' => $vacationBalanceAfterApplication,
-                'balance_after_application' => $vacationBalanceAfterApplication,
-            ],
-            'sick' => [
-                'total_earned' => $sickTotalEarned,
-                'less_this_application' => $sickLessThisApplication,
-                'balance' => $sickBalanceAfterApplication,
-                'balance_after_application' => $sickBalanceAfterApplication,
-            ],
-            'as_of_date' => $referenceDateTime->format('F j, Y'),
-        ];
-
-        if ($selectedLeaveTypeDeduction !== null) {
-            $currentSelectedLeaveTypeBalance = $this->findLeaveTypeBalanceByNameInSnapshot(
-                $snapshot,
-                (string) $selectedLeaveTypeDeduction['leave_type_name']
-            );
-
-            $selectedLeaveTypeBalanceAfterApplication = $this->roundLeaveCreditValue(
-                (float) ($currentSelectedLeaveTypeBalance ?? 0.0)
-                    + $this->roundLeaveCreditValue($laterSelectedLeaveTypeDeductions)
-            );
-
-            $snapshotPayload[self::CERTIFICATION_SELECTED_LEAVE_TYPE_BUCKET] = $this->buildSelectedCertificationLeaveTypeBucket(
-                $selectedLeaveTypeBalanceAfterApplication,
-                $selectedLeaveTypeDeduction,
-                true
-            );
-        }
-
-        return $snapshotPayload;
     }
 
     private function resolveCertificationLeaveDeductionsByType(LeaveApplication $app): array
     {
-        $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
-        $isForcedLeave = LeaveType::isForcedLeaveType($app->leaveType, (int) $app->leave_type_id);
-        if ($isForcedLeave) {
-            $normalizedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
-        }
-        $deductibleDays = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
-            ? 0.0
-            : $this->roundLeaveCreditValue($this->resolveApplicationDeductibleDays($app));
-        $linkedVacationDeduction = $this->roundLeaveCreditValue((float) ($app->linked_vacation_leave_deducted_days ?? 0.0));
-        $linkedSickDeduction = $this->roundLeaveCreditValue((float) ($app->linked_sick_leave_deducted_days ?? 0.0));
-        $leaveTypeName = trim((string) ($app->leaveType?->name ?? ''));
-
-        $vacation = 0.0;
-        $sick = 0.0;
-        if ((bool) $app->is_monetization) {
-            foreach ($this->resolveStoredMonetizationLeaveCreditComponents($app) as $component) {
-                if ($this->isVacationLeaveType(null, (int) $component['leave_type_id'])) {
-                    $vacation += (float) $component['days'];
-                } elseif ($this->isSickLeaveType(null, (int) $component['leave_type_id'])) {
-                    $sick += (float) $component['days'];
-                }
-            }
-        } elseif (strcasecmp($leaveTypeName, 'Vacation Leave') === 0) {
-            $primaryDeductionDays = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
-                ? 0.0
-                : $this->roundLeaveCreditValue(
-                    $this->resolveStoredPrimaryLeaveDeduction(
-                        $app,
-                        $app->leaveType,
-                        $deductibleDays
-                    )
-                );
-            $vacation = $primaryDeductionDays;
-            $sick = $linkedSickDeduction;
-        } elseif (strcasecmp($leaveTypeName, 'Sick Leave') === 0) {
-            $primaryDeductionDays = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
-                ? 0.0
-                : $this->roundLeaveCreditValue(
-                    $this->resolveStoredPrimaryLeaveDeduction(
-                        $app,
-                        $app->leaveType,
-                        $deductibleDays
-                    )
-                );
-            $sick = $primaryDeductionDays;
-            $vacation = $linkedVacationDeduction;
-        } elseif ($isForcedLeave) {
-            $vacation = $linkedVacationDeduction > 0.0
-                ? $linkedVacationDeduction
-                : $deductibleDays;
-        } elseif ($linkedVacationDeduction > 0.0) {
-            $vacation = $linkedVacationDeduction;
-        }
-
-        return [
-            'vacation' => $this->roundLeaveCreditValue($vacation),
-            'sick' => $this->roundLeaveCreditValue($sick),
-        ];
+        return $this->leaveCertificationService()->resolveCertificationLeaveDeductionsByType(
+            $app,
+            fn (LeaveApplication $a, ?LeaveType $lt, float $days) => $this->resolveStoredPrimaryLeaveDeduction($a, $lt, $days),
+            fn (LeaveApplication $a) => $this->resolveStoredMonetizationLeaveCreditComponents($a)
+        );
     }
 
     /**
@@ -17562,43 +13269,7 @@ class LeaveApplicationController extends Controller
      */
     private function resolveSelectedCertificationLeaveTypeDeduction(LeaveApplication $app): ?array
     {
-        $leaveType = $app->leaveType;
-        if (! $leaveType instanceof LeaveType || (bool) $app->is_monetization || ! (bool) $leaveType->is_credit_based) {
-            return null;
-        }
-
-        $leaveTypeName = LeaveType::canonicalizeLeaveTypeName($leaveType->name ?? null);
-        if ($leaveTypeName === null || strcasecmp($leaveTypeName, 'Mandatory / Forced Leave') === 0) {
-            return null;
-        }
-
-        if (in_array(strtolower($leaveTypeName), ['vacation leave', 'sick leave'], true)) {
-            return null;
-        }
-
-        $leaveTypeId = (int) ($leaveType->id ?? $app->leave_type_id);
-        if ($leaveTypeId <= 0) {
-            $leaveTypeId = (int) $app->leave_type_id;
-        }
-        if ($leaveTypeId <= 0) {
-            return null;
-        }
-
-        $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, false);
-        $deductibleDays = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
-            ? 0.0
-            : $this->roundLeaveCreditValue($this->resolveApplicationDeductibleDays($app));
-        $linkedVacationDeduction = $this->roundLeaveCreditValue((float) ($app->linked_vacation_leave_deducted_days ?? 0.0));
-        $linkedSickDeduction = $this->roundLeaveCreditValue((float) ($app->linked_sick_leave_deducted_days ?? 0.0));
-        $lessThisApplication = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
-            ? 0.0
-            : $this->roundLeaveCreditValue(max($deductibleDays - $linkedVacationDeduction - $linkedSickDeduction, 0.0));
-
-        return [
-            'leave_type_id' => $leaveTypeId,
-            'leave_type_name' => $leaveTypeName,
-            'less_this_application' => $lessThisApplication,
-        ];
+        return $this->leaveCertificationService()->resolveSelectedCertificationLeaveTypeDeduction($app);
     }
 
     /**
@@ -17610,167 +13281,27 @@ class LeaveApplicationController extends Controller
         array $selectedLeaveTypeDeduction,
         bool $deductionAlreadyApplied
     ): array {
-        $selectedLeaveTypeBalance = $this->roundLeaveCreditValue($currentBalance);
-        $selectedLeaveTypeLessThisApplication = $this->roundLeaveCreditValue(
-            (float) $selectedLeaveTypeDeduction['less_this_application']
+        return $this->leaveCertificationService()->buildSelectedCertificationLeaveTypeBucket(
+            $currentBalance,
+            $selectedLeaveTypeDeduction,
+            $deductionAlreadyApplied
         );
-        $selectedLeaveTypeTotalEarned = $this->roundLeaveCreditValue($deductionAlreadyApplied
-            ? ($selectedLeaveTypeBalance + $selectedLeaveTypeLessThisApplication)
-            : $selectedLeaveTypeBalance);
-        $selectedLeaveTypeBalanceAfterApplication = $this->roundLeaveCreditValue($deductionAlreadyApplied
-            ? $selectedLeaveTypeBalance
-            : ($selectedLeaveTypeBalance - $selectedLeaveTypeLessThisApplication));
-
-        return [
-            'leave_type_id' => (int) $selectedLeaveTypeDeduction['leave_type_id'],
-            'leave_type_name' => (string) $selectedLeaveTypeDeduction['leave_type_name'],
-            'total_earned' => $selectedLeaveTypeTotalEarned,
-            'less_this_application' => $selectedLeaveTypeLessThisApplication,
-            'balance' => $selectedLeaveTypeBalance,
-            'balance_after_application' => $selectedLeaveTypeBalanceAfterApplication,
-        ];
     }
 
     private function persistCertificationLeaveCreditsSnapshot(LeaveApplication $app, array $snapshot): void
     {
-        if (! $this->hasLeaveApplicationCertificationCreditsSnapshotColumn()) {
-            return;
-        }
-
-        $normalizedSnapshot = $this->normalizeCertificationLeaveCreditsPayload($snapshot, $app);
-        if ($normalizedSnapshot === null) {
-            return;
-        }
-
-        $encodedSnapshot = json_encode($normalizedSnapshot, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-        if ($encodedSnapshot === false) {
-            return;
-        }
-
-        LeaveApplication::query()
-            ->whereKey((int) $app->id)
-            ->update([
-                'certification_leave_credits_snapshot' => $encodedSnapshot,
-            ]);
-
-        $app->setAttribute('certification_leave_credits_snapshot', $normalizedSnapshot);
+        $this->leaveCertificationService()->persistCertificationLeaveCreditsSnapshot($app, $snapshot);
     }
 
     private function buildCertificationLeaveCredits(LeaveApplication $app, array $leaveBalanceSnapshot = []): array
     {
-        $vacationCurrentBalance = $this->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Vacation Leave');
-        $sickCurrentBalance = $this->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Sick Leave');
-        $applicationStatus = strtoupper(trim((string) ($app->status ?? '')));
-        $isPendingStatus = in_array($applicationStatus, [
-            LeaveApplication::STATUS_PENDING_ADMIN,
-            LeaveApplication::STATUS_PENDING_HR,
-        ], true);
-        $deductionAlreadyApplied = $applicationStatus === LeaveApplication::STATUS_APPROVED
-            || ($isPendingStatus && $this->hasPendingApprovedUpdateRequest($app));
-
-        $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
-        $isForcedLeave = LeaveType::isForcedLeaveType($app->leaveType, (int) $app->leave_type_id);
-        if ($isForcedLeave) {
-            $normalizedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
-        }
-        $deductibleDays = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
-            ? 0.0
-            : $this->roundLeaveCreditValue($this->resolveApplicationDeductibleDays($app));
-
-        $leaveTypeName = trim((string) ($app->leaveType?->name ?? ''));
-        $linkedVacationDeduction = $this->roundLeaveCreditValue((float) ($app->linked_vacation_leave_deducted_days ?? 0.0));
-        $linkedSickDeduction = $this->roundLeaveCreditValue((float) ($app->linked_sick_leave_deducted_days ?? 0.0));
-
-        $vacationLessThisApplication = 0.0;
-        $sickLessThisApplication = 0.0;
-
-        if ((bool) $app->is_monetization) {
-            foreach ($this->resolveStoredMonetizationLeaveCreditComponents($app) as $component) {
-                if ($this->isVacationLeaveType(null, (int) $component['leave_type_id'])) {
-                    $vacationLessThisApplication += (float) $component['days'];
-                } elseif ($this->isSickLeaveType(null, (int) $component['leave_type_id'])) {
-                    $sickLessThisApplication += (float) $component['days'];
-                }
-            }
-        } elseif (strcasecmp($leaveTypeName, 'Vacation Leave') === 0) {
-            $primaryDeductionDays = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
-                ? 0.0
-                : $this->roundLeaveCreditValue(
-                    $this->resolveStoredPrimaryLeaveDeduction(
-                        $app,
-                        $app->leaveType,
-                        $deductibleDays
-                    )
-                );
-            $vacationLessThisApplication = $primaryDeductionDays;
-            $sickLessThisApplication = $linkedSickDeduction;
-        } elseif (strcasecmp($leaveTypeName, 'Sick Leave') === 0) {
-            $primaryDeductionDays = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY
-                ? 0.0
-                : $this->roundLeaveCreditValue(
-                    $this->resolveStoredPrimaryLeaveDeduction(
-                        $app,
-                        $app->leaveType,
-                        $deductibleDays
-                    )
-                );
-            $sickLessThisApplication = $primaryDeductionDays;
-            $vacationLessThisApplication = $linkedVacationDeduction;
-        } elseif ($isForcedLeave) {
-            $vacationLessThisApplication = $linkedVacationDeduction > 0.0
-                ? $linkedVacationDeduction
-                : $deductibleDays;
-        } elseif ($linkedVacationDeduction > 0.0) {
-            $vacationLessThisApplication = $linkedVacationDeduction;
-        }
-
-        $vacationLessThisApplication = $this->roundLeaveCreditValue($vacationLessThisApplication);
-        $sickLessThisApplication = $this->roundLeaveCreditValue($sickLessThisApplication);
-
-        $vacationTotalEarned = $this->roundLeaveCreditValue($deductionAlreadyApplied
-            ? ($vacationCurrentBalance + $vacationLessThisApplication)
-            : $vacationCurrentBalance);
-        $sickTotalEarned = $this->roundLeaveCreditValue($deductionAlreadyApplied
-            ? ($sickCurrentBalance + $sickLessThisApplication)
-            : $sickCurrentBalance);
-        $vacationBalanceAfterApplication = $this->roundLeaveCreditValue($deductionAlreadyApplied
-            ? $vacationCurrentBalance
-            : ($vacationCurrentBalance - $vacationLessThisApplication));
-        $sickBalanceAfterApplication = $this->roundLeaveCreditValue($deductionAlreadyApplied
-            ? $sickCurrentBalance
-            : ($sickCurrentBalance - $sickLessThisApplication));
-
-        $snapshotPayload = [
-            'vacation' => [
-                'total_earned' => $vacationTotalEarned,
-                'less_this_application' => $vacationLessThisApplication,
-                'balance' => $vacationCurrentBalance,
-                'balance_after_application' => $vacationBalanceAfterApplication,
-            ],
-            'sick' => [
-                'total_earned' => $sickTotalEarned,
-                'less_this_application' => $sickLessThisApplication,
-                'balance' => $sickCurrentBalance,
-                'balance_after_application' => $sickBalanceAfterApplication,
-            ],
-            'as_of_date' => $app->created_at?->format('F j, Y') ?? now()->format('F j, Y'),
-        ];
-
-        $selectedLeaveTypeDeduction = $this->resolveSelectedCertificationLeaveTypeDeduction($app);
-        if ($selectedLeaveTypeDeduction !== null) {
-            $selectedLeaveTypeCurrentBalance = $this->findLeaveTypeBalanceByNameInSnapshot(
-                $leaveBalanceSnapshot,
-                (string) $selectedLeaveTypeDeduction['leave_type_name']
-            );
-
-            $snapshotPayload[self::CERTIFICATION_SELECTED_LEAVE_TYPE_BUCKET] = $this->buildSelectedCertificationLeaveTypeBucket(
-                (float) ($selectedLeaveTypeCurrentBalance ?? 0.0),
-                $selectedLeaveTypeDeduction,
-                $deductionAlreadyApplied
-            );
-        }
-
-        return $snapshotPayload;
+        return $this->leaveCertificationService()->buildCertificationLeaveCredits(
+            $app,
+            $leaveBalanceSnapshot,
+            fn (LeaveApplication $a) => $this->hasPendingApprovedUpdateRequest($a),
+            fn (LeaveApplication $a, ?LeaveType $lt, float $days) => $this->resolveStoredPrimaryLeaveDeduction($a, $lt, $days),
+            fn (LeaveApplication $a) => $this->resolveStoredMonetizationLeaveCreditComponents($a)
+        );
     }
 
     private function mergeEmployeeControlNoInput(Request $request): void
