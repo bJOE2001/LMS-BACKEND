@@ -97,12 +97,16 @@ class EmployeeController extends Controller
             $department = Department::query()->active()->find($departmentId);
         }
         if (! $department && $office !== '') {
-            $department = Department::query()->active()
-                ->where(function ($q) use ($office) {
-                    $q->where('name', $office)
-                        ->orWhere('code', $office)
-                        ->orWhere('acronym', $office);
-                })->first();
+            $department = Department::query()->active()->where('name', $office)->first();
+
+            if (! $department) {
+                $normalizedOffice = $this->normalizeDepartmentLookupLabel($office);
+                if ($normalizedOffice !== '') {
+                    $department = Department::query()->active()->get()->first(
+                        fn (Department $dept): bool => $this->normalizeDepartmentLookupLabel((string) $dept->name) === $normalizedOffice
+                    );
+                }
+            }
         }
 
         $resolvedDepartmentId = $department?->id ? (int) $department->id : $departmentId;
