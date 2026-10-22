@@ -10,6 +10,8 @@ use App\Models\LeaveApplicationUpdateRequest;
 use App\Models\LeaveType;
 use App\Services\Leave\LeaveWorkflowService;
 use Carbon\Carbon;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Tests\TestCase;
 
@@ -1411,5 +1413,213 @@ class LeaveWorkflowServiceTest extends TestCase
         $this->assertSame(0.5, $payload['without_pay_days']);
         $this->assertSame(['2026-06-02' => 'half'], $payload['selected_date_coverage']);
         $this->assertSame(['2026-06-02' => 'PM'], $payload['selected_date_half_day_portion']);
+    }
+
+    public function test_application_has_hr_selected_date_ledger_values(): void
+    {
+        $app = new LeaveApplication;
+        $this->assertFalse($this->service->applicationHasHrSelectedDateLedgerValues($app));
+
+        $app->selected_date_deduction = ['2026-06-01' => 1.0];
+        $this->assertTrue($this->service->applicationHasHrSelectedDateLedgerValues($app));
+    }
+
+    public function test_apply_hr_application_edit_validation_errors(): void
+    {
+        $hr = new HRAccount;
+        $hr->id = 1;
+
+        $leaveType = new LeaveType;
+        $leaveType->id = 1;
+        $leaveType->name = 'Vacation Leave';
+        $leaveType->max_days = 5;
+
+        $app = new LeaveApplication;
+        $app->id = 10;
+        $app->leave_type_id = 1;
+        $app->setRelation('leaveType', $leaveType);
+
+        // Zero total days
+        $resZeroDays = $this->service->applyHrApplicationEdit($app, $hr, ['total_days' => 0], 'Test');
+        $this->assertInstanceOf(JsonResponse::class, $resZeroDays);
+        $this->assertSame(422, $resZeroDays->getStatusCode());
+        $this->assertStringContainsString('must include at least one day', $resZeroDays->getData(true)['message']);
+
+        // Empty selected dates
+        $resNoDates = $this->service->applyHrApplicationEdit($app, $hr, ['total_days' => 1, 'selected_dates' => []], 'Test');
+        $this->assertInstanceOf(JsonResponse::class, $resNoDates);
+        $this->assertSame(422, $resNoDates->getStatusCode());
+        $this->assertStringContainsString('must include at least one leave date', $resNoDates->getData(true)['message']);
+    }
+
+    public function test_build_requested_leave_update_payload_blocks_mode_switching(): void
+    {
+        $app = new LeaveApplication;
+        $app->is_monetization = false;
+
+        $res = $this->service->buildRequestedLeaveUpdatePayload(
+            $app,
+            ['is_monetization' => true],
+            [],
+            '',
+            LeaveApplication::PAY_MODE_WITH_PAY,
+            false,
+            []
+        );
+
+        $this->assertInstanceOf(JsonResponse::class, $res);
+        $this->assertSame(422, $res->getStatusCode());
+        $this->assertStringContainsString('Switching between leave and monetization modes is not allowed', $res->getData(true)['message']);
+    }
+
+    public function test_execute_hr_update_pay_status_validation_errors(): void
+    {
+        $hr = new HRAccount;
+        $hr->id = 1;
+
+        // Invalid status
+        $appApproved = new LeaveApplication;
+        $appApproved->status = LeaveApplication::STATUS_APPROVED;
+        $resStatus = $this->service->executeHrUpdatePayStatus($appApproved, $hr, null, 'WP', false, false);
+        $this->assertSame(422, $resStatus->getStatusCode());
+        $this->assertStringContainsString('only be overridden during CHRMO Certification', $resStatus->getData(true)['message']);
+
+        // Monetization not allowed
+        $appMonetization = new LeaveApplication;
+        $appMonetization->status = LeaveApplication::STATUS_PENDING_HR;
+        $appMonetization->is_monetization = true;
+        $appMonetization->setRelation('updateRequests', collect());
+        $resMonetization = $this->service->executeHrUpdatePayStatus($appMonetization, $hr, null, 'WP', false, false);
+        $this->assertSame(422, $resMonetization->getStatusCode());
+        $this->assertStringContainsString('Monetization applications must remain with pay', $resMonetization->getData(true)['message']);
+    }
+
+    public function test_execute_hr_approve_invalid_status(): void
+    {
+        $hr = new HRAccount;
+        $hr->id = 1;
+
+        $app = new LeaveApplication;
+        $app->status = LeaveApplication::STATUS_PENDING_ADMIN;
+
+        $res = $this->service->executeHrApprove($app, $hr, 'Remarks');
+        $this->assertSame(422, $res->getStatusCode());
+        $this->assertStringContainsString("expected 'PENDING_HR'", $res->getData(true)['message']);
+    }
+
+    public function test_execute_hr_save_application_edit_validation_errors(): void
+    {
+        $hr = new HRAccount;
+        $hr->id = 1;
+
+        $appRejected = new LeaveApplication;
+        $appRejected->status = LeaveApplication::STATUS_REJECTED;
+
+        $resStatus = $this->service->executeHrSaveApplicationEdit(
+            Request::create('/hr/applications/1/edit', 'POST'),
+            $hr,
+            $appRejected,
+            []
+        );
+        $this->assertSame(422, $resStatus->getStatusCode());
+        $this->assertStringContainsString('Only Pending HR and Approved applications can be edited by HR', $resStatus->getData(true)['message']);
+
+        $appMonetization = new LeaveApplication;
+        $appMonetization->status = LeaveApplication::STATUS_PENDING_HR;
+        $appMonetization->is_monetization = true;
+
+        $resMonetization = $this->service->executeHrSaveApplicationEdit(
+            Request::create('/hr/applications/1/edit', 'POST'),
+            $hr,
+            $appMonetization,
+            []
+        );
+        $this->assertSame(422, $resMonetization->getStatusCode());
+        $this->assertStringContainsString('Monetization applications are not supported', $resMonetization->getData(true)['message']);
+    }
+
+    public function test_execute_admin_request_recall_validation_errors(): void
+    {
+        $admin = new DepartmentAdmin;
+        $admin->id = 1;
+        $admin->department_id = 10;
+
+        $app = new LeaveApplication;
+        $app->id = 100;
+        $app->employee_control_no = '00123';
+        $app->is_monetization = true;
+        $app->status = LeaveApplication::STATUS_APPROVED;
+
+        $resUnauth = $this->service->executeAdminRequestRecall(
+            $admin,
+            $app,
+            ['recall_reason' => 'Need back', 'recall_selected_dates' => ['2026-06-01']],
+            fn () => (object) ['control_no' => '00123', 'office_id' => 99]
+        );
+        $this->assertSame(403, $resUnauth->getStatusCode());
+
+        $dept = new \App\Models\Department;
+        $dept->id = 10;
+        $dept->name = 'IT Department';
+        $admin->setRelation('department', $dept);
+
+        $resMonetization = $this->service->executeAdminRequestRecall(
+            $admin,
+            $app,
+            ['recall_reason' => 'Need back', 'recall_selected_dates' => ['2026-06-01']],
+            fn () => (object) ['control_no' => '00123', 'office' => 'IT Department']
+        );
+        $this->assertSame(422, $resMonetization->getStatusCode());
+        $this->assertStringContainsString('Monetization requests cannot be recalled', $resMonetization->getData(true)['message']);
+    }
+
+    public function test_execute_regular_leave_submission_missing_leave_type(): void
+    {
+        $request = Request::create('/leave-applications', 'POST');
+        $actor = (object) ['id' => 1];
+        $employee = (object) ['control_no' => '00123'];
+
+        $res = $this->service->executeRegularLeaveSubmission(
+            $request,
+            [
+                'leave_type_id' => 999999,
+                'start_date' => '2026-06-01',
+                'end_date' => '2026-06-01',
+                'total_days' => 1.0,
+            ],
+            $actor,
+            $employee
+        );
+
+        $this->assertSame(422, $res->getStatusCode());
+        $this->assertStringContainsString('Selected leave type is not available', $res->getData(true)['message']);
+    }
+
+    public function test_execute_monetization_submission_admin_missing_employee(): void
+    {
+        $request = Request::create('/admin/leave-applications', 'POST');
+        $admin = new DepartmentAdmin;
+        $admin->id = 1;
+        $dept = new \App\Models\Department;
+        $dept->id = 10;
+        $dept->name = 'HR';
+        $admin->setRelation('department', $dept);
+
+        $res = $this->service->executeMonetizationSubmission(
+            $request,
+            [
+                'employee_control_no' => '99999',
+                'leave_type_id' => 1,
+                'total_days' => 10,
+            ],
+            $admin,
+            null,
+            true,
+            null,
+            fn () => null
+        );
+
+        $this->assertSame(422, $res->getStatusCode());
+        $this->assertStringContainsString('Employee not found in HRIS', $res->getData(true)['message']);
     }
 }
