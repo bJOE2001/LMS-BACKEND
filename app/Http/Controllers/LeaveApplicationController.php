@@ -4081,6 +4081,8 @@ class LeaveApplicationController extends Controller
             'latest_update_requested_at' => $latestUpdateMeta['requested_at']?->toIso8601String(),
             'latest_update_reviewed_at' => $latestUpdateMeta['reviewed_at']?->toIso8601String(),
             'latest_update_review_remarks' => $latestUpdateMeta['review_remarks'],
+            'update_requests' => $this->formatApplicationUpdateRequests($app),
+            'updateRequests' => $this->formatApplicationUpdateRequests($app),
             'rejection_reason' => $app->status === LeaveApplication::STATUS_REJECTED && ! $isCancelled ? $app->remarks : null,
             'employee_name' => $employeeName,
             'office' => $office,
@@ -4485,6 +4487,45 @@ class LeaveApplicationController extends Controller
             $app,
             fn (...$args) => $this->applyRegularLeavePolicy(...$args)
         );
+    }
+
+    /**
+     * @return array<int, array<string, mixed>>
+     */
+    private function formatApplicationUpdateRequests(LeaveApplication $app): array
+    {
+        $updateRequests = null;
+
+        if ($app->relationLoaded('updateRequests')) {
+            $updateRequests = $app->updateRequests;
+        } elseif ($app->id) {
+            $updateRequests = LeaveApplicationUpdateRequest::query()
+                ->where('leave_application_id', (int) $app->id)
+                ->latest('id')
+                ->get();
+        }
+
+        if (! $updateRequests) {
+            return [];
+        }
+
+        return $updateRequests
+            ->filter(fn ($req) => $req instanceof LeaveApplicationUpdateRequest)
+            ->sortByDesc(fn (LeaveApplicationUpdateRequest $req) => (int) $req->id)
+            ->map(fn (LeaveApplicationUpdateRequest $r): array => [
+                'id' => (int) $r->id,
+                'status' => strtoupper(trim((string) $r->status)),
+                'action_type' => $this->resolveUpdateRequestActionTypeFromPayload($r->requested_payload),
+                'payload' => $this->normalizePendingUpdatePayload($r->requested_payload),
+                'reason' => $this->trimNullableString($r->requested_reason),
+                'previous_status' => strtoupper(trim((string) ($r->previous_status ?? ''))),
+                'requested_by' => $this->trimNullableString($r->requested_by_control_no),
+                'requested_at' => $r->requested_at?->toIso8601String(),
+                'reviewed_at' => $r->reviewed_at?->toIso8601String(),
+                'review_remarks' => $this->trimNullableString($r->review_remarks),
+            ])
+            ->values()
+            ->all();
     }
 
     private function normalizePendingUpdatePayload(mixed $payload): ?array
@@ -5972,6 +6013,8 @@ class LeaveApplicationController extends Controller
             'latest_update_requested_at' => $latestUpdateMeta['requested_at']?->toIso8601String(),
             'latest_update_reviewed_at' => $latestUpdateMeta['reviewed_at']?->toIso8601String(),
             'latest_update_review_remarks' => $latestUpdateMeta['review_remarks'],
+            'update_requests' => $this->formatApplicationUpdateRequests($app),
+            'updateRequests' => $this->formatApplicationUpdateRequests($app),
             'selected_dates' => $app->resolvedSelectedDates(),
             'selected_date_pay_status' => $selectedDatePayStatus,
             'selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
