@@ -188,4 +188,22 @@ class LeaveCalculationServiceTest extends TestCase
         $app->leave_type_id = 9999;
         $this->assertSame(0.0, $this->service->resolveApplicationCtoDeductedHours($app));
     }
+
+    public function test_resolve_date_coverage_weights_and_sick_leave_pay_status_overrides(): void
+    {
+        $selectedDates = ['2026-06-01', '2026-06-02', '2026-06-03'];
+        $coverage = ['2026-06-02' => 'half'];
+
+        $weights = $this->service->resolveDateCoverageWeights($selectedDates, $coverage, 2.5, null);
+        $this->assertSame(1.0, $weights['2026-06-01']);
+        $this->assertSame(0.5, $weights['2026-06-02']);
+        $this->assertSame(1.0, $weights['2026-06-03']);
+
+        $overrides = $this->service->buildSickLeavePayStatusOverrides($selectedDates, $coverage, 2.5, 1.5, null);
+        $this->assertSame([
+            '2026-06-01' => LeaveApplication::PAY_MODE_WITH_PAY,
+            '2026-06-02' => LeaveApplication::PAY_MODE_WITH_PAY,
+            '2026-06-03' => LeaveApplication::PAY_MODE_WITHOUT_PAY,
+        ], $overrides);
+    }
 }

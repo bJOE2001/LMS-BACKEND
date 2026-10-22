@@ -2,12 +2,15 @@
 
 namespace Tests\Unit;
 
+use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Models\LeaveApplication;
 use App\Models\LeaveApplicationLog;
 use App\Models\LeaveApplicationUpdateRequest;
+use App\Models\LeaveType;
 use App\Services\Leave\LeaveWorkflowService;
 use Carbon\Carbon;
+use Illuminate\Support\Facades\DB;
 use Tests\TestCase;
 
 class LeaveWorkflowServiceTest extends TestCase
@@ -727,5 +730,686 @@ class LeaveWorkflowServiceTest extends TestCase
         $responsePending = $this->service->executeHrRecall($appPending, $hr, 'Test', ['2026-03-10']);
         $this->assertSame(422, $responsePending->getStatusCode());
         $this->assertStringContainsString('Cannot recall: application status is', $responsePending->getData(true)['message']);
+    }
+
+    public function test_resolve_pending_update_meta_empty(): void
+    {
+        $app = new LeaveApplication;
+        $app->id = null;
+        $meta = $this->service->resolvePendingUpdateMeta($app);
+
+        $this->assertNull($meta['payload']);
+        $this->assertNull($meta['action_type']);
+        $this->assertNull($meta['reason']);
+        $this->assertNull($meta['previous_status']);
+        $this->assertNull($meta['request_record']);
+    }
+
+    public function test_execute_hr_receive_update_not_pending_approved_update(): void
+    {
+        $hr = new HRAccount;
+        $hr->id = 1;
+
+        $app = new LeaveApplication;
+        $app->status = LeaveApplication::STATUS_APPROVED;
+
+        $response = $this->service->executeHrReceiveUpdate(
+            $app,
+            $hr,
+            'Test remarks',
+            pendingMetaResolver: fn () => ['payload' => null]
+        );
+
+        $this->assertSame(422, $response->getStatusCode());
+        $this->assertStringContainsString('application is not in pending approved-update review', $response->getData(true)['message']);
+    }
+
+    public function test_execute_hr_release_update_invalid_status(): void
+    {
+        $hr = new HRAccount;
+        $hr->id = 1;
+
+        $app = new LeaveApplication;
+        $app->status = LeaveApplication::STATUS_PENDING_ADMIN;
+
+        $response = $this->service->executeHrReleaseUpdate(
+            $app,
+            $hr,
+            'Test remarks',
+            latestMetaResolver: fn () => ['action_type' => LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE]
+        );
+
+        $this->assertSame(422, $response->getStatusCode());
+        $this->assertStringContainsString('Cannot mark updated copy as released', $response->getData(true)['message']);
+    }
+
+    public function test_hr_approve_pending_recall_request_calls_recall(): void
+    {
+        $hr = new HRAccount;
+        $hr->id = 1;
+
+        $app = new LeaveApplication;
+        $app->is_monetization = true; // Will trigger 422 immediately inside executeHrRecall
+        $app->status = LeaveApplication::STATUS_APPROVED;
+
+        $response = $this->service->hrApprovePendingRecallRequest(
+            $app,
+            $hr,
+            'Remarks',
+            pendingUpdateMeta: [
+                'reason' => 'Need employee back',
+                'payload' => [
+                    'recall_selected_dates' => ['2026-03-10'],
+                ],
+            ]
+        );
+
+        $this->assertSame(422, $response->getStatusCode());
+        $this->assertStringContainsString('Monetization requests cannot be recalled', $response->getData(true)['message']);
+    }
+
+    public function test_execute_hr_approve_pending_cancellation_request_catches_balance_conflict(): void
+    {
+        $hr = new HRAccount;
+        $hr->id = 1;
+
+        $app = new LeaveApplication;
+        $app->employee_control_no = null;
+
+        $response = $this->service->executeHrApprovePendingCancellationRequest(
+            $app,
+            $hr,
+            'Remarks',
+            refundCallback: function () {
+                throw new \RuntimeException('HR_CANCEL_REQUEST_BALANCE_CONFLICT');
+            }
+        );
+
+        $this->assertSame(409, $response->getStatusCode());
+        $this->assertStringContainsString('Unable to apply this leave cancellation request due to leave balance mismatch', $response->getData(true)['message']);
+    }
+
+    public function test_create_employee_filed_application(): void
+    {
+        DB::beginTransaction();
+        try {
+            $account = (object) ['id' => 99999];
+            $app = $this->service->createEmployeeFiledApplication($account, [
+                'employee_control_no' => '999999',
+                'leave_type_id' => 1,
+                'total_days' => 2.0,
+                'deductible_days' => 2.0,
+            ]);
+
+            $this->assertInstanceOf(LeaveApplication::class, $app);
+            $this->assertSame(LeaveApplication::STATUS_PENDING_ADMIN, $app->status);
+            $this->assertSame('999999', $app->employee_control_no);
+
+            $log = LeaveApplicationLog::where('leave_application_id', $app->id)
+                ->where('action', LeaveApplicationLog::ACTION_SUBMITTED)
+                ->first();
+
+            $this->assertNotNull($log);
+            $this->assertSame(LeaveApplicationLog::PERFORMER_EMPLOYEE, $log->performed_by_type);
+            $this->assertSame(99999, (int) $log->performed_by_id);
+        } finally {
+            DB::rollBack();
+        }
+    }
+
+    public function test_create_admin_filed_application(): void
+    {
+        DB::beginTransaction();
+        try {
+            $admin = DepartmentAdmin::first();
+            if (! $admin) {
+                $this->markTestSkipped('No DepartmentAdmin available in test database.');
+            }
+
+            $app = $this->service->createAdminFiledApplication($admin, [
+                'employee_control_no' => '888888',
+                'leave_type_id' => 1,
+                'total_days' => 3.0,
+                'deductible_days' => 3.0,
+            ], 'Admin filed for employee');
+
+            $this->assertInstanceOf(LeaveApplication::class, $app);
+            $this->assertSame(LeaveApplication::STATUS_PENDING_HR, $app->status);
+            $this->assertSame($admin->id, (int) $app->admin_id);
+            $this->assertNotNull($app->admin_approved_at);
+
+            $submitLog = LeaveApplicationLog::where('leave_application_id', $app->id)
+                ->where('action', LeaveApplicationLog::ACTION_SUBMITTED)
+                ->first();
+            $this->assertNotNull($submitLog);
+            $this->assertSame(LeaveApplicationLog::PERFORMER_ADMIN, $submitLog->performed_by_type);
+            $this->assertSame($admin->id, (int) $submitLog->performed_by_id);
+
+            $approvedLog = LeaveApplicationLog::where('leave_application_id', $app->id)
+                ->where('action', LeaveApplicationLog::ACTION_ADMIN_APPROVED)
+                ->first();
+            $this->assertNotNull($approvedLog);
+            $this->assertSame('Admin filed for employee', $approvedLog->remarks);
+        } finally {
+            DB::rollBack();
+        }
+    }
+
+    public function test_notify_department_admins_of_employee_filed_application(): void
+    {
+        $app = new LeaveApplication;
+        $app->id = 77777;
+        $app->total_days = 2.0;
+
+        $employee = (object) [
+            'firstname' => 'Test',
+            'surname' => 'Employee',
+            'office' => 'NON_EXISTENT_TEST_OFFICE',
+        ];
+
+        $this->service->notifyDepartmentAdminsOfEmployeeFiledApplication($app, $employee);
+        $this->service->notifyDepartmentAdminsOfEmployeeFiledApplication($app, $employee, 'VL (2 days)');
+
+        $this->assertTrue(true);
+    }
+
+    public function test_notify_hr_accounts_of_admin_filed_application(): void
+    {
+        DB::beginTransaction();
+        try {
+            $account = (object) ['id' => 99999];
+            $app = $this->service->createEmployeeFiledApplication($account, [
+                'employee_control_no' => '999999',
+                'leave_type_id' => 1,
+                'total_days' => 1.0,
+                'deductible_days' => 1.0,
+            ]);
+
+            $this->service->notifyHrAccountsOfAdminFiledApplication($app, 'Test Employee', false);
+            $this->service->notifyHrAccountsOfAdminFiledApplication($app, 'Test Employee', true, 'SL (1 day)');
+
+            $this->assertTrue(true);
+        } finally {
+            DB::rollBack();
+        }
+    }
+
+    public function test_notify_parties_of_employee_cancellation(): void
+    {
+        DB::beginTransaction();
+        try {
+            $account = (object) ['id' => 99999];
+            $app = $this->service->createEmployeeFiledApplication($account, [
+                'employee_control_no' => '999999',
+                'leave_type_id' => 1,
+                'total_days' => 1.0,
+                'deductible_days' => 1.0,
+            ]);
+
+            $employee = (object) [
+                'firstname' => 'Test',
+                'surname' => 'Employee',
+                'office' => 'NON_EXISTENT_TEST_OFFICE',
+                'control_no' => '999999',
+            ];
+
+            $this->service->notifyPartiesOfEmployeeCancellation($app, $employee, LeaveApplication::STATUS_PENDING_HR, 'Personal reason');
+            $this->assertTrue(true);
+        } finally {
+            DB::rollBack();
+        }
+    }
+
+    public function test_notify_department_admins_of_approved_leave_cancellation_request(): void
+    {
+        $app = new LeaveApplication;
+        $app->id = 77777;
+
+        $employee = (object) [
+            'firstname' => 'Test',
+            'surname' => 'Employee',
+            'office' => 'NON_EXISTENT_TEST_OFFICE',
+        ];
+
+        $this->service->notifyDepartmentAdminsOfApprovedLeaveCancellationRequest($app, $employee, 'Family emergency');
+        $this->assertTrue(true);
+    }
+
+    public function test_withdraw_pending_approved_update_request(): void
+    {
+        DB::beginTransaction();
+        try {
+            $account = (object) ['id' => 99999];
+            $app = $this->service->createEmployeeFiledApplication($account, [
+                'employee_control_no' => '999999',
+                'leave_type_id' => 1,
+                'total_days' => 2.0,
+                'deductible_days' => 2.0,
+                'remarks' => "Initial remark\nCancellation request submitted by employee. Reason: test",
+            ]);
+
+            $updateRequest = LeaveApplicationUpdateRequest::create([
+                'leave_application_id' => (int) $app->id,
+                'status' => LeaveApplicationUpdateRequest::STATUS_PENDING,
+                'previous_status' => LeaveApplication::STATUS_APPROVED,
+                'requested_payload' => ['total_days' => 2.0],
+                'requested_reason' => 'test',
+            ]);
+
+            LeaveApplicationLog::create([
+                'leave_application_id' => $app->id,
+                'action' => LeaveApplicationLog::ACTION_SUBMITTED,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_EMPLOYEE,
+                'performed_by_id' => 99999,
+                'remarks' => 'Cancellation request submitted by employee. Reason: test',
+                'created_at' => now(),
+            ]);
+
+            $this->service->withdrawPendingApprovedUpdateRequest($app, $updateRequest, LeaveApplication::STATUS_APPROVED);
+
+            $app->refresh();
+            $this->assertSame(LeaveApplication::STATUS_APPROVED, $app->status);
+            $this->assertStringNotContainsString('Cancellation request submitted', (string) $app->remarks);
+
+            $this->assertNull(LeaveApplicationUpdateRequest::find($updateRequest->id));
+            $this->assertSame(0, LeaveApplicationLog::where('leave_application_id', $app->id)
+                ->where('remarks', 'LIKE', '%Cancellation request submitted%')
+                ->count());
+        } finally {
+            DB::rollBack();
+        }
+    }
+
+    public function test_submit_employee_leave_update_request_and_notify(): void
+    {
+        DB::beginTransaction();
+        try {
+            $account = (object) ['id' => 99999];
+            $app = $this->service->createEmployeeFiledApplication($account, [
+                'employee_control_no' => '999999',
+                'leave_type_id' => 1,
+                'total_days' => 2.0,
+                'deductible_days' => 2.0,
+            ]);
+
+            $employee = (object) [
+                'firstname' => 'Test',
+                'surname' => 'Employee',
+                'office' => 'NON_EXISTENT_TEST_OFFICE',
+                'control_no' => '999999',
+            ];
+
+            // Test on approved application
+            $this->service->submitEmployeeLeaveUpdateRequest(
+                $app,
+                ['total_days' => 3.0],
+                'Edit request submitted by employee. Reason: test update',
+                'test update',
+                99999,
+                '999999',
+                'Test Employee',
+                true
+            );
+
+            $app->refresh();
+            $this->assertSame(LeaveApplication::STATUS_PENDING_ADMIN, $app->status);
+
+            $updateReq = LeaveApplicationUpdateRequest::where('leave_application_id', $app->id)
+                ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
+                ->first();
+            $this->assertNotNull($updateReq);
+            $this->assertSame('test update', $updateReq->requested_reason);
+
+            $this->service->notifyPartiesOfEmployeeUpdateRequest($app, $employee, true, 'test update');
+            $this->service->notifyPartiesOfEmployeeUpdateRequest($app, $employee, false, 'test update');
+
+            $this->assertTrue(true);
+        } finally {
+            DB::rollBack();
+        }
+    }
+
+    public function test_resolve_admin_approval_response_message(): void
+    {
+        $this->assertSame(
+            'Application approved by admin. Forwarded to HR.',
+            $this->service->resolveAdminApprovalResponseMessage(false)
+        );
+        $this->assertSame(
+            'Leave cancellation request approved by admin. Forwarded to HR for final approval.',
+            $this->service->resolveAdminApprovalResponseMessage(true, LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL)
+        );
+        $this->assertSame(
+            'Leave recall request approved by admin. Forwarded to HR for final approval.',
+            $this->service->resolveAdminApprovalResponseMessage(true, LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL)
+        );
+        $this->assertSame(
+            'Leave update request approved by admin. Forwarded to HR for final approval.',
+            $this->service->resolveAdminApprovalResponseMessage(true, LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE)
+        );
+    }
+
+    public function test_is_recallable_leave_type(): void
+    {
+        $app = new LeaveApplication;
+        $app->leave_type_id = 1;
+
+        $vlType = new LeaveType;
+        $vlType->id = 1;
+        $vlType->name = 'Vacation Leave';
+
+        $this->assertTrue($this->service->isRecallableLeaveType($app, $vlType));
+
+        $flType = new LeaveType;
+        $flType->id = 2;
+        $flType->name = 'Mandatory / Forced Leave';
+        $app->leave_type_id = 2;
+        $this->assertTrue($this->service->isRecallableLeaveType($app, $flType));
+
+        $slType = new LeaveType;
+        $slType->id = 3;
+        $slType->name = 'Sick Leave';
+        $app->leave_type_id = 3;
+        $this->assertFalse($this->service->isRecallableLeaveType($app, $slType));
+    }
+
+    public function test_notify_hr_accounts_of_admin_approval_and_recall(): void
+    {
+        DB::beginTransaction();
+        try {
+            $account = (object) ['id' => 99999];
+            $app = $this->service->createEmployeeFiledApplication($account, [
+                'employee_control_no' => '999999',
+                'leave_type_id' => 1,
+                'total_days' => 2.0,
+                'deductible_days' => 2.0,
+            ]);
+
+            $this->service->notifyHrAccountsOfAdminApproval($app, 'Test Employee', false);
+            $this->service->notifyHrAccountsOfAdminApproval($app, 'Test Employee', true, LeaveApplicationUpdateRequest::ACTION_TYPE_CANCEL);
+            $this->service->notifyHrAccountsOfAdminApproval($app, 'Test Employee', true, LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL);
+            $this->service->notifyHrAccountsOfAdminApproval($app, 'Test Employee', true, LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE);
+
+            $this->service->notifyHrAccountsOfAdminRecallRequest($app, 'Test Employee', 'Need employee for urgent tasks');
+
+            $this->assertTrue(true);
+        } finally {
+            DB::rollBack();
+        }
+    }
+
+    public function test_notify_applicant_of_hr_approval_and_rejection(): void
+    {
+        $app = new LeaveApplication;
+        $app->id = 12345;
+        $app->applicant_admin_id = null;
+        $app->is_monetization = false;
+        $app->total_days = 2.0;
+
+        $leaveType = new LeaveType;
+        $leaveType->name = 'Vacation Leave';
+        $app->setRelation('leaveType', $leaveType);
+
+        $approvedSmsCalled = false;
+        $this->service->notifyApplicantOfHrApproval($app, function ($calledApp) use (&$approvedSmsCalled, $app): void {
+            $approvedSmsCalled = ($calledApp === $app);
+        });
+        $this->assertTrue($approvedSmsCalled);
+
+        $rejectedSmsCalled = false;
+        $this->service->notifyApplicantOfHrRejection($app, 'Missing requirements', function ($calledApp) use (&$rejectedSmsCalled, $app): void {
+            $rejectedSmsCalled = ($calledApp === $app);
+        });
+        $this->assertTrue($rejectedSmsCalled);
+    }
+
+    public function test_hr_application_edit_request_workflow_helpers_and_rejection(): void
+    {
+        $payloadWithMeta = $this->service->withHrApplicationEditRequestMeta(['reason' => 'Fix date']);
+        $this->assertSame(LeaveWorkflowService::HR_APPLICATION_EDIT_REQUEST_KIND, $payloadWithMeta['request_kind']);
+        $this->assertSame(LeaveApplicationUpdateRequest::ACTION_TYPE_UPDATE, $payloadWithMeta['action_type']);
+
+        $hr = new HRAccount;
+        $hr->id = 42;
+        $hr->username = 'hrstaff';
+        $this->assertSame('HR:42:hrstaff', $this->service->formatHrEditRequestActor($hr));
+
+        $hrNoUser = new HRAccount;
+        $hrNoUser->id = 99;
+        $hrNoUser->username = '';
+        $this->assertSame('HR:99', $this->service->formatHrEditRequestActor($hrNoUser));
+
+        $log = new LeaveApplicationLog;
+        $log->action = LeaveApplicationLog::ACTION_HR_APPLICATION_EDITED;
+        $this->assertTrue($this->service->isHrApplicationEditWorkflowLog($log));
+
+        $log->action = LeaveApplicationLog::ACTION_HR_APPROVED;
+        $this->assertFalse($this->service->isHrApplicationEditWorkflowLog($log));
+
+        $editRequest = new LeaveApplicationUpdateRequest;
+        $editRequest->requested_payload = ['request_kind' => LeaveApplicationUpdateRequest::REQUEST_KIND_HR_EDIT];
+        $this->assertSame(LeaveApplicationUpdateRequest::REQUEST_KIND_HR_EDIT, $this->service->resolveEditRequestPayloadRequestKind($editRequest));
+
+        $editRequest->requested_payload = json_encode(['request_kind' => LeaveApplicationUpdateRequest::REQUEST_KIND_HR_EDIT]);
+        $this->assertSame(LeaveApplicationUpdateRequest::REQUEST_KIND_HR_EDIT, $this->service->resolveEditRequestPayloadRequestKind($editRequest));
+
+        $editRequest->requested_payload = null;
+        $this->assertNull($this->service->resolveEditRequestPayloadRequestKind($editRequest));
+    }
+
+    public function test_create_and_reject_hr_staff_application_edit_request(): void
+    {
+        DB::beginTransaction();
+        try {
+            $account = (object) ['id' => 99999];
+            $app = $this->service->createEmployeeFiledApplication($account, [
+                'employee_control_no' => '999999',
+                'leave_type_id' => 1,
+                'total_days' => 2.0,
+                'deductible_days' => 2.0,
+            ]);
+
+            $hr = HRAccount::first() ?? new HRAccount(['id' => 1, 'username' => 'test_hr']);
+
+            $editRequest = $this->service->createHrStaffApplicationEditRequest(
+                $app,
+                $hr,
+                ['total_days' => 3.0],
+                'Correcting days',
+                'Test Employee'
+            );
+
+            $this->assertInstanceOf(LeaveApplicationUpdateRequest::class, $editRequest);
+            $this->assertSame(LeaveApplicationUpdateRequest::STATUS_PENDING, $editRequest->status);
+            $this->assertSame('HR:'.$hr->id.':'.$hr->username, $editRequest->requested_by_control_no);
+
+            $rejected = $this->service->executeHrRejectApplicationEditRequest($editRequest, $hr, 'Incorrect details');
+            $this->assertSame(LeaveApplicationUpdateRequest::STATUS_REJECTED, $rejected->status);
+            $this->assertSame('Incorrect details', $rejected->review_remarks);
+        } finally {
+            DB::rollBack();
+        }
+    }
+
+    public function test_hr_bulk_cmo_cbmo_review_and_release(): void
+    {
+        DB::beginTransaction();
+        try {
+            $account = (object) ['id' => 99999];
+            $app = $this->service->createEmployeeFiledApplication($account, [
+                'employee_control_no' => '999999',
+                'leave_type_id' => 1,
+                'total_days' => 2.0,
+                'deductible_days' => 2.0,
+            ]);
+
+            $app->status = LeaveApplication::STATUS_APPROVED;
+            $app->save();
+
+            $hr = HRAccount::first() ?? new HRAccount(['id' => 1, 'username' => 'test_hr']);
+
+            // Initially, not received by HR -> skipped in CMO review
+            $app->load('logs');
+            $reviewResult = $this->service->executeHrBulkCmoCbmoReview(
+                collect([$app]),
+                $hr,
+                'Review remarks'
+            );
+            $this->assertSame(0, $reviewResult['processed_count']);
+            $this->assertSame(1, $reviewResult['skipped_count']);
+
+            // Add HR_RECEIVED log
+            LeaveApplicationLog::create([
+                'leave_application_id' => $app->id,
+                'action' => LeaveApplicationLog::ACTION_HR_RECEIVED,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_HR,
+                'performed_by_id' => $hr->id,
+                'remarks' => 'Hard copy received',
+                'created_at' => now(),
+            ]);
+
+            $app->load('logs');
+            $smsCalled = false;
+            $reviewResult = $this->service->executeHrBulkCmoCbmoReview(
+                collect([$app]),
+                $hr,
+                'Review remarks',
+                function ($calledApp) use (&$smsCalled, $app): void {
+                    $smsCalled = ($calledApp->id === $app->id);
+                }
+            );
+            $this->assertSame(1, $reviewResult['processed_count']);
+            $this->assertTrue($smsCalled);
+
+            // Now release
+            $app->load('logs');
+            $releaseResult = $this->service->executeHrBulkRelease(
+                collect([$app]),
+                $hr,
+                'Release remarks'
+            );
+            $this->assertSame(1, $releaseResult['processed_count']);
+            $this->assertSame(0, $releaseResult['skipped_count']);
+
+            // Subsequent release should recognize it's already released and process without error
+            $app->load('logs');
+            $releaseResult2 = $this->service->executeHrBulkRelease(
+                collect([$app]),
+                $hr,
+                'Release remarks'
+            );
+            $this->assertSame(1, $releaseResult2['processed_count']);
+        } finally {
+            DB::rollBack();
+        }
+    }
+
+    public function test_has_requested_leave_update_changes(): void
+    {
+        $app = new LeaveApplication;
+        $app->leave_type_id = 1;
+        $app->start_date = Carbon::parse('2026-11-01');
+        $app->end_date = Carbon::parse('2026-11-02');
+        $app->selected_dates = ['2026-11-01', '2026-11-02'];
+        $app->total_days = 2.0;
+        $app->deductible_days = 2.0;
+        $app->reason = 'Vacation';
+        $app->details_of_leave = 'Within PH';
+        $app->commutation = 'Not Requested';
+        $app->pay_mode = LeaveApplication::PAY_MODE_WITH_PAY;
+        $app->is_monetization = false;
+
+        $identicalPayload = [
+            'leave_type_id' => 1,
+            'start_date' => '2026-11-01',
+            'end_date' => '2026-11-02',
+            'selected_dates' => ['2026-11-01', '2026-11-02'],
+            'total_days' => 2.0,
+            'deductible_days' => 2.0,
+            'reason' => 'Vacation',
+            'details_of_leave' => 'Within PH',
+            'commutation' => 'Not Requested',
+            'pay_mode' => LeaveApplication::PAY_MODE_WITH_PAY,
+            'is_monetization' => false,
+        ];
+
+        $this->assertFalse($this->service->hasRequestedLeaveUpdateChanges($app, $identicalPayload));
+
+        $changedPayload = $identicalPayload;
+        $changedPayload['reason'] = 'Different reason';
+        $this->assertTrue($this->service->hasRequestedLeaveUpdateChanges($app, $changedPayload));
+
+        $changedDaysPayload = $identicalPayload;
+        $changedDaysPayload['total_days'] = 3.0;
+        $this->assertTrue($this->service->hasRequestedLeaveUpdateChanges($app, $changedDaysPayload));
+    }
+
+    public function test_normalize_hr_edit_helpers(): void
+    {
+        $this->assertSame(2.5, $this->service->normalizeHrEditDayValue('2.5', 0.0));
+        $this->assertSame(1.0, $this->service->normalizeHrEditDayValue('invalid', 1.0));
+        $this->assertSame(0.0, $this->service->normalizeHrEditDayValue(-5, 0.0));
+        $this->assertSame(999.0, $this->service->normalizeHrEditDayValue(1500, 0.0));
+
+        $dates = $this->service->normalizeHrEditSelectedDates(json_encode(['2026-06-03', '2026-06-01', '2026-06-03']));
+        $this->assertSame(['2026-06-01', '2026-06-03'], $dates);
+
+        $numericMap = $this->service->normalizeHrEditNumericDateMap(['2026-06-03' => '1.5', '2026-06-01' => 1]);
+        $this->assertSame(['2026-06-01' => 1.0, '2026-06-03' => 1.5], $numericMap);
+
+        $compacted = $this->service->compactHrEditNumericDateMap($numericMap, ['2026-06-01']);
+        $this->assertSame(['2026-06-01' => 1.0], $compacted);
+
+        $rows = $this->service->normalizeHrEditRowsInput([
+            '2026-06-01' => 'WITH PAY',
+            '2026-06-02' => ['pay_status' => 'WITHOUT PAY'],
+        ]);
+        $this->assertCount(2, $rows);
+        $this->assertSame('2026-06-01', $rows[0]['date_key']);
+        $this->assertSame('WITH PAY', $rows[0]['pay_status']);
+        $this->assertSame('2026-06-02', $rows[1]['date_key']);
+    }
+
+    public function test_normalize_hr_application_edit_payload(): void
+    {
+        $leaveType = new LeaveType;
+        $leaveType->id = 1;
+        $leaveType->name = 'Vacation Leave';
+
+        $app = new LeaveApplication;
+        $app->leave_type_id = 1;
+        $app->start_date = Carbon::parse('2026-06-01');
+        $app->end_date = Carbon::parse('2026-06-02');
+        $app->selected_dates = ['2026-06-01', '2026-06-02'];
+        $app->total_days = 2.0;
+        $app->pay_mode = LeaveApplication::PAY_MODE_WITH_PAY;
+        $app->setRelation('leaveType', $leaveType);
+
+        $input = [
+            'pay_status_rows' => [
+                [
+                    'date_key' => '2026-06-01',
+                    'coverage' => 'whole',
+                    'pay_status' => 'WITH PAY',
+                    'with_pay_days' => 1.0,
+                ],
+                [
+                    'date_key' => '2026-06-02',
+                    'coverage' => 'half',
+                    'half_day_portion' => 'PM',
+                    'pay_status' => 'WITHOUT PAY',
+                    'without_pay_days' => 0.5,
+                ],
+            ],
+        ];
+
+        $payload = $this->service->normalizeHrApplicationEditPayload($input, $app);
+        $this->assertIsArray($payload);
+        $this->assertSame(LeaveWorkflowService::HR_APPLICATION_EDIT_REQUEST_KIND, $payload['request_kind']);
+        $this->assertSame(1.5, $payload['total_days']);
+        $this->assertSame(1.0, $payload['deductible_days']);
+        $this->assertSame(0.5, $payload['without_pay_days']);
+        $this->assertSame(['2026-06-02' => 'half'], $payload['selected_date_coverage']);
+        $this->assertSame(['2026-06-02' => 'PM'], $payload['selected_date_half_day_portion']);
     }
 }

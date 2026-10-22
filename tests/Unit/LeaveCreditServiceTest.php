@@ -256,4 +256,37 @@ class LeaveCreditServiceTest extends TestCase
         $data = $response->getData(true);
         $this->assertStringContainsString('Mandatory / Forced Leave requires available Vacation Leave balance.', $data['message']);
     }
+
+    public function test_build_insufficient_cto_balance_response(): void
+    {
+        $eligibility = [
+            'available_balance' => 1.0,
+            'required_balance_days' => 2.0,
+            'available_balance_hours' => 8.0,
+            'required_balance_hours' => 16.0,
+        ];
+
+        $response = $this->service->buildInsufficientCtoBalanceResponse($eligibility);
+        $this->assertSame(422, $response->getStatusCode());
+        $data = $response->getData(true);
+        $this->assertStringContainsString('Insufficient CTO balance', $data['message']);
+        $this->assertSame(8.0, (float) $data['available_cto_balance_hours']);
+        $this->assertSame(16.0, (float) $data['required_cto_balance_hours']);
+    }
+
+    public function test_resolve_tracked_leave_balance_before_application_deduction_without_owner(): void
+    {
+        $app = new LeaveApplication;
+        $app->employee_control_no = null;
+        $app->applicant_admin_id = null;
+
+        $this->assertSame(
+            2.5,
+            $this->service->resolveTrackedLeaveBalanceBeforeApplicationDeduction($app, 1, 2.5)
+        );
+        $this->assertSame(
+            0.0,
+            $this->service->resolveTrackedLeaveBalanceBeforeApplicationDeduction($app, null, 2.5)
+        );
+    }
 }

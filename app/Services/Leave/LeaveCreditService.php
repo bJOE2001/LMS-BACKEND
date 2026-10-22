@@ -6,15 +6,33 @@ use App\Models\LeaveApplication;
 use App\Models\LeaveBalance;
 use App\Models\LeaveType;
 use App\Services\CocLedgerService;
+use App\Services\WorkScheduleService;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
 class LeaveCreditService
 {
+    public const CTO_STANDARD_DAY_HOURS = WorkScheduleService::STANDARD_WORKDAY_HOURS;
+
     public function __construct(
         public LeaveCalculationService $calculationService,
         public CocLedgerService $cocLedgerService
     ) {}
+
+    public function hasLeaveApplicationCtoHoursColumn(): bool
+    {
+        static $resolved = false;
+        static $hasColumn = false;
+
+        if (! $resolved) {
+            $hasColumn = Schema::hasColumn('tblLeaveApplications', 'cto_deducted_hours');
+            $resolved = true;
+        }
+
+        return $hasColumn;
+    }
 
     public function resolveCanonicalLeaveTypeId(?int $leaveTypeId): ?int
     {
@@ -1871,6 +1889,43 @@ class LeaveCreditService
         ], 422);
     }
 
+    public function buildInsufficientCtoBalanceResponse(array $eligibility): JsonResponse
+    {
+        $availableBalance = round(max((float) ($eligibility['available_balance'] ?? 0.0), 0.0), 3);
+        $requiredBalance = round(max((float) ($eligibility['required_balance_days'] ?? 0.0), 0.0), 3);
+        $availableBalanceHours = round(max((float) ($eligibility['available_balance_hours'] ?? 0.0), 0.0), 2);
+        $requiredBalanceHours = round(max((float) ($eligibility['required_balance_hours'] ?? 0.0), 0.0), 2);
+        $message = 'Insufficient CTO balance. Available CTO is '
+            .number_format($availableBalanceHours, 2)
+            .' hour(s)'
+            .($availableBalance > 0 ? ' ('.LeaveWorkflowService::formatDays($availableBalance).' display balance)' : '')
+            .', but this request needs '
+            .number_format($requiredBalanceHours, 2)
+            .' hour(s). CTO applications must stay with pay and can only use available, unexpired CTO credits.';
+
+        return response()->json([
+            'message' => $message,
+            'errors' => [
+                'leave_type_id' => [
+                    $message,
+                ],
+                'available_cto_balance' => [
+                    'Available CTO balance is '
+                    .LeaveWorkflowService::formatDays($availableBalance)
+                    .($availableBalanceHours > 0 ? ' ('.number_format($availableBalanceHours, 2).' hour(s))' : '')
+                    .', but '
+                    .LeaveWorkflowService::formatDays($requiredBalance)
+                    .($requiredBalanceHours > 0 ? ' ('.number_format($requiredBalanceHours, 2).' hour(s))' : '')
+                    .' is required.',
+                ],
+            ],
+            'available_cto_balance' => $availableBalance,
+            'required_cto_balance' => $requiredBalance,
+            'available_cto_balance_hours' => $availableBalanceHours,
+            'required_cto_balance_hours' => $requiredBalanceHours,
+        ], 422);
+    }
+
     public function validateApprovalLeaveBalances(
         LeaveApplication $app,
         ?LeaveType $leaveType,
@@ -2239,5 +2294,233 @@ class LeaveCreditService
                 .LeaveWorkflowService::formatDays($requiredPrimaryLeaveDays)
             .'.',
         ], 422);
+    }
+
+    public function resolveEmployeeLeaveBalanceSnapshot(
+        string $employeeControlNo,
+        int $leaveTypeId,
+        ?callable $candidatesResolver = null
+    ): array {
+        $controlNoCandidates = $candidatesResolver !== null
+            ? $candidatesResolver($employeeControlNo)
+            : [$employeeControlNo];
+        $lookupLeaveTypeIds = $this->resolveBalanceLookupLeaveTypeIds($leaveTypeId);
+        $canonicalLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+
+        $isCtoSnapshot = $this->isCtoLeaveType(null, $canonicalLeaveTypeId);
+
+        if ($isCtoSnapshot) {
+            $pendingReservedHoursExpression = $this->hasLeaveApplicationCtoHoursColumn()
+                ? 'COALESCE(cto_deducted_hours, COALESCE(deductible_days, total_days) * 8.0)'
+                : 'COALESCE(deductible_days, total_days) * 8.0';
+            $currentBalanceHours = round($this->cocLedgerService->getAvailableHours($employeeControlNo, $canonicalLeaveTypeId), 2);
+            $pendingReservedHours = round((float) LeaveApplication::query()
+                ->whereIn('leave_type_id', $lookupLeaveTypeIds === [] ? [$canonicalLeaveTypeId] : $lookupLeaveTypeIds)
+                ->whereIn('status', [
+                    LeaveApplication::STATUS_PENDING_ADMIN,
+                    LeaveApplication::STATUS_PENDING_HR,
+                ])
+                ->where(function ($query): void {
+                    $query->where('is_monetization', true)
+                        ->orWhereRaw(
+                            'UPPER(LTRIM(RTRIM(COALESCE(pay_mode, ?)))) <> ?',
+                            [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY]
+                        );
+                })
+                ->whereIn('employee_control_no', $controlNoCandidates)
+                ->sum(DB::raw($pendingReservedHoursExpression)), 2);
+
+            $availableBalanceHours = max(round($currentBalanceHours - $pendingReservedHours, 2), 0.0);
+            $currentBalance = round($currentBalanceHours / self::CTO_STANDARD_DAY_HOURS, 3);
+            $pendingReservedDays = round($pendingReservedHours / self::CTO_STANDARD_DAY_HOURS, 3);
+            $availableBalance = round($availableBalanceHours / self::CTO_STANDARD_DAY_HOURS, 3);
+
+            return [
+                'current_balance' => $currentBalance,
+                'current_balance_hours' => $currentBalanceHours,
+                'pending_reserved_days' => $pendingReservedDays,
+                'pending_reserved_hours' => $pendingReservedHours,
+                'available_balance' => $availableBalance,
+                'available_balance_hours' => $availableBalanceHours,
+            ];
+        }
+
+        $balance = $this->findPreferredEmployeeLeaveBalanceRecord(
+            $employeeControlNo,
+            $canonicalLeaveTypeId,
+            false,
+            $candidatesResolver
+        );
+        $currentBalance = $balance ? (float) $balance->balance : 0.0;
+
+        $pendingReservedDays = $this->resolvePendingReservedDaysForTrackedLeaveType(
+            $employeeControlNo,
+            $canonicalLeaveTypeId,
+            null,
+            $candidatesResolver
+        );
+
+        $availableBalance = max(round($currentBalance - $pendingReservedDays, 3), 0.0);
+
+        return [
+            'current_balance' => $currentBalance,
+            'current_balance_hours' => 0.0,
+            'pending_reserved_days' => $pendingReservedDays,
+            'pending_reserved_hours' => 0.0,
+            'available_balance' => $availableBalance,
+            'available_balance_hours' => 0.0,
+        ];
+    }
+
+    public function resolveTrackedLeaveBalanceBeforeApplicationDeduction(
+        LeaveApplication $app,
+        ?int $leaveTypeId,
+        float $storedDeduction,
+        ?callable $adminControlNoResolver = null,
+        ?callable $candidatesResolver = null
+    ): float {
+        $resolvedLeaveTypeId = $leaveTypeId !== null
+            ? ($this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId)
+            : null;
+        if ($resolvedLeaveTypeId === null || $resolvedLeaveTypeId <= 0) {
+            return 0.0;
+        }
+
+        $employeeControlNo = $this->resolveApplicationBalanceOwnerControlNo($app, $adminControlNoResolver);
+        if ($employeeControlNo === null) {
+            return round(max($storedDeduction, 0.0), 3);
+        }
+
+        $currentBalance = (float) (
+            $this->findPreferredEmployeeLeaveBalanceRecord(
+                $employeeControlNo,
+                $resolvedLeaveTypeId,
+                false,
+                $candidatesResolver
+            )?->balance ?? 0.0
+        );
+
+        return round(max($currentBalance + max($storedDeduction, 0.0), 0.0), 3);
+    }
+
+    public function resolvePendingTrackedLeaveBalanceAvailableToApplication(
+        LeaveApplication $app,
+        ?int $leaveTypeId,
+        float $storedDeduction,
+        ?callable $adminControlNoResolver = null,
+        ?callable $candidatesResolver = null
+    ): float {
+        $resolvedLeaveTypeId = $leaveTypeId !== null
+            ? ($this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId)
+            : null;
+        if ($resolvedLeaveTypeId === null || $resolvedLeaveTypeId <= 0) {
+            return 0.0;
+        }
+
+        $employeeControlNo = $this->resolveApplicationBalanceOwnerControlNo($app, $adminControlNoResolver);
+        if ($employeeControlNo === null) {
+            return round(max($storedDeduction, 0.0), 3);
+        }
+
+        $balanceSnapshot = $this->resolveEmployeeLeaveBalanceSnapshot(
+            $employeeControlNo,
+            $resolvedLeaveTypeId,
+            $candidatesResolver
+        );
+        $availableBalance = (float) ($balanceSnapshot['available_balance'] ?? 0.0);
+
+        return round(max($availableBalance + max($storedDeduction, 0.0), 0.0), 3);
+    }
+
+    public function applyScheduleRepricingBalanceDelta(
+        LeaveApplication $application,
+        int $leaveTypeId,
+        float $deltaDays,
+        string $balanceConflictCode,
+        ?callable $candidatesResolver = null,
+        ?callable $adminControlNoResolver = null,
+        ?callable $employeeResolver = null
+    ): void {
+        $normalizedDeltaDays = round($deltaDays, 3);
+        if ($leaveTypeId <= 0 || abs($normalizedDeltaDays) < 0.001) {
+            return;
+        }
+
+        if ($application->employee_control_no) {
+            $balance = $this->findPreferredEmployeeLeaveBalanceRecord(
+                (string) $application->employee_control_no,
+                $leaveTypeId,
+                true,
+                $candidatesResolver
+            );
+
+            if (! $balance) {
+                if ($normalizedDeltaDays > 0) {
+                    throw new \RuntimeException($balanceConflictCode);
+                }
+
+                $resolvedEmployee = $employeeResolver !== null
+                    ? $employeeResolver((string) $application->employee_control_no)
+                    : null;
+                $canonicalControlNo = trim((string) (
+                    $resolvedEmployee?->control_no
+                    ?? $application->employee_control_no
+                ));
+                if ($canonicalControlNo === '') {
+                    throw new \RuntimeException($balanceConflictCode);
+                }
+
+                $balance = LeaveBalance::query()->create([
+                    'employee_control_no' => $canonicalControlNo,
+                    'leave_type_id' => $leaveTypeId,
+                    'balance' => 0,
+                    'year' => (int) now()->year,
+                ]);
+            }
+
+            if ($normalizedDeltaDays > 0) {
+                if ((float) $balance->balance + 1e-9 < $normalizedDeltaDays) {
+                    throw new \RuntimeException($balanceConflictCode);
+                }
+
+                $balance->decrement('balance', $normalizedDeltaDays);
+
+                return;
+            }
+
+            $balance->increment('balance', abs($normalizedDeltaDays));
+
+            return;
+        }
+
+        if ($application->applicant_admin_id) {
+            $balance = $this->findAdminEmployeeLeaveBalance(
+                (int) $application->applicant_admin_id,
+                $leaveTypeId,
+                true,
+                $adminControlNoResolver,
+                $candidatesResolver
+            );
+
+            if (! $balance) {
+                if ($normalizedDeltaDays > 0) {
+                    throw new \RuntimeException($balanceConflictCode);
+                }
+
+                return;
+            }
+
+            if ($normalizedDeltaDays > 0) {
+                if ((float) $balance->balance + 1e-9 < $normalizedDeltaDays) {
+                    throw new \RuntimeException($balanceConflictCode);
+                }
+
+                $balance->decrement('balance', $normalizedDeltaDays);
+
+                return;
+            }
+
+            $balance->increment('balance', abs($normalizedDeltaDays));
+        }
     }
 }

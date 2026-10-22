@@ -681,4 +681,183 @@ class LeaveCalculationService
 
         return $this->resolveCtoDeductedHours($this->resolveApplicationDeductibleDays($app));
     }
+
+    public function normalizeSelectedDatePayStatusMap(mixed $value): ?array
+    {
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $value = $decoded;
+            }
+        }
+
+        if (! is_array($value) || $value === []) {
+            return null;
+        }
+
+        $normalized = [];
+        foreach ($value as $rawDate => $rawStatus) {
+            $dateKey = $this->normalizeDateKey($rawDate);
+            if ($dateKey === null) {
+                $dateKey = trim((string) $rawDate);
+            }
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $resolvedMode = $this->resolvePayModeFromStatusValue($rawStatus);
+            if ($resolvedMode === null) {
+                continue;
+            }
+
+            $normalized[$dateKey] = $resolvedMode;
+        }
+
+        if ($normalized === []) {
+            return null;
+        }
+
+        ksort($normalized);
+
+        return $normalized;
+    }
+
+    public function resolveDateCoverageWeights(
+        array $selectedDates,
+        ?array $selectedDateCoverage,
+        float $totalDays,
+        ?string $employeeControlNo = null
+    ): array {
+        $resolvedDates = [];
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeDateKey($rawDate);
+            if ($dateKey === null) {
+                $dateKey = trim((string) $rawDate);
+            }
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $resolvedDates[$dateKey] = true;
+        }
+
+        $resolvedDates = array_keys($resolvedDates);
+        sort($resolvedDates);
+
+        if ($resolvedDates === []) {
+            return [];
+        }
+
+        $coverageMap = is_array($selectedDateCoverage) ? $selectedDateCoverage : [];
+        $hasCoverageOverrides = $coverageMap !== [];
+
+        $defaultWholeDayWeight = $this->workScheduleService->resolveCoverageDeductionDays('whole', $employeeControlNo);
+        $defaultHalfDayWeight = $this->workScheduleService->resolveCoverageDeductionDays('half', $employeeControlNo);
+        $defaultCoverageWeight = $defaultWholeDayWeight;
+        $dateCount = count($resolvedDates);
+        if ($dateCount > 0) {
+            $halfMatch = abs(($dateCount * $defaultHalfDayWeight) - $totalDays) < 0.00001;
+            $wholeMatch = abs(((float) $dateCount) - $totalDays) < 0.00001;
+            if ($halfMatch) {
+                $defaultCoverageWeight = $defaultHalfDayWeight;
+            } elseif (! $wholeMatch) {
+                $defaultCoverageWeight = round(max(min($totalDays / $dateCount, $defaultWholeDayWeight), $defaultHalfDayWeight), 3);
+            }
+        }
+
+        $weights = [];
+        foreach ($resolvedDates as $dateKey) {
+            $hasCoverageValue = array_key_exists($dateKey, $coverageMap);
+            $coverage = strtolower(trim((string) ($coverageMap[$dateKey] ?? '')));
+            if ($coverage === 'half') {
+                $weights[$dateKey] = $defaultHalfDayWeight;
+
+                continue;
+            }
+
+            if ($coverage === 'whole') {
+                $weights[$dateKey] = $defaultWholeDayWeight;
+
+                continue;
+            }
+
+            if ($hasCoverageOverrides && ! $hasCoverageValue) {
+                $weights[$dateKey] = $defaultWholeDayWeight;
+
+                continue;
+            }
+
+            $weights[$dateKey] = $defaultCoverageWeight;
+        }
+
+        return $weights;
+    }
+
+    public function buildSickLeavePayStatusOverrides(
+        ?array $selectedDates,
+        ?array $selectedDateCoverage,
+        float $totalDays,
+        float $withPayCap = 5.0,
+        ?string $employeeControlNo = null
+    ): ?array {
+        if (! is_array($selectedDates) || $selectedDates === []) {
+            return null;
+        }
+
+        $resolvedDates = [];
+        foreach ($selectedDates as $rawDate) {
+            $dateKey = $this->normalizeDateKey($rawDate);
+            if ($dateKey === null) {
+                $dateKey = trim((string) $rawDate);
+            }
+            if ($dateKey === '') {
+                continue;
+            }
+
+            $resolvedDates[$dateKey] = true;
+        }
+
+        $resolvedDates = array_keys($resolvedDates);
+        sort($resolvedDates);
+
+        if ($resolvedDates === []) {
+            return null;
+        }
+
+        $coverageWeights = $this->resolveDateCoverageWeights(
+            $resolvedDates,
+            $selectedDateCoverage,
+            $totalDays,
+            $employeeControlNo
+        );
+
+        $remainingWithPay = round(max($withPayCap, 0.0), 3);
+        $statusOverrides = [];
+
+        foreach ($resolvedDates as $dateKey) {
+            $weight = round(max((float) ($coverageWeights[$dateKey] ?? 1.0), 0.0), 3);
+            if ($weight <= 0) {
+                $statusOverrides[$dateKey] = LeaveApplication::PAY_MODE_WITHOUT_PAY;
+
+                continue;
+            }
+
+            if ($remainingWithPay <= 0.0) {
+                $statusOverrides[$dateKey] = LeaveApplication::PAY_MODE_WITHOUT_PAY;
+
+                continue;
+            }
+
+            if ($remainingWithPay + 1e-9 < $weight) {
+                $statusOverrides[$dateKey] = LeaveApplication::PAY_MODE_WITHOUT_PAY;
+
+                continue;
+            }
+
+            $statusOverrides[$dateKey] = LeaveApplication::PAY_MODE_WITH_PAY;
+            $remainingWithPay = round(max($remainingWithPay - $weight, 0.0), 3);
+        }
+
+        return $statusOverrides;
+    }
 }
