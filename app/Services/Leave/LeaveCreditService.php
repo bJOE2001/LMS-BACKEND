@@ -10,6 +10,7 @@ use App\Services\CocLedgerService;
 use App\Services\WorkScheduleService;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
@@ -2823,11 +2824,10 @@ class LeaveCreditService
             return response()->json(['message' => 'Leave type not found.'], 404);
         }
 
-        if ($assertEmployeeCanAccessLeaveTypeBalance !== null) {
-            $accessResponse = $assertEmployeeCanAccessLeaveTypeBalance($employee, $leaveType);
-            if ($accessResponse instanceof JsonResponse) {
-                return $accessResponse;
-            }
+        $assertAccess = $assertEmployeeCanAccessLeaveTypeBalance ?? fn ($emp, $lt) => $this->eligibilityService()->assertEmployeeCanAccessLeaveTypeBalance($emp, $lt);
+        $accessResponse = $assertAccess($employee, $leaveType);
+        if ($accessResponse instanceof JsonResponse) {
+            return $accessResponse;
         }
 
         $ctoBalanceHours = null;
@@ -2893,11 +2893,10 @@ class LeaveCreditService
             return response()->json(['message' => 'Leave type not found.'], 404);
         }
 
-        if ($assertEmployeeCanAccessLeaveTypeBalance !== null) {
-            $leaveTypeBalanceAccess = $assertEmployeeCanAccessLeaveTypeBalance($employee, $leaveType);
-            if ($leaveTypeBalanceAccess instanceof JsonResponse) {
-                return $leaveTypeBalanceAccess;
-            }
+        $assertAccess = $assertEmployeeCanAccessLeaveTypeBalance ?? fn ($emp, $lt) => $this->eligibilityService()->assertEmployeeCanAccessLeaveTypeBalance($emp, $lt);
+        $leaveTypeBalanceAccess = $assertAccess($employee, $leaveType);
+        if ($leaveTypeBalanceAccess instanceof JsonResponse) {
+            return $leaveTypeBalanceAccess;
         }
 
         $ctoBalanceHours = null;
@@ -2939,6 +2938,54 @@ class LeaveCreditService
                 $ctoBalanceHours
             )
         ));
+    }
+
+    public function handleErmsGetLeaveBalance(
+        Request $request,
+        int $id,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $assertErmsEmployeeIsPulled = null,
+        ?callable $assertEmployeeCanAccessLeaveTypeBalance = null,
+        ?callable $controlNoResponseBuilder = null,
+        ?callable $candidatesResolver = null
+    ): JsonResponse {
+        $employeeControlNo = trim((string) $request->input('employee_control_no', ''));
+        if ($employeeControlNo !== '') {
+            $request->merge(['employee_control_no' => $employeeControlNo]);
+        }
+
+        $validated = $request->validate([
+            'employee_control_no' => ['nullable', 'string', 'regex:/^\d+$/'],
+            'leave_type_id' => ['nullable', 'integer', 'exists:tblLeaveTypes,id'],
+        ]);
+
+        $queryControlNo = $validated['employee_control_no'] ?? null;
+        $queryLeaveTypeId = $validated['leave_type_id'] ?? null;
+
+        if ($queryControlNo !== null && $queryLeaveTypeId === null) {
+            $controlNo = trim((string) $queryControlNo);
+            $leaveTypeId = $id;
+        } elseif ($queryControlNo === null && $queryLeaveTypeId !== null) {
+            $controlNo = (string) $id;
+            $leaveTypeId = (int) $queryLeaveTypeId;
+        } elseif ($queryControlNo !== null && $queryLeaveTypeId !== null) {
+            $controlNo = trim((string) $queryControlNo);
+            $leaveTypeId = (int) $queryLeaveTypeId;
+        } else {
+            return response()->json([
+                'message' => 'Provide either employee_control_no, or leave_type_id query parameter.',
+            ], 422);
+        }
+
+        return $this->executeErmsGetLeaveBalance(
+            $controlNo,
+            $leaveTypeId,
+            $findEmployeeByControlNo,
+            $assertErmsEmployeeIsPulled,
+            $assertEmployeeCanAccessLeaveTypeBalance,
+            $controlNoResponseBuilder,
+            $candidatesResolver
+        );
     }
 
     public function executeErmsGetLeaveBalances(

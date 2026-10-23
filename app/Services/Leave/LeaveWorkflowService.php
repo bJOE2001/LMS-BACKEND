@@ -14,6 +14,7 @@ use App\Models\LeaveApplicationUpdateRequest;
 use App\Models\LeaveType;
 use App\Models\Notification;
 use App\Services\LeaveApplicationDocumentVerificationService;
+use App\Services\WorkScheduleService;
 use Carbon\CarbonImmutable;
 use DateTimeInterface;
 use Illuminate\Database\Eloquent\Builder;
@@ -2340,6 +2341,12 @@ class LeaveWorkflowService
             ], 422);
         }
 
+        if ($pendingUpdateRequest === null && $this->hasPendingApprovedUpdateRequest($app)) {
+            return response()->json([
+                'message' => 'Cannot recall while there is a pending approved update request for this application.',
+            ], 422);
+        }
+
         $allowedStatuses = $pendingUpdateRequest instanceof LeaveApplicationUpdateRequest
             ? [LeaveApplication::STATUS_PENDING_HR, LeaveApplication::STATUS_APPROVED]
             : [LeaveApplication::STATUS_APPROVED];
@@ -2640,6 +2647,7 @@ class LeaveWorkflowService
         LeaveApplication $app,
         ?callable $policyResolver = null
     ): array {
+        $policyResolver = $policyResolver ?? fn (...$args) => $this->eligibilityService()->applyRegularLeavePolicy(...$args);
         $pendingRequest = $this->getPendingApprovedUpdateRequestRecord($app);
         if ($pendingRequest instanceof LeaveApplicationUpdateRequest) {
             return [
@@ -2668,6 +2676,7 @@ class LeaveWorkflowService
         LeaveApplication $app,
         ?callable $policyResolver = null
     ): array {
+        $policyResolver = $policyResolver ?? fn (...$args) => $this->eligibilityService()->applyRegularLeavePolicy(...$args);
         $latestRequest = $this->getLatestUpdateRequestRecord($app);
         if ($latestRequest instanceof LeaveApplicationUpdateRequest) {
             return [
@@ -8634,6 +8643,12 @@ class LeaveWorkflowService
             ], 422);
         }
 
+        if ($this->hasPendingApprovedUpdateRequest($app)) {
+            return response()->json([
+                'message' => 'Cannot recall while there is a pending approved update request for this application.',
+            ], 422);
+        }
+
         if ($app->status !== LeaveApplication::STATUS_APPROVED) {
             return response()->json([
                 'message' => "Cannot request recall: application status is '{$app->status}', expected 'APPROVED'.",
@@ -9441,6 +9456,495 @@ class LeaveWorkflowService
         ]);
     }
 
+    public function handleHrApplicationEditRequests(
+        Request $request,
+        ?callable $editRequestFormatter = null
+    ): JsonResponse {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can view application edit requests.'], 403);
+        }
+
+        return $this->executeHrApplicationEditRequests(
+            $hr,
+            $request->query('status'),
+            $editRequestFormatter
+        );
+    }
+
+    public function handleHrSaveApplicationEdit(
+        Request $request,
+        int $id,
+        ?callable $candidatesResolver = null,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $applicationFormatter = null,
+        ?callable $editRequestFormatter = null,
+        ?callable $lockSnapshotCallback = null,
+        ?callable $adminControlNoResolver = null
+    ): JsonResponse {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can edit leave applications.'], 403);
+        }
+
+        $validated = $request->validate([
+            'reason' => ['nullable', 'string', 'max:2000'],
+            'remarks' => ['nullable', 'string', 'max:2000'],
+            'pay_status_rows' => ['nullable', 'array', 'min:1'],
+            'payStatusRows' => ['nullable', 'array', 'min:1'],
+            'selected_dates' => ['nullable', 'array', 'min:1'],
+            'selectedDates' => ['nullable', 'array', 'min:1'],
+            'selected_date_pay_status' => ['nullable', 'array'],
+            'selectedDatePayStatus' => ['nullable', 'array'],
+            'selected_date_coverage' => ['nullable', 'array'],
+            'selectedDateCoverage' => ['nullable', 'array'],
+            'selected_date_half_day_portion' => ['nullable', 'array'],
+            'selectedDateHalfDayPortion' => ['nullable', 'array'],
+            'deductible_days_by_date' => ['nullable', 'array'],
+            'without_pay_days_by_date' => ['nullable', 'array'],
+            'allow_sl_vl_cross_deduction' => ['nullable', 'boolean'],
+        ]);
+
+        $app = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        return $this->executeHrSaveApplicationEdit(
+            $request,
+            $hr,
+            $app,
+            $validated,
+            $candidatesResolver,
+            $findEmployeeByControlNo,
+            $applicationFormatter,
+            $editRequestFormatter,
+            $lockSnapshotCallback,
+            $adminControlNoResolver
+        );
+    }
+
+    public function handleHrApproveApplicationEditRequest(
+        Request $request,
+        int $id,
+        ?callable $controlNoCandidatesResolver = null,
+        ?callable $findAdminEmployeeControlNo = null,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $editRequestFormatter = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can approve application edit requests.'], 403);
+        }
+
+        $validated = $request->validate([
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        return $this->executeHrApproveApplicationEditRequest(
+            $hr,
+            $id,
+            $validated['remarks'] ?? null,
+            $controlNoCandidatesResolver,
+            $findAdminEmployeeControlNo,
+            $findEmployeeByControlNo,
+            $editRequestFormatter,
+            $applicationFormatter
+        );
+    }
+
+    public function handleHrRejectApplicationEditRequest(
+        Request $request,
+        int $id,
+        ?callable $editRequestFormatter = null
+    ): JsonResponse {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can reject application edit requests.'], 403);
+        }
+
+        if (! $this->isHrAccessControlOwner($hr)) {
+            return response()->json(['message' => 'Only HR Admin accounts can reject application edit requests.'], 403);
+        }
+
+        $validated = $request->validate([
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $editRequest = LeaveApplicationUpdateRequest::query()
+            ->with(['leaveApplication.leaveType', 'reviewedByHr'])
+            ->find($id);
+        if (! $editRequest || ! $this->isHrApplicationEditRequestRecord($editRequest)) {
+            return response()->json(['message' => 'Application edit request not found.'], 404);
+        }
+
+        if (strtoupper(trim((string) $editRequest->status)) !== LeaveApplicationUpdateRequest::STATUS_PENDING) {
+            return response()->json(['message' => 'Only pending application edit requests can be rejected.'], 422);
+        }
+
+        $this->executeHrRejectApplicationEditRequest(
+            $editRequest,
+            $hr,
+            $validated['remarks'] ?? null
+        );
+
+        $editRequest->refresh()->load(['leaveApplication.leaveType', 'reviewedByHr']);
+
+        $formatter = $editRequestFormatter ?? fn (LeaveApplicationUpdateRequest $req): array => $this->formatHrApplicationEditRequest($req);
+
+        return response()->json([
+            'message' => 'Application edit request rejected.',
+            'edit_request' => $formatter($editRequest),
+        ]);
+    }
+
+    public function handleAdminApprove(
+        Request $request,
+        int $id,
+        ?callable $adminCanManageCallback = null,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $admin = $request->user();
+        if (! $admin instanceof DepartmentAdmin) {
+            return response()->json(['message' => 'Only department admins can approve applications.'], 403);
+        }
+
+        $request->validate([
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        return $this->executeAdminApprove(
+            $admin,
+            $id,
+            $request->input('remarks'),
+            $adminCanManageCallback,
+            $findEmployeeByControlNo,
+            $applicationFormatter
+        );
+    }
+
+    public function handleAdminReject(
+        Request $request,
+        int $id,
+        ?callable $adminCanManageCallback = null,
+        ?callable $smsCallback = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $admin = $request->user();
+        if (! $admin instanceof DepartmentAdmin) {
+            return response()->json(['message' => 'Only department admins can reject applications.'], 403);
+        }
+
+        $request->validate([
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        return $this->executeAdminReject(
+            $admin,
+            $id,
+            $request->input('remarks'),
+            $adminCanManageCallback,
+            $smsCallback,
+            $applicationFormatter
+        );
+    }
+
+    public function handleAdminRequestRecall(
+        Request $request,
+        int $id,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $admin = $request->user();
+        if (! $admin instanceof DepartmentAdmin) {
+            return response()->json(['message' => 'Only department admins can request recalls.'], 403);
+        }
+
+        $validated = $request->validate([
+            'recall_reason' => ['required', 'string', 'max:2000'],
+            'recall_selected_dates' => ['required', 'array', 'min:1'],
+            'recall_selected_dates.*' => ['required', 'date'],
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $app = LeaveApplication::with(['leaveType', 'applicantAdmin'])->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        return $this->executeAdminRequestRecall(
+            $admin,
+            $app,
+            $validated,
+            $findEmployeeByControlNo,
+            $applicationFormatter
+        );
+    }
+
+    public function handleExportReceivedApplications(
+        Request $request,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $validated = $request->validate([
+            'from_date' => ['nullable', 'date'],
+            'to_date' => ['nullable', 'date', 'after_or_equal:from_date'],
+        ]);
+
+        return $this->executeExportReceivedApplications(
+            $validated,
+            $applicationFormatter
+        );
+    }
+
+    public function handleExportReleasedApplications(
+        Request $request,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $validated = $request->validate([
+            'from_date' => ['nullable', 'date'],
+            'to_date' => ['nullable', 'date', 'after_or_equal:from_date'],
+        ]);
+
+        return $this->executeExportReleasedApplications(
+            $validated,
+            $applicationFormatter
+        );
+    }
+
+    public function handleHrCancelledApplications(
+        Request $request,
+        ?callable $actorDirectoryResolver = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $validated = $request->validate([
+            'tab' => ['nullable', 'string', 'in:ALL,APPROVED_CANCELLATION,EMPLOYEE_CANCELLED'],
+            'search' => ['nullable', 'string', 'max:255'],
+            'department' => ['nullable', 'string', 'max:255'],
+            'from_date' => ['nullable', 'date'],
+            'to_date' => ['nullable', 'date'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+            'page' => ['nullable', 'integer', 'min:1'],
+        ]);
+
+        return $this->executeHrCancelledApplications(
+            $validated,
+            $actorDirectoryResolver,
+            $applicationFormatter
+        );
+    }
+
+    public function handleExportCancelledApplications(
+        Request $request,
+        ?callable $actorDirectoryResolver = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $validated = $request->validate([
+            'tab' => ['nullable', 'string', 'in:ALL,APPROVED_CANCELLATION,EMPLOYEE_CANCELLED'],
+            'search' => ['nullable', 'string', 'max:255'],
+            'department' => ['nullable', 'string', 'max:255'],
+            'from_date' => ['nullable', 'date'],
+            'to_date' => ['nullable', 'date'],
+        ]);
+
+        return $this->executeExportCancelledApplications(
+            $validated,
+            $actorDirectoryResolver,
+            $applicationFormatter
+        );
+    }
+
+    public function handleHrReceiveUpdate(
+        Request $request,
+        int $id,
+        ?callable $actorDirectoryResolver = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can confirm received applications.'], 403);
+        }
+
+        $request->validate([
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $app = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        return $this->executeHrReceiveUpdate(
+            $app,
+            $hr,
+            $request->input('remarks'),
+            $actorDirectoryResolver,
+            $applicationFormatter
+        );
+    }
+
+    public function handleHrReleaseUpdate(
+        Request $request,
+        int $id,
+        ?callable $actorDirectoryResolver = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can confirm released applications.'], 403);
+        }
+
+        $request->validate([
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $app = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        return $this->executeHrReleaseUpdate(
+            $app,
+            $hr,
+            $request->input('remarks'),
+            $actorDirectoryResolver,
+            $applicationFormatter
+        );
+    }
+
+    public function handleHrApprove(
+        Request $request,
+        int $id,
+        ?callable $applicationEmployeeResolver = null,
+        ?callable $controlNoCandidatesResolver = null,
+        ?callable $findAdminEmployeeControlNo = null,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $lockSnapshotCallback = null,
+        ?callable $smsCallback = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can approve applications.'], 403);
+        }
+
+        $request->validate([
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $app = LeaveApplication::with('leaveType')->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        return $this->executeHrApprove(
+            $app,
+            $hr,
+            $request->input('remarks'),
+            $applicationEmployeeResolver,
+            $controlNoCandidatesResolver,
+            $findAdminEmployeeControlNo,
+            $findEmployeeByControlNo,
+            $lockSnapshotCallback,
+            $smsCallback,
+            $applicationFormatter
+        );
+    }
+
+    public function handleHrReject(
+        Request $request,
+        int $id,
+        ?callable $smsCallback = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can reject applications.'], 403);
+        }
+
+        $request->validate([
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $app = LeaveApplication::find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        return $this->executeHrReject(
+            $app,
+            $hr,
+            $request->input('remarks'),
+            $smsCallback,
+            $applicationFormatter
+        );
+    }
+
+    public function handleHrRecall(
+        Request $request,
+        int $id,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can recall applications.'], 403);
+        }
+
+        $validated = $request->validate([
+            'recall_reason' => ['required', 'string', 'max:2000'],
+            'recall_selected_dates' => ['required', 'array', 'min:1'],
+            'recall_selected_dates.*' => ['required', 'date'],
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $app = LeaveApplication::with('leaveType')->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $reason = trim((string) ($validated['recall_reason'] ?? $validated['remarks'] ?? ''));
+        $recallSelectedDates = is_array($validated['recall_selected_dates'] ?? null)
+            ? $validated['recall_selected_dates']
+            : [];
+
+        return $this->executeHrRecall(
+            $app,
+            $hr,
+            $reason,
+            $recallSelectedDates,
+            null,
+            null,
+            $applicationFormatter
+        );
+    }
+
     public function executeLogPrint(
         Request $request,
         int $id
@@ -9914,12 +10418,18 @@ class LeaveWorkflowService
         int $id,
         HRAccount $hr,
         array $validated,
-        LeaveApplicationDocumentVerificationService $documentVerificationService,
-        callable $actorDirectoryBuilder,
-        callable $applicationFormatter,
-        callable $isCancelledRemark,
-        callable $isPendingApprovedUpdateRequest
+        ?LeaveApplicationDocumentVerificationService $documentVerificationService = null,
+        ?callable $actorDirectoryBuilder = null,
+        ?callable $applicationFormatter = null,
+        ?callable $isCancelledRemark = null,
+        ?callable $isPendingApprovedUpdateRequest = null
     ): JsonResponse {
+        $documentVerificationService = $documentVerificationService ?? ($this->documentVerificationService ?? app(LeaveApplicationDocumentVerificationService::class));
+        $isCancelledRemark = $isCancelledRemark ?? fn ($r) => $this->isCancelledRemark($r);
+        $isPendingApprovedUpdateRequest = $isPendingApprovedUpdateRequest ?? fn ($app) => $this->isPendingApprovedUpdateRequest($app);
+        $actorDirectoryBuilder = $actorDirectoryBuilder ?? fn ($apps) => $this->buildWorkflowActorDirectory($apps);
+        $applicationFormatter = $applicationFormatter ?? fn ($app, $dir) => $this->formatErmsApplication($app, $dir);
+
         $verificationToken = trim((string) ($validated['verification_token'] ?? ''));
         $decodedToken = null;
         if ($verificationToken !== '') {
@@ -9981,12 +10491,18 @@ class LeaveWorkflowService
         int $id,
         HRAccount $hr,
         array $validated,
-        LeaveApplicationDocumentVerificationService $documentVerificationService,
-        callable $actorDirectoryBuilder,
-        callable $applicationFormatter,
-        callable $isCancelledRemark,
-        callable $isPendingApprovedUpdateRequest
+        ?LeaveApplicationDocumentVerificationService $documentVerificationService = null,
+        ?callable $actorDirectoryBuilder = null,
+        ?callable $applicationFormatter = null,
+        ?callable $isCancelledRemark = null,
+        ?callable $isPendingApprovedUpdateRequest = null
     ): JsonResponse {
+        $documentVerificationService = $documentVerificationService ?? ($this->documentVerificationService ?? app(LeaveApplicationDocumentVerificationService::class));
+        $isCancelledRemark = $isCancelledRemark ?? fn ($r) => $this->isCancelledRemark($r);
+        $isPendingApprovedUpdateRequest = $isPendingApprovedUpdateRequest ?? fn ($app) => $this->isPendingApprovedUpdateRequest($app);
+        $actorDirectoryBuilder = $actorDirectoryBuilder ?? fn ($apps) => $this->buildWorkflowActorDirectory($apps);
+        $applicationFormatter = $applicationFormatter ?? fn ($app, $dir) => $this->formatErmsApplication($app, $dir);
+
         $verificationToken = trim((string) ($validated['verification_token'] ?? ''));
         $decodedToken = null;
         if ($verificationToken !== '') {
@@ -10052,10 +10568,14 @@ class LeaveWorkflowService
 
     public function executeHrUndoReceive(
         int $id,
-        callable $cycleRequestedAtResolver,
-        callable $actorDirectoryBuilder,
-        callable $applicationFormatter
+        ?callable $cycleRequestedAtResolver = null,
+        ?callable $actorDirectoryBuilder = null,
+        ?callable $applicationFormatter = null
     ): JsonResponse {
+        $cycleRequestedAtResolver = $cycleRequestedAtResolver ?? fn ($app) => $this->resolveCurrentHrDocumentCycleRequestedAt($app);
+        $actorDirectoryBuilder = $actorDirectoryBuilder ?? fn ($apps) => $this->buildWorkflowActorDirectory($apps);
+        $applicationFormatter = $applicationFormatter ?? fn ($app, $dir) => $this->formatErmsApplication($app, $dir);
+
         $app = LeaveApplication::query()
             ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
             ->find($id);
@@ -10084,10 +10604,14 @@ class LeaveWorkflowService
 
     public function executeHrUndoRelease(
         int $id,
-        callable $cycleRequestedAtResolver,
-        callable $actorDirectoryBuilder,
-        callable $applicationFormatter
+        ?callable $cycleRequestedAtResolver = null,
+        ?callable $actorDirectoryBuilder = null,
+        ?callable $applicationFormatter = null
     ): JsonResponse {
+        $cycleRequestedAtResolver = $cycleRequestedAtResolver ?? fn ($app) => $this->resolveCurrentHrDocumentCycleRequestedAt($app);
+        $actorDirectoryBuilder = $actorDirectoryBuilder ?? fn ($apps) => $this->buildWorkflowActorDirectory($apps);
+        $applicationFormatter = $applicationFormatter ?? fn ($app, $dir) => $this->formatErmsApplication($app, $dir);
+
         $app = LeaveApplication::query()
             ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
             ->find($id);
@@ -10114,10 +10638,13 @@ class LeaveWorkflowService
         int $id,
         HRAccount $hr,
         ?string $remarks,
-        callable $smsNotificationCallback,
-        callable $actorDirectoryBuilder,
-        callable $applicationFormatter
+        ?callable $smsNotificationCallback = null,
+        ?callable $actorDirectoryBuilder = null,
+        ?callable $applicationFormatter = null
     ): JsonResponse {
+        $actorDirectoryBuilder = $actorDirectoryBuilder ?? fn ($apps) => $this->buildWorkflowActorDirectory($apps);
+        $applicationFormatter = $applicationFormatter ?? fn ($app, $dir) => $this->formatErmsApplication($app, $dir);
+
         $app = LeaveApplication::query()
             ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
             ->find($id);
@@ -10167,6 +10694,17 @@ class LeaveWorkflowService
             if (is_callable($pendingUpdateRejectHandler)) {
                 return $pendingUpdateRejectHandler($app);
             }
+
+            $policyResolver = fn (...$args) => $this->eligibilityService()->applyRegularLeavePolicy(...$args);
+            $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app, $policyResolver);
+
+            return $this->executeHrRejectPendingUpdateRequest(
+                $app,
+                $hr,
+                $remarks,
+                $pendingUpdateMeta,
+                $applicationFormatter
+            );
         }
 
         $this->hrRejectApplication($app, $hr, $remarks);
@@ -10923,5 +11461,833 @@ class LeaveWorkflowService
         }
 
         return $data;
+    }
+
+    public function normalizeSelectedDatesInput(Request $request): void
+    {
+        $selectedDates = $request->input('selected_dates');
+        if (is_string($selectedDates)) {
+            $decoded = json_decode($selectedDates, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                $selectedDates = $decoded;
+            }
+        }
+
+        if ($selectedDates !== null && $selectedDates !== '') {
+            $request->merge(['selected_dates' => $selectedDates]);
+        }
+    }
+
+    public function normalizeSelectedDatePolicyInput(Request $request): void
+    {
+        $selectedDateCoverage = $request->input('selected_date_coverage');
+        if ($selectedDateCoverage === null || $selectedDateCoverage === '') {
+            $selectedDateCoverage = $request->input('selected_date_coverages');
+        }
+
+        $selectedDateHalfDayPortion = $request->input('selected_date_half_day_portion');
+        if ($selectedDateHalfDayPortion === null || $selectedDateHalfDayPortion === '') {
+            $selectedDateHalfDayPortion = $request->input('selectedDateHalfDayPortion');
+        }
+        if ($selectedDateHalfDayPortion === null || $selectedDateHalfDayPortion === '') {
+            $selectedDateHalfDayPortion = $request->input('selected_date_half_day_period');
+        }
+        if ($selectedDateHalfDayPortion === null || $selectedDateHalfDayPortion === '') {
+            $selectedDateHalfDayPortion = $request->input('selectedDateHalfDayPeriod');
+        }
+        if ($selectedDateHalfDayPortion === null || $selectedDateHalfDayPortion === '') {
+            $selectedDateHalfDayPortion = $request->input('selected_date_halfday_period');
+        }
+        if ($selectedDateHalfDayPortion === null || $selectedDateHalfDayPortion === '') {
+            $selectedDateHalfDayPortion = $request->input('selected_date_half_day_portions');
+        }
+
+        $normalizedCoverage = $this->calculationService->normalizeSelectedDateCoverageMap($selectedDateCoverage);
+        $normalizedHalfDayPortion = $this->calculationService->mergeSelectedDateHalfDayPortionMaps(
+            $this->calculationService->normalizeSelectedDateHalfDayPortionMap($selectedDateHalfDayPortion),
+            $this->calculationService->normalizeSelectedDateHalfDayPortionMap($selectedDateCoverage)
+        );
+
+        if (is_array($normalizedHalfDayPortion) && $normalizedHalfDayPortion !== []) {
+            $coverageMap = is_array($normalizedCoverage) ? $normalizedCoverage : [];
+            foreach (array_keys($normalizedHalfDayPortion) as $dateKey) {
+                $coverageMap[$dateKey] = 'half';
+            }
+            ksort($coverageMap);
+            $normalizedCoverage = $coverageMap;
+        }
+
+        if ($normalizedCoverage !== null) {
+            $request->merge(['selected_date_coverage' => $normalizedCoverage]);
+        }
+
+        if ($normalizedHalfDayPortion !== null) {
+            $request->merge(['selected_date_half_day_portion' => $normalizedHalfDayPortion]);
+        }
+    }
+
+    public function mergeEmployeeControlNoInput(Request $request): void
+    {
+        $employeeControlNo = trim((string) $request->input('employee_control_no', ''));
+        if ($employeeControlNo === '') {
+            return;
+        }
+
+        $request->merge([
+            'employee_control_no' => $employeeControlNo,
+        ]);
+    }
+
+    public function resolveValidatedEmployeeControlNo(array $validated): string
+    {
+        return trim((string) ($validated['employee_control_no'] ?? ''));
+    }
+
+    public function employeeControlNoResponse(?string $controlNo): array
+    {
+        $normalized = trim((string) ($controlNo ?? ''));
+
+        return [
+            'employee_control_no' => $normalized !== '' ? $normalized : null,
+        ];
+    }
+
+    public function validateRegularLeaveSubmissionInput(Request $request, bool $isTerminalLeave, bool $requireEmployeeControlNo = false): array
+    {
+        $rules = [
+            'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
+            'start_date' => $isTerminalLeave ? ['nullable', 'date'] : ['required', 'date'],
+            'end_date' => $isTerminalLeave ? ['nullable', 'date'] : ['required', 'date', 'after_or_equal:start_date'],
+            'total_days' => ['required', 'numeric', 'min:0.5', 'max:'.($isTerminalLeave ? '999' : '365')],
+            'reason' => ['nullable', 'string', 'max:2000'],
+            'details_of_leave' => ['nullable', 'string', 'max:2000'],
+            'selected_dates' => ['nullable', 'array'],
+            'selected_dates.*' => ['date'],
+            'selected_date_pay_status' => ['nullable', 'array'],
+            'selected_date_pay_status.*' => ['nullable', 'string', 'in:WP,WOP'],
+            'selected_date_coverage' => ['nullable', 'array'],
+            'selected_date_coverage.*' => ['nullable', 'string', 'in:whole,half'],
+            'selected_date_half_day_portion' => ['nullable', 'array'],
+            'selected_date_half_day_portion.*' => ['nullable', 'string', 'in:AM,PM'],
+            'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
+            'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
+            'allow_sl_vl_cross_deduction' => ['nullable', 'boolean'],
+            'attachment' => ['nullable', 'file', 'max:10240'],
+            'attachment_submitted' => ['nullable', 'boolean'],
+            'attachment_attached' => ['nullable', 'boolean'],
+            'has_attachment' => ['nullable', 'boolean'],
+            'with_attachment' => ['nullable', 'boolean'],
+            'attachment_reference' => ['nullable', 'string', 'max:500'],
+        ];
+
+        if ($requireEmployeeControlNo) {
+            $rules['employee_control_no'] = ['required', 'string', 'regex:/^\d+$/'];
+        }
+
+        return $request->validate($rules);
+    }
+
+    public function validateMonetizationSubmissionInput(Request $request): array
+    {
+        $this->mergeEmployeeControlNoInput($request);
+
+        return $request->validate([
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
+            'leave_type_id' => ['required', 'integer', 'exists:tblLeaveTypes,id'],
+            'total_days' => ['required', 'numeric', 'min:'.LeaveApplication::MONETIZATION_MINIMUM_REQUEST_DAYS, 'max:999'],
+            'monetization_leave_credits' => ['nullable', 'array', 'min:1', 'max:2'],
+            'monetization_leave_credits.*.leave_type_id' => ['required_with:monetization_leave_credits', 'integer', 'exists:tblLeaveTypes,id'],
+            'monetization_leave_credits.*.days' => ['required_with:monetization_leave_credits', 'numeric', 'min:0', 'max:999'],
+            'reason' => ['nullable', 'string', 'max:2000'],
+            'details_of_leave' => ['nullable', 'string', 'max:2000'],
+            'salary' => ['nullable', 'numeric', 'min:0'],
+            'attachment' => ['nullable', 'file', 'max:10240'],
+            'attachment_submitted' => ['nullable', 'boolean'],
+            'attachment_attached' => ['nullable', 'boolean'],
+            'has_attachment' => ['nullable', 'boolean'],
+            'with_attachment' => ['nullable', 'boolean'],
+            'attachment_reference' => ['nullable', 'string', 'max:500'],
+        ]);
+    }
+
+    public function executeErmsStore(
+        Request $request,
+        ?callable $candidatesResolver = null,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $applicationFormatter = null,
+        ?callable $assertErmsEmployeeIsPulled = null
+    ): JsonResponse {
+        $this->normalizeSelectedDatesInput($request);
+        $this->normalizeSelectedDatePolicyInput($request);
+        $this->mergeEmployeeControlNoInput($request);
+
+        $baseValidated = $request->validate([
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
+            'is_monetization' => ['nullable', 'boolean'],
+        ]);
+
+        $controlNo = $this->resolveValidatedEmployeeControlNo($baseValidated);
+        $employee = $findEmployeeByControlNo !== null
+            ? $findEmployeeByControlNo($controlNo)
+            : $this->eligibilityService()->findEmployeeByControlNo($controlNo);
+
+        if (! $employee) {
+            return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+
+        if ($assertErmsEmployeeIsPulled !== null) {
+            $pulledAccess = $assertErmsEmployeeIsPulled((string) $employee->control_no);
+            if ($pulledAccess instanceof JsonResponse) {
+                return $pulledAccess;
+            }
+        }
+
+        $actor = (object) ['id' => (int) ltrim((string) $employee->control_no, '0')];
+        $isMonetization = (bool) ($baseValidated['is_monetization'] ?? false);
+
+        if ($isMonetization) {
+            $validated = $this->validateMonetizationSubmissionInput($request);
+
+            return $this->executeMonetizationSubmission(
+                $request,
+                $validated,
+                $actor,
+                $employee,
+                false,
+                $candidatesResolver,
+                $findEmployeeByControlNo,
+                $applicationFormatter
+            );
+        }
+
+        $leaveTypeId = (int) $request->input('leave_type_id');
+        $canonicalId = $this->creditService->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+        $isTerminalLeave = $this->creditService->isTerminalLeaveTypeId($canonicalId);
+
+        $validated = $this->validateRegularLeaveSubmissionInput($request, $isTerminalLeave, false);
+
+        return $this->executeRegularLeaveSubmission(
+            $request,
+            $validated,
+            $actor,
+            $employee,
+            false,
+            $candidatesResolver,
+            $findEmployeeByControlNo,
+            $applicationFormatter
+        );
+    }
+
+    public function executeStore(
+        Request $request,
+        ?callable $candidatesResolver = null,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $this->normalizeSelectedDatesInput($request);
+        $this->normalizeSelectedDatePolicyInput($request);
+
+        $account = $request->user();
+        if (! is_object($account)) {
+            return response()->json(['message' => 'Only employee accounts can submit leave applications.'], 403);
+        }
+
+        $this->mergeEmployeeControlNoInput($request);
+
+        $baseValidated = $request->validate([
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
+            'is_monetization' => ['nullable', 'boolean'],
+        ]);
+
+        $employee = $findEmployeeByControlNo !== null
+            ? $findEmployeeByControlNo($this->resolveValidatedEmployeeControlNo($baseValidated))
+            : $this->eligibilityService()->findEmployeeByControlNo($this->resolveValidatedEmployeeControlNo($baseValidated));
+
+        if (! $employee) {
+            return response()->json(['error' => 'Employee not found'], 404);
+        }
+
+        $isMonetization = (bool) ($baseValidated['is_monetization'] ?? false);
+
+        if ($isMonetization) {
+            $validated = $this->validateMonetizationSubmissionInput($request);
+
+            return $this->executeMonetizationSubmission(
+                $request,
+                $validated,
+                $account,
+                $employee,
+                false,
+                $candidatesResolver,
+                $findEmployeeByControlNo,
+                $applicationFormatter
+            );
+        }
+
+        $leaveTypeId = (int) $request->input('leave_type_id');
+        $canonicalId = $this->creditService->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+        $isTerminalLeave = $this->creditService->isTerminalLeaveTypeId($canonicalId);
+
+        $validated = $this->validateRegularLeaveSubmissionInput($request, $isTerminalLeave, true);
+
+        return $this->executeRegularLeaveSubmission(
+            $request,
+            $validated,
+            $account,
+            $employee,
+            false,
+            $candidatesResolver,
+            $findEmployeeByControlNo,
+            $applicationFormatter
+        );
+    }
+
+    public function executeAdminStore(
+        Request $request,
+        DepartmentAdmin $admin,
+        ?callable $candidatesResolver = null,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $this->normalizeSelectedDatesInput($request);
+        $this->normalizeSelectedDatePolicyInput($request);
+
+        $isMonetization = (bool) $request->input('is_monetization', false);
+
+        if ($isMonetization) {
+            $validated = $this->validateMonetizationSubmissionInput($request);
+
+            return $this->executeMonetizationSubmission(
+                $request,
+                $validated,
+                $admin,
+                null,
+                true,
+                $candidatesResolver,
+                $findEmployeeByControlNo,
+                $applicationFormatter
+            );
+        }
+
+        $leaveTypeId = (int) $request->input('leave_type_id');
+        $canonicalId = $this->creditService->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+        $isTerminalLeave = $this->creditService->isTerminalLeaveTypeId($canonicalId);
+
+        $validated = $this->validateRegularLeaveSubmissionInput($request, $isTerminalLeave, true);
+
+        return $this->executeRegularLeaveSubmission(
+            $request,
+            $validated,
+            $admin,
+            null,
+            true,
+            $candidatesResolver,
+            $findEmployeeByControlNo,
+            $applicationFormatter
+        );
+    }
+
+    public function assertErmsRequestEmployee(
+        Request $request,
+        ?int $routeId,
+        array $validated,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $assertErmsEmployeeIsPulled = null
+    ): array|JsonResponse {
+        $applicationId = (int) $validated['leave_application_id'];
+        if ($routeId !== null && $applicationId !== $routeId) {
+            return response()->json([
+                'message' => 'Route ID and payload leave_application_id must match.',
+            ], 422);
+        }
+
+        $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
+        $employee = $findEmployeeByControlNo !== null
+            ? $findEmployeeByControlNo($controlNo)
+            : $this->eligibilityService()->findEmployeeByControlNo($controlNo);
+
+        if (! $employee) {
+            return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+
+        if ($assertErmsEmployeeIsPulled !== null) {
+            $pulledAccess = $assertErmsEmployeeIsPulled((string) $employee->control_no);
+            if ($pulledAccess instanceof JsonResponse) {
+                return $pulledAccess;
+            }
+        }
+
+        return ['employee' => $employee, 'control_no' => $controlNo, 'application_id' => $applicationId];
+    }
+
+    public function handleErmsCancel(
+        Request $request,
+        ?int $id,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $assertErmsEmployeeIsPulled = null,
+        ?callable $ownershipFilter = null,
+        ?callable $statusLabelResolver = null,
+        ?callable $actorDirectoryBuilder = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $routeId = $id;
+
+        $request->merge(array_filter([
+            'leave_application_id' => $request->input('leave_application_id') ?? $routeId,
+        ], static fn ($value) => $value !== null && $value !== ''));
+
+        $this->mergeEmployeeControlNoInput($request);
+
+        $validated = $request->validate([
+            'leave_application_id' => ['required', 'integer'],
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
+            'cancellation_reason' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $res = $this->assertErmsRequestEmployee($request, $routeId, $validated, $findEmployeeByControlNo, $assertErmsEmployeeIsPulled);
+        if ($res instanceof JsonResponse) {
+            return $res;
+        }
+
+        return $this->executeErmsCancel(
+            (int) $validated['leave_application_id'],
+            $res['employee'],
+            $res['control_no'],
+            (string) ($validated['cancellation_reason'] ?? ''),
+            $ownershipFilter ?? fn ($query, $no) => $query->where('employee_control_no', $no),
+            $statusLabelResolver ?? fn ($status) => $this->ermsStatusLabel($status),
+            $actorDirectoryBuilder ?? fn ($apps) => $this->buildWorkflowActorDirectory($apps),
+            $applicationFormatter ?? fn ($app, $dir) => $this->formatErmsApplication($app, $dir)
+        );
+    }
+
+    public function handleErmsRequestCancel(
+        Request $request,
+        ?int $id,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $assertErmsEmployeeIsPulled = null,
+        ?callable $candidatesResolver = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $routeId = $id;
+
+        $request->merge(array_filter([
+            'leave_application_id' => $request->input('leave_application_id') ?? $routeId,
+        ], static fn ($value) => $value !== null && $value !== ''));
+
+        $this->mergeEmployeeControlNoInput($request);
+
+        $validated = $request->validate([
+            'leave_application_id' => ['required', 'integer'],
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
+            'cancellation_reason' => ['nullable', 'string', 'max:2000'],
+            'remarks' => ['nullable', 'string', 'max:2000'],
+            'reason' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $res = $this->assertErmsRequestEmployee($request, $routeId, $validated, $findEmployeeByControlNo, $assertErmsEmployeeIsPulled);
+        if ($res instanceof JsonResponse) {
+            return $res;
+        }
+
+        return $this->executeErmsRequestCancel(
+            $validated,
+            $res['employee'],
+            $res['control_no'],
+            $candidatesResolver,
+            $findEmployeeByControlNo,
+            $applicationFormatter
+        );
+    }
+
+    public function handleErmsWithdrawRequest(
+        Request $request,
+        ?int $id,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $assertErmsEmployeeIsPulled = null,
+        ?callable $candidatesResolver = null,
+        ?callable $ermsApplicationFormatter = null,
+        ?callable $actorDirectoryBuilder = null
+    ): JsonResponse {
+        $routeId = $id;
+
+        $request->merge(array_filter([
+            'leave_application_id' => $request->input('leave_application_id') ?? $routeId,
+        ], static fn ($value) => $value !== null && $value !== ''));
+
+        $this->mergeEmployeeControlNoInput($request);
+
+        $validated = $request->validate([
+            'leave_application_id' => ['required', 'integer'],
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
+            'remarks' => ['nullable', 'string', 'max:2000'],
+            'reason' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $res = $this->assertErmsRequestEmployee($request, $routeId, $validated, $findEmployeeByControlNo, $assertErmsEmployeeIsPulled);
+        if ($res instanceof JsonResponse) {
+            return $res;
+        }
+
+        return $this->executeErmsWithdrawRequest(
+            $validated,
+            $res['employee'],
+            $res['control_no'],
+            $candidatesResolver,
+            $ermsApplicationFormatter,
+            $actorDirectoryBuilder
+        );
+    }
+
+    public function handleErmsRequestUpdate(
+        Request $request,
+        ?int $id,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $assertErmsEmployeeIsPulled = null,
+        ?callable $candidatesResolver = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $this->normalizeSelectedDatesInput($request);
+        $this->normalizeSelectedDatePolicyInput($request);
+
+        $routeId = $id;
+
+        $request->merge(array_filter([
+            'leave_application_id' => $request->input('leave_application_id') ?? $routeId,
+        ], static fn ($value) => $value !== null && $value !== ''));
+
+        $this->mergeEmployeeControlNoInput($request);
+
+        $validated = $request->validate([
+            'leave_application_id' => ['required', 'integer'],
+            'employee_control_no' => ['required', 'string', 'regex:/^\d+$/'],
+            'request_update' => ['nullable', 'boolean'],
+            'edit_reason' => ['nullable', 'string', 'max:2000'],
+            'update_reason' => ['nullable', 'string', 'max:2000'],
+            'remarks' => ['nullable', 'string', 'max:2000'],
+            'reason' => ['nullable', 'string', 'max:2000'],
+            'reason_purpose' => ['nullable', 'string', 'max:2000'],
+            'details_of_leave' => ['nullable', 'string', 'max:2000'],
+            'leave_type_id' => ['nullable', 'integer', 'exists:tblLeaveTypes,id'],
+            'start_date' => ['nullable', 'date'],
+            'end_date' => ['nullable', 'date', 'after_or_equal:start_date'],
+            'selected_dates' => ['nullable', 'array'],
+            'selected_dates.*' => ['date'],
+            'selected_date_pay_status' => ['nullable', 'array'],
+            'selected_date_pay_status.*' => ['nullable', 'string', 'in:WP,WOP'],
+            'selected_date_coverage' => ['nullable', 'array'],
+            'selected_date_coverage.*' => ['nullable', 'string', 'in:whole,half'],
+            'selected_date_half_day_portion' => ['nullable', 'array'],
+            'selected_date_half_day_portion.*' => ['nullable', 'string', 'in:AM,PM'],
+            'total_days' => ['nullable', 'numeric', 'min:0.5', 'max:365'],
+            'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
+            'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
+            'allow_sl_vl_cross_deduction' => ['nullable', 'boolean'],
+            'attachment' => ['nullable', 'file', 'max:10240'],
+            'attachment_submitted' => ['nullable', 'boolean'],
+            'attachment_attached' => ['nullable', 'boolean'],
+            'has_attachment' => ['nullable', 'boolean'],
+            'with_attachment' => ['nullable', 'boolean'],
+            'attachment_reference' => ['nullable', 'string', 'max:500'],
+            'is_monetization' => ['nullable', 'boolean'],
+        ]);
+
+        $res = $this->assertErmsRequestEmployee($request, $routeId, $validated, $findEmployeeByControlNo, $assertErmsEmployeeIsPulled);
+        if ($res instanceof JsonResponse) {
+            return $res;
+        }
+
+        return $this->executeErmsRequestUpdate(
+            $request,
+            $validated,
+            $res['employee'],
+            $res['control_no'],
+            $candidatesResolver,
+            $findEmployeeByControlNo,
+            $applicationFormatter
+        );
+    }
+
+    public function formatErmsEmployeeContext(object $employee): array
+    {
+        $statusKey = $this->eligibilityService()->resolveEmploymentStatusKey($employee->status ?? null);
+        $resolvedSchedule = $this->calculationService->workScheduleService->resolveScheduleForEmployee(
+            (string) ($employee->control_no ?? '')
+        );
+
+        return [
+            'control_no' => (string) ($employee->control_no ?? ''),
+            'firstname' => $employee->firstname ?? null,
+            'surname' => $employee->surname ?? null,
+            'middlename' => $employee->middlename ?? null,
+            'office' => $employee->office ?? null,
+            'designation' => $employee->designation ?? null,
+            'status' => $this->eligibilityService()->formatEmploymentStatusLabel($employee->status ?? null),
+            'raw_status' => $this->trimNullableString($employee->status ?? null),
+            'employment_status_key' => $statusKey,
+            'ui_variant' => $statusKey === LeaveType::EMPLOYMENT_STATUS_CONTRACTUAL ? 'contractual' : 'default',
+            'allowed_leave_scope' => $this->eligibilityService()->employeeHasResolvedEmploymentStatus($employee) ? 'configured' : 'unverified',
+            'is_contractual' => $statusKey === LeaveType::EMPLOYMENT_STATUS_CONTRACTUAL,
+            'working_hours_per_day' => round((float) ($resolvedSchedule['working_hours_per_day'] ?? WorkScheduleService::STANDARD_WORKDAY_HOURS), 2),
+            'whole_day_leave_deduction' => round((float) ($resolvedSchedule['whole_day_leave_deduction'] ?? 1.0), 3),
+            'half_day_leave_deduction' => round((float) ($resolvedSchedule['half_day_leave_deduction'] ?? 0.5), 3),
+        ];
+    }
+
+    public function getAllowedErmsLeaveTypesForEmployee(object $employee): Collection
+    {
+        return LeaveType::query()
+            ->withoutLegacySpecialPrivilegeAliases()
+            ->orderBy('name')
+            ->get([
+                'id',
+                'name',
+                'category',
+                'max_days',
+                'is_credit_based',
+                'requires_documents',
+                'allowed_status',
+            ])
+            ->filter(fn (LeaveType $leaveType): bool => ! $this->eligibilityService()->employeeHasResolvedEmploymentStatus($employee)
+                || $leaveType->allowsEmploymentStatus($employee->status ?? null))
+            ->map(fn (LeaveType $leaveType): array => [
+                'id' => (int) $leaveType->id,
+                'name' => $leaveType->name,
+                'category' => $leaveType->category,
+                'max_days' => $leaveType->max_days !== null ? (int) $leaveType->max_days : null,
+                'is_credit_based' => (bool) $leaveType->is_credit_based,
+                'requires_documents' => (bool) $leaveType->requires_documents,
+                'allowed_status' => $leaveType->normalizedAllowedStatuses(),
+                'allowed_status_labels' => $leaveType->allowedStatusLabels(),
+            ])
+            ->values();
+    }
+
+    public function handleHrUpdatePayStatus(
+        Request $request,
+        int $id,
+        ?callable $employeeResolver = null,
+        ?callable $candidatesResolver = null,
+        ?callable $adminControlNoResolver = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can override pay status.'], 403);
+        }
+
+        $validated = $request->validate([
+            'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
+            'allow_sl_vl_cross_deduction' => ['nullable', 'boolean'],
+            'selected_date_pay_status' => ['nullable', 'array'],
+            'selected_date_pay_status.*' => ['nullable', 'string', 'in:WP,WOP'],
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $app = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $rawSelectedDatePayStatus = array_key_exists('selected_date_pay_status', $validated)
+            ? $validated['selected_date_pay_status']
+            : $request->input('selected_date_pay_status');
+        $requestedAllowSlVlCrossDeduction = $this->resolveRequestSlVlCrossDeductionFlag(
+            $request,
+            $validated,
+            (bool) ($app->allow_sl_vl_cross_deduction ?? false)
+        );
+        $requestedPayMode = $this->resolveRequestedPayMode(
+            $request,
+            $validated,
+            false,
+            $app->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY
+        );
+
+        return $this->executeHrUpdatePayStatus(
+            $app,
+            $hr,
+            is_array($rawSelectedDatePayStatus) ? $rawSelectedDatePayStatus : null,
+            $requestedPayMode,
+            $requestedAllowSlVlCrossDeduction,
+            $request->has('allow_sl_vl_cross_deduction'),
+            $request->input('remarks'),
+            $employeeResolver,
+            $candidatesResolver,
+            $adminControlNoResolver,
+            $applicationFormatter
+        );
+    }
+
+    public function handleHrBulkCmoCbmoReview(
+        Request $request,
+        ?callable $smsSender = null,
+        ?callable $actorDirectoryBuilder = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can confirm CMO/CVMO review.'], 403);
+        }
+
+        $validated = $request->validate([
+            'ids' => ['required', 'array', 'min:1', 'max:500'],
+            'ids.*' => ['required', 'integer', 'min:1'],
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $ids = array_values(array_unique(array_filter(array_map('intval', $validated['ids']))));
+        if (empty($ids)) {
+            return response()->json(['message' => 'No valid application IDs provided.'], 422);
+        }
+
+        $remarks = trim((string) ($validated['remarks'] ?? '')) ?: 'CMO/CVMO review completed.';
+
+        $applications = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->whereIn('id', $ids)
+            ->get();
+
+        $result = $this->executeHrBulkCmoCbmoReview(
+            $applications,
+            $hr,
+            $remarks,
+            $smsSender
+        );
+
+        $processedCount = $result['processed_count'];
+        $actorDirectory = $actorDirectoryBuilder !== null
+            ? $actorDirectoryBuilder($applications)
+            : $this->buildWorkflowActorDirectory($applications);
+        $formattedApplications = $applications->map(
+            fn (LeaveApplication $application) => $applicationFormatter !== null
+                ? $applicationFormatter($application, $actorDirectory)
+                : $this->formatErmsApplication($application, $actorDirectory)
+        )->values();
+
+        return response()->json([
+            'message' => "Successfully processed {$processedCount} leave application(s) for CMO/CVMO review.",
+            'processed_count' => $processedCount,
+            'skipped_count' => $result['skipped_count'],
+            'processed_ids' => $result['processed_ids'],
+            'applications' => $formattedApplications,
+        ]);
+    }
+
+    public function handleHrBulkRelease(
+        Request $request,
+        ?callable $actorDirectoryBuilder = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can confirm released applications.'], 403);
+        }
+
+        $validated = $request->validate([
+            'ids' => ['required', 'array', 'min:1', 'max:500'],
+            'ids.*' => ['required', 'integer', 'min:1'],
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $ids = array_values(array_unique(array_filter(array_map('intval', $validated['ids']))));
+        if (empty($ids)) {
+            return response()->json(['message' => 'No valid application IDs provided.'], 422);
+        }
+
+        $remarks = trim((string) ($validated['remarks'] ?? '')) ?: 'Released hard copy leave application form.';
+
+        $applications = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->whereIn('id', $ids)
+            ->get();
+
+        $result = $this->executeHrBulkRelease(
+            $applications,
+            $hr,
+            $remarks
+        );
+
+        $processedCount = $result['processed_count'];
+        $actorDirectory = $actorDirectoryBuilder !== null
+            ? $actorDirectoryBuilder($applications)
+            : $this->buildWorkflowActorDirectory($applications);
+        $formattedApplications = $applications->map(
+            fn (LeaveApplication $application) => $applicationFormatter !== null
+                ? $applicationFormatter($application, $actorDirectory)
+                : $this->formatErmsApplication($application, $actorDirectory)
+        )->values();
+
+        return response()->json([
+            'message' => "Successfully released {$processedCount} leave application(s).",
+            'processed_count' => $processedCount,
+            'skipped_count' => $result['skipped_count'],
+            'processed_ids' => $result['processed_ids'],
+            'applications' => $formattedApplications,
+        ]);
+    }
+
+    public function executeHrViewAttachment(
+        Request $request,
+        int $id
+    ) {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $application = LeaveApplication::query()
+            ->where(function ($query): void {
+                $query
+                    ->where('status', '!=', LeaveApplication::STATUS_PENDING_ADMIN)
+                    ->orWhere(function ($nestedQuery): void {
+                        $nestedQuery
+                            ->where('status', LeaveApplication::STATUS_PENDING_ADMIN)
+                            ->whereHas('updateRequests', function ($updateRequestQuery): void {
+                                $updateRequestQuery
+                                    ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
+                                    ->whereRaw(
+                                        'UPPER(LTRIM(RTRIM(COALESCE(previous_status, ?)))) = ?',
+                                        ['', LeaveApplication::STATUS_APPROVED]
+                                    );
+                            });
+                    });
+            })
+            ->find($id);
+        if (! $application) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        return $this->streamApplicationAttachment($application);
+    }
+
+    public function executeAdminViewAttachment(
+        Request $request,
+        int $id,
+        ?callable $adminCanManageCallback = null
+    ) {
+        $admin = $request->user();
+        if (! $admin instanceof DepartmentAdmin) {
+            return response()->json(['message' => 'Only department admins can access this endpoint.'], 403);
+        }
+
+        $admin->loadMissing('department');
+        $application = LeaveApplication::query()
+            ->find($id);
+        if (! $application) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $canManage = $adminCanManageCallback !== null
+            ? $adminCanManageCallback($admin, $application)
+            : $this->adminCanManageApplication($admin, $application);
+
+        if (! $canManage) {
+            return response()->json(['message' => 'You can only view attachments from your department.'], 403);
+        }
+
+        return $this->streamApplicationAttachment($application);
     }
 }
