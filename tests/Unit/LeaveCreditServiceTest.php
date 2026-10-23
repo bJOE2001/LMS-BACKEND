@@ -289,4 +289,62 @@ class LeaveCreditServiceTest extends TestCase
             $this->service->resolveTrackedLeaveBalanceBeforeApplicationDeduction($app, null, 2.5)
         );
     }
+
+    public function test_empty_erms_leave_balance_payload(): void
+    {
+        $payload = $this->service->emptyErmsLeaveBalancePayload('Vacation Leave');
+        $this->assertNull($payload['leave_type_id']);
+        $this->assertSame('Vacation Leave', $payload['leave_type_name']);
+        $this->assertSame(0.0, $payload['balance']);
+        $this->assertSame([], $payload['credit_history']);
+    }
+
+    public function test_merge_credit_histories_by_type(): void
+    {
+        $group1 = [
+            1 => [
+                ['accrual_date' => '2026-01-01', 'credits_added' => 1.25],
+            ],
+        ];
+        $group2 = [
+            1 => [
+                ['accrual_date' => '2026-02-01', 'credits_added' => 1.25],
+            ],
+            2 => [
+                ['accrual_date' => '2026-02-01', 'credits_added' => 1.0],
+            ],
+        ];
+
+        $merged = $this->service->mergeCreditHistoriesByType($group1, $group2);
+        $this->assertCount(2, $merged[1]);
+        $this->assertCount(1, $merged[2]);
+    }
+
+    public function test_execute_get_leave_balance_not_found(): void
+    {
+        $res = $this->service->executeGetLeaveBalance('99999', 1);
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Employee record not found.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_erms_get_leave_balance_not_found(): void
+    {
+        $res = $this->service->executeErmsGetLeaveBalance('99999', 1);
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Employee record not found.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_erms_get_leave_balances_invalid_control_no(): void
+    {
+        $res = $this->service->executeErmsGetLeaveBalances('invalid-control-no');
+        $this->assertSame(422, $res->getStatusCode());
+        $this->assertSame('Invalid control number.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_erms_get_leave_balances_not_found(): void
+    {
+        $res = $this->service->executeErmsGetLeaveBalances('99999');
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Employee record not found.', $res->getData(true)['message']);
+    }
 }

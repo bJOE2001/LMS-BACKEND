@@ -2,14 +2,18 @@
 
 namespace App\Services\Leave;
 
+use App\Http\Controllers\Concerns\FiltersEmployeeControlNos;
 use App\Models\DepartmentAdmin;
+use App\Models\DepartmentHead;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
 use App\Models\LeaveApplication;
 use App\Models\LeaveApplicationLog;
+use App\Models\LeaveApplicationPrintLog;
 use App\Models\LeaveApplicationUpdateRequest;
 use App\Models\LeaveType;
 use App\Models\Notification;
+use App\Services\LeaveApplicationDocumentVerificationService;
 use Carbon\CarbonImmutable;
 use DateTimeInterface;
 use Illuminate\Database\Eloquent\Builder;
@@ -18,22 +22,49 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\Storage;
 
 class LeaveWorkflowService
 {
+    use FiltersEmployeeControlNos;
+
     public function __construct(
         public ?LeaveCreditService $creditService = null,
         public ?LeaveCalculationService $calculationService = null,
         public ?LeaveEligibilityService $eligibilityService = null,
+        public ?LeaveCertificationService $certificationService = null,
+        public ?LeaveApplicationDocumentVerificationService $documentVerificationService = null,
     ) {
         $this->creditService = $creditService ?? app(LeaveCreditService::class);
         $this->calculationService = $calculationService ?? app(LeaveCalculationService::class);
         $this->eligibilityService = $eligibilityService ?? app(LeaveEligibilityService::class);
+        $this->certificationService = $certificationService ?? app(LeaveCertificationService::class);
+        $this->documentVerificationService = $documentVerificationService ?? app(LeaveApplicationDocumentVerificationService::class);
     }
 
     private function eligibilityService(): LeaveEligibilityService
     {
         return $this->eligibilityService ??= app(LeaveEligibilityService::class);
+    }
+
+    private function certificationService(): LeaveCertificationService
+    {
+        return $this->certificationService ??= app(LeaveCertificationService::class);
+    }
+
+    private function documentVerificationService(): LeaveApplicationDocumentVerificationService
+    {
+        return $this->documentVerificationService ??= app(LeaveApplicationDocumentVerificationService::class);
+    }
+
+    private function creditService(): LeaveCreditService
+    {
+        return $this->creditService ??= app(LeaveCreditService::class);
+    }
+
+    private function calculationService(): LeaveCalculationService
+    {
+        return $this->calculationService ??= app(LeaveCalculationService::class);
     }
 
     public const HR_APPLICATION_EDIT_REQUEST_KIND = LeaveApplicationUpdateRequest::REQUEST_KIND_HR_EDIT;
@@ -8692,5 +8723,2205 @@ class LeaveWorkflowService
                 ? $applicationFormatter($app->fresh(['leaveType', 'applicantAdmin']))
                 : $app->fresh(['leaveType', 'applicantAdmin'])?->toArray(),
         ]);
+    }
+
+    public function executeAdminIndex(
+        DepartmentAdmin $admin,
+        ?callable $departmentEmployeeControlNosResolver = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $deptName = $admin->department?->name;
+        $departmentEmployeeControlNos = $departmentEmployeeControlNosResolver !== null
+            ? $departmentEmployeeControlNosResolver($deptName, $admin->department_id !== null ? (int) $admin->department_id : null)
+            : $this->eligibilityService()->findDepartmentEmployeeControlNos(
+                $deptName,
+                null,
+                $admin->department_id !== null ? (int) $admin->department_id : null
+            );
+        $departmentAdminIds = $admin->department_id !== null
+            ? DepartmentAdmin::query()
+                ->where('department_id', $admin->department_id)
+                ->pluck('id')
+                ->map(fn ($value) => (int) $value)
+                ->values()
+                ->all()
+            : [];
+
+        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin.department', 'updateRequests', 'logs'])
+            ->whereIn('status', [
+                LeaveApplication::STATUS_PENDING_ADMIN,
+                LeaveApplication::STATUS_PENDING_HR,
+                LeaveApplication::STATUS_APPROVED,
+                LeaveApplication::STATUS_REJECTED,
+                LeaveApplication::STATUS_RECALLED,
+                LeaveApplication::STATUS_CANCELLED,
+            ])
+            ->where(function ($query) use ($departmentEmployeeControlNos, $admin, $departmentAdminIds): void {
+                $hasVisibilityConstraint = false;
+
+                if ($departmentEmployeeControlNos !== []) {
+                    $this->whereInEmployeeControlNos($query, $departmentEmployeeControlNos);
+                    $hasVisibilityConstraint = true;
+                }
+
+                if ($admin->department_id !== null) {
+                    $selfDepartmentVisibility = function ($selfScopedQuery) use ($admin): void {
+                        $selfScopedQuery
+                            ->where(function ($employeeControlNoQuery): void {
+                                $employeeControlNoQuery
+                                    ->whereNull('employee_control_no')
+                                    ->orWhere('employee_control_no', '');
+                            })
+                            ->whereHas('applicantAdmin', fn ($nestedQuery) => $nestedQuery->where('department_id', $admin->department_id));
+                    };
+
+                    if ($hasVisibilityConstraint) {
+                        $query->orWhere($selfDepartmentVisibility);
+                    } else {
+                        $query->where($selfDepartmentVisibility);
+                    }
+                    $hasVisibilityConstraint = true;
+                }
+
+                if ($departmentAdminIds !== []) {
+                    $selfAdminVisibility = function ($selfScopedQuery) use ($departmentAdminIds): void {
+                        $selfScopedQuery
+                            ->where(function ($employeeControlNoQuery): void {
+                                $employeeControlNoQuery
+                                    ->whereNull('employee_control_no')
+                                    ->orWhere('employee_control_no', '');
+                            })
+                            ->whereIn('admin_id', $departmentAdminIds);
+                    };
+
+                    if ($hasVisibilityConstraint) {
+                        $query->orWhere($selfAdminVisibility);
+                    } else {
+                        $query->where($selfAdminVisibility);
+                    }
+                    $hasVisibilityConstraint = true;
+                }
+
+                if (! $hasVisibilityConstraint) {
+                    $query->whereRaw('1 = 0');
+                }
+            })
+            ->orderBy('created_at')
+            ->orderBy('id')
+            ->get();
+        $applications = $this->sortLeaveApplicationsForHrQueue($applications);
+
+        return response()->json([
+            'applications' => $applications->map(fn ($app) => $applicationFormatter !== null ? $applicationFormatter($app) : $this->formatApplication($app)),
+        ]);
+    }
+
+    public function executeAdminShow(
+        DepartmentAdmin $admin,
+        int $id,
+        ?callable $adminCanManageCallback = null,
+        ?callable $actorDirectoryBuilder = null,
+        ?callable $ermsApplicationFormatter = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $admin->loadMissing('department');
+        $application = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($id);
+
+        if (! $application) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $canManage = $adminCanManageCallback !== null
+            ? $adminCanManageCallback($admin, $application)
+            : $this->adminCanManageApplication($admin, $application);
+
+        if (! $canManage) {
+            return response()->json(['message' => 'You can only view applications from your department.'], 403);
+        }
+
+        $actorDirectory = $actorDirectoryBuilder !== null
+            ? $actorDirectoryBuilder([$application])
+            : $this->buildWorkflowActorDirectory([$application]);
+
+        $workflowPayload = $ermsApplicationFormatter !== null
+            ? $ermsApplicationFormatter($application, $actorDirectory)
+            : $this->formatErmsApplication($application, $actorDirectory);
+        $detailPayload = $applicationFormatter !== null
+            ? $applicationFormatter($application)
+            : $this->formatApplication($application);
+
+        return response()->json([
+            'application' => array_replace($workflowPayload, $detailPayload),
+        ]);
+    }
+
+    public function executeAdminApprove(
+        DepartmentAdmin $admin,
+        int $id,
+        ?string $remarks = null,
+        ?callable $adminCanManageCallback = null,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $admin->loadMissing('department');
+        $app = LeaveApplication::find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $canManage = $adminCanManageCallback !== null
+            ? $adminCanManageCallback($admin, $app)
+            : $this->adminCanManageApplication($admin, $app);
+
+        if (! $canManage) {
+            return response()->json(['message' => 'You can only manage applications from your department.'], 403);
+        }
+
+        if ($app->status !== LeaveApplication::STATUS_PENDING_ADMIN) {
+            return response()->json(['message' => "Cannot approve: application status is '{$app->status}', expected 'PENDING_ADMIN'."], 422);
+        }
+
+        $isPendingApprovedUpdateRequest = $this->hasPendingApprovedUpdateRequest($app);
+        $pendingApprovedActionType = $this->resolvePendingApprovedUpdateActionType($app);
+
+        $this->adminApproveApplication(
+            $app,
+            $admin,
+            $remarks,
+            $isPendingApprovedUpdateRequest,
+            $pendingApprovedActionType
+        );
+
+        $employeeName = $this->resolveEmployeeDisplayName($app, $findEmployeeByControlNo);
+        $this->notifyHrAccountsOfAdminApproval(
+            $app,
+            $employeeName,
+            $isPendingApprovedUpdateRequest,
+            $pendingApprovedActionType
+        );
+
+        return response()->json([
+            'message' => $this->resolveAdminApprovalResponseMessage(
+                $isPendingApprovedUpdateRequest,
+                $pendingApprovedActionType
+            ),
+            'application' => $applicationFormatter !== null
+                ? $applicationFormatter($app->fresh('leaveType'))
+                : $app->fresh('leaveType')?->toArray(),
+        ]);
+    }
+
+    public function executeAdminReject(
+        DepartmentAdmin $admin,
+        int $id,
+        ?string $remarks = null,
+        ?callable $adminCanManageCallback = null,
+        ?callable $rejectPendingUpdateRequestCallback = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $admin->loadMissing('department');
+        $app = LeaveApplication::find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $canManage = $adminCanManageCallback !== null
+            ? $adminCanManageCallback($admin, $app)
+            : $this->adminCanManageApplication($admin, $app);
+
+        if (! $canManage) {
+            return response()->json(['message' => 'You can only manage applications from your department.'], 403);
+        }
+
+        if (! in_array($app->status, [
+            LeaveApplication::STATUS_PENDING_ADMIN,
+            LeaveApplication::STATUS_PENDING_HR,
+        ], true)) {
+            return response()->json([
+                'message' => "Cannot reject: application status is '{$app->status}'. Expected 'PENDING_ADMIN' or 'PENDING_HR'.",
+            ], 422);
+        }
+
+        if ($this->hasPendingApprovedUpdateRequest($app)) {
+            if ($rejectPendingUpdateRequestCallback !== null) {
+                return $rejectPendingUpdateRequestCallback($app, $admin, $remarks);
+            }
+
+            $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
+
+            return $this->executeAdminRejectPendingUpdateRequest(
+                $app,
+                $admin,
+                $remarks,
+                $pendingUpdateMeta,
+                $applicationFormatter
+            );
+        }
+
+        $rejectionResult = $this->adminRejectApplication($app, $admin, $remarks);
+        $status = $rejectionResult['status'];
+
+        $app->load('leaveType');
+
+        return response()->json([
+            'message' => $status === LeaveApplication::STATUS_CANCELLED
+                ? 'Application cancelled by admin.'
+                : 'Application rejected by admin.',
+            'application' => $applicationFormatter !== null
+                ? $applicationFormatter($app->fresh('leaveType'))
+                : $app->fresh('leaveType')?->toArray(),
+        ]);
+    }
+
+    public function executeAdminEmployees(
+        DepartmentAdmin $admin,
+        ?callable $balanceLookupBuilder = null
+    ): JsonResponse {
+        $admin->loadMissing('department');
+        $deptName = $admin->department?->name;
+        $hrisEmployees = HrisEmployee::allByOffice($deptName, null);
+        $leaveBalanceLookup = $balanceLookupBuilder !== null
+            ? $balanceLookupBuilder($hrisEmployees)
+            : $this->eligibilityService()->buildLeaveBalanceLookupForEmployees($hrisEmployees);
+
+        $employees = $hrisEmployees->map(function ($employee) use ($leaveBalanceLookup): array {
+            $controlNo = trim((string) ($employee->control_no ?? ''));
+            $fullName = trim(implode(' ', array_filter([
+                trim((string) ($employee->firstname ?? '')),
+                trim((string) ($employee->middlename ?? '')),
+                trim((string) ($employee->surname ?? '')),
+            ])));
+            $normalizedControlNo = $this->eligibilityService()->normalizeControlNo($controlNo);
+            $leaveBalances = $leaveBalanceLookup[$normalizedControlNo] ?? [];
+
+            return [
+                'control_no' => $controlNo,
+                'full_name' => $fullName,
+                'firstname' => $employee->firstname ?? null,
+                'surname' => $employee->surname ?? null,
+                'status' => $this->eligibilityService()->formatEmploymentStatusLabel($employee->status ?? null),
+                'raw_status' => $this->trimNullableString($employee->status ?? null),
+                'employment_status_key' => $this->eligibilityService()->resolveEmploymentStatusKey($employee->status ?? null),
+                'activity_status' => strtoupper(trim((string) ($employee->activity_status ?? 'INACTIVE'))),
+                'is_active' => (bool) ($employee->is_active ?? false),
+                'designation' => $employee->designation ?? null,
+                'office' => $employee->office ?? null,
+                'salary' => $employee->rate_mon !== null ? (float) $employee->rate_mon : null,
+                'rate_mon' => $employee->rate_mon !== null ? (float) $employee->rate_mon : null,
+                'leave_balances' => collect($leaveBalances)->map(fn ($leaveBalance) => [
+                    'leave_type_id' => $leaveBalance->leave_type_id,
+                    'leave_type_name' => trim((string) ($leaveBalance->leave_type_name ?? $leaveBalance->leaveType?->name ?? '')),
+                    'balance' => (float) $leaveBalance->balance,
+                ])->values(),
+            ];
+        })->values();
+
+        $leaveTypes = LeaveType::orderBy('name')->get()->map(fn ($lt) => [
+            'id' => $lt->id,
+            'name' => $lt->name,
+            'is_credit_based' => $lt->is_credit_based,
+            'max_days' => $lt->max_days,
+            'requires_documents' => (bool) $lt->requires_documents,
+            'allowed_status' => $lt->normalizedAllowedStatuses(),
+            'allowed_status_labels' => $lt->allowedStatusLabels(),
+        ]);
+
+        return response()->json([
+            'employees' => $employees,
+            'leave_types' => $leaveTypes,
+        ]);
+    }
+
+    public function executeExportReceivedApplications(
+        array $validated,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $fromDate = $validated['from_date'] ?? now()->toDateString();
+        $toDate = $validated['to_date'] ?? now()->toDateString();
+        $start = $fromDate.' 00:00:00';
+        $end = $toDate.' 23:59:59';
+
+        $applications = LeaveApplication::query()
+            ->select([
+                'id',
+                'applicant_admin_id',
+                'employee_control_no',
+                'employee_name',
+                'leave_type_id',
+                'start_date',
+                'end_date',
+                'selected_dates',
+                'total_days',
+                'status',
+                'remarks',
+                'hr_id',
+                'created_at',
+            ])
+            ->with([
+                'leaveType:id,name',
+                'applicantAdmin:id,department_id,employee_control_no,full_name',
+                'applicantAdmin.department:id,name',
+                'updateRequests:id,leave_application_id,requested_payload,requested_reason,previous_status,requested_by_control_no,requested_at,status,reviewed_at,review_remarks',
+                'logs:id,leave_application_id,action,performed_by_type,performed_by_id,remarks,created_at',
+            ])
+            ->whereHas('logs', function ($q) use ($start, $end) {
+                $q->where('action', LeaveApplicationLog::ACTION_HR_RECEIVED)
+                    ->whereBetween('created_at', [$start, $end]);
+            })
+            ->orderBy('created_at')
+            ->orderBy('id')
+            ->get();
+
+        return response()->json([
+            'applications' => $applications->map(fn (LeaveApplication $app) => $applicationFormatter !== null ? $applicationFormatter($app) : $app->toArray()),
+        ]);
+    }
+
+    public function executeExportReleasedApplications(
+        array $validated,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $fromDate = $validated['from_date'] ?? now()->toDateString();
+        $toDate = $validated['to_date'] ?? now()->toDateString();
+        $start = $fromDate.' 00:00:00';
+        $end = $toDate.' 23:59:59';
+
+        $applications = LeaveApplication::query()
+            ->select([
+                'id',
+                'applicant_admin_id',
+                'employee_control_no',
+                'employee_name',
+                'leave_type_id',
+                'start_date',
+                'end_date',
+                'selected_dates',
+                'total_days',
+                'status',
+                'remarks',
+                'hr_id',
+                'created_at',
+            ])
+            ->with([
+                'leaveType:id,name',
+                'applicantAdmin:id,department_id,employee_control_no,full_name',
+                'applicantAdmin.department:id,name',
+                'updateRequests:id,leave_application_id,requested_payload,requested_reason,previous_status,requested_by_control_no,requested_at,status,reviewed_at,review_remarks',
+                'logs:id,leave_application_id,action,performed_by_type,performed_by_id,remarks,created_at',
+            ])
+            ->whereHas('logs', function ($q) use ($start, $end) {
+                $q->where('action', LeaveApplicationLog::ACTION_HR_RELEASED)
+                    ->whereBetween('created_at', [$start, $end]);
+            })
+            ->orderBy('created_at')
+            ->orderBy('id')
+            ->get();
+
+        return response()->json([
+            'applications' => $applications->map(fn (LeaveApplication $app) => $applicationFormatter !== null ? $applicationFormatter($app) : $app->toArray()),
+        ]);
+    }
+
+    public function executeHrCancelledApplications(
+        array $validated,
+        ?callable $actorDirectoryBuilder = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $tab = strtoupper(trim((string) ($validated['tab'] ?? 'ALL')));
+        $perPage = (int) ($validated['per_page'] ?? 10);
+        $requestedPage = (int) ($validated['page'] ?? 1);
+        $searchTokens = $this->tokenizeHrApplicationSearch($validated['search'] ?? null);
+        $department = trim((string) ($validated['department'] ?? ''));
+        $fromDate = $validated['from_date'] ?? null;
+        $toDate = $validated['to_date'] ?? null;
+
+        $approvedCancelCondition = $this->getApprovedCancellationCondition();
+        $baseQuery = $this->buildCancelledApplicationsBaseQuery(
+            $searchTokens,
+            $department,
+            $fromDate,
+            $toDate
+        );
+
+        $totalAll = (clone $baseQuery)->count();
+        $totalApproved = (clone $baseQuery)->where($approvedCancelCondition)->count();
+        $totalPendingCancelled = (clone $baseQuery)->whereNot($approvedCancelCondition)->count();
+
+        $listQuery = clone $baseQuery;
+        if ($tab === 'APPROVED_CANCELLATION') {
+            $listQuery->where($approvedCancelCondition);
+        } elseif ($tab === 'EMPLOYEE_CANCELLED') {
+            $listQuery->whereNot($approvedCancelCondition);
+        }
+
+        $listQuery->orderByDesc('updated_at')->orderByDesc('id');
+
+        DB::unprepared('SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED');
+        try {
+            $paginator = $listQuery->paginate($perPage, ['*'], 'page', $requestedPage);
+            $pageApplications = $paginator->getCollection();
+        } finally {
+            DB::unprepared('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+        }
+
+        $pageApplications->load([
+            'leaveType',
+            'applicantAdmin.department',
+            'updateRequests',
+            'logs',
+        ]);
+
+        $actorDirectory = $actorDirectoryBuilder !== null
+            ? $actorDirectoryBuilder($pageApplications)
+            : $this->buildWorkflowActorDirectory($pageApplications);
+
+        $formatted = $pageApplications->map(function (LeaveApplication $app) use ($actorDirectory, $applicationFormatter): array {
+            $formattedApp = $applicationFormatter !== null
+                ? $applicationFormatter($app, $actorDirectory)
+                : $this->formatApplication($app, $actorDirectory);
+            $cancellationType = $this->resolveApplicationCancellationType($app);
+            $cancellationDetails = $this->resolveApplicationCancellationDetails($app, $cancellationType);
+
+            return array_merge($formattedApp, [
+                'cancellation_type' => $cancellationType,
+                'cancellation_type_label' => $cancellationType === 'APPROVED_CANCELLATION'
+                    ? 'Approved Cancellation'
+                    : 'Cancelled While Pending',
+                'cancellation_date' => $cancellationDetails['date'],
+                'cancellation_actor' => $cancellationDetails['actor'],
+                'cancellation_reason' => $cancellationDetails['reason'],
+            ]);
+        });
+
+        return response()->json([
+            'applications' => $formatted->all(),
+            'counts' => [
+                'all' => $totalAll,
+                'approved_cancellations' => $totalApproved,
+                'employee_cancelled' => $totalPendingCancelled,
+            ],
+            'pagination' => [
+                'total' => $paginator->total(),
+                'per_page' => $paginator->perPage(),
+                'current_page' => $paginator->currentPage(),
+                'last_page' => $paginator->lastPage(),
+            ],
+        ]);
+    }
+
+    public function executeExportCancelledApplications(
+        array $validated,
+        ?callable $actorDirectoryBuilder = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $tab = strtoupper(trim((string) ($validated['tab'] ?? 'ALL')));
+        $searchTokens = $this->tokenizeHrApplicationSearch($validated['search'] ?? null);
+        $department = trim((string) ($validated['department'] ?? ''));
+        $fromDate = $validated['from_date'] ?? null;
+        $toDate = $validated['to_date'] ?? null;
+
+        $approvedCancelCondition = $this->getApprovedCancellationCondition();
+        $query = $this->buildCancelledApplicationsBaseQuery(
+            $searchTokens,
+            $department,
+            $fromDate,
+            $toDate
+        );
+
+        if ($tab === 'APPROVED_CANCELLATION') {
+            $query->where($approvedCancelCondition);
+        } elseif ($tab === 'EMPLOYEE_CANCELLED') {
+            $query->whereNot($approvedCancelCondition);
+        }
+
+        DB::unprepared('SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED');
+        try {
+            $applications = $query
+                ->with([
+                    'leaveType',
+                    'applicantAdmin.department',
+                    'updateRequests',
+                    'logs',
+                ])
+                ->orderByDesc('updated_at')
+                ->orderByDesc('id')
+                ->limit(1000)
+                ->get();
+        } finally {
+            DB::unprepared('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+        }
+
+        $actorDirectory = $actorDirectoryBuilder !== null
+            ? $actorDirectoryBuilder($applications)
+            : $this->buildWorkflowActorDirectory($applications);
+
+        $formatted = $applications->map(function (LeaveApplication $app) use ($actorDirectory, $applicationFormatter): array {
+            $formattedApp = $applicationFormatter !== null
+                ? $applicationFormatter($app, $actorDirectory)
+                : $this->formatApplication($app, $actorDirectory);
+            $cancellationType = $this->resolveApplicationCancellationType($app);
+            $cancellationDetails = $this->resolveApplicationCancellationDetails($app, $cancellationType);
+
+            return array_merge($formattedApp, [
+                'cancellation_type' => $cancellationType,
+                'cancellation_type_label' => $cancellationType === 'APPROVED_CANCELLATION'
+                    ? 'Approved Cancellation'
+                    : 'Cancelled While Pending',
+                'cancellation_date' => $cancellationDetails['date'],
+                'cancellation_actor' => $cancellationDetails['actor'],
+                'cancellation_reason' => $cancellationDetails['reason'],
+            ]);
+        });
+
+        return response()->json([
+            'applications' => $formatted->all(),
+        ]);
+    }
+
+    public function executeHrShow(
+        int $id,
+        ?callable $actorDirectoryBuilder = null,
+        ?callable $ermsApplicationFormatter = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $application = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->where(function ($query): void {
+                $query
+                    ->where('status', '!=', LeaveApplication::STATUS_PENDING_ADMIN)
+                    ->orWhere(function ($nestedQuery): void {
+                        $nestedQuery
+                            ->where('status', LeaveApplication::STATUS_PENDING_ADMIN)
+                            ->whereHas('updateRequests', function ($updateRequestQuery): void {
+                                $updateRequestQuery
+                                    ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
+                                    ->whereRaw(
+                                        'UPPER(LTRIM(RTRIM(COALESCE(previous_status, ?)))) = ?',
+                                        ['', LeaveApplication::STATUS_APPROVED]
+                                    );
+                            });
+                    });
+            })
+            ->find($id);
+
+        if (! $application) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $actorDirectory = $actorDirectoryBuilder !== null
+            ? $actorDirectoryBuilder([$application])
+            : $this->buildWorkflowActorDirectory([$application]);
+
+        $workflowPayload = $ermsApplicationFormatter !== null
+            ? $ermsApplicationFormatter($application, $actorDirectory)
+            : [];
+        $detailPayload = $applicationFormatter !== null
+            ? $applicationFormatter($application, $actorDirectory)
+            : $application->toArray();
+
+        return response()->json([
+            'application' => array_replace($workflowPayload, $detailPayload),
+        ]);
+    }
+
+    public function executeHrApplicationEditRequests(
+        HRAccount $hr,
+        ?string $status = null,
+        ?callable $editRequestFormatter = null
+    ): JsonResponse {
+        if (! $this->isHrAccessControlOwner($hr)) {
+            return response()->json(['message' => 'Only HR Admin accounts can view application edit requests.'], 403);
+        }
+
+        $normalizedStatus = strtoupper(trim((string) ($status ?? LeaveApplicationUpdateRequest::STATUS_PENDING)));
+        $allowedStatuses = [
+            LeaveApplicationUpdateRequest::STATUS_PENDING,
+            LeaveApplicationUpdateRequest::STATUS_APPROVED,
+            LeaveApplicationUpdateRequest::STATUS_REJECTED,
+            'ALL',
+        ];
+        if (! in_array($normalizedStatus, $allowedStatuses, true)) {
+            $normalizedStatus = LeaveApplicationUpdateRequest::STATUS_PENDING;
+        }
+
+        $query = LeaveApplicationUpdateRequest::query()
+            ->with(['leaveApplication.leaveType', 'reviewedByHr'])
+            ->latest('id');
+
+        if ($normalizedStatus !== 'ALL') {
+            $query->where('status', $normalizedStatus);
+        }
+
+        $requests = $query
+            ->limit(500)
+            ->get()
+            ->filter(fn (LeaveApplicationUpdateRequest $editRequest): bool => $this->isHrApplicationEditRequestRecord($editRequest))
+            ->values();
+
+        return response()->json([
+            'requests' => $requests
+                ->map(fn (LeaveApplicationUpdateRequest $editRequest): array => $editRequestFormatter !== null ? $editRequestFormatter($editRequest) : $this->formatHrApplicationEditRequest($editRequest))
+                ->all(),
+            'count' => $requests->count(),
+        ]);
+    }
+
+    public function executeHrApproveApplicationEditRequest(
+        HRAccount $hr,
+        int $id,
+        ?string $remarks = null,
+        ?callable $controlNoCandidatesResolver = null,
+        ?callable $findAdminEmployeeControlNo = null,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $editRequestFormatter = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        if (! $this->isHrAccessControlOwner($hr)) {
+            return response()->json(['message' => 'Only HR Admin accounts can approve application edit requests.'], 403);
+        }
+
+        $editRequest = LeaveApplicationUpdateRequest::query()
+            ->with(['leaveApplication.leaveType', 'reviewedByHr'])
+            ->find($id);
+        if (! $editRequest || ! $this->isHrApplicationEditRequestRecord($editRequest)) {
+            return response()->json(['message' => 'Application edit request not found.'], 404);
+        }
+
+        if (strtoupper(trim((string) $editRequest->status)) !== LeaveApplicationUpdateRequest::STATUS_PENDING) {
+            return response()->json(['message' => 'Only pending application edit requests can be approved.'], 422);
+        }
+
+        $app = $editRequest->leaveApplication;
+        if (! $app instanceof LeaveApplication) {
+            return response()->json(['message' => 'Leave application for this edit request no longer exists.'], 404);
+        }
+
+        if (! in_array($app->status, [LeaveApplication::STATUS_PENDING_HR, LeaveApplication::STATUS_APPROVED], true)) {
+            return response()->json([
+                'message' => 'Only Pending HR and Approved applications can receive an approved HR edit.',
+            ], 422);
+        }
+
+        $normalizedPayload = $this->normalizeHrApplicationEditPayload(
+            is_array($editRequest->requested_payload) ? $editRequest->requested_payload : [],
+            $app
+        );
+        if ($normalizedPayload instanceof JsonResponse) {
+            return $normalizedPayload;
+        }
+
+        $applied = $this->applyHrApplicationEdit(
+            $app,
+            $hr,
+            $normalizedPayload,
+            $this->trimNullableString($editRequest->requested_reason) ?? 'Approved HR staff edit request.',
+            $editRequest,
+            $this->trimNullableString($remarks),
+            $controlNoCandidatesResolver,
+            $findAdminEmployeeControlNo,
+            $findEmployeeByControlNo
+        );
+
+        if ($applied instanceof JsonResponse) {
+            return $applied;
+        }
+
+        $editRequest->refresh()->load(['leaveApplication.leaveType', 'reviewedByHr']);
+
+        return response()->json([
+            'message' => 'Application edit request approved and applied.',
+            'edit_request' => $editRequestFormatter !== null
+                ? $editRequestFormatter($editRequest)
+                : $this->formatHrApplicationEditRequest($editRequest),
+            'application' => $applicationFormatter !== null
+                ? $applicationFormatter($applied->fresh(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests']))
+                : $applied->fresh(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])?->toArray(),
+        ]);
+    }
+
+    public function executeLogPrint(
+        Request $request,
+        int $id
+    ): JsonResponse {
+        $app = LeaveApplication::find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $user = $request->user();
+        $performerType = LeaveApplicationPrintLog::PERFORMER_EMPLOYEE;
+        $performerId = null;
+        $performerName = null;
+
+        if ($user instanceof HRAccount || $user instanceof DepartmentAdmin) {
+            $performerType = LeaveApplicationPrintLog::PERFORMER_ADMIN;
+            $performerId = (string) $user->id;
+            $performerName = $user->name ?? $user->username ?? $user->full_name ?? null;
+        } elseif ($user) {
+            $performerType = LeaveApplicationPrintLog::PERFORMER_EMPLOYEE;
+            $performerId = (string) (data_get($user, 'control_no') ?? data_get($user, 'id') ?? '');
+            $performerName = data_get($user, 'full_name') ?? data_get($user, 'name') ?? null;
+        }
+
+        if ($request->filled('printed_by_name') && empty($performerName)) {
+            $performerName = (string) $request->input('printed_by_name');
+        }
+
+        $printLog = LeaveApplicationPrintLog::create([
+            'leave_application_id' => $app->id,
+            'printed_by_type' => $performerType,
+            'printed_by_id' => $performerId,
+            'printed_by_name' => $performerName,
+            'ip_address' => $request->ip(),
+            'user_agent' => $request->userAgent(),
+            'remarks' => $request->input('remarks'),
+            'created_at' => now(),
+        ]);
+
+        return response()->json([
+            'message' => 'Leave application print logged successfully.',
+            'data' => $printLog,
+        ], 201);
+    }
+
+    public function executeErmsLogPrint(
+        Request $request,
+        int $id
+    ): JsonResponse {
+        $app = LeaveApplication::find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $performerId = (string) ($request->input('printed_by_id') ?? $request->input('employee_control_no') ?? $request->input('control_no') ?? $app->employee_control_no);
+        $performerName = (string) ($request->input('printed_by_name') ?? $app->employee_name);
+
+        $printLog = LeaveApplicationPrintLog::create([
+            'leave_application_id' => $app->id,
+            'printed_by_type' => LeaveApplicationPrintLog::PERFORMER_EMPLOYEE,
+            'printed_by_id' => $performerId,
+            'printed_by_name' => $performerName,
+            'ip_address' => $request->ip(),
+            'user_agent' => $request->userAgent(),
+            'remarks' => $request->input('remarks', 'Printed via ERMS'),
+            'created_at' => now(),
+        ]);
+
+        return response()->json([
+            'message' => 'ERMS leave application print logged successfully.',
+            'data' => $printLog,
+        ], 201);
+    }
+
+    public function executeHrPrintLogs(int $id): JsonResponse
+    {
+        $app = LeaveApplication::find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $printLogs = LeaveApplicationPrintLog::where('leave_application_id', $app->id)
+            ->orderBy('created_at', 'desc')
+            ->get();
+
+        return response()->json([
+            'status' => 'success',
+            'data' => $printLogs,
+        ]);
+    }
+
+    public function executeErmsEmployeeAccess(
+        string $controlNo,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $isPulledEmployeeResolver = null,
+        ?callable $isDepartmentAdminEmployeeResolver = null,
+        ?callable $controlNoResponseBuilder = null
+    ): JsonResponse {
+        if ($controlNo === '') {
+            return response()->json([
+                'message' => 'The employee_control_no query parameter is required.',
+            ], 422);
+        }
+
+        $controlNoPayload = $controlNoResponseBuilder !== null
+            ? $controlNoResponseBuilder($controlNo)
+            : ['employee_control_no' => $controlNo];
+
+        $employee = $findEmployeeByControlNo !== null
+            ? $findEmployeeByControlNo($controlNo)
+            : null;
+
+        if (! $employee) {
+            return response()->json([
+                'message' => 'Employee record not found.',
+                ...$controlNoPayload,
+                'is_pulled_employee' => false,
+                'is_department_admin_employee' => false,
+                'can_access_leave_modules' => false,
+            ], 404);
+        }
+
+        $resolvedControlNo = (string) $employee->control_no;
+        $isPulledEmployee = $isPulledEmployeeResolver !== null
+            ? $isPulledEmployeeResolver($resolvedControlNo)
+            : false;
+        $isDepartmentAdminEmployee = $isDepartmentAdminEmployeeResolver !== null
+            ? $isDepartmentAdminEmployeeResolver($resolvedControlNo)
+            : false;
+        $canAccessLeaveModules = $isPulledEmployee || $isDepartmentAdminEmployee;
+
+        $resolvedControlNoPayload = $controlNoResponseBuilder !== null
+            ? $controlNoResponseBuilder($resolvedControlNo)
+            : ['employee_control_no' => $resolvedControlNo];
+
+        return response()->json([
+            ...$resolvedControlNoPayload,
+            'is_pulled_employee' => $isPulledEmployee,
+            'is_department_admin_employee' => $isDepartmentAdminEmployee,
+            'can_access_leave_modules' => $canAccessLeaveModules,
+        ]);
+    }
+
+    public function executeErmsIndex(
+        string $controlNo,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $assertErmsEmployeeIsPulled = null,
+        ?callable $applyApplicationOwnershipFilter = null,
+        ?callable $actorDirectoryBuilder = null,
+        ?callable $employeeContextFormatter = null,
+        ?callable $allowedLeaveTypesResolver = null,
+        ?callable $ermsApplicationFormatter = null,
+        ?callable $controlNoResponseBuilder = null
+    ): JsonResponse {
+        if ($controlNo === '') {
+            return response()->json([
+                'message' => 'The employee_control_no query parameter is required.',
+            ], 422);
+        }
+
+        $employee = $findEmployeeByControlNo !== null
+            ? $findEmployeeByControlNo($controlNo)
+            : null;
+
+        if (! $employee) {
+            return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+
+        if ($assertErmsEmployeeIsPulled !== null) {
+            $pulledAccess = $assertErmsEmployeeIsPulled((string) $employee->control_no);
+            if ($pulledAccess instanceof JsonResponse) {
+                return $pulledAccess;
+            }
+        }
+
+        $applications = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->where(function ($query) use ($applyApplicationOwnershipFilter, $controlNo): void {
+                if ($applyApplicationOwnershipFilter !== null) {
+                    $applyApplicationOwnershipFilter($query, $controlNo);
+                } else {
+                    $query->where('employee_control_no', $controlNo);
+                }
+            })
+            ->orderBy('created_at')
+            ->orderBy('id')
+            ->get();
+
+        $applications = $this->sortLeaveApplicationsForHrQueue($applications);
+
+        $actorDirectory = $actorDirectoryBuilder !== null
+            ? $actorDirectoryBuilder($applications)
+            : $this->buildWorkflowActorDirectory($applications);
+
+        $employeeContext = $employeeContextFormatter !== null
+            ? $employeeContextFormatter($employee)
+            : [];
+
+        $leaveTypes = $allowedLeaveTypesResolver !== null
+            ? $allowedLeaveTypesResolver($employee)
+            : [];
+
+        $controlNoPayload = $controlNoResponseBuilder !== null
+            ? $controlNoResponseBuilder((string) $employee->control_no)
+            : ['employee_control_no' => (string) $employee->control_no];
+
+        return response()->json([
+            ...$controlNoPayload,
+            'employment_status' => $employeeContext['status'] ?? null,
+            'employment_status_key' => $employeeContext['employment_status_key'] ?? null,
+            'ui_variant' => $employeeContext['ui_variant'] ?? null,
+            'employee' => $employeeContext,
+            'leave_types' => $leaveTypes,
+            'applications' => $applications
+                ->map(fn (LeaveApplication $app) => $ermsApplicationFormatter !== null
+                    ? $ermsApplicationFormatter($app, $actorDirectory)
+                    : $app->toArray()
+                )
+                ->values(),
+        ]);
+    }
+
+    public function executeErmsShow(
+        string $controlNo,
+        int $id,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $assertErmsEmployeeIsPulled = null,
+        ?callable $applyApplicationOwnershipFilter = null,
+        ?callable $actorDirectoryBuilder = null,
+        ?callable $leaveBalanceSnapshotResolver = null,
+        ?callable $findLeaveTypeBalanceInSnapshot = null,
+        ?callable $ermsApplicationFormatter = null,
+        ?callable $certificationLeaveCreditsResolver = null,
+        ?callable $controlNoResponseBuilder = null
+    ): JsonResponse {
+        if ($controlNo === '') {
+            return response()->json([
+                'message' => 'The employee_control_no query parameter is required.',
+            ], 422);
+        }
+
+        $employee = $findEmployeeByControlNo !== null
+            ? $findEmployeeByControlNo($controlNo)
+            : null;
+
+        if (! $employee) {
+            return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+
+        if ($assertErmsEmployeeIsPulled !== null) {
+            $pulledAccess = $assertErmsEmployeeIsPulled((string) $employee->control_no);
+            if ($pulledAccess instanceof JsonResponse) {
+                return $pulledAccess;
+            }
+        }
+
+        $application = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->where('id', $id)
+            ->where(function ($query) use ($applyApplicationOwnershipFilter, $controlNo): void {
+                if ($applyApplicationOwnershipFilter !== null) {
+                    $applyApplicationOwnershipFilter($query, $controlNo);
+                } else {
+                    $query->where('employee_control_no', $controlNo);
+                }
+            })
+            ->first();
+
+        if (! $application) {
+            return response()->json(['message' => 'Leave application not found for this employee.'], 404);
+        }
+
+        $actorDirectory = $actorDirectoryBuilder !== null
+            ? $actorDirectoryBuilder(collect([$application]))
+            : $this->buildWorkflowActorDirectory(collect([$application]));
+
+        $leaveBalanceSnapshot = $leaveBalanceSnapshotResolver !== null
+            ? $leaveBalanceSnapshotResolver($application)
+            : [];
+
+        $currentLeaveBalance = $findLeaveTypeBalanceInSnapshot !== null
+            ? $findLeaveTypeBalanceInSnapshot($leaveBalanceSnapshot, (int) $application->leave_type_id)
+            : null;
+
+        $applicationPayload = $ermsApplicationFormatter !== null
+            ? $ermsApplicationFormatter($application, $actorDirectory)
+            : $application->toArray();
+
+        $certificationLeaveCredits = $certificationLeaveCreditsResolver !== null
+            ? $certificationLeaveCreditsResolver($application, $leaveBalanceSnapshot)
+            : null;
+
+        $applicationPayload['leaveBalance'] = $currentLeaveBalance;
+        $applicationPayload['leaveBalances'] = $leaveBalanceSnapshot;
+        $applicationPayload['leave_balances'] = $leaveBalanceSnapshot;
+        $applicationPayload['employee_leave_balances'] = $leaveBalanceSnapshot;
+        $applicationPayload['certificationLeaveCredits'] = $certificationLeaveCredits;
+        $applicationPayload['certification_leave_credits'] = $certificationLeaveCredits;
+
+        $controlNoPayload = $controlNoResponseBuilder !== null
+            ? $controlNoResponseBuilder((string) $employee->control_no)
+            : ['employee_control_no' => (string) $employee->control_no];
+
+        return response()->json([
+            ...$controlNoPayload,
+            'application' => $applicationPayload,
+        ]);
+    }
+
+    public function executeErmsCancel(
+        int $applicationId,
+        object $employee,
+        string $controlNo,
+        string $cancellationReason,
+        callable $ownershipFilter,
+        callable $statusLabelResolver,
+        callable $actorDirectoryBuilder,
+        callable $applicationFormatter
+    ): JsonResponse {
+        $app = LeaveApplication::query()
+            ->with('leaveType')
+            ->where('id', $applicationId)
+            ->where(fn ($query) => $ownershipFilter($query, $controlNo))
+            ->first();
+
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found for this employee.'], 404);
+        }
+
+        $cancelableStatuses = [
+            LeaveApplication::STATUS_PENDING_ADMIN,
+            LeaveApplication::STATUS_PENDING_HR,
+        ];
+
+        if (! in_array($app->status, $cancelableStatuses, true)) {
+            $statusLabel = $statusLabelResolver($app->status);
+
+            return response()->json([
+                'message' => "Cannot cancel: application status is '{$statusLabel}'. Only pending applications can be cancelled.",
+            ], 422);
+        }
+
+        $reason = trim($cancellationReason);
+        $remarks = $reason !== ''
+            ? "Cancelled by employee: {$reason}"
+            : 'Cancelled by employee';
+        $statusBeforeCancel = $app->status;
+
+        $performedById = (int) ltrim((string) $employee->control_no, '0');
+        if ($performedById <= 0) {
+            $performedById = (int) ($app->employee_control_no ?: 1);
+        }
+
+        $this->employeeCancelPendingApplication(
+            $app,
+            $performedById,
+            $remarks
+        );
+
+        $this->notifyPartiesOfEmployeeCancellation(
+            $app,
+            $employee,
+            $statusBeforeCancel,
+            $reason
+        );
+
+        $application = $app->fresh(['leaveType', 'applicantAdmin.department', 'logs']);
+        $actorDirectory = $actorDirectoryBuilder([$application]);
+
+        return response()->json([
+            'message' => 'Leave application cancelled successfully.',
+            'application' => $applicationFormatter($application, $actorDirectory),
+        ]);
+    }
+
+    public function executeHrVerifyDocument(
+        mixed $token,
+        LeaveApplicationDocumentVerificationService $documentVerificationService,
+        callable $isPendingApprovedUpdateRequest,
+        callable $isCancelledRemark,
+        callable $actorDirectoryBuilder,
+        callable $applicationFormatter
+    ): JsonResponse {
+        $decodedToken = $documentVerificationService->decode((string) $token);
+        if ($decodedToken === null) {
+            return response()->json([
+                'message' => 'The leave application QR code is invalid or has been altered.',
+                'verification' => [
+                    'status' => 'invalid',
+                    'token_valid' => false,
+                    'document_current' => false,
+                    'can_receive' => false,
+                ],
+            ], 422);
+        }
+
+        $application = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($decodedToken['application_id']);
+
+        if (! $application) {
+            return response()->json([
+                'message' => 'The verified QR code refers to a leave application that no longer exists.',
+                'verification' => [
+                    'status' => 'not_found',
+                    'token_valid' => true,
+                    'document_current' => false,
+                    'can_receive' => false,
+                ],
+            ], 404);
+        }
+
+        $documentCurrent = $documentVerificationService->isCurrent(
+            $application,
+            $decodedToken['fingerprint']
+        );
+        $receivedLog = $application->logs->first(
+            fn (LeaveApplicationLog $log): bool => $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
+        $releasedLog = $application->logs->first(
+            fn (LeaveApplicationLog $log): bool => $log->action === LeaveApplicationLog::ACTION_HR_RELEASED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
+        $cmoCbmoReviewedLog = $application->logs->first(
+            fn (LeaveApplicationLog $log): bool => $log->action === LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
+        $canReceiveByStatus = $application->status !== LeaveApplication::STATUS_PENDING_ADMIN
+            || $isPendingApprovedUpdateRequest($application);
+        $isCancelled = $application->status === LeaveApplication::STATUS_CANCELLED
+            || $application->logs->contains(
+                fn (LeaveApplicationLog $log): bool => $isCancelledRemark($log->remarks)
+            ) || $isCancelledRemark($application->remarks);
+        $currentVerification = $documentVerificationService->issue($application);
+        $actorDirectory = $actorDirectoryBuilder([$application]);
+
+        $canRelease = $documentCurrent
+            && $releasedLog === null
+            && $receivedLog !== null
+            && $cmoCbmoReviewedLog !== null
+            && $canReceiveByStatus
+            && ! $isCancelled;
+
+        return response()->json([
+            'message' => $documentCurrent
+                ? 'The QR code is valid. Compare the printed form with the official application details before receiving or releasing it.'
+                : 'The QR code is authentic, but the printed form is no longer the current application version.',
+            'verification' => [
+                'status' => $documentCurrent ? 'verified' : 'outdated',
+                'token_valid' => true,
+                'document_current' => $documentCurrent,
+                'scanned_reference' => $documentVerificationService->reference(
+                    (int) $decodedToken['application_id'],
+                    (string) $decodedToken['fingerprint']
+                ),
+                'current_reference' => $currentVerification['reference'],
+                'format_version' => $decodedToken['format_version'],
+                'already_received' => $receivedLog !== null,
+                'already_released' => $releasedLog !== null,
+                'has_cmo_cbmo_review' => $cmoCbmoReviewedLog !== null,
+                'can_receive' => $documentCurrent && $receivedLog === null && $canReceiveByStatus && ! $isCancelled,
+                'can_release' => $canRelease,
+                'checked_at' => now()->toIso8601String(),
+            ],
+            'application' => $applicationFormatter($application, $actorDirectory),
+        ]);
+    }
+
+    public function executeHrReceive(
+        int $id,
+        HRAccount $hr,
+        array $validated,
+        LeaveApplicationDocumentVerificationService $documentVerificationService,
+        callable $actorDirectoryBuilder,
+        callable $applicationFormatter,
+        callable $isCancelledRemark,
+        callable $isPendingApprovedUpdateRequest
+    ): JsonResponse {
+        $verificationToken = trim((string) ($validated['verification_token'] ?? ''));
+        $decodedToken = null;
+        if ($verificationToken !== '') {
+            $decodedToken = $documentVerificationService->decode($verificationToken);
+            if ($decodedToken === null || (int) $decodedToken['application_id'] !== $id) {
+                return response()->json([
+                    'message' => 'Scan and verify the QR code from this leave application form before receiving it.',
+                ], 422);
+            }
+        }
+
+        $app = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        if ($decodedToken !== null && ! $documentVerificationService->isCurrent($app, (string) $decodedToken['fingerprint'])) {
+            return response()->json([
+                'message' => 'This printed form is outdated. Print the current leave application form and scan its QR code.',
+            ], 422);
+        }
+
+        $isCancelled = $app->status === LeaveApplication::STATUS_CANCELLED
+            || $app->logs->contains(
+                fn (LeaveApplicationLog $log): bool => $isCancelledRemark($log->remarks)
+            ) || $isCancelledRemark($app->remarks);
+        if ($isCancelled) {
+            return response()->json([
+                'message' => 'Cannot mark as received: application is cancelled.',
+            ], 422);
+        }
+
+        $pendingApprovedUpdate = $isPendingApprovedUpdateRequest($app);
+        if ($app->status === LeaveApplication::STATUS_PENDING_ADMIN && ! $pendingApprovedUpdate) {
+            return response()->json([
+                'message' => "Cannot mark as received: application status is '{$app->status}'.",
+            ], 422);
+        }
+
+        $wasNewlyReceived = $this->confirmHardCopyReceipt(
+            $app,
+            $hr,
+            $validated['remarks'] ?? null
+        );
+
+        $actorDirectory = $actorDirectoryBuilder([$app]);
+
+        return response()->json([
+            'message' => $wasNewlyReceived
+                ? 'Hard-copy receipt confirmed.'
+                : 'Hard-copy receipt was already confirmed for this application.',
+            'application' => $applicationFormatter($app, $actorDirectory),
+        ]);
+    }
+
+    public function executeHrRelease(
+        int $id,
+        HRAccount $hr,
+        array $validated,
+        LeaveApplicationDocumentVerificationService $documentVerificationService,
+        callable $actorDirectoryBuilder,
+        callable $applicationFormatter,
+        callable $isCancelledRemark,
+        callable $isPendingApprovedUpdateRequest
+    ): JsonResponse {
+        $verificationToken = trim((string) ($validated['verification_token'] ?? ''));
+        $decodedToken = null;
+        if ($verificationToken !== '') {
+            $decodedToken = $documentVerificationService->decode($verificationToken);
+            if ($decodedToken === null || (int) $decodedToken['application_id'] !== $id) {
+                return response()->json([
+                    'message' => 'Scan and verify the QR code from this leave application form before releasing it.',
+                ], 422);
+            }
+        }
+
+        $app = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        if ($decodedToken !== null && ! $documentVerificationService->isCurrent($app, (string) $decodedToken['fingerprint'])) {
+            return response()->json([
+                'message' => 'This printed form is outdated. Print the current leave application form and scan its QR code.',
+            ], 422);
+        }
+
+        $isCancelled = $app->status === LeaveApplication::STATUS_CANCELLED
+            || $app->logs->contains(
+                fn (LeaveApplicationLog $log): bool => $isCancelledRemark($log->remarks)
+            ) || $isCancelledRemark($app->remarks);
+        if ($isCancelled) {
+            return response()->json([
+                'message' => 'Cannot mark as released: application is cancelled.',
+            ], 422);
+        }
+
+        $pendingApprovedUpdate = $isPendingApprovedUpdateRequest($app);
+        if ($app->status === LeaveApplication::STATUS_PENDING_ADMIN && ! $pendingApprovedUpdate) {
+            return response()->json([
+                'message' => "Cannot mark as released: application status is '{$app->status}'.",
+            ], 422);
+        }
+
+        $releaseResult = $this->confirmHardCopyRelease(
+            $app,
+            $hr,
+            $validated['remarks'] ?? null
+        );
+
+        if (! $releaseResult['ok']) {
+            return response()->json([
+                'message' => $releaseResult['message'],
+            ], 422);
+        }
+
+        $actorDirectory = $actorDirectoryBuilder([$app]);
+
+        return response()->json([
+            'message' => $releaseResult['already_released']
+                ? 'Hard-copy release was already confirmed for this application.'
+                : 'Hard-copy release confirmed.',
+            'application' => $applicationFormatter($app, $actorDirectory),
+        ]);
+    }
+
+    public function executeHrUndoReceive(
+        int $id,
+        callable $cycleRequestedAtResolver,
+        callable $actorDirectoryBuilder,
+        callable $applicationFormatter
+    ): JsonResponse {
+        $app = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $cycleRequestedAt = $cycleRequestedAtResolver($app);
+        $undoResult = $this->undoHardCopyReceipt($app, $cycleRequestedAt);
+
+        if (! $undoResult['ok']) {
+            return response()->json([
+                'message' => $undoResult['message'],
+            ], 422);
+        }
+
+        $actorDirectory = $actorDirectoryBuilder([$app]);
+
+        return response()->json([
+            'message' => $undoResult['was_undone']
+                ? 'Hard-copy receipt was undone.'
+                : 'Hard-copy receipt is not currently confirmed for this application.',
+            'application' => $applicationFormatter($app, $actorDirectory),
+        ]);
+    }
+
+    public function executeHrUndoRelease(
+        int $id,
+        callable $cycleRequestedAtResolver,
+        callable $actorDirectoryBuilder,
+        callable $applicationFormatter
+    ): JsonResponse {
+        $app = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $wasUndone = $this->undoHardCopyRelease(
+            $app,
+            $cycleRequestedAtResolver($app)
+        );
+
+        $actorDirectory = $actorDirectoryBuilder([$app]);
+
+        return response()->json([
+            'message' => $wasUndone
+                ? 'Hard-copy release was undone.'
+                : 'Hard-copy release is not currently confirmed for this application.',
+            'application' => $applicationFormatter($app, $actorDirectory),
+        ]);
+    }
+
+    public function executeHrCmoCbmoReview(
+        int $id,
+        HRAccount $hr,
+        ?string $remarks,
+        callable $smsNotificationCallback,
+        callable $actorDirectoryBuilder,
+        callable $applicationFormatter
+    ): JsonResponse {
+        $app = LeaveApplication::query()
+            ->with(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])
+            ->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        $reviewResult = $this->confirmCmoCbmoReview(
+            $app,
+            $hr,
+            $remarks
+        );
+
+        if (! $reviewResult['ok']) {
+            return response()->json([
+                'message' => $reviewResult['message'],
+            ], 422);
+        }
+
+        if (! $reviewResult['already_reviewed']) {
+            $smsNotificationCallback($app);
+        }
+
+        $actorDirectory = $actorDirectoryBuilder([$app]);
+
+        return response()->json([
+            'message' => $reviewResult['already_reviewed']
+                ? 'CMO/CVMO review was already completed for this application.'
+                : 'CMO/CVMO review completed.',
+            'application' => $applicationFormatter($app, $actorDirectory),
+        ]);
+    }
+
+    public function executeHrReject(
+        LeaveApplication $app,
+        HRAccount $hr,
+        ?string $remarks = null,
+        ?callable $smsCallback = null,
+        ?callable $applicationFormatter = null,
+        ?callable $pendingUpdateRejectHandler = null
+    ): JsonResponse {
+        if ($app->status !== LeaveApplication::STATUS_PENDING_HR) {
+            return response()->json(['message' => "Cannot reject: application status is '{$app->status}', expected 'PENDING_HR'."], 422);
+        }
+
+        if ($this->isPendingApprovedUpdateRequest($app)) {
+            if (is_callable($pendingUpdateRejectHandler)) {
+                return $pendingUpdateRejectHandler($app);
+            }
+        }
+
+        $this->hrRejectApplication($app, $hr, $remarks);
+
+        // Notify the applicant that HR rejected
+        $this->notifyApplicantOfHrRejection(
+            $app,
+            $remarks,
+            $smsCallback
+        );
+
+        $freshApp = $app->fresh('leaveType');
+        $formatted = is_callable($applicationFormatter)
+            ? $applicationFormatter($freshApp)
+            : $this->formatApplication($freshApp);
+
+        return response()->json([
+            'message' => 'Application rejected by HR.',
+            'application' => $formatted,
+        ]);
+    }
+
+    public function streamApplicationAttachment(LeaveApplication $application)
+    {
+        $reference = trim((string) ($application->attachment_reference ?? ''));
+        if ($reference === '') {
+            return response()->json(['message' => 'No uploaded attachment found for this leave application.'], 404);
+        }
+
+        if (filter_var($reference, FILTER_VALIDATE_URL)) {
+            return redirect()->away($reference);
+        }
+
+        $normalizedReference = ltrim(str_replace('\\', '/', $reference), '/');
+        if ($normalizedReference === '' || str_contains($normalizedReference, '..')) {
+            return response()->json(['message' => 'Attachment file not found.'], 404);
+        }
+
+        if (str_starts_with($normalizedReference, 'storage/')) {
+            $normalizedReference = ltrim(substr($normalizedReference, strlen('storage/')), '/');
+        }
+
+        $candidatePaths = [$normalizedReference];
+        if (! str_starts_with($normalizedReference, 'public/')) {
+            $candidatePaths[] = 'public/'.$normalizedReference;
+        }
+
+        $candidateDisks = array_values(array_unique(array_filter([
+            (string) config('filesystems.default', 'local'),
+            'public',
+            'local',
+        ])));
+
+        foreach ($candidateDisks as $disk) {
+            /** @var \Illuminate\Filesystem\FilesystemAdapter $storage */
+            $storage = Storage::disk($disk);
+            foreach ($candidatePaths as $path) {
+                if (! $storage->exists($path)) {
+                    continue;
+                }
+
+                $filename = basename($path);
+                $mimeType = $storage->mimeType($path) ?: 'application/octet-stream';
+
+                return $storage->response(
+                    $path,
+                    $filename,
+                    [
+                        'Content-Type' => $mimeType,
+                        'Content-Disposition' => 'inline; filename="'.$filename.'"',
+                        'X-Content-Type-Options' => 'nosniff',
+                    ]
+                );
+            }
+        }
+
+        return response()->json(['message' => 'Attachment file not found.'], 404);
+    }
+
+    public function formatApplicationUpdateRequests(
+        LeaveApplication $app,
+        ?callable $policyResolver = null
+    ): array {
+        $updateRequests = null;
+
+        if ($app->relationLoaded('updateRequests')) {
+            $updateRequests = $app->updateRequests;
+        } elseif ($app->id) {
+            $updateRequests = LeaveApplicationUpdateRequest::query()
+                ->where('leave_application_id', (int) $app->id)
+                ->latest('id')
+                ->get();
+        }
+
+        if (! $updateRequests) {
+            return [];
+        }
+
+        return $updateRequests
+            ->filter(fn ($req) => $req instanceof LeaveApplicationUpdateRequest)
+            ->sortByDesc(fn (LeaveApplicationUpdateRequest $req) => (int) $req->id)
+            ->map(fn (LeaveApplicationUpdateRequest $r): array => [
+                'id' => (int) $r->id,
+                'status' => strtoupper(trim((string) $r->status)),
+                'action_type' => $this->resolveUpdateRequestActionTypeFromPayload($r->requested_payload),
+                'payload' => $this->normalizePendingUpdatePayload($r->requested_payload, $policyResolver),
+                'reason' => trim((string) ($r->requested_reason ?? '')) !== '' ? trim((string) $r->requested_reason) : null,
+                'previous_status' => strtoupper(trim((string) ($r->previous_status ?? ''))),
+                'requested_by' => trim((string) ($r->requested_by_control_no ?? '')) !== '' ? trim((string) $r->requested_by_control_no) : null,
+                'requested_at' => $r->requested_at?->toIso8601String(),
+                'reviewed_at' => $r->reviewed_at?->toIso8601String(),
+                'review_remarks' => trim((string) ($r->review_remarks ?? '')) !== '' ? trim((string) $r->review_remarks) : null,
+            ])
+            ->values()
+            ->all();
+    }
+
+    public function normalizeControlNo(?string $value): string
+    {
+        return $this->eligibilityService()->normalizeControlNo($value);
+    }
+
+    public function resolveApplicationEmployee(
+        LeaveApplication $app,
+        ?callable $findEmployeeByControlNo = null
+    ): ?object {
+        if ($app->employee_control_no === null) {
+            return null;
+        }
+
+        $controlNo = trim((string) $app->employee_control_no);
+        if ($controlNo === '') {
+            return null;
+        }
+
+        return $findEmployeeByControlNo !== null
+            ? $findEmployeeByControlNo($controlNo)
+            : HrisEmployee::findByControlNo($controlNo);
+    }
+
+    public function isDepartmentHeadRecord(?string $controlNo): bool
+    {
+        $normalizedControlNo = $this->normalizeControlNo($controlNo);
+        if ($normalizedControlNo === '') {
+            return false;
+        }
+
+        $departmentHeads = DepartmentHead::query()->get(['control_no']);
+        foreach ($departmentHeads as $head) {
+            $headControlNo = $this->normalizeControlNo((string) $head->control_no);
+            if ($headControlNo !== '' && $headControlNo === $normalizedControlNo) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public function formatErmsApplication(
+        LeaveApplication $app,
+        array $actorDirectory = [],
+        ?callable $findEmployeeByControlNo = null
+    ): array {
+        $documentVerification = $this->documentVerificationService()->issue($app);
+        $resolvedEmployee = $this->resolveApplicationEmployee($app, $findEmployeeByControlNo);
+        $employeeName = trim((string) ($app->employee_name ?? ''));
+        if ($employeeName === '') {
+            $employeeName = $this->formatEmployeeFullName($resolvedEmployee);
+        }
+        if ($employeeName === '') {
+            $employeeName = trim((string) ($app->applicantAdmin?->full_name ?? ''));
+        }
+        if ($employeeName === '') {
+            $employeeName = $this->resolveEmployeeDisplayName($app, $findEmployeeByControlNo);
+        }
+        $office = $resolvedEmployee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
+
+        $milestoneLogs = $this->resolveApplicationMilestoneLogs(
+            $app,
+            fn ($r) => $this->isCancelledRemark($r)
+        );
+        $submittedLog = $milestoneLogs['submitted'];
+        $adminApprovedLog = $milestoneLogs['admin_approved'];
+        $hrApprovedLog = $milestoneLogs['hr_approved'];
+        $hrReceivedLog = $milestoneLogs['hr_received'];
+        $cmoCbmoReviewedLog = $milestoneLogs['cmo_cbmo_reviewed'];
+        $hrReleasedLog = $milestoneLogs['hr_released'];
+        $hrRecalledLog = $milestoneLogs['hr_recalled'];
+        $adminRejectedLog = $milestoneLogs['admin_rejected'];
+        $hrRejectedLog = $milestoneLogs['hr_rejected'];
+        $cancelledLog = $milestoneLogs['cancelled'];
+
+        $filedBy = $this->resolveWorkflowPerformerName($submittedLog, $actorDirectory, $employeeName);
+        if (! $filedBy && $app->applicant_admin_id && $app->applicantAdmin) {
+            $filedBy = trim((string) ($app->applicantAdmin->full_name ?? '')) ?: null;
+        }
+        if (! $filedBy) {
+            $filedBy = $employeeName;
+        }
+        $adminActionBy = ($app->admin_id && isset($actorDirectory['admin'][(int) $app->admin_id]))
+            ? $actorDirectory['admin'][(int) $app->admin_id]
+            : $this->resolveWorkflowPerformerName($adminApprovedLog ?? $adminRejectedLog, $actorDirectory, $employeeName);
+        $hrActionBy = $this->resolveWorkflowPerformerName($hrApprovedLog ?? $hrRejectedLog, $actorDirectory, $employeeName);
+        if ($hrActionBy === null && $app->status !== LeaveApplication::STATUS_RECALLED && $app->hr_id && isset($actorDirectory['hr'][(int) $app->hr_id])) {
+            $hrActionBy = $actorDirectory['hr'][(int) $app->hr_id];
+        }
+        $recallActionBy = $this->resolveWorkflowPerformerName($hrRecalledLog, $actorDirectory, $employeeName);
+        if ($recallActionBy === null && $app->status === LeaveApplication::STATUS_RECALLED && $app->hr_id && isset($actorDirectory['hr'][(int) $app->hr_id])) {
+            $recallActionBy = $actorDirectory['hr'][(int) $app->hr_id];
+        }
+        $receivedActionBy = $this->resolveWorkflowPerformerName($hrReceivedLog, $actorDirectory, $employeeName);
+        $cmoCbmoReviewActionBy = $this->resolveWorkflowPerformerName($cmoCbmoReviewedLog, $actorDirectory, $employeeName);
+        $releasedActionBy = $this->resolveWorkflowPerformerName($hrReleasedLog, $actorDirectory, $employeeName);
+
+        $isCancelled = $app->status === LeaveApplication::STATUS_CANCELLED || $cancelledLog !== null || $this->isCancelledRemark($app->remarks);
+        $hasPendingApprovedUpdateRequest = $this->hasPendingApprovedUpdateRequest($app);
+        $displayStatus = $isCancelled
+            ? 'Cancelled'
+            : (
+                $this->shouldPresentApprovedWhilePendingUpdate($app, $hasPendingApprovedUpdateRequest)
+                    ? 'Approved'
+                    : $this->ermsStatusLabel($app->status)
+            );
+        $queueMeta = $this->resolveLeaveHrQueueMeta($app);
+        $cancellationReason = $this->extractCancellationReason($app->remarks);
+        $cancelledBy = $cancelledLog
+            ? ($this->resolveWorkflowPerformerName($cancelledLog, $actorDirectory, $employeeName) ?? $employeeName)
+            : ($isCancelled ? $employeeName : null);
+
+        $disapprovedBy = null;
+        if ($app->status === LeaveApplication::STATUS_REJECTED) {
+            if ($cancelledBy) {
+                $disapprovedBy = $cancelledBy;
+            } elseif ($hrRejectedLog || $app->hr_id) {
+                $disapprovedBy = $this->resolveWorkflowPerformerName($hrRejectedLog, $actorDirectory, $employeeName)
+                    ?? $hrActionBy;
+            } elseif ($adminRejectedLog || $app->admin_id) {
+                $disapprovedBy = $this->resolveWorkflowPerformerName($adminRejectedLog, $actorDirectory, $employeeName)
+                    ?? $adminActionBy;
+            }
+        }
+
+        $adminActionAt = $adminApprovedLog?->created_at
+            ?? $adminRejectedLog?->created_at
+            ?? $app->admin_approved_at;
+        $hrActionAt = $hrApprovedLog?->created_at
+            ?? $hrRejectedLog?->created_at
+            ?? $app->hr_approved_at;
+        $recallActionAt = $hrRecalledLog?->created_at
+            ?? ($app->status === LeaveApplication::STATUS_RECALLED ? $app->updated_at : null);
+        $receivedActionAt = $hrReceivedLog?->created_at;
+        $cmoCbmoReviewActionAt = $cmoCbmoReviewedLog?->created_at;
+        $releasedActionAt = $hrReleasedLog?->created_at;
+        $cancelledAt = $cancelledLog?->created_at ?? ($isCancelled ? $app->updated_at : null);
+
+        $disapprovedAt = null;
+        if ($app->status === LeaveApplication::STATUS_REJECTED) {
+            if ($cancelledAt) {
+                $disapprovedAt = $cancelledAt;
+            } elseif ($hrRejectedLog?->created_at) {
+                $disapprovedAt = $hrRejectedLog->created_at;
+            } elseif ($adminRejectedLog?->created_at) {
+                $disapprovedAt = $adminRejectedLog->created_at;
+            }
+        }
+
+        $processedBy = null;
+        $reviewedAt = null;
+
+        if ($isCancelled) {
+            $processedBy = $cancelledBy;
+            $reviewedAt = $cancelledAt;
+        } elseif ($app->status === LeaveApplication::STATUS_PENDING_HR) {
+            $processedBy = $adminActionBy;
+            $reviewedAt = $adminActionAt;
+        } elseif ($app->status === LeaveApplication::STATUS_APPROVED) {
+            $processedBy = $hrActionBy ?? $adminActionBy;
+            $reviewedAt = $hrActionAt ?? $adminActionAt;
+        } elseif ($app->status === LeaveApplication::STATUS_RECALLED) {
+            $processedBy = $recallActionBy ?? $hrActionBy ?? $adminActionBy;
+            $reviewedAt = $recallActionAt ?? $hrActionAt ?? $adminActionAt;
+        } elseif ($app->status === LeaveApplication::STATUS_REJECTED) {
+            $processedBy = $disapprovedBy;
+            $reviewedAt = $disapprovedAt ?? $hrActionAt ?? $adminActionAt;
+        }
+
+        $logs = $app->relationLoaded('logs')
+            ? $app->logs->sortBy(fn (LeaveApplicationLog $log) => $log->created_at?->timestamp ?? 0)->values()
+            : collect();
+
+        $statusHistory = $logs
+            ->filter(fn (LeaveApplicationLog $log): bool => ! $this->isHrApplicationEditWorkflowLog($log))
+            ->map(function (LeaveApplicationLog $log) use ($actorDirectory, $employeeName) {
+                $actorName = $this->resolveWorkflowPerformerName($log, $actorDirectory, $employeeName);
+
+                return [
+                    'id' => (int) $log->id,
+                    'leave_application_id' => (int) $log->leave_application_id,
+                    'action' => $log->action,
+                    'stage' => $this->mapWorkflowLogStage($log),
+                    'actor_name' => $actorName,
+                    'action_by_name' => $actorName,
+                    'action_by' => $actorName,
+                    'performed_by_type' => strtoupper((string) $log->performed_by_type),
+                    'performed_by_id' => $log->performed_by_id !== null ? (int) $log->performed_by_id : null,
+                    'remarks' => $log->remarks,
+                    'created_at' => $log->created_at?->toIso8601String(),
+                ];
+            })->values();
+
+        $approverName = $processedBy ?? $hrActionBy ?? $adminActionBy;
+
+        $selectedDates = $app->resolvedSelectedDates();
+        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
+        $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
+        $pendingPayload = is_array($pendingUpdateMeta['payload'] ?? null) ? $pendingUpdateMeta['payload'] : [];
+        $latestPayload = is_array($latestUpdateMeta['payload'] ?? null) ? $latestUpdateMeta['payload'] : [];
+        $effectiveRecallDateKeys = $this->resolveEffectiveStoredRecallDateKeys($app);
+        $isForcedLeave = LeaveType::isForcedLeaveType($app->leaveType, (int) $app->leave_type_id);
+        $normalizedPayMode = $this->calculationService()->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
+        if ($isForcedLeave) {
+            $normalizedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+        $withoutPay = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
+        $selectedDatePayStatus = $isForcedLeave
+            ? null
+            : (is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null);
+        $deductibleDays = $isForcedLeave
+            ? round(max((float) ($app->total_days ?? 0.0), 0.0), 3)
+            : $this->calculationService()->resolveApplicationDeductibleDays($app);
+        $ctoDeductedHours = $this->calculationService()->resolveApplicationCtoDeductedHours($app);
+        $resolvedReason = $this->trimNullableString($app->reason)
+            ?? $this->trimNullableString($latestPayload['reason'] ?? null)
+            ?? $this->trimNullableString($pendingPayload['reason'] ?? null);
+        $resolvedDetailsOfLeave = $this->trimNullableString($app->details_of_leave)
+            ?? $this->trimNullableString($latestPayload['details_of_leave'] ?? $latestPayload['detailsOfLeave'] ?? null)
+            ?? $this->trimNullableString($pendingPayload['details_of_leave'] ?? $pendingPayload['detailsOfLeave'] ?? null);
+        $monetizationComponents = (bool) $app->is_monetization
+            ? $this->certificationService()->resolveStoredMonetizationLeaveCreditComponents($app)
+            : [];
+        $displayLeaveTypeName = (bool) $app->is_monetization && $monetizationComponents !== []
+            ? $this->eligibilityService()->formatMonetizationComponentsLabel($monetizationComponents, false)
+            : $app->leaveType?->name;
+
+        return [
+            'id' => $app->id,
+            'document_verification' => $documentVerification,
+            'documentVerification' => $documentVerification,
+            'employee_control_no' => $app->employee_control_no ? (string) $app->employee_control_no : null,
+            'leave_type_id' => $app->leave_type_id,
+            'leave_type_name' => $displayLeaveTypeName,
+            'start_date' => $app->start_date?->toDateString(),
+            'end_date' => $app->end_date?->toDateString(),
+            'selected_dates' => $selectedDates,
+            'selected_date_pay_status' => $selectedDatePayStatus,
+            'selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
+            'selected_date_half_day_portion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selectedDateHalfDayPortion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selected_date_half_day_period' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selectedDateHalfDayPeriod' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selected_date_halfday_period' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'total_days' => (float) $app->total_days,
+            'deductible_days' => $deductibleDays,
+            'cto_deducted_hours' => $ctoDeductedHours,
+            'reason' => $resolvedReason,
+            'reason_purpose' => $resolvedReason,
+            'details_of_leave' => $resolvedDetailsOfLeave,
+            'detailsOfLeave' => $resolvedDetailsOfLeave,
+            'pay_mode' => $normalizedPayMode,
+            'allow_sl_vl_cross_deduction' => (bool) ($app->allow_sl_vl_cross_deduction ?? false),
+            'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
+            'without_pay' => $withoutPay,
+            'with_pay' => ! $withoutPay,
+            'linked_forced_leave_deducted_days' => round(max((float) ($app->linked_forced_leave_deducted_days ?? 0.0), 0.0), 3),
+            'linked_vacation_leave_deducted_days' => round(max((float) ($app->linked_vacation_leave_deducted_days ?? 0.0), 0.0), 3),
+            'linked_sick_leave_deducted_days' => round(max((float) ($app->linked_sick_leave_deducted_days ?? 0.0), 0.0), 3),
+            'attachment_required' => (bool) ($app->attachment_required ?? false),
+            'attachment_submitted' => (bool) ($app->attachment_submitted ?? false),
+            'attachment_reference' => $this->trimNullableString($app->attachment_reference ?? null),
+            'is_monetization' => (bool) $app->is_monetization,
+            'monetization_leave_credits' => $monetizationComponents,
+            'monetization_leave_credit_label' => $monetizationComponents !== []
+                ? $this->eligibilityService()->formatMonetizationComponentsLabel($monetizationComponents)
+                : null,
+            'date_filed' => $app->created_at?->toDateString(),
+            'filed_at' => $app->created_at?->toIso8601String(),
+            'created_at' => $app->created_at?->toIso8601String(),
+            'status' => $displayStatus,
+            'raw_status' => $app->status,
+            'queue_group_status' => $queueMeta['group_status'],
+            'queueGroupStatus' => $queueMeta['group_status'],
+            'queue_group_priority' => $queueMeta['group_priority'],
+            'queueGroupPriority' => $queueMeta['group_priority'],
+            'queue_stage_key' => $queueMeta['stage_key'],
+            'queueStageKey' => $queueMeta['stage_key'],
+            'queue_stage_priority' => $queueMeta['stage_priority'],
+            'queueStagePriority' => $queueMeta['stage_priority'],
+            'remarks' => $app->remarks,
+            'pending_update' => $pendingUpdateMeta['payload'],
+            'pending_update_action_type' => $pendingUpdateMeta['action_type'],
+            'pending_update_reason' => $pendingUpdateMeta['reason'],
+            'pending_update_previous_status' => $pendingUpdateMeta['previous_status'],
+            'pending_update_requested_by' => $pendingUpdateMeta['requested_by'],
+            'pending_update_requested_at' => $pendingUpdateMeta['requested_at']?->toIso8601String(),
+            'has_pending_update_request' => $hasPendingApprovedUpdateRequest,
+            'latest_update_request_status' => $latestUpdateMeta['status'],
+            'latest_update_request_payload' => $latestUpdateMeta['payload'],
+            'latest_update_request_action_type' => $latestUpdateMeta['action_type'],
+            'latest_update_request_reason' => $latestUpdateMeta['reason'],
+            'latest_update_request_previous_status' => $latestUpdateMeta['previous_status'],
+            'latest_update_requested_by' => $latestUpdateMeta['requested_by'],
+            'latest_update_requested_at' => $latestUpdateMeta['requested_at']?->toIso8601String(),
+            'latest_update_reviewed_at' => $latestUpdateMeta['reviewed_at']?->toIso8601String(),
+            'latest_update_review_remarks' => $latestUpdateMeta['review_remarks'],
+            'update_requests' => $this->formatApplicationUpdateRequests($app),
+            'updateRequests' => $this->formatApplicationUpdateRequests($app),
+            'rejection_reason' => $app->status === LeaveApplication::STATUS_REJECTED && ! $isCancelled ? $app->remarks : null,
+            'employee_name' => $employeeName,
+            'office' => $office,
+            'officeAcronym' => $resolvedEmployee?->officeAcronym,
+            'office_acronym' => $resolvedEmployee?->officeAcronym,
+            'hrisOfficeAcronym' => $resolvedEmployee?->hrisOfficeAcronym,
+            'hris_office_acronym' => $resolvedEmployee?->hrisOfficeAcronym,
+            'employment_status' => $resolvedEmployee?->status,
+            'employment_status_key' => LeaveType::normalizeEmploymentStatusKey($resolvedEmployee?->status),
+            'filed_by' => $filedBy,
+            'approver_name' => $approverName,
+            'admin_action_by' => $adminActionBy,
+            'hr_action_by' => $hrActionBy,
+            'received_by' => $receivedActionBy,
+            'receivedBy' => $receivedActionBy,
+            'hr_received_by' => $receivedActionBy,
+            'cmo_cbmo_reviewed_by' => $cmoCbmoReviewActionBy,
+            'cmoCbmoReviewedBy' => $cmoCbmoReviewActionBy,
+            'released_by' => $releasedActionBy,
+            'releasedBy' => $releasedActionBy,
+            'hr_released_by' => $releasedActionBy,
+            'recall_action_by' => $recallActionBy,
+            'processed_by' => $processedBy,
+            'disapproved_by' => $disapprovedBy,
+            'cancelled_by' => $cancelledBy,
+            'cancelled' => $isCancelled,
+            'cancellation_reason' => $cancellationReason,
+            'reviewed_at' => $reviewedAt?->toIso8601String(),
+            'admin_action_at' => $adminActionAt?->toIso8601String(),
+            'hr_action_at' => $hrActionAt?->toIso8601String(),
+            'received_at' => $receivedActionAt?->toIso8601String(),
+            'receivedAt' => $receivedActionAt?->toIso8601String(),
+            'hr_received_at' => $receivedActionAt?->toIso8601String(),
+            'cmo_cbmo_reviewed_at' => $cmoCbmoReviewActionAt?->toIso8601String(),
+            'cmoCbmoReviewedAt' => $cmoCbmoReviewActionAt?->toIso8601String(),
+            'released_at' => $releasedActionAt?->toIso8601String(),
+            'releasedAt' => $releasedActionAt?->toIso8601String(),
+            'hr_released_at' => $releasedActionAt?->toIso8601String(),
+            'recall_action_at' => $recallActionAt?->toIso8601String(),
+            'recallEffectiveDate' => $app->recall_effective_date?->toDateString(),
+            'recall_effective_date' => $app->recall_effective_date?->toDateString(),
+            'recallSelectedDates' => $effectiveRecallDateKeys !== [] ? $effectiveRecallDateKeys : null,
+            'recall_selected_dates' => $effectiveRecallDateKeys !== [] ? $effectiveRecallDateKeys : null,
+            'disapproved_at' => $disapprovedAt?->toIso8601String(),
+            'cancelled_at' => $cancelledAt?->toIso8601String(),
+            'has_hr_received' => $hrReceivedLog !== null,
+            'hasHrReceived' => $hrReceivedLog !== null,
+            'has_cmo_cbmo_reviewed' => $cmoCbmoReviewedLog !== null,
+            'hasCmoCbmoReviewed' => $cmoCbmoReviewedLog !== null,
+            'has_hr_released' => $hrReleasedLog !== null,
+            'hasHrReleased' => $hrReleasedLog !== null,
+            'status_history' => $statusHistory,
+            'logs' => $statusHistory,
+            'employee' => $resolvedEmployee ? [
+                'control_no' => $resolvedEmployee->control_no,
+                'firstname' => $resolvedEmployee->firstname,
+                'middlename' => $resolvedEmployee->middlename,
+                'surname' => $resolvedEmployee->surname,
+                'full_name' => $this->formatEmployeeFullName($resolvedEmployee),
+                'designation' => $resolvedEmployee->designation,
+                'office' => $resolvedEmployee->office,
+                'officeAcronym' => $resolvedEmployee->officeAcronym,
+                'office_acronym' => $resolvedEmployee->officeAcronym,
+                'hrisOfficeAcronym' => $resolvedEmployee->hrisOfficeAcronym,
+                'hris_office_acronym' => $resolvedEmployee->hrisOfficeAcronym,
+                'employment_status' => $resolvedEmployee->status,
+                'employment_status_key' => LeaveType::normalizeEmploymentStatusKey($resolvedEmployee->status),
+                'status' => $resolvedEmployee->status,
+            ] : null,
+            'is_department_head' => $this->isDepartmentHeadRecord($resolvedEmployee?->control_no ?? $app->employee_control_no),
+        ];
+    }
+
+    public function formatApplication(
+        LeaveApplication $app,
+        ?array $actorDirectory = null,
+        ?callable $findEmployeeByControlNo = null
+    ): array {
+        $documentVerification = $this->documentVerificationService()->issue($app);
+        $resolvedEmployee = $this->resolveApplicationEmployee($app, $findEmployeeByControlNo);
+        $employeeName = trim((string) ($app->employee_name ?? ''));
+        if ($employeeName === '') {
+            $employeeName = $this->formatEmployeeFullName($resolvedEmployee);
+        }
+        $applicantName = $employeeName !== ''
+            ? $employeeName
+            : trim((string) ($app->applicantAdmin?->full_name ?? ''));
+        if ($applicantName === '') {
+            $applicantName = $this->resolveEmployeeDisplayName($app, $findEmployeeByControlNo);
+        }
+        $office = $resolvedEmployee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
+        $durationDays = (float) $app->total_days;
+        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
+        $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
+        $leaveBalanceSnapshot = $this->creditService()->getApplicationLeaveBalanceSnapshot($app);
+        $vacationLeaveBalance = $this->certificationService()->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Vacation Leave');
+        $sickLeaveBalance = $this->certificationService()->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Sick Leave');
+        $monthlyRate = $resolvedEmployee?->rate_mon !== null ? (float) $resolvedEmployee->rate_mon : null;
+        $terminalLeaveEstimatedAmount = $this->certificationService()->resolveTerminalLeaveEstimatedAmount(
+            $monthlyRate,
+            $vacationLeaveBalance,
+            $sickLeaveBalance
+        );
+        $monetizationComponents = (bool) $app->is_monetization
+            ? $this->certificationService()->resolveStoredMonetizationLeaveCreditComponents($app)
+            : [];
+        $displayLeaveTypeName = (bool) $app->is_monetization && $monetizationComponents !== []
+            ? $this->eligibilityService()->formatMonetizationComponentsLabel($monetizationComponents, false)
+            : ($app->leaveType?->name ?? 'Unknown');
+        $isForcedLeave = LeaveType::isForcedLeaveType($app->leaveType, (int) $app->leave_type_id);
+        $currentLeaveBalance = $this->certificationService()->findLeaveTypeBalanceInSnapshot($leaveBalanceSnapshot, (int) $app->leave_type_id);
+        $normalizedPayMode = $this->calculationService()->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
+        $hasForcedLeaveHrLedgerOverride = $isForcedLeave
+            && (
+                is_array($app->selected_date_pay_status)
+                || is_array($app->selected_date_deduction)
+                || is_array($app->selected_date_without_pay)
+                || round(max((float) ($app->without_pay_days ?? 0.0), 0.0), 3) > 0.0
+            );
+        if ($isForcedLeave && ! $hasForcedLeaveHrLedgerOverride) {
+            $normalizedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+        $withoutPay = $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
+        $selectedDatePayStatus = is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null;
+        $deductibleDays = $isForcedLeave && ! $hasForcedLeaveHrLedgerOverride
+            ? round(max((float) ($app->total_days ?? 0.0), 0.0), 3)
+            : $this->calculationService()->resolveApplicationDeductibleDays($app);
+        $withoutPayDays = round(max((float) ($app->without_pay_days ?? 0.0), 0.0), 3);
+        $ctoDeductedHours = $this->calculationService()->resolveApplicationCtoDeductedHours($app);
+        $hasPendingApprovedUpdateRequest = $this->hasPendingApprovedUpdateRequest($app);
+        $displayStatus = $this->shouldPresentApprovedWhilePendingUpdate($app, $hasPendingApprovedUpdateRequest)
+            ? $this->statusToFrontend(LeaveApplication::STATUS_APPROVED)
+            : $this->statusToFrontend($app->status);
+        $queueMeta = $this->resolveLeaveHrQueueMeta($app);
+        $logs = $app->relationLoaded('logs')
+            ? $app->logs
+                ->filter(fn ($log) => $log instanceof LeaveApplicationLog)
+                ->sort(function (LeaveApplicationLog $a, LeaveApplicationLog $b) {
+                    $timeA = $a->created_at?->timestamp ?? 0;
+                    $timeB = $b->created_at?->timestamp ?? 0;
+                    if ($timeA === $timeB) {
+                        return ($a->id ?? 0) <=> ($b->id ?? 0);
+                    }
+
+                    return $timeA <=> $timeB;
+                })
+                ->values()
+            : collect();
+
+        if ($actorDirectory === null && $logs->isNotEmpty()) {
+            $actorDirectory = $this->buildWorkflowActorDirectory([$app]);
+        }
+
+        $hrReceivedLog = $logs->last(
+            fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_RECEIVED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
+        $cmoCbmoReviewedLog = $logs->last(
+            fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
+        $hrReleasedLog = $logs->last(
+            fn (LeaveApplicationLog $log) => $log->action === LeaveApplicationLog::ACTION_HR_RELEASED
+                && strtoupper((string) $log->performed_by_type) === LeaveApplicationLog::PERFORMER_HR
+        );
+        $statusHistory = $this->buildWorkflowStatusHistory(
+            $logs,
+            $actorDirectory,
+            $applicantName,
+            fn ($val) => $this->normalizeControlNo($val)
+        );
+
+        $effectiveRecallDateKeys = $this->resolveEffectiveStoredRecallDateKeys($app);
+
+        $data = [
+            'id' => $app->id,
+            'document_verification' => $documentVerification,
+            'documentVerification' => $documentVerification,
+            'employee_control_no' => $app->employee_control_no,
+            'applicant_admin_id' => $app->applicant_admin_id,
+            'is_department_head' => $this->isDepartmentHeadRecord($resolvedEmployee?->control_no ?? $app->employee_control_no),
+            'leave_type_id' => $app->leave_type_id,
+            'leaveType' => $displayLeaveTypeName,
+            'leave_type_name' => $displayLeaveTypeName,
+            'startDate' => $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : null,
+            'endDate' => $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : null,
+            'days' => $durationDays,
+            'duration_value' => $durationDays,
+            'duration_unit' => 'day',
+            'duration_label' => self::formatDays($durationDays),
+            'reason' => $app->reason,
+            'details_of_leave' => $app->details_of_leave,
+            'detailsOfLeave' => $app->details_of_leave,
+            'status' => $displayStatus,
+            'rawStatus' => $app->status,
+            'queue_group_status' => $queueMeta['group_status'],
+            'queueGroupStatus' => $queueMeta['group_status'],
+            'queue_group_priority' => $queueMeta['group_priority'],
+            'queueGroupPriority' => $queueMeta['group_priority'],
+            'queue_stage_key' => $queueMeta['stage_key'],
+            'queueStageKey' => $queueMeta['stage_key'],
+            'queue_stage_priority' => $queueMeta['stage_priority'],
+            'queueStagePriority' => $queueMeta['stage_priority'],
+            'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
+            'filedAt' => $app->created_at?->toIso8601String(),
+            'filed_at' => $app->created_at?->toIso8601String(),
+            'createdAt' => $app->created_at?->toIso8601String(),
+            'created_at' => $app->created_at?->toIso8601String(),
+            'remarks' => $app->remarks,
+            'pending_update' => $pendingUpdateMeta['payload'],
+            'pending_update_action_type' => $pendingUpdateMeta['action_type'],
+            'pending_update_reason' => $pendingUpdateMeta['reason'],
+            'pending_update_previous_status' => $pendingUpdateMeta['previous_status'],
+            'pending_update_requested_by' => $pendingUpdateMeta['requested_by'],
+            'pending_update_requested_at' => $pendingUpdateMeta['requested_at']?->toIso8601String(),
+            'pendingUpdateRequestedAt' => $pendingUpdateMeta['requested_at']?->toIso8601String(),
+            'pendingUpdateRequestedBy' => $pendingUpdateMeta['requested_by'],
+            'pendingUpdateReason' => $pendingUpdateMeta['reason'],
+            'pendingUpdateActionType' => $pendingUpdateMeta['action_type'],
+            'pendingUpdatePreviousStatus' => $pendingUpdateMeta['previous_status'],
+            'has_pending_update_request' => $hasPendingApprovedUpdateRequest,
+            'latest_update_request_status' => $latestUpdateMeta['status'],
+            'latest_update_request_payload' => $latestUpdateMeta['payload'],
+            'latest_update_request_action_type' => $latestUpdateMeta['action_type'],
+            'latest_update_request_reason' => $latestUpdateMeta['reason'],
+            'latest_update_request_previous_status' => $latestUpdateMeta['previous_status'],
+            'latest_update_requested_by' => $latestUpdateMeta['requested_by'],
+            'latest_update_requested_at' => $latestUpdateMeta['requested_at']?->toIso8601String(),
+            'latest_update_reviewed_at' => $latestUpdateMeta['reviewed_at']?->toIso8601String(),
+            'latest_update_review_remarks' => $latestUpdateMeta['review_remarks'],
+            'update_requests' => $this->formatApplicationUpdateRequests($app),
+            'updateRequests' => $this->formatApplicationUpdateRequests($app),
+            'selected_dates' => $app->resolvedSelectedDates(),
+            'selected_date_pay_status' => $selectedDatePayStatus,
+            'selected_date_coverage' => is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null,
+            'selected_date_half_day_portion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selectedDateHalfDayPortion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selected_date_half_day_period' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selectedDateHalfDayPeriod' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selected_date_halfday_period' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selected_date_deduction' => is_array($app->selected_date_deduction) ? $app->selected_date_deduction : null,
+            'selectedDateDeduction' => is_array($app->selected_date_deduction) ? $app->selected_date_deduction : null,
+            'deductible_days_by_date' => is_array($app->selected_date_deduction) ? $app->selected_date_deduction : null,
+            'selected_date_without_pay' => is_array($app->selected_date_without_pay) ? $app->selected_date_without_pay : null,
+            'selectedDateWithoutPay' => is_array($app->selected_date_without_pay) ? $app->selected_date_without_pay : null,
+            'without_pay_days_by_date' => is_array($app->selected_date_without_pay) ? $app->selected_date_without_pay : null,
+            'wop_days_by_date' => is_array($app->selected_date_without_pay) ? $app->selected_date_without_pay : null,
+            'commutation' => $app->commutation ?? 'Not Requested',
+            'pay_mode' => $normalizedPayMode,
+            'allow_sl_vl_cross_deduction' => (bool) ($app->allow_sl_vl_cross_deduction ?? false),
+            'pay_status' => $withoutPay ? 'Without Pay' : 'With Pay',
+            'without_pay' => $withoutPay,
+            'with_pay' => ! $withoutPay,
+            'linked_forced_leave_deducted_days' => round(max((float) ($app->linked_forced_leave_deducted_days ?? 0.0), 0.0), 3),
+            'linked_vacation_leave_deducted_days' => round(max((float) ($app->linked_vacation_leave_deducted_days ?? 0.0), 0.0), 3),
+            'linked_sick_leave_deducted_days' => round(max((float) ($app->linked_sick_leave_deducted_days ?? 0.0), 0.0), 3),
+            'attachment_required' => (bool) ($app->attachment_required ?? false),
+            'attachment_submitted' => (bool) ($app->attachment_submitted ?? false),
+            'attachment_reference' => $this->trimNullableString($app->attachment_reference ?? null),
+            'attachment_available' => $this->trimNullableString($app->attachment_reference ?? null) !== null,
+            'has_attachment' => $this->trimNullableString($app->attachment_reference ?? null) !== null,
+            'is_monetization' => (bool) $app->is_monetization,
+            'monetization_leave_credits' => $monetizationComponents,
+            'monetizationLeaveCredits' => $monetizationComponents,
+            'monetization_leave_credit_label' => $monetizationComponents !== []
+                ? $this->eligibilityService()->formatMonetizationComponentsLabel($monetizationComponents)
+                : null,
+            'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
+            'rate_mon' => $monthlyRate,
+            'vl_balance' => $vacationLeaveBalance,
+            'sl_balance' => $sickLeaveBalance,
+            'terminal_leave_estimated_amount' => $terminalLeaveEstimatedAmount,
+            'deductible_days' => $deductibleDays,
+            'with_pay_days' => $deductibleDays,
+            'withPayDays' => $deductibleDays,
+            'without_pay_days' => $withoutPayDays,
+            'withoutPayDays' => $withoutPayDays,
+            'cto_deducted_hours' => $ctoDeductedHours,
+            'leaveBalance' => $currentLeaveBalance,
+            'leaveBalances' => $leaveBalanceSnapshot,
+            'leave_balances' => $leaveBalanceSnapshot,
+            'employee_leave_balances' => $leaveBalanceSnapshot,
+            'certificationLeaveCredits' => $this->certificationService()->resolveCertificationLeaveCredits($app, $leaveBalanceSnapshot),
+            'admin_id' => $app->admin_id,
+            'hr_id' => $app->hr_id,
+            'admin_approved_at' => $app->admin_approved_at?->toIso8601String(),
+            'hr_approved_at' => $app->hr_approved_at?->toIso8601String(),
+            'received_at' => $hrReceivedLog?->created_at?->toIso8601String(),
+            'receivedAt' => $hrReceivedLog?->created_at?->toIso8601String(),
+            'hr_received_at' => $hrReceivedLog?->created_at?->toIso8601String(),
+            'cmo_cbmo_reviewed_at' => $cmoCbmoReviewedLog?->created_at?->toIso8601String(),
+            'cmoCbmoReviewedAt' => $cmoCbmoReviewedLog?->created_at?->toIso8601String(),
+            'released_at' => $hrReleasedLog?->created_at?->toIso8601String(),
+            'releasedAt' => $hrReleasedLog?->created_at?->toIso8601String(),
+            'hr_released_at' => $hrReleasedLog?->created_at?->toIso8601String(),
+            'has_hr_received' => $hrReceivedLog !== null,
+            'hasHrReceived' => $hrReceivedLog !== null,
+            'has_cmo_cbmo_reviewed' => $cmoCbmoReviewedLog !== null,
+            'hasCmoCbmoReviewed' => $cmoCbmoReviewedLog !== null,
+            'has_hr_released' => $hrReleasedLog !== null,
+            'hasHrReleased' => $hrReleasedLog !== null,
+            'status_history' => $statusHistory,
+            'logs' => $statusHistory,
+            'recallEffectiveDate' => $app->recall_effective_date?->toDateString(),
+            'recall_effective_date' => $app->recall_effective_date?->toDateString(),
+            'recallSelectedDates' => $effectiveRecallDateKeys !== [] ? $effectiveRecallDateKeys : null,
+            'recall_selected_dates' => $effectiveRecallDateKeys !== [] ? $effectiveRecallDateKeys : null,
+            'employeeName' => $applicantName,
+            'employee_name' => $applicantName,
+            'applicantName' => $applicantName,
+            'applicant_name' => $applicantName,
+            'office' => $office,
+            'officeAcronym' => $resolvedEmployee?->officeAcronym,
+            'office_acronym' => $resolvedEmployee?->officeAcronym,
+            'hrisOfficeAcronym' => $resolvedEmployee?->hrisOfficeAcronym,
+            'hris_office_acronym' => $resolvedEmployee?->hrisOfficeAcronym,
+            'employment_status' => $resolvedEmployee?->status,
+            'employment_status_key' => LeaveType::normalizeEmploymentStatusKey($resolvedEmployee?->status),
+        ];
+
+        if ($resolvedEmployee) {
+            $data['employee'] = [
+                'control_no' => $resolvedEmployee->control_no,
+                'firstname' => $resolvedEmployee->firstname,
+                'middlename' => $resolvedEmployee->middlename,
+                'surname' => $resolvedEmployee->surname,
+                'full_name' => $this->formatEmployeeFullName($resolvedEmployee),
+                'designation' => $resolvedEmployee->designation,
+                'office' => $resolvedEmployee->office,
+                'officeAcronym' => $resolvedEmployee->officeAcronym,
+                'office_acronym' => $resolvedEmployee->officeAcronym,
+                'hrisOfficeAcronym' => $resolvedEmployee->hrisOfficeAcronym,
+                'hris_office_acronym' => $resolvedEmployee->hrisOfficeAcronym,
+                'employment_status' => $resolvedEmployee->status,
+                'employment_status_key' => LeaveType::normalizeEmploymentStatusKey($resolvedEmployee->status),
+                'status' => $resolvedEmployee->status,
+            ];
+        }
+
+        return $data;
     }
 }

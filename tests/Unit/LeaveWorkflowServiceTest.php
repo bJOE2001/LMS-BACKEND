@@ -1622,4 +1622,317 @@ class LeaveWorkflowServiceTest extends TestCase
         $this->assertSame(422, $res->getStatusCode());
         $this->assertStringContainsString('Employee not found in HRIS', $res->getData(true)['message']);
     }
+
+    public function test_tokenize_hr_application_search(): void
+    {
+        $this->assertSame([], $this->service->tokenizeHrApplicationSearch(null));
+        $this->assertSame([], $this->service->tokenizeHrApplicationSearch('   '));
+        $this->assertSame(['john', 'doe'], $this->service->tokenizeHrApplicationSearch('john doe'));
+        $this->assertSame(['alice', 'bob'], $this->service->tokenizeHrApplicationSearch('  alice   bob  '));
+    }
+
+    public function test_execute_admin_show_not_found(): void
+    {
+        $admin = new DepartmentAdmin;
+        $admin->id = 1;
+        $admin->department_id = 10;
+
+        $res = $this->service->executeAdminShow($admin, 999999);
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Leave application not found.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_admin_approve_not_found(): void
+    {
+        $admin = new DepartmentAdmin;
+        $admin->id = 1;
+        $admin->department_id = 10;
+
+        $res = $this->service->executeAdminApprove($admin, 999999);
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Leave application not found.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_admin_reject_not_found(): void
+    {
+        $admin = new DepartmentAdmin;
+        $admin->id = 1;
+        $admin->department_id = 10;
+
+        $res = $this->service->executeAdminReject($admin, 999999);
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Leave application not found.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_hr_show_not_found(): void
+    {
+        $res = $this->service->executeHrShow(999999);
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Leave application not found.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_hr_application_edit_requests_forbidden_for_non_admin(): void
+    {
+        $hr = new HRAccount;
+        $hr->id = 1;
+        $hr->role = 'Staff';
+
+        $res = $this->service->executeHrApplicationEditRequests($hr);
+        $this->assertSame(403, $res->getStatusCode());
+        $this->assertSame('Only HR Admin accounts can view application edit requests.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_hr_approve_application_edit_request_forbidden_for_non_admin(): void
+    {
+        $hr = new HRAccount;
+        $hr->id = 1;
+        $hr->role = 'Staff';
+
+        $res = $this->service->executeHrApproveApplicationEditRequest($hr, 123);
+        $this->assertSame(403, $res->getStatusCode());
+        $this->assertSame('Only HR Admin accounts can approve application edit requests.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_log_print_not_found(): void
+    {
+        $request = Request::create('/api/leave-applications/999999/log-print', 'POST');
+        $res = $this->service->executeLogPrint($request, 999999);
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Leave application not found.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_erms_log_print_not_found(): void
+    {
+        $request = Request::create('/api/erms/leave-applications/999999/log-print', 'POST');
+        $res = $this->service->executeErmsLogPrint($request, 999999);
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Leave application not found.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_hr_print_logs_not_found(): void
+    {
+        $res = $this->service->executeHrPrintLogs(999999);
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Leave application not found.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_erms_employee_access_empty_control_no(): void
+    {
+        $res = $this->service->executeErmsEmployeeAccess('');
+        $this->assertSame(422, $res->getStatusCode());
+        $this->assertSame('The employee_control_no query parameter is required.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_erms_employee_access_not_found(): void
+    {
+        $res = $this->service->executeErmsEmployeeAccess('99999');
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Employee record not found.', $res->getData(true)['message']);
+        $this->assertFalse($res->getData(true)['can_access_leave_modules']);
+    }
+
+    public function test_execute_erms_index_not_found(): void
+    {
+        $res = $this->service->executeErmsIndex('99999');
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Employee record not found.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_erms_show_not_found(): void
+    {
+        $res = $this->service->executeErmsShow('99999', 1);
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Employee record not found.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_erms_cancel_not_found(): void
+    {
+        $employee = (object) ['control_no' => '12345'];
+        $res = $this->service->executeErmsCancel(
+            999999,
+            $employee,
+            '12345',
+            'Changed mind',
+            fn ($query, $ctrlNo) => $query->where('employee_control_no', $ctrlNo),
+            fn ($status) => (string) $status,
+            fn ($apps) => [],
+            fn ($app, $dir) => []
+        );
+
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Leave application not found for this employee.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_hr_verify_document_invalid_token(): void
+    {
+        $docService = $this->createMock(\App\Services\LeaveApplicationDocumentVerificationService::class);
+        $docService->method('decode')->willReturn(null);
+
+        $res = $this->service->executeHrVerifyDocument(
+            'invalid-token',
+            $docService,
+            fn ($a) => false,
+            fn ($r) => false,
+            fn ($apps) => [],
+            fn ($app, $dir) => []
+        );
+
+        $this->assertSame(422, $res->getStatusCode());
+        $this->assertSame('The leave application QR code is invalid or has been altered.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_hr_receive_not_found(): void
+    {
+        $hr = new HRAccount;
+        $hr->id = 1;
+        $docService = $this->createMock(\App\Services\LeaveApplicationDocumentVerificationService::class);
+
+        $res = $this->service->executeHrReceive(
+            999999,
+            $hr,
+            ['remarks' => 'test'],
+            $docService,
+            fn ($apps) => [],
+            fn ($app, $dir) => [],
+            fn ($r) => false,
+            fn ($a) => false
+        );
+
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Leave application not found.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_hr_release_not_found(): void
+    {
+        $hr = new HRAccount;
+        $hr->id = 1;
+        $docService = $this->createMock(\App\Services\LeaveApplicationDocumentVerificationService::class);
+
+        $res = $this->service->executeHrRelease(
+            999999,
+            $hr,
+            ['remarks' => 'test'],
+            $docService,
+            fn ($apps) => [],
+            fn ($app, $dir) => [],
+            fn ($r) => false,
+            fn ($a) => false
+        );
+
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Leave application not found.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_hr_undo_receive_not_found(): void
+    {
+        $res = $this->service->executeHrUndoReceive(
+            999999,
+            fn ($a) => null,
+            fn ($apps) => [],
+            fn ($app, $dir) => []
+        );
+
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Leave application not found.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_hr_undo_release_not_found(): void
+    {
+        $res = $this->service->executeHrUndoRelease(
+            999999,
+            fn ($a) => null,
+            fn ($apps) => [],
+            fn ($app, $dir) => []
+        );
+
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Leave application not found.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_hr_cmo_cbmo_review_not_found(): void
+    {
+        $hr = new HRAccount;
+        $hr->id = 1;
+
+        $res = $this->service->executeHrCmoCbmoReview(
+            999999,
+            $hr,
+            'test',
+            fn ($a) => null,
+            fn ($apps) => [],
+            fn ($app, $dir) => []
+        );
+
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('Leave application not found.', $res->getData(true)['message']);
+    }
+
+    public function test_execute_hr_reject_invalid_status(): void
+    {
+        $app = new LeaveApplication;
+        $app->status = LeaveApplication::STATUS_APPROVED;
+        $hr = new HRAccount;
+        $hr->id = 1;
+
+        $res = $this->service->executeHrReject($app, $hr, 'Rejected');
+        $this->assertSame(422, $res->getStatusCode());
+        $this->assertStringContainsString("Cannot reject: application status is 'APPROVED'", $res->getData(true)['message']);
+    }
+
+    public function test_stream_application_attachment_no_reference(): void
+    {
+        $app = new LeaveApplication;
+        $app->attachment_reference = null;
+
+        $res = $this->service->streamApplicationAttachment($app);
+        $this->assertSame(404, $res->getStatusCode());
+        $this->assertSame('No uploaded attachment found for this leave application.', $res->getData(true)['message']);
+    }
+
+    public function test_format_application_update_requests_empty(): void
+    {
+        $app = new LeaveApplication;
+        $app->id = null;
+
+        $res = $this->service->formatApplicationUpdateRequests($app);
+        $this->assertSame([], $res);
+    }
+
+    public function test_format_erms_application_basic_structure(): void
+    {
+        $app = new LeaveApplication;
+        $app->id = 123;
+        $app->status = LeaveApplication::STATUS_PENDING_ADMIN;
+        $app->total_days = 2.0;
+        $app->setRelation('logs', collect());
+        $app->setRelation('updateRequests', collect());
+
+        $formatted = $this->service->formatErmsApplication($app, []);
+
+        $this->assertIsArray($formatted);
+        $this->assertSame(123, $formatted['id']);
+        $this->assertSame(2.0, $formatted['total_days']);
+        $this->assertSame('Pending', $formatted['status']);
+        $this->assertArrayHasKey('document_verification', $formatted);
+        $this->assertArrayHasKey('queue_group_status', $formatted);
+    }
+
+    public function test_format_application_basic_structure(): void
+    {
+        $app = new LeaveApplication;
+        $app->id = 456;
+        $app->status = LeaveApplication::STATUS_APPROVED;
+        $app->total_days = 1.0;
+        $app->setRelation('logs', collect());
+        $app->setRelation('updateRequests', collect());
+
+        $formatted = $this->service->formatApplication($app, []);
+
+        $this->assertIsArray($formatted);
+        $this->assertSame(456, $formatted['id']);
+        $this->assertSame(1.0, $formatted['days']);
+        $this->assertSame('Approved', $formatted['status']);
+        $this->assertArrayHasKey('document_verification', $formatted);
+        $this->assertArrayHasKey('certificationLeaveCredits', $formatted);
+    }
 }

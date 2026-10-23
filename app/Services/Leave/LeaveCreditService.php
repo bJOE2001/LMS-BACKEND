@@ -4,6 +4,7 @@ namespace App\Services\Leave;
 
 use App\Models\LeaveApplication;
 use App\Models\LeaveBalance;
+use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveType;
 use App\Services\CocLedgerService;
 use App\Services\WorkScheduleService;
@@ -18,8 +19,14 @@ class LeaveCreditService
 
     public function __construct(
         public LeaveCalculationService $calculationService,
-        public CocLedgerService $cocLedgerService
+        public CocLedgerService $cocLedgerService,
+        public ?LeaveEligibilityService $eligibilityService = null
     ) {}
+
+    private function eligibilityService(): LeaveEligibilityService
+    {
+        return $this->eligibilityService ??= app(LeaveEligibilityService::class);
+    }
 
     public function hasLeaveApplicationCtoHoursColumn(): bool
     {
@@ -2522,5 +2529,527 @@ class LeaveCreditService
 
             $balance->increment('balance', abs($normalizedDeltaDays));
         }
+    }
+
+    public function formatErmsLeaveBalancePayload(
+        LeaveType $leaveType,
+        ?LeaveBalance $balance,
+        array $deductionHistory = [],
+        ?float $ctoBalanceHours = null
+    ): array {
+        $accrualHistory = [];
+        if ($balance) {
+            $historyEntries = $balance->relationLoaded('accrualHistories')
+                ? $balance->accrualHistories
+                : $balance->accrualHistories()->get();
+
+            $accrualHistory = $historyEntries
+                ->map(function (LeaveBalanceAccrualHistory $entry): array {
+                    return [
+                        'accrual_date' => $entry->accrual_date?->toDateString(),
+                        'transaction_date' => $entry->accrual_date?->toDateString(),
+                        'credits_added' => (float) $entry->credits_added,
+                        'entry_type' => 'ACCRUAL',
+                        'transaction_type' => 'ACCRUAL',
+                        'label' => 'Monthly accrual',
+                        'description' => 'Monthly accrual',
+                        'source' => $entry->source,
+                        'created_at' => $entry->created_at?->toIso8601String(),
+                    ];
+                })
+                ->values()
+                ->all();
+        }
+
+        $creditHistory = array_merge($accrualHistory, $deductionHistory);
+        usort($creditHistory, function (array $left, array $right): int {
+            $leftDate = (string) ($left['transaction_date'] ?? $left['accrual_date'] ?? $left['created_at'] ?? '');
+            $rightDate = (string) ($right['transaction_date'] ?? $right['accrual_date'] ?? $right['created_at'] ?? '');
+            if ($leftDate !== $rightDate) {
+                return $leftDate < $rightDate ? 1 : -1;
+            }
+
+            $leftCreatedAt = (string) ($left['created_at'] ?? '');
+            $rightCreatedAt = (string) ($right['created_at'] ?? '');
+            if ($leftCreatedAt !== $rightCreatedAt) {
+                return $leftCreatedAt < $rightCreatedAt ? 1 : -1;
+            }
+
+            return ((int) ($right['leave_application_id'] ?? 0)) <=> ((int) ($left['leave_application_id'] ?? 0));
+        });
+
+        $resolvedBalanceHours = $this->isCtoLeaveType($leaveType, (int) $leaveType->id)
+            ? (
+                $ctoBalanceHours !== null
+                    ? round(max((float) $ctoBalanceHours, 0.0), 2)
+                    : $this->calculationService->resolveCtoDeductedHours((float) ($balance?->balance ?? 0.0))
+            )
+            : null;
+
+        return [
+            'leave_type_id' => (int) $leaveType->id,
+            'leave_type_name' => $leaveType->name,
+            'balance' => $balance ? (float) $balance->balance : 0.0,
+            'balance_hours' => $resolvedBalanceHours,
+            'available_balance_hours' => $resolvedBalanceHours,
+            'is_credit_based' => (bool) $leaveType->is_credit_based,
+            'is_accrued' => $leaveType->category === LeaveType::CATEGORY_ACCRUED,
+            'accrual_rate' => $leaveType->accrual_rate !== null ? (float) $leaveType->accrual_rate : null,
+            'accrual_day_of_month' => $leaveType->accrual_day_of_month !== null ? (int) $leaveType->accrual_day_of_month : null,
+            'last_accrual_date' => $balance?->last_accrual_date?->toDateString(),
+            'accrual_history' => $accrualHistory,
+            'accrualHistory' => $accrualHistory,
+            'credit_history' => $creditHistory,
+            'creditHistory' => $creditHistory,
+            'updated_at' => $balance?->updated_at?->toIso8601String(),
+            'year' => $balance?->year !== null ? (int) $balance->year : null,
+        ];
+    }
+
+    public function emptyErmsLeaveBalancePayload(string $leaveTypeName): array
+    {
+        return [
+            'leave_type_id' => null,
+            'leave_type_name' => $leaveTypeName,
+            'balance' => 0.0,
+            'is_credit_based' => null,
+            'is_accrued' => null,
+            'accrual_rate' => null,
+            'accrual_day_of_month' => null,
+            'last_accrual_date' => null,
+            'accrual_history' => [],
+            'accrualHistory' => [],
+            'credit_history' => [],
+            'creditHistory' => [],
+            'updated_at' => null,
+            'year' => null,
+        ];
+    }
+
+    public function buildErmsAccruedLeaveCard(
+        array $typesByName,
+        array $balanceRecordsByType,
+        array $deductionHistoryByType,
+        string $leaveTypeName
+    ): array {
+        $type = $typesByName[strtolower(trim($leaveTypeName))] ?? null;
+        if (! $type instanceof LeaveType) {
+            return $this->emptyErmsLeaveBalancePayload($leaveTypeName);
+        }
+
+        $balance = $balanceRecordsByType[(int) $type->id] ?? null;
+
+        return $this->formatErmsLeaveBalancePayload(
+            $type,
+            $balance instanceof LeaveBalance ? $balance : null,
+            $deductionHistoryByType[(int) $type->id] ?? []
+        );
+    }
+
+    public function buildErmsLatestAccruedCreditsPayload(
+        object $employee,
+        array $typesByName,
+        array $balanceRecordsByType,
+        array $deductionHistoryByType,
+        ?callable $employmentStatusKeyResolver = null
+    ): array {
+        $statusKey = $employmentStatusKeyResolver !== null
+            ? $employmentStatusKeyResolver($employee->status ?? null)
+            : $this->eligibilityService()->resolveEmploymentStatusKey($employee->status ?? null);
+
+        $isContractual = $statusKey === LeaveType::EMPLOYMENT_STATUS_CONTRACTUAL;
+
+        return [
+            'vacation' => $isContractual
+                ? $this->emptyErmsLeaveBalancePayload('Vacation Leave')
+                : $this->buildErmsAccruedLeaveCard(
+                    $typesByName,
+                    $balanceRecordsByType,
+                    $deductionHistoryByType,
+                    'Vacation Leave'
+                ),
+            'sick' => $isContractual
+                ? $this->emptyErmsLeaveBalancePayload('Sick Leave')
+                : $this->buildErmsAccruedLeaveCard(
+                    $typesByName,
+                    $balanceRecordsByType,
+                    $deductionHistoryByType,
+                    'Sick Leave'
+                ),
+            'wellness' => $this->buildErmsAccruedLeaveCard(
+                $typesByName,
+                $balanceRecordsByType,
+                $deductionHistoryByType,
+                'Wellness Leave'
+            ),
+        ];
+    }
+
+    public function mergeCreditHistoriesByType(array ...$historyGroups): array
+    {
+        $merged = [];
+
+        foreach ($historyGroups as $group) {
+            foreach ($group as $typeId => $entries) {
+                $normalizedTypeId = (int) $typeId;
+                if ($normalizedTypeId <= 0 || ! is_array($entries) || $entries === []) {
+                    continue;
+                }
+
+                if (! array_key_exists($normalizedTypeId, $merged)) {
+                    $merged[$normalizedTypeId] = [];
+                }
+
+                foreach ($entries as $entry) {
+                    if (! is_array($entry)) {
+                        continue;
+                    }
+                    $merged[$normalizedTypeId][] = $entry;
+                }
+            }
+        }
+
+        return $merged;
+    }
+
+    public function loadEmployeeLeaveDeductionHistoryByType(
+        string $controlNo,
+        ?int $leaveTypeId = null,
+        ?callable $candidatesResolver = null
+    ): array {
+        $lookupLeaveTypeIds = $leaveTypeId !== null
+            ? $this->resolveBalanceLookupLeaveTypeIds($leaveTypeId)
+            : [];
+
+        $candidates = $candidatesResolver !== null
+            ? $candidatesResolver($controlNo)
+            : [$controlNo];
+
+        $applications = LeaveApplication::query()
+            ->with(['leaveType:id,name,is_credit_based'])
+            ->where('status', LeaveApplication::STATUS_APPROVED)
+            ->whereIn('employee_control_no', $candidates)
+            ->when($leaveTypeId !== null, function ($query) use ($leaveTypeId, $lookupLeaveTypeIds): void {
+                $query->whereIn(
+                    'leave_type_id',
+                    $lookupLeaveTypeIds !== [] ? $lookupLeaveTypeIds : [$leaveTypeId]
+                );
+            })
+            ->orderByDesc('hr_approved_at')
+            ->orderByDesc('id')
+            ->get([
+                'id',
+                'employee_control_no',
+                'leave_type_id',
+                'total_days',
+                'deductible_days',
+                'pay_mode',
+                'is_monetization',
+                'status',
+                'hr_approved_at',
+                'created_at',
+            ]);
+
+        $historyByType = [];
+
+        foreach ($applications as $application) {
+            if (! $application instanceof LeaveApplication) {
+                continue;
+            }
+
+            $typeId = $this->resolveCanonicalLeaveTypeId((int) $application->leave_type_id)
+                ?? (int) $application->leave_type_id;
+            if ($typeId <= 0) {
+                continue;
+            }
+
+            if ($this->isCtoLeaveType($application->leaveType, $typeId)) {
+                continue;
+            }
+
+            $deductsEmployeeBalance = $this->applicationDeductsEmployeeBalance(
+                (bool) $application->is_monetization,
+                $application->leaveType,
+                $application->pay_mode
+            );
+            if (! $deductsEmployeeBalance) {
+                continue;
+            }
+
+            $approvedAt = $application->hr_approved_at ?? $application->created_at;
+            $creditsDeducted = round((float) ($application->deductible_days ?? $application->total_days ?? 0), 3);
+            if ($approvedAt === null || $creditsDeducted <= 0) {
+                continue;
+            }
+
+            $historyByType[$typeId][] = [
+                'accrual_date' => $approvedAt->toDateString(),
+                'transaction_date' => $approvedAt->toDateString(),
+                'credits_added' => -$creditsDeducted,
+                'entry_type' => 'DEDUCTION',
+                'transaction_type' => 'DEDUCTION',
+                'label' => $application->is_monetization ? 'Monetization approved' : 'Leave approved',
+                'description' => $application->is_monetization
+                    ? 'Approved monetization'
+                    : 'Approved leave application',
+                'application_id' => (int) $application->id,
+                'leave_application_id' => (int) $application->id,
+                'source' => 'LEAVE_APPLICATION',
+                'created_at' => $approvedAt->toIso8601String(),
+            ];
+        }
+
+        return $historyByType;
+    }
+
+    public function executeGetLeaveBalance(
+        string $controlNo,
+        int $leaveTypeId,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $assertEmployeeCanAccessLeaveTypeBalance = null,
+        ?callable $candidatesResolver = null
+    ): JsonResponse {
+        $employee = $findEmployeeByControlNo !== null
+            ? $findEmployeeByControlNo($controlNo)
+            : null;
+
+        if (! $employee) {
+            return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+
+        $resolvedLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+        $leaveType = LeaveType::find($resolvedLeaveTypeId);
+        if (! $leaveType) {
+            return response()->json(['message' => 'Leave type not found.'], 404);
+        }
+
+        if ($assertEmployeeCanAccessLeaveTypeBalance !== null) {
+            $accessResponse = $assertEmployeeCanAccessLeaveTypeBalance($employee, $leaveType);
+            if ($accessResponse instanceof JsonResponse) {
+                return $accessResponse;
+            }
+        }
+
+        $ctoBalanceHours = null;
+        if ($this->isCtoLeaveType($leaveType, (int) $leaveType->id)) {
+            $this->syncEmployeeCtoBalance((string) $employee->control_no, false, null, $candidatesResolver, $findEmployeeByControlNo);
+            $ctoSnapshot = $this->cocLedgerService->syncEmployeeLedger(
+                (string) $employee->control_no,
+                (int) $leaveType->id,
+                null,
+                false
+            );
+            $ctoBalanceHours = isset($ctoSnapshot['availableHours'])
+                ? (float) $ctoSnapshot['availableHours']
+                : null;
+        }
+
+        $balance = $this->findPreferredEmployeeLeaveBalanceRecord(
+            (string) $employee->control_no,
+            (int) $leaveType->id,
+            $candidatesResolver
+        );
+        if ($balance instanceof LeaveBalance) {
+            $balance->loadMissing('accrualHistories');
+        }
+
+        return response()->json([
+            'leave_type_id' => $leaveType->id,
+            'leave_type_name' => $leaveType->name,
+            'balance' => $balance ? (float) $balance->balance : 0,
+            'balance_hours' => $this->isCtoLeaveType($leaveType, (int) $leaveType->id)
+                ? $this->calculationService->resolveCtoDeductedHours((float) ($balance?->balance ?? 0.0))
+                : null,
+        ]);
+    }
+
+    public function executeErmsGetLeaveBalance(
+        string $controlNo,
+        int $leaveTypeId,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $assertErmsEmployeeIsPulled = null,
+        ?callable $assertEmployeeCanAccessLeaveTypeBalance = null,
+        ?callable $controlNoResponseBuilder = null,
+        ?callable $candidatesResolver = null
+    ): JsonResponse {
+        $employee = $findEmployeeByControlNo !== null
+            ? $findEmployeeByControlNo($controlNo)
+            : null;
+
+        if (! $employee) {
+            return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+
+        if ($assertErmsEmployeeIsPulled !== null) {
+            $pulledAccess = $assertErmsEmployeeIsPulled((string) $employee->control_no);
+            if ($pulledAccess instanceof JsonResponse) {
+                return $pulledAccess;
+            }
+        }
+
+        $resolvedLeaveTypeId = $this->resolveCanonicalLeaveTypeId($leaveTypeId) ?? $leaveTypeId;
+        $leaveType = LeaveType::find($resolvedLeaveTypeId);
+        if (! $leaveType) {
+            return response()->json(['message' => 'Leave type not found.'], 404);
+        }
+
+        if ($assertEmployeeCanAccessLeaveTypeBalance !== null) {
+            $leaveTypeBalanceAccess = $assertEmployeeCanAccessLeaveTypeBalance($employee, $leaveType);
+            if ($leaveTypeBalanceAccess instanceof JsonResponse) {
+                return $leaveTypeBalanceAccess;
+            }
+        }
+
+        $ctoBalanceHours = null;
+        if ($this->isCtoLeaveType($leaveType, (int) $leaveType->id)) {
+            $this->syncEmployeeCtoBalance((string) $employee->control_no, false, null, $candidatesResolver, $findEmployeeByControlNo);
+            $ctoSnapshot = $this->cocLedgerService->syncEmployeeLedger(
+                (string) $employee->control_no,
+                (int) $leaveType->id,
+                null,
+                false
+            );
+            $ctoBalanceHours = isset($ctoSnapshot['availableHours'])
+                ? (float) $ctoSnapshot['availableHours']
+                : null;
+        }
+
+        $balance = $this->findPreferredEmployeeLeaveBalanceRecord((string) $employee->control_no, (int) $leaveType->id, $candidatesResolver);
+        if ($balance instanceof LeaveBalance) {
+            $balance->loadMissing('accrualHistories');
+        }
+
+        $deductionHistoryByType = $this->loadEmployeeLeaveDeductionHistoryByType((string) $employee->control_no, (int) $leaveType->id, $candidatesResolver);
+        $cocCreditHistoryByType = $this->cocLedgerService->getHistoryByLeaveType((string) $employee->control_no, (int) $leaveType->id);
+        $creditHistoryByType = $this->mergeCreditHistoriesByType(
+            $deductionHistoryByType,
+            $cocCreditHistoryByType
+        );
+
+        $controlNoPayload = $controlNoResponseBuilder !== null
+            ? $controlNoResponseBuilder((string) $employee->control_no)
+            : ['employee_control_no' => (string) $employee->control_no];
+
+        return response()->json(array_merge(
+            $controlNoPayload,
+            $this->formatErmsLeaveBalancePayload(
+                $leaveType,
+                $balance,
+                $creditHistoryByType[(int) $leaveType->id] ?? [],
+                $ctoBalanceHours
+            )
+        ));
+    }
+
+    public function executeErmsGetLeaveBalances(
+        string $controlNo,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $assertErmsEmployeeIsPulled = null,
+        ?callable $controlNoResponseBuilder = null,
+        ?callable $candidatesResolver = null,
+        ?callable $employmentStatusFilter = null,
+        ?callable $employmentStatusKeyResolver = null
+    ): JsonResponse {
+        if (! preg_match('/^\d+$/', $controlNo)) {
+            return response()->json(['message' => 'Invalid control number.'], 422);
+        }
+
+        $employee = $findEmployeeByControlNo !== null
+            ? $findEmployeeByControlNo($controlNo)
+            : null;
+
+        if (! $employee) {
+            return response()->json(['message' => 'Employee record not found.'], 404);
+        }
+
+        if ($assertErmsEmployeeIsPulled !== null) {
+            $pulledAccess = $assertErmsEmployeeIsPulled((string) $employee->control_no);
+            if ($pulledAccess instanceof JsonResponse) {
+                return $pulledAccess;
+            }
+        }
+
+        $types = LeaveType::query()
+            ->withoutLegacySpecialPrivilegeAliases()
+            ->select([
+                'id',
+                'name',
+                'category',
+                'accrual_rate',
+                'accrual_day_of_month',
+                'is_credit_based',
+                'allowed_status',
+            ])
+            ->orderBy('name')
+            ->get()
+            ->filter(function (LeaveType $leaveType) use ($employee, $employmentStatusFilter): bool {
+                if ($employmentStatusFilter !== null) {
+                    return $employmentStatusFilter($employee, $leaveType);
+                }
+
+                return ! $this->eligibilityService()->employeeHasResolvedEmploymentStatus($employee)
+                    || $leaveType->allowsEmploymentStatus($employee->status ?? null);
+            })
+            ->values();
+
+        $typesByName = $types
+            ->keyBy(fn (LeaveType $type) => strtolower(trim((string) $type->name)))
+            ->all();
+
+        $this->syncEmployeeCtoBalance((string) $employee->control_no, false, null, $candidatesResolver, $findEmployeeByControlNo);
+        $ctoLeaveTypeId = $this->resolveCtoLeaveTypeId();
+        $ctoBalanceHours = null;
+        if ($ctoLeaveTypeId !== null) {
+            $ctoSnapshot = $this->cocLedgerService->syncEmployeeLedger(
+                (string) $employee->control_no,
+                $ctoLeaveTypeId,
+                null,
+                false
+            );
+            $ctoBalanceHours = isset($ctoSnapshot['availableHours'])
+                ? (float) $ctoSnapshot['availableHours']
+                : null;
+        }
+
+        $balanceRecordsByType = $this->mapLeaveBalancesByCanonicalTypeId(LeaveBalance::query()
+            ->with('accrualHistories')
+            ->where('employee_control_no', $employee->control_no)
+            ->get()
+        );
+        $deductionHistoryByType = $this->loadEmployeeLeaveDeductionHistoryByType((string) $employee->control_no, null, $candidatesResolver);
+        $cocCreditHistoryByType = $this->cocLedgerService->getHistoryByLeaveType((string) $employee->control_no);
+        $creditHistoryByType = $this->mergeCreditHistoriesByType(
+            $deductionHistoryByType,
+            $cocCreditHistoryByType
+        );
+
+        $balances = $types->map(function (LeaveType $type) use ($balanceRecordsByType, $creditHistoryByType, $ctoLeaveTypeId, $ctoBalanceHours) {
+            $balance = $balanceRecordsByType[(int) $type->id] ?? null;
+
+            return $this->formatErmsLeaveBalancePayload(
+                $type,
+                $balance instanceof LeaveBalance ? $balance : null,
+                $creditHistoryByType[(int) $type->id] ?? [],
+                $ctoLeaveTypeId !== null && (int) $type->id === $ctoLeaveTypeId ? $ctoBalanceHours : null
+            );
+        })->values();
+
+        $controlNoPayload = $controlNoResponseBuilder !== null
+            ? $controlNoResponseBuilder((string) $employee->control_no)
+            : ['employee_control_no' => (string) $employee->control_no];
+
+        return response()->json([
+            ...$controlNoPayload,
+            'salary' => $employee->rate_mon !== null ? (float) $employee->rate_mon : null,
+            'rate_mon' => $employee->rate_mon !== null ? (float) $employee->rate_mon : null,
+            'balances' => $balances,
+            'latest_accrued_credits' => $this->buildErmsLatestAccruedCreditsPayload(
+                $employee,
+                $typesByName,
+                $balanceRecordsByType,
+                $creditHistoryByType,
+                $employmentStatusKeyResolver
+            ),
+        ]);
     }
 }
