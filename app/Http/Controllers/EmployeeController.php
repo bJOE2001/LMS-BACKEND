@@ -2,6 +2,8 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\BiometricDevice;
+use App\Models\BiometricEnrollment;
 use App\Models\COCApplication;
 use App\Models\Department;
 use App\Models\DepartmentAdmin;
@@ -515,6 +517,7 @@ class EmployeeController extends Controller
             'search' => ['nullable', 'string', 'max:100'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
             'activity' => ['nullable', 'string', 'in:ALL,ACTIVE,INACTIVE'],
+            'biometric_status' => ['nullable', 'string', 'in:ALL,all,REGISTERED,registered,PENDING,pending,PENDING_ENROLLMENT,pending_enrollment,NOT_REGISTERED,not_registered'],
         ]);
 
         $account = $request->user();
@@ -622,6 +625,8 @@ class EmployeeController extends Controller
         if ($isHrAccount) {
             $this->attachManualLeaveCreditsUsageFlags($employees);
         }
+
+        $this->attachBiometricEnrollmentStatus($employees);
 
         return response()->json([
             'employees' => $employees,
@@ -2745,6 +2750,34 @@ class EmployeeController extends Controller
             ->pipe(fn (Collection $rows): Collection => $this->sortEmployeeRows($rows))
             ->values();
 
+        $biometricStatus = trim((string) $request->input('biometric_status', ''));
+        if ($biometricStatus !== '' && strtoupper($biometricStatus) !== 'ALL') {
+            $upperBio = strtoupper($biometricStatus);
+            if (in_array($upperBio, ['REGISTERED', 'FINGERPRINT_ENROLLED'], true)) {
+                $enrolledControlNos = BiometricEnrollment::query()
+                    ->whereIn('status', [BiometricEnrollment::STATUS_REGISTERED, BiometricEnrollment::STATUS_FINGERPRINT_ENROLLED])
+                    ->pluck('employee_control_no')
+                    ->all();
+                $combinedRows = $combinedRows->filter(fn (array $r) => in_array($r['control_no'] ?? '', $enrolledControlNos, true))->values();
+            } elseif (in_array($upperBio, ['PENDING', 'PENDING_ENROLLMENT'], true)) {
+                $pendingControlNos = BiometricEnrollment::query()
+                    ->where('status', BiometricEnrollment::STATUS_PENDING_ENROLLMENT)
+                    ->pluck('employee_control_no')
+                    ->all();
+                $combinedRows = $combinedRows->filter(fn (array $r) => in_array($r['control_no'] ?? '', $pendingControlNos, true))->values();
+            } elseif (in_array($upperBio, ['NOT_REGISTERED', 'UNREGISTERED'], true)) {
+                $anyEnrolledControlNos = BiometricEnrollment::query()
+                    ->whereIn('status', [
+                        BiometricEnrollment::STATUS_REGISTERED,
+                        BiometricEnrollment::STATUS_FINGERPRINT_ENROLLED,
+                        BiometricEnrollment::STATUS_PENDING_ENROLLMENT,
+                    ])
+                    ->pluck('employee_control_no')
+                    ->all();
+                $combinedRows = $combinedRows->filter(fn (array $r) => ! in_array($r['control_no'] ?? '', $anyEnrolledControlNos, true))->values();
+            }
+        }
+
         $paginatedRows = new LengthAwarePaginator(
             $combinedRows->forPage($page, $perPage)->values(),
             $combinedRows->count(),
@@ -3338,6 +3371,68 @@ class EmployeeController extends Controller
                 $controlNo = trim((string) ($row['control_no'] ?? ''));
                 $row['has_manual_leave_credits'] = $controlNo !== ''
                     && $this->hasControlNoInLookup($controlNo, $manualCreditUsageLookup);
+
+                return $row;
+            })
+        );
+    }
+
+    private function attachBiometricEnrollmentStatus(LengthAwarePaginator $employees): void
+    {
+        $rows = $employees->getCollection();
+        if ($rows->isEmpty()) {
+            return;
+        }
+
+        $rowControlNos = $rows
+            ->map(fn (mixed $row): string => trim((string) (is_array($row) ? ($row['control_no'] ?? '') : '')))
+            ->filter(fn (string $controlNo): bool => $controlNo !== '')
+            ->values()
+            ->all();
+
+        if (empty($rowControlNos)) {
+            return;
+        }
+
+        $enrollments = BiometricEnrollment::query()
+            ->whereIn('employee_control_no', $rowControlNos)
+            ->get()
+            ->keyBy('employee_control_no');
+
+        $deviceSns = $enrollments->pluck('enrollment_device_sn')->filter()->unique()->values()->all();
+        $devices = empty($deviceSns)
+            ? collect()
+            : BiometricDevice::query()->whereIn('serial_number', $deviceSns)->get()->keyBy('serial_number');
+
+        $employees->setCollection(
+            $rows->map(function (mixed $row) use ($enrollments, $devices): mixed {
+                if (! is_array($row)) {
+                    return $row;
+                }
+
+                $controlNo = trim((string) ($row['control_no'] ?? ''));
+                $enrollment = $controlNo !== '' ? $enrollments->get($controlNo) : null;
+
+                if (! $enrollment) {
+                    $row['biometric_status'] = 'NOT_REGISTERED';
+                    $row['biometric_device_sn'] = null;
+                    $row['biometric_device_name'] = null;
+                    $row['biometric_enrolled_at'] = null;
+
+                    return $row;
+                }
+
+                $status = $enrollment->status;
+                if ($status === BiometricEnrollment::STATUS_FINGERPRINT_ENROLLED) {
+                    $status = BiometricEnrollment::STATUS_REGISTERED;
+                }
+
+                $device = $enrollment->enrollment_device_sn ? $devices->get($enrollment->enrollment_device_sn) : null;
+
+                $row['biometric_status'] = $status;
+                $row['biometric_device_sn'] = $enrollment->enrollment_device_sn;
+                $row['biometric_device_name'] = $device ? ($device->device_name ?: $device->department_name ?: $device->serial_number) : $enrollment->enrollment_device_sn;
+                $row['biometric_enrolled_at'] = $enrollment->enrolled_at?->format('Y-m-d H:i:s');
 
                 return $row;
             })

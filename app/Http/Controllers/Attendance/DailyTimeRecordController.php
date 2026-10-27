@@ -735,15 +735,18 @@ class DailyTimeRecordController extends Controller
         $dtr->adjustment_remarks = 'Manual time override by admin';
         $dtr->adjusted_by_admin_id = $adminId;
 
+        $schedule = $this->dtrService->resolveSchedule($canonicalControlNo);
+
         // Calculate rendered regular hours
         $rendered = $this->dtrService->calculateRenderedHours(
             $amArrival,
             $amDeparture,
             $pmArrival,
-            $pmDeparture
+            $pmDeparture,
+            null,
+            $schedule
         );
 
-        $schedule = $this->dtrService->resolveSchedule($canonicalControlNo);
         $lateAndUndertime = $this->dtrService->calculateLateAndUndertime(
             $amArrival,
             $amDeparture,

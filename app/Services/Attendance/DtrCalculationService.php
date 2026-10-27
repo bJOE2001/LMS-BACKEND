@@ -5,11 +5,10 @@ namespace App\Services\Attendance;
 use App\Models\AttendanceRawLog;
 use App\Models\DailyTimeRecord;
 use App\Models\EmployeeDepartmentAssignment;
-use App\Models\EmployeeWorkScheduleOverride;
 use App\Models\Holiday;
 use App\Models\HrisEmployee;
 use App\Models\LeaveApplication;
-use App\Models\WorkScheduleSetting;
+use App\Services\WorkScheduleService;
 use Carbon\Carbon;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Collection;
@@ -27,6 +26,12 @@ class DtrCalculationService
 
     /** Maximum regular workday hours (8 hours) */
     public const STANDARD_WORKDAY_HOURS = 8.00;
+
+    public function __construct(
+        public ?WorkScheduleService $workScheduleService = null
+    ) {
+        $this->workScheduleService = $workScheduleService ?? app(WorkScheduleService::class);
+    }
 
     /**
      * Build list of control number variations to tolerate leading zero differences (e.g. "11790" vs "011790").
@@ -84,7 +89,7 @@ class DtrCalculationService
             ->get();
 
         // 4. De-duplicate punches within 2 minutes of each other
-        $cleanPunches = $this->filterDoubleTaps($rawPunches);
+        $cleanPunches = $this->filterDoubleTaps($rawPunches, $schedule);
 
         // 5. Slot Punches into 4 Daily Slots (AM In, AM Out, PM In, PM Out)
         $slotted = $this->slotPunches($cleanPunches, $schedule);
@@ -163,12 +168,13 @@ class DtrCalculationService
             $slotted['am_departure'],
             $slotted['pm_arrival'],
             $slotted['pm_departure'],
-            $leaveInfo
+            $leaveInfo,
+            $schedule
         );
 
         if ($existingDtr && $existingDtr->is_adjusted) {
             if ($existingDtr->adjustment_reason !== 'MANUAL_OVERRIDE' && $renderedHours <= 0) {
-                $renderedHours = 8.00;
+                $renderedHours = (float) ($schedule['working_hours_per_day'] ?? self::STANDARD_WORKDAY_HOURS);
             } elseif ($renderedHours <= 0 && (float) $existingDtr->rendered_hours > 0) {
                 $renderedHours = (float) $existingDtr->rendered_hours;
             }
@@ -334,21 +340,31 @@ class DtrCalculationService
     /**
      * Filter out accidental double taps within 2 minutes of each other.
      *
-     * Departure Window (Lunch Out 11:00-12:30, PM Out >= 16:00):
+     * Departure Window (Lunch Out, PM Out):
      * If an employee taps at 11:59 and again at 12:00 (or 16:59 and 17:00),
      * keep the LATEST punch so they are not penalized with false undertime.
      *
-     * Arrival Window (Morning In < 11:00, Lunch In 12:31-14:00):
+     * Arrival Window (Morning In, Lunch In):
      * Keep the EARLIEST punch so they receive credit for arriving on time.
      *
      * @param  Collection<int, AttendanceRawLog>  $punches
+     * @param  array{work_start_time?: string, work_end_time?: string, break_start_time?: string, break_end_time?: string}|null  $schedule
      * @return Collection<int, AttendanceRawLog>
      */
-    public function filterDoubleTaps(Collection $punches): Collection
+    public function filterDoubleTaps(Collection $punches, ?array $schedule = null): Collection
     {
         if ($punches->count() <= 1) {
             return $punches;
         }
+
+        $breakStart = $this->formatScheduleTime($schedule['break_start_time'] ?? null, '12:00:00');
+        $breakEnd = $this->formatScheduleTime($schedule['break_end_time'] ?? null, '13:00:00');
+        $workEnd = $this->formatScheduleTime($schedule['work_end_time'] ?? null, '17:00:00');
+
+        $preLunchThreshold = Carbon::parse($breakStart)->subHour()->format('H:i:s');
+        $breakDurationSec = abs(Carbon::parse($breakEnd)->diffInSeconds(Carbon::parse($breakStart)));
+        $midLunchThreshold = Carbon::parse($breakStart)->addSeconds((int) ($breakDurationSec / 2))->format('H:i:s');
+        $departureThreshold = Carbon::parse($workEnd)->subHour()->format('H:i:s');
 
         $filtered = collect();
         $lastTime = null;
@@ -362,8 +378,8 @@ class DtrCalculationService
             } else {
                 // Double tap detected (within 120 seconds)
                 $timeStr = $time->format('H:i:s');
-                $isDepartureWindow = ($timeStr >= '11:00:00' && $timeStr <= '12:30:00')
-                    || ($timeStr >= '16:00:00');
+                $isDepartureWindow = ($timeStr >= $preLunchThreshold && $timeStr <= $midLunchThreshold)
+                    || ($timeStr >= $departureThreshold);
 
                 // In departure windows, prefer the latest punch to prevent false undertime
                 if ($isDepartureWindow) {
@@ -402,10 +418,19 @@ class DtrCalculationService
         $times = $punches->map(fn ($p) => Carbon::parse($p->punch_time)->format('H:i:s'))->values();
         $count = $times->count();
 
-        // Standard time window thresholds
-        $lunchThreshold = '12:00:00';
-        $afternoonThreshold = '13:00:00';
-        $departureThreshold = '16:00:00';
+        // Standard time window thresholds derived from schedule:
+        $breakStart = $this->formatScheduleTime($schedule['break_start_time'] ?? null, '12:00:00');
+        $breakEnd = $this->formatScheduleTime($schedule['break_end_time'] ?? null, '13:00:00');
+        $workEnd = $this->formatScheduleTime($schedule['work_end_time'] ?? null, '17:00:00');
+
+        $lunchThreshold = $breakStart;
+        $afternoonThreshold = $breakEnd;
+        $departureThreshold = Carbon::parse($workEnd)->subHour()->format('H:i:s');
+        $preLunchThreshold = Carbon::parse($breakStart)->subHour()->format('H:i:s');
+
+        $breakDurationSec = abs(Carbon::parse($breakEnd)->diffInSeconds(Carbon::parse($breakStart)));
+        $midLunchThreshold = Carbon::parse($breakStart)->addSeconds((int) ($breakDurationSec / 2))->format('H:i:s');
+        $postLunchThreshold = Carbon::parse($breakEnd)->addHour()->format('H:i:s');
 
         if ($count === 1) {
             $time = $times[0];
@@ -430,19 +455,19 @@ class DtrCalculationService
                 // Classic 2-punch day (morning in, afternoon out)
                 $result['am_arrival'] = $t1;
                 $result['pm_departure'] = $t2;
-            } elseif ($t1 < $lunchThreshold && $t2 >= '11:00:00' && $t2 <= '13:00:00') {
+            } elseif ($t1 < $lunchThreshold && $t2 >= $preLunchThreshold && $t2 <= $afternoonThreshold) {
                 // Morning in, lunch out
                 $result['am_arrival'] = $t1;
                 $result['am_departure'] = $t2;
-            } elseif ($t1 >= '11:00:00' && $t2 <= '14:00:00') {
+            } elseif ($t1 >= $preLunchThreshold && $t2 <= $postLunchThreshold) {
                 // Both punches during lunch window (e.g. 12:35 PM out, 1:00 PM in)
                 $result['am_departure'] = $t1;
                 $result['pm_arrival'] = $t2;
-            } elseif ($t1 > '12:30:00' && $t2 >= $departureThreshold) {
+            } elseif ($t1 > $midLunchThreshold && $t2 >= $departureThreshold) {
                 // Lunch in, afternoon out
                 $result['pm_arrival'] = $t1;
                 $result['pm_departure'] = $t2;
-            } elseif ($t1 < '11:00:00' && $t2 < '11:00:00') {
+            } elseif ($t1 < $preLunchThreshold && $t2 < $preLunchThreshold) {
                 // Multiple morning arrival taps (e.g. 7:30 AM & 8:50 AM) - take earliest arrival
                 $result['am_arrival'] = $t1;
             } else {
@@ -454,40 +479,49 @@ class DtrCalculationService
         }
 
         // For 3 or more punches: Assign with Smart Safeguard
-        // 1. AM Arrival (earliest punch before 11:00 AM)
-        $amArrival = $times->first(fn ($t) => $t < '11:00:00');
-        if ($amArrival !== null) {
-            $result['am_arrival'] = $amArrival;
+        // 1. AM Arrival:
+        // Earliest punch before pre-lunch threshold, OR if there are multiple morning punches before midLunchThreshold,
+        // the earliest punch is AM Arrival (even if arriving late, e.g. 11:00 AM)
+        $morningPunches = $times->filter(fn ($t) => $t <= $midLunchThreshold)->values();
+        if ($morningPunches->count() >= 2) {
+            $result['am_arrival'] = $morningPunches->first();
+        } else {
+            $amArrival = $times->first(fn ($t) => $t < $preLunchThreshold);
+            if ($amArrival !== null) {
+                $result['am_arrival'] = $amArrival;
+            }
         }
 
-        // 2. Midday Lunch Window (between 11:00 and 14:00) - Smart Safeguard
-        // AM OUT (Lunch Out): 11:00 AM – 12:30 PM
-        // PM IN (Lunch In): 12:31 PM – 02:00 PM
-        $lunchOutPunches = $times->filter(fn ($t) => $t >= '11:00:00' && $t <= '12:30:00')->values();
-        $lunchInPunches = $times->filter(fn ($t) => $t > '12:30:00' && $t <= '14:00:00')->values();
+        // 2. Midday Lunch Window - Smart Safeguard
+        // Exclude the punch already assigned to AM Arrival
+        $availableForLunch = $times->filter(fn ($t) => $t !== $result['am_arrival'])->values();
+        // Lunch Out: preLunchThreshold – midLunchThreshold
+        // Lunch In: midLunchThreshold – postLunchThreshold
+        $lunchOutPunches = $availableForLunch->filter(fn ($t) => $t >= $preLunchThreshold && $t <= $midLunchThreshold)->values();
+        $lunchInPunches = $availableForLunch->filter(fn ($t) => $t > $midLunchThreshold && $t <= $postLunchThreshold)->values();
 
         if ($lunchOutPunches->isNotEmpty() && $lunchInPunches->isNotEmpty()) {
             // Punches in both windows: First in Lunch-Out window is AM Departure, first in Lunch-In window is PM Arrival
             $result['am_departure'] = $lunchOutPunches->first();
             $result['pm_arrival'] = $lunchInPunches->first();
         } elseif ($lunchOutPunches->isNotEmpty() && $lunchInPunches->isEmpty()) {
-            // Only punches in Lunch-Out window (e.g. 12:00 and 12:08, employee is currently on lunch break)
+            // Only punches in Lunch-Out window (e.g. employee is currently on lunch break)
             $result['am_departure'] = $lunchOutPunches->first();
             $result['pm_arrival'] = null;
         } elseif ($lunchOutPunches->isEmpty() && $lunchInPunches->count() >= 2) {
-            // Smart Safeguard: Left for lunch late (both punches after 12:30 PM, e.g. 12:35 PM out, 1:00 PM in)
+            // Smart Safeguard: Left for lunch late (both punches after mid-lunch threshold)
             $result['am_departure'] = $lunchInPunches[0];
             $result['pm_arrival'] = $lunchInPunches[1];
         } elseif ($lunchOutPunches->isEmpty() && $lunchInPunches->count() === 1) {
-            // Single punch after 12:30 PM
+            // Single punch after mid-lunch threshold
             $result['pm_arrival'] = $lunchInPunches[0];
         }
 
-        // 3. PM Departure (punches from 16:00 onwards, pick latest)
-        $pmDepartures = $times->filter(fn ($t) => $t >= '16:00:00')->values();
+        // 3. PM Departure (punches from departure threshold onwards, pick latest)
+        $pmDepartures = $times->filter(fn ($t) => $t >= $departureThreshold)->values();
         if ($pmDepartures->isNotEmpty()) {
             $result['pm_departure'] = $pmDepartures->last();
-        } elseif ($times->last() > '13:30:00' && $times->last() !== $result['pm_arrival'] && $times->last() !== $result['am_departure']) {
+        } elseif ($times->last() > Carbon::parse($breakEnd)->addMinutes(30)->format('H:i:s') && $times->last() !== $result['pm_arrival'] && $times->last() !== $result['am_departure']) {
             $result['pm_departure'] = $times->last();
         }
 
@@ -517,47 +551,42 @@ class DtrCalculationService
         $undertimeMinutes = 0;
         $overtimeMinutes = 0;
 
-        $workStart = Carbon::parse($schedule['work_start_time']);
-        $breakStart = Carbon::parse($schedule['break_start_time']);
-        $breakEnd = Carbon::parse($schedule['break_end_time']);
-        $workEnd = Carbon::parse($schedule['work_end_time']);
+        $workStart = Carbon::parse($schedule['work_start_time'])->second(0);
+        $breakStart = Carbon::parse($schedule['break_start_time'])->second(0);
+        $breakEnd = Carbon::parse($schedule['break_end_time'])->second(0);
+        $workEnd = Carbon::parse($schedule['work_end_time'])->second(0);
 
-        // Check Morning Late (Strict 8:00:00 AM)
+        // Check Morning Late (CSC Form 48: 08:00:00 to 08:00:59 is on time, tardiness begins at 08:01:00)
         $isMorningOnLeave = $leaveInfo !== null && $leaveInfo['is_on_leave'] && $leaveInfo['portion'] === 'morning';
         if (! $isMorningOnLeave && $amIn !== null) {
-            $actualAmIn = Carbon::parse($amIn);
+            $actualAmIn = Carbon::parse($amIn)->second(0);
             if ($actualAmIn->isAfter($workStart)) {
-                // Strict: 8:00:01 counts as 1 minute late
-                $seconds = abs($actualAmIn->diffInSeconds($workStart));
-                $lateMinutes += (int) ceil($seconds / 60);
+                $lateMinutes += (int) abs($actualAmIn->diffInMinutes($workStart));
             }
         }
 
-        // Check Lunch Late (Strict 1:00:00 PM)
+        // Check Lunch Late (CSC Form 48: 13:00:00 to 13:00:59 is on time, tardiness begins at 13:01:00)
         $isAfternoonOnLeave = $leaveInfo !== null && $leaveInfo['is_on_leave'] && $leaveInfo['portion'] === 'afternoon';
         if (! $isAfternoonOnLeave && $pmIn !== null) {
-            $actualPmIn = Carbon::parse($pmIn);
+            $actualPmIn = Carbon::parse($pmIn)->second(0);
             if ($actualPmIn->isAfter($breakEnd)) {
-                $seconds = abs($actualPmIn->diffInSeconds($breakEnd));
-                $lateMinutes += (int) ceil($seconds / 60);
+                $lateMinutes += (int) abs($actualPmIn->diffInMinutes($breakEnd));
             }
         }
 
-        // Check AM Undertime (leaving early for lunch before 12:00 PM)
+        // Check AM Undertime (leaving early before lunch, e.g. 11:59:xx counts as 1 minute undertime)
         if (! $isMorningOnLeave && $amOut !== null) {
-            $actualAmOut = Carbon::parse($amOut);
+            $actualAmOut = Carbon::parse($amOut)->second(0);
             if ($actualAmOut->isBefore($breakStart)) {
-                $seconds = abs($breakStart->diffInSeconds($actualAmOut));
-                $undertimeMinutes += (int) ceil($seconds / 60);
+                $undertimeMinutes += (int) abs($breakStart->diffInMinutes($actualAmOut));
             }
         }
 
-        // Check PM Undertime (leaving early before 5:00 PM)
+        // Check PM Undertime (leaving early before official work end, e.g. 16:59:xx counts as 1 minute undertime)
         if (! $isAfternoonOnLeave && $pmOut !== null) {
-            $actualPmOut = Carbon::parse($pmOut);
+            $actualPmOut = Carbon::parse($pmOut)->second(0);
             if ($actualPmOut->isBefore($workEnd)) {
-                $seconds = abs($workEnd->diffInSeconds($actualPmOut));
-                $undertimeMinutes += (int) ceil($seconds / 60);
+                $undertimeMinutes += (int) abs($workEnd->diffInMinutes($actualPmOut));
             }
         }
 
@@ -572,17 +601,58 @@ class DtrCalculationService
      * Calculate rendered working hours for the day.
      *
      * @param  array{is_on_leave: bool, portion: ?string}|null  $leaveInfo
+     * @param  array{work_start_time?: string, work_end_time?: string, break_start_time?: string, break_end_time?: string, working_hours_per_day?: float|int, half_day_leave_deduction?: float|int}|null  $schedule
      */
-    public function calculateRenderedHours(?string $amIn, ?string $amOut, ?string $pmIn, ?string $pmOut, ?array $leaveInfo = null): float
-    {
+    public function calculateRenderedHours(
+        ?string $amIn,
+        ?string $amOut,
+        ?string $pmIn,
+        ?string $pmOut,
+        ?array $leaveInfo = null,
+        ?array $schedule = null
+    ): float {
+        $workingHoursPerDay = (float) ($schedule['working_hours_per_day'] ?? self::STANDARD_WORKDAY_HOURS);
+        if ($workingHoursPerDay <= 0) {
+            $workingHoursPerDay = self::STANDARD_WORKDAY_HOURS;
+        }
+
+        $halfDayRatio = (float) ($schedule['half_day_leave_deduction'] ?? 0.500);
+        if ($halfDayRatio <= 0) {
+            $halfDayRatio = 0.500;
+        }
+
+        $halfDayHours = $workingHoursPerDay * $halfDayRatio;
+        $halfDayMinutes = (int) round($halfDayHours * 60);
+
+        $amCapMinutes = 240;
+        $pmCapMinutes = 240;
+        $lunchBreakMinutes = self::LUNCH_BREAK_MINUTES;
+
+        if ($schedule !== null) {
+            $workStart = $this->formatScheduleTime($schedule['work_start_time'] ?? null, '08:00:00');
+            $breakStart = $this->formatScheduleTime($schedule['break_start_time'] ?? null, '12:00:00');
+            $breakEnd = $this->formatScheduleTime($schedule['break_end_time'] ?? null, '13:00:00');
+            $workEnd = $this->formatScheduleTime($schedule['work_end_time'] ?? null, '17:00:00');
+
+            $amCapMinutes = max(0, (int) Carbon::parse($breakStart)->diffInMinutes(Carbon::parse($workStart)));
+            $pmCapMinutes = max(0, (int) Carbon::parse($workEnd)->diffInMinutes(Carbon::parse($breakEnd)));
+            $lunchBreakMinutes = max(0, (int) Carbon::parse($breakEnd)->diffInMinutes(Carbon::parse($breakStart)));
+
+            if ($amCapMinutes === 0) {
+                $amCapMinutes = $halfDayMinutes;
+            }
+            if ($pmCapMinutes === 0) {
+                $pmCapMinutes = $halfDayMinutes;
+            }
+        }
+
         $baseLeaveMinutes = 0;
         if ($leaveInfo !== null && $leaveInfo['is_on_leave']) {
             if ($leaveInfo['portion'] === 'whole') {
-                return self::STANDARD_WORKDAY_HOURS;
+                return $workingHoursPerDay;
             }
             if ($leaveInfo['portion'] === 'morning' || $leaveInfo['portion'] === 'afternoon') {
-                // 4 hours credited for the approved half day, plus afternoon/morning worked
-                $baseLeaveMinutes = 240;
+                $baseLeaveMinutes = $halfDayMinutes;
             }
         }
 
@@ -591,38 +661,38 @@ class DtrCalculationService
         // Both AM punches present (only count if not on morning leave)
         $isMorningLeave = $leaveInfo !== null && $leaveInfo['is_on_leave'] && $leaveInfo['portion'] === 'morning';
         if (! $isMorningLeave && $amIn !== null && $amOut !== null) {
-            $tIn = Carbon::parse($amIn);
-            $tOut = Carbon::parse($amOut);
+            $tIn = Carbon::parse($amIn)->second(0);
+            $tOut = Carbon::parse($amOut)->second(0);
             if ($tOut->isAfter($tIn)) {
-                $totalMinutes += min(240, abs($tOut->diffInMinutes($tIn)));
+                $totalMinutes += min($amCapMinutes, abs($tOut->diffInMinutes($tIn)));
             }
         }
 
         // Both PM punches present (only count if not on afternoon leave)
         $isAfternoonLeave = $leaveInfo !== null && $leaveInfo['is_on_leave'] && $leaveInfo['portion'] === 'afternoon';
         if (! $isAfternoonLeave && $pmIn !== null && $pmOut !== null) {
-            $tIn = Carbon::parse($pmIn);
-            $tOut = Carbon::parse($pmOut);
+            $tIn = Carbon::parse($pmIn)->second(0);
+            $tOut = Carbon::parse($pmOut)->second(0);
             if ($tOut->isAfter($tIn)) {
-                $totalMinutes += min(240, abs($tOut->diffInMinutes($tIn)));
+                $totalMinutes += min($pmCapMinutes, abs($tOut->diffInMinutes($tIn)));
             }
         }
 
         // Fallback: 2-punch day (AM in and PM out with no lunch punches)
         if ($totalMinutes === 0 && $amIn !== null && $pmOut !== null) {
-            $tIn = Carbon::parse($amIn);
-            $tOut = Carbon::parse($pmOut);
+            $tIn = Carbon::parse($amIn)->second(0);
+            $tOut = Carbon::parse($pmOut)->second(0);
             if ($tOut->isAfter($tIn)) {
                 $rawSpan = abs($tOut->diffInMinutes($tIn));
-                // Deduct standard 60-min lunch break
-                $totalMinutes = max(0, $rawSpan - self::LUNCH_BREAK_MINUTES);
+                // Deduct lunch break
+                $totalMinutes = max(0, $rawSpan - $lunchBreakMinutes);
             }
         }
 
-        // Convert to hours (capped at 8.00 standard hours)
+        // Convert to hours (capped at $workingHoursPerDay)
         $hours = round($totalMinutes / 60, 2);
 
-        return min(self::STANDARD_WORKDAY_HOURS, $hours);
+        return min($workingHoursPerDay, max(0.0, $hours));
     }
 
     /**
@@ -762,41 +832,45 @@ class DtrCalculationService
     }
 
     /**
-     * Resolve working schedule for employee.
+     * Resolve working schedule for employee using WorkScheduleService as the single source of truth.
      *
      * @param  array<int, string>  $variants
-     * @return array{work_start_time: string, work_end_time: string, break_start_time: string, break_end_time: string}
+     * @return array{
+     *   work_start_time: string,
+     *   work_end_time: string,
+     *   break_start_time: string,
+     *   break_end_time: string,
+     *   working_hours_per_day: float,
+     *   whole_day_leave_deduction: float,
+     *   half_day_leave_deduction: float,
+     *   source: string
+     * }
      */
     public function resolveSchedule(string $controlNo, array $variants = []): array
     {
         try {
             $lookupList = array_values(array_unique(array_filter([$controlNo, ...$variants])));
-            $override = EmployeeWorkScheduleOverride::query()
-                ->whereIn('employee_control_no', $lookupList)
-                ->where('is_active', true)
-                ->first();
-
-            if ($override) {
-                return [
-                    'work_start_time' => $override->work_start_time ?: '08:00:00',
-                    'work_end_time' => $override->work_end_time ?: '17:00:00',
-                    'break_start_time' => $override->break_start_time ?: '12:00:00',
-                    'break_end_time' => $override->break_end_time ?: '13:00:00',
-                ];
+            $resolved = null;
+            foreach ($lookupList as $candidate) {
+                $candidateResolved = $this->workScheduleService->resolveScheduleForEmployee($candidate);
+                if (($candidateResolved['source'] ?? '') === 'employee') {
+                    $resolved = $candidateResolved;
+                    break;
+                }
             }
 
-            $default = WorkScheduleSetting::query()
-                ->where('setting_key', WorkScheduleSetting::GLOBAL_SETTING_KEY)
-                ->first();
+            $resolved ??= $this->workScheduleService->resolveScheduleForEmployee($controlNo);
 
-            if ($default) {
-                return [
-                    'work_start_time' => $default->work_start_time ?: '08:00:00',
-                    'work_end_time' => $default->work_end_time ?: '17:00:00',
-                    'break_start_time' => $default->break_start_time ?: '12:00:00',
-                    'break_end_time' => $default->break_end_time ?: '13:00:00',
-                ];
-            }
+            return [
+                'work_start_time' => $this->formatScheduleTime($resolved['work_start_time'] ?? null, '08:00:00'),
+                'work_end_time' => $this->formatScheduleTime($resolved['work_end_time'] ?? null, '17:00:00'),
+                'break_start_time' => $this->formatScheduleTime($resolved['break_start_time'] ?? null, '12:00:00'),
+                'break_end_time' => $this->formatScheduleTime($resolved['break_end_time'] ?? null, '13:00:00'),
+                'working_hours_per_day' => (float) ($resolved['working_hours_per_day'] ?? WorkScheduleService::STANDARD_WORKDAY_HOURS),
+                'whole_day_leave_deduction' => (float) ($resolved['whole_day_leave_deduction'] ?? 1.0),
+                'half_day_leave_deduction' => (float) ($resolved['half_day_leave_deduction'] ?? 0.5),
+                'source' => $resolved['source'] ?? 'default',
+            ];
         } catch (Throwable) {
             // Fallback to strict standard
         }
@@ -806,7 +880,24 @@ class DtrCalculationService
             'work_end_time' => '17:00:00',
             'break_start_time' => '12:00:00',
             'break_end_time' => '13:00:00',
+            'working_hours_per_day' => WorkScheduleService::STANDARD_WORKDAY_HOURS,
+            'whole_day_leave_deduction' => 1.0,
+            'half_day_leave_deduction' => 0.5,
+            'source' => 'default',
         ];
+    }
+
+    private function formatScheduleTime(?string $time, string $default): string
+    {
+        if ($time === null || trim($time) === '') {
+            return $default;
+        }
+
+        try {
+            return Carbon::parse($time)->format('H:i:s');
+        } catch (Throwable) {
+            return $default;
+        }
     }
 
     /**

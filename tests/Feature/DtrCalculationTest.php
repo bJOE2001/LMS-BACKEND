@@ -5,6 +5,7 @@ namespace Tests\Feature;
 use App\Models\AttendanceRawLog;
 use App\Models\DailyTimeRecord;
 use App\Models\EmployeeDepartmentAssignment;
+use App\Models\EmployeeWorkScheduleOverride;
 use App\Models\LeaveApplication;
 use App\Models\LeaveType;
 use App\Services\Attendance\DtrCalculationService;
@@ -47,6 +48,10 @@ class DtrCalculationTest extends TestCase
             ->delete();
 
         EmployeeDepartmentAssignment::query()
+            ->where('employee_control_no', self::TEST_CONTROL_NO)
+            ->delete();
+
+        EmployeeWorkScheduleOverride::query()
             ->where('employee_control_no', self::TEST_CONTROL_NO)
             ->delete();
     }
@@ -767,14 +772,80 @@ class DtrCalculationTest extends TestCase
 
     public function test_recalculate_mahusay_october_30_half_day_pm_leave(): void
     {
+        LeaveApplication::where('id', 30038)->update(['status' => 'APPROVED']);
+
         $service = app(DtrCalculationService::class);
         $dtr = $service->calculateForEmployeeDate('011790', '2026-10-30');
 
         $this->assertNotNull($dtr);
         $this->assertSame(DailyTimeRecord::STATUS_ON_LEAVE_PM, $dtr->status);
-        $this->assertEquals(4.00, (float) $dtr->rendered_hours);
+        // Mahusay has a 10-hour custom schedule override (7:00-18:00) with 0.625 half-day leave deduction rate: 10 * 0.625 = 6.25 hrs
+        $this->assertEquals(6.25, (float) $dtr->rendered_hours);
         $this->assertSame('FL', $dtr->leave_type_code);
         $this->assertSame(0, $dtr->late_minutes);
+        $this->assertSame(0, $dtr->undertime_minutes);
+    }
+
+    public function test_dtr_uses_work_schedule_override_for_slotting_and_rendered_hours(): void
+    {
+        // Setup employee override: 07:00 to 16:00, lunch 11:00 to 12:00
+        EmployeeWorkScheduleOverride::query()->create([
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'employee_name' => 'Test Employee',
+            'work_start_time' => '07:00:00',
+            'work_end_time' => '16:00:00',
+            'break_start_time' => '11:00:00',
+            'break_end_time' => '12:00:00',
+            'working_hours_per_day' => 8.00,
+            'whole_day_leave_deduction' => 1.000,
+            'half_day_leave_deduction' => 0.500,
+            'is_active' => true,
+        ]);
+
+        // Punches: 07:15 AM (15 mins late for 07:00 shift), 11:05 AM (lunch out), 11:55 AM (lunch in), 16:05 PM (PM out)
+        AttendanceRawLog::query()->create([
+            'biometric_pin' => self::TEST_CONTROL_NO,
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'punch_time' => self::TEST_DATE.' 07:15:00',
+            'punch_state' => 0,
+            'verify_type' => 15,
+            'sync_source' => 'ADMS',
+        ]);
+        AttendanceRawLog::query()->create([
+            'biometric_pin' => self::TEST_CONTROL_NO,
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'punch_time' => self::TEST_DATE.' 11:05:00',
+            'punch_state' => 1,
+            'verify_type' => 15,
+            'sync_source' => 'ADMS',
+        ]);
+        AttendanceRawLog::query()->create([
+            'biometric_pin' => self::TEST_CONTROL_NO,
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'punch_time' => self::TEST_DATE.' 11:55:00',
+            'punch_state' => 0,
+            'verify_type' => 15,
+            'sync_source' => 'ADMS',
+        ]);
+        AttendanceRawLog::query()->create([
+            'biometric_pin' => self::TEST_CONTROL_NO,
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'punch_time' => self::TEST_DATE.' 16:05:00',
+            'punch_state' => 1,
+            'verify_type' => 15,
+            'sync_source' => 'ADMS',
+        ]);
+
+        $service = app(DtrCalculationService::class);
+        $dtr = $service->calculateForEmployeeDate(self::TEST_CONTROL_NO, self::TEST_DATE);
+
+        $this->assertNotNull($dtr);
+        $this->assertSame('07:15:00', $dtr->am_arrival);
+        $this->assertSame('11:05:00', $dtr->am_departure);
+        $this->assertSame('11:55:00', $dtr->pm_arrival);
+        $this->assertSame('16:05:00', $dtr->pm_departure);
+        // Under 07:00 start, 07:15 is 15 minutes late. (Under default 08:00 start, it would have been 0 minutes late)
+        $this->assertSame(15, $dtr->late_minutes);
         $this->assertSame(0, $dtr->undertime_minutes);
     }
 
@@ -807,5 +878,108 @@ class DtrCalculationTest extends TestCase
         $this->assertSame('O.F.', $dtr->adjusted_slots['am_departure']);
         $this->assertSame('O.B.', $dtr->adjusted_slots['pm_arrival']);
         $this->assertSame('O.B.', $dtr->adjusted_slots['pm_departure']);
+    }
+
+    public function test_csc_form_48_minute_level_precision_for_tardiness_and_undertime(): void
+    {
+        // 08:00:45 AM (under CSC Form 48, 08:00:xx is 8:00 AM, on time, 0 late)
+        AttendanceRawLog::query()->create([
+            'biometric_pin' => self::TEST_CONTROL_NO,
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'punch_time' => self::TEST_DATE.' 08:00:45',
+            'punch_state' => 0,
+            'verify_type' => 15,
+            'sync_source' => 'ADMS',
+        ]);
+        // 12:00:20 PM (on time, 0 undertime)
+        AttendanceRawLog::query()->create([
+            'biometric_pin' => self::TEST_CONTROL_NO,
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'punch_time' => self::TEST_DATE.' 12:00:20',
+            'punch_state' => 1,
+            'verify_type' => 15,
+            'sync_source' => 'ADMS',
+        ]);
+        // 13:01:15 PM (1 minute late under CSC Form 48)
+        AttendanceRawLog::query()->create([
+            'biometric_pin' => self::TEST_CONTROL_NO,
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'punch_time' => self::TEST_DATE.' 13:01:15',
+            'punch_state' => 0,
+            'verify_type' => 15,
+            'sync_source' => 'ADMS',
+        ]);
+        // 16:59:30 PM (1 minute undertime under CSC Form 48)
+        AttendanceRawLog::query()->create([
+            'biometric_pin' => self::TEST_CONTROL_NO,
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'punch_time' => self::TEST_DATE.' 16:59:30',
+            'punch_state' => 1,
+            'verify_type' => 15,
+            'sync_source' => 'ADMS',
+        ]);
+
+        $service = app(DtrCalculationService::class);
+        $dtr = $service->calculateForEmployeeDate(self::TEST_CONTROL_NO, self::TEST_DATE);
+
+        $this->assertNotNull($dtr);
+        $this->assertSame(1, $dtr->late_minutes, 'Morning arrival at 08:00:45 is on time (0 late), PM arrival at 13:01:15 is 1 min late');
+        $this->assertSame(1, $dtr->undertime_minutes, 'Lunch departure at 12:00:20 is on time (0 undertime), PM departure at 16:59:30 is 1 min undertime');
+        // Rendered: 08:00 to 12:00 = 4.0h (240m), 13:01 to 16:59 = 3h 58m (238m) = 478m = 7.97 hours
+        $this->assertEquals(7.97, (float) $dtr->rendered_hours);
+    }
+
+    public function test_late_morning_arrival_at_eleven_am_is_slotted_as_am_arrival_with_late_minutes(): void
+    {
+        // 11:00 AM (Morning Arrival - 3 hours / 180 mins late for 08:00 shift)
+        AttendanceRawLog::query()->create([
+            'biometric_pin' => self::TEST_CONTROL_NO,
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'punch_time' => self::TEST_DATE.' 11:00:00',
+            'punch_state' => 0,
+            'verify_type' => 15,
+            'sync_source' => 'ADMS',
+        ]);
+        // 12:00 PM (Lunch Departure - on time)
+        AttendanceRawLog::query()->create([
+            'biometric_pin' => self::TEST_CONTROL_NO,
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'punch_time' => self::TEST_DATE.' 12:00:00',
+            'punch_state' => 1,
+            'verify_type' => 15,
+            'sync_source' => 'ADMS',
+        ]);
+        // 13:00 PM (Lunch Arrival - on time)
+        AttendanceRawLog::query()->create([
+            'biometric_pin' => self::TEST_CONTROL_NO,
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'punch_time' => self::TEST_DATE.' 13:00:00',
+            'punch_state' => 0,
+            'verify_type' => 15,
+            'sync_source' => 'ADMS',
+        ]);
+        // 17:00 PM (Afternoon Departure - on time)
+        AttendanceRawLog::query()->create([
+            'biometric_pin' => self::TEST_CONTROL_NO,
+            'employee_control_no' => self::TEST_CONTROL_NO,
+            'punch_time' => self::TEST_DATE.' 17:00:00',
+            'punch_state' => 1,
+            'verify_type' => 15,
+            'sync_source' => 'ADMS',
+        ]);
+
+        $service = app(DtrCalculationService::class);
+        $dtr = $service->calculateForEmployeeDate(self::TEST_CONTROL_NO, self::TEST_DATE);
+
+        $this->assertNotNull($dtr);
+        $this->assertSame('11:00:00', $dtr->am_arrival, '11:00 AM punch must be slotted into AM Arrival');
+        $this->assertSame('12:00:00', $dtr->am_departure, '12:00 PM punch must be slotted into AM Departure');
+        $this->assertSame('13:00:00', $dtr->pm_arrival, '13:00 PM punch must be slotted into PM Arrival');
+        $this->assertSame('17:00:00', $dtr->pm_departure, '17:00 PM punch must be slotted into PM Departure');
+        // 11:00 AM is 180 minutes late from 08:00 AM start, 0 undertime
+        $this->assertSame(180, $dtr->late_minutes, 'Timing in at 11:00 AM is 180 minutes late, not undertime');
+        $this->assertSame(0, $dtr->undertime_minutes, 'Departing at 12:00 and 17:00 is on time, so 0 undertime');
+        // Rendered hours: 11:00 to 12:00 (1.0h) + 13:00 to 17:00 (4.0h) = 5.00 hours
+        $this->assertEquals(5.00, (float) $dtr->rendered_hours);
     }
 }
