@@ -80,7 +80,7 @@ class AttendanceRemarkAndHolidayTest extends TestCase
         $deleteResponse->assertStatus(200)
             ->assertJsonPath('message', 'Remark deleted successfully.');
 
-        $this->assertDatabaseMissing('tblDtrRemarks', ['id' => $remarkId]);
+        $this->assertDatabaseMissing('tblDtrRemarks', ['id' => $remarkId], 'bio');
     }
 
     public function test_can_fetch_holidays_options(): void
@@ -141,7 +141,7 @@ class AttendanceRemarkAndHolidayTest extends TestCase
         $deleteResponse->assertStatus(200)
             ->assertJsonPath('message', 'Holiday deleted successfully.');
 
-        $this->assertDatabaseMissing('tblHolidays', ['id' => $holidayId]);
+        $this->assertDatabaseMissing('tblHolidays', ['id' => $holidayId], 'bio');
     }
 
     public function test_override_dtr_with_remark(): void

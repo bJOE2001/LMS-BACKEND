@@ -7,6 +7,8 @@ use Illuminate\Database\Eloquent\Model;
 
 class DtrRemark extends Model
 {
+    protected $connection = 'bio';
+
     protected $table = 'tblDtrRemarks';
 
     protected $fillable = [

@@ -7,9 +7,20 @@ use Illuminate\Console\Command;
 
 class SyncZkBioPunchesCommand extends Command
 {
-    protected $signature = 'bio:sync-punches
+    protected $signature = 'bio:sync
                             {--install-trigger : Install the real-time SQL Server trigger on zkbiotime.dbo.iclock_transaction}
                             {--limit=1000 : Maximum number of transactions to pull}';
+
+    /**
+     * Aliases for easy recall.
+     *
+     * @var list<string>
+     */
+    protected $aliases = [
+        'dtr:sync',
+        'attendance:sync',
+        'bio:sync-punches',
+    ];
 
     protected $description = 'Synchronize punch logs from ZKBio Time (zkbiotime.dbo.iclock_transaction) into LMS BIO_DB';
 

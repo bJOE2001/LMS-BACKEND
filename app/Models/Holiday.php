@@ -7,6 +7,8 @@ use Illuminate\Database\Eloquent\Model;
 
 class Holiday extends Model
 {
+    protected $connection = 'bio';
+
     protected $table = 'tblHolidays';
 
     protected $fillable = [

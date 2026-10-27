@@ -17,7 +17,18 @@ class InstallZkBioTriggersCommand extends Command
      *
      * @var string
      */
-    protected $signature = 'zkbio:install-triggers';
+    protected $signature = 'bio:triggers';
+
+    /**
+     * Aliases for easy recall.
+     *
+     * @var list<string>
+     */
+    protected $aliases = [
+        'bio:setup',
+        'zkbio:install-triggers',
+        'dtr:triggers',
+    ];
 
     /**
      * The console command description.

@@ -13,7 +13,18 @@ class ReconcileZkBioEnrollmentsCommand extends Command
      *
      * @var string
      */
-    protected $signature = 'zkbio:reconcile-enrollments {--control_no= : Specific employee control number to reconcile}';
+    protected $signature = 'bio:sync-enrollments {--control_no= : Specific employee control number to reconcile}';
+
+    /**
+     * Aliases for easy recall.
+     *
+     * @var list<string>
+     */
+    protected $aliases = [
+        'bio:enrollments',
+        'bio:reconcile',
+        'zkbio:reconcile-enrollments',
+    ];
 
     /**
      * The console command description.

@@ -379,6 +379,7 @@ class DailyTimeRecordController extends Controller
             'department_id' => ['nullable', 'integer'],
             'date' => ['nullable', 'date_format:Y-m-d'],
             'search' => ['nullable', 'string', 'max:100'],
+            'employment_status' => ['nullable', 'string', 'max:50'],
         ]);
 
         $account = $request->user();
@@ -495,8 +496,19 @@ class DailyTimeRecordController extends Controller
                 'is_biometric_registered' => $enrollment?->isRegistered() ?? false,
                 'synced_devices' => $enrollment?->synced_devices ?? [],
                 'attendance_status' => $attendanceStatus,
+                'employment_status' => $emp?->status ?? null,
                 'dtr' => $dtr,
             ];
+        }
+
+        // Apply employment status filter if provided
+        $employmentStatusFilter = strtoupper(trim((string) ($validated['employment_status'] ?? '')));
+        if ($employmentStatusFilter !== '' && $employmentStatusFilter !== 'ALL') {
+            $dtrRows = array_values(array_filter($dtrRows, function ($row) use ($employmentStatusFilter): bool {
+                $rowStatus = strtoupper(trim((string) ($row['employment_status'] ?? '')));
+
+                return $rowStatus === $employmentStatusFilter;
+            }));
         }
 
         // Apply search filter if provided

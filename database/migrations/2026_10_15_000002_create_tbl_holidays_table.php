@@ -12,8 +12,8 @@ return new class extends Migration
      */
     public function up(): void
     {
-        if (! Schema::hasTable('tblHolidays')) {
-            Schema::create('tblHolidays', function (Blueprint $table): void {
+        if (! Schema::connection('bio')->hasTable('tblHolidays')) {
+            Schema::connection('bio')->create('tblHolidays', function (Blueprint $table): void {
                 $table->id();
                 $table->date('holiday_date')->index('IX_tblHolidays_holiday_date');
                 $table->string('name', 150);
@@ -41,7 +41,7 @@ return new class extends Migration
             ];
 
             foreach ($defaultHolidays as $holiday) {
-                DB::table('tblHolidays')->insert(array_merge($holiday, [
+                DB::connection('bio')->table('tblHolidays')->insert(array_merge($holiday, [
                     'is_active' => true,
                     'description' => null,
                     'created_at' => now(),
@@ -56,6 +56,6 @@ return new class extends Migration
      */
     public function down(): void
     {
-        Schema::dropIfExists('tblHolidays');
+        Schema::connection('bio')->dropIfExists('tblHolidays');
     }
 };

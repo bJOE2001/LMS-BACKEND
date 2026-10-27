@@ -12,8 +12,8 @@ return new class extends Migration
      */
     public function up(): void
     {
-        if (! Schema::hasTable('tblDtrRemarks')) {
-            Schema::create('tblDtrRemarks', function (Blueprint $table): void {
+        if (! Schema::connection('bio')->hasTable('tblDtrRemarks')) {
+            Schema::connection('bio')->create('tblDtrRemarks', function (Blueprint $table): void {
                 $table->id();
                 $table->string('abbrv', 50)->nullable()->index('IX_tblDtrRemarks_abbrv');
                 $table->string('description', 150);
@@ -30,7 +30,7 @@ return new class extends Migration
             ];
 
             foreach ($defaultRemarks as $remark) {
-                DB::table('tblDtrRemarks')->insert(array_merge($remark, [
+                DB::connection('bio')->table('tblDtrRemarks')->insert(array_merge($remark, [
                     'created_at' => now(),
                     'updated_at' => now(),
                 ]));
@@ -43,6 +43,6 @@ return new class extends Migration
      */
     public function down(): void
     {
-        Schema::dropIfExists('tblDtrRemarks');
+        Schema::connection('bio')->dropIfExists('tblDtrRemarks');
     }
 };

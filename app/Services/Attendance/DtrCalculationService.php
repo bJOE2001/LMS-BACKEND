@@ -97,7 +97,7 @@ class DtrCalculationService
         // 6. Check for Approved Leaves in LMS_DB
         $leaveInfo = $this->resolveApprovedLeave($canonicalControlNo, $dateStr, $variants);
 
-        // 6b. Check for Active Holidays in LMS_DB
+        // 6b. Check for Active Holidays in BIO_DB
         $holiday = Holiday::query()
             ->active()
             ->where(function ($q) use ($dateStr, $dateObj): void {
