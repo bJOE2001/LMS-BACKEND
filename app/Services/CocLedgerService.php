@@ -10,21 +10,24 @@ use App\Models\LeaveApplication;
 use App\Models\LeaveBalance;
 use App\Models\LeaveType;
 use Carbon\CarbonImmutable;
-use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Schema;
 
 class CocLedgerService
 {
     private const HOURS_PER_DAY = 8.0;
+
     private const MINUTES_PER_HOUR = 60;
+
     private const MINUTES_PER_WORKDAY = 480;
+
     private const MINIMUM_CREDITABLE_EXCESS_MINUTES = 20;
 
     public function syncEmployeeLedger(
         string $employeeControlNo,
         ?int $leaveTypeId = null,
         ?CarbonImmutable $asOfDate = null,
-        bool $syncLeaveBalance = true
+        bool $syncLeaveBalance = true,
+        ?int $excludeApplicationId = null
     ): array {
         $resolvedLeaveTypeId = $leaveTypeId ?: $this->resolveCtoLeaveTypeId();
         if ($resolvedLeaveTypeId === null) {
@@ -36,13 +39,13 @@ class CocLedgerService
             return $this->emptySnapshot($resolvedLeaveTypeId);
         }
 
-        $snapshot = $this->buildLedgerSnapshot($employeeControlNo, $resolvedLeaveTypeId, $asOfDate);
+        $snapshot = $this->buildLedgerSnapshot($employeeControlNo, $resolvedLeaveTypeId, $asOfDate, $excludeApplicationId);
 
-        if ($this->hasLedgerTable()) {
+        if ($excludeApplicationId === null && $this->hasLedgerTable()) {
             $this->persistLedgerEntries($controlNoCandidates, $snapshot);
         }
 
-        if ($syncLeaveBalance) {
+        if ($syncLeaveBalance && $excludeApplicationId === null) {
             $this->syncLeaveBalanceRow($controlNoCandidates, $snapshot);
         }
 
@@ -52,17 +55,19 @@ class CocLedgerService
     public function getAvailableHours(
         string $employeeControlNo,
         ?int $leaveTypeId = null,
-        ?CarbonImmutable $asOfDate = null
+        ?CarbonImmutable $asOfDate = null,
+        ?int $excludeApplicationId = null
     ): float {
-        return (float) ($this->syncEmployeeLedger($employeeControlNo, $leaveTypeId, $asOfDate, false)['availableHours'] ?? 0.0);
+        return (float) ($this->syncEmployeeLedger($employeeControlNo, $leaveTypeId, $asOfDate, false, $excludeApplicationId)['availableHours'] ?? 0.0);
     }
 
     public function getAvailableDays(
         string $employeeControlNo,
         ?int $leaveTypeId = null,
-        ?CarbonImmutable $asOfDate = null
+        ?CarbonImmutable $asOfDate = null,
+        ?int $excludeApplicationId = null
     ): float {
-        return (float) ($this->syncEmployeeLedger($employeeControlNo, $leaveTypeId, $asOfDate, false)['availableDays'] ?? 0.0);
+        return (float) ($this->syncEmployeeLedger($employeeControlNo, $leaveTypeId, $asOfDate, false, $excludeApplicationId)['availableDays'] ?? 0.0);
     }
 
     public function getHistoryByLeaveType(
@@ -77,7 +82,7 @@ class CocLedgerService
         }
 
         $entries = collect($snapshot['entries'] ?? [])
-            ->map(fn(array $entry) => $this->formatHistoryEntry($entry))
+            ->map(fn (array $entry) => $this->formatHistoryEntry($entry))
             ->filter()
             ->values()
             ->all();
@@ -90,7 +95,8 @@ class CocLedgerService
     private function buildLedgerSnapshot(
         string $employeeControlNo,
         int $leaveTypeId,
-        ?CarbonImmutable $asOfDate = null
+        ?CarbonImmutable $asOfDate = null,
+        ?int $excludeApplicationId = null
     ): array {
         $controlNoCandidates = $this->controlNoCandidates($employeeControlNo);
         if ($controlNoCandidates === []) {
@@ -156,6 +162,7 @@ class CocLedgerService
             ->where('status', LeaveApplication::STATUS_APPROVED)
             ->whereIn('employee_control_no', $controlNoCandidates)
             ->where('leave_type_id', $leaveTypeId)
+            ->when($excludeApplicationId !== null, fn ($query) => $query->where('id', '<>', (int) $excludeApplicationId))
             ->where(function ($query): void {
                 $query->where('is_monetization', true)
                     ->orWhereRaw(
@@ -190,7 +197,7 @@ class CocLedgerService
 
         $timelineEvents = $earnedEvents
             ->concat($usedEvents)
-            ->filter(fn(array $event): bool => $event['effectiveAt']->lt($asOf) || $event['effectiveAt']->equalTo($asOf))
+            ->filter(fn (array $event): bool => $event['effectiveAt']->lt($asOf) || $event['effectiveAt']->equalTo($asOf))
             ->sort(function (array $left, array $right): int {
                 $dateComparison = $left['effectiveAt']->getTimestamp() <=> $right['effectiveAt']->getTimestamp();
                 if ($dateComparison !== 0) {
@@ -221,9 +228,9 @@ class CocLedgerService
         ): void {
             $creditBuckets = collect($creditBuckets)
                 ->sortBy([
-                    fn(array $bucket) => $bucket['expiresOn']->getTimestamp(),
-                    fn(array $bucket) => $bucket['effectiveAt']->getTimestamp(),
-                    fn(array $bucket) => $bucket['cocApplicationId'] ?? 0,
+                    fn (array $bucket) => $bucket['expiresOn']->getTimestamp(),
+                    fn (array $bucket) => $bucket['effectiveAt']->getTimestamp(),
+                    fn (array $bucket) => $bucket['cocApplicationId'] ?? 0,
                 ])
                 ->values()
                 ->all();
@@ -234,7 +241,7 @@ class CocLedgerService
                     continue;
                 }
 
-                if (!$bucket['expiresOn']->lt($cutoff)) {
+                if (! $bucket['expiresOn']->lt($cutoff)) {
                     continue;
                 }
 
@@ -301,9 +308,9 @@ class CocLedgerService
 
             $creditBuckets = collect($creditBuckets)
                 ->sortBy([
-                    fn(array $bucket) => $bucket['expiresOn']->getTimestamp(),
-                    fn(array $bucket) => $bucket['effectiveAt']->getTimestamp(),
-                    fn(array $bucket) => $bucket['cocApplicationId'] ?? 0,
+                    fn (array $bucket) => $bucket['expiresOn']->getTimestamp(),
+                    fn (array $bucket) => $bucket['effectiveAt']->getTimestamp(),
+                    fn (array $bucket) => $bucket['cocApplicationId'] ?? 0,
                 ])
                 ->values()
                 ->all();
@@ -420,11 +427,11 @@ class CocLedgerService
             ->where('leave_type_id', $leaveTypeId)
             ->first();
 
-        if (!$balance && $availableDays <= 0) {
+        if (! $balance && $availableDays <= 0) {
             return;
         }
 
-        if (!$balance) {
+        if (! $balance) {
             LeaveBalance::query()->create([
                 'employee_control_no' => $canonicalControlNo,
                 'leave_type_id' => $leaveTypeId,
@@ -435,9 +442,9 @@ class CocLedgerService
             return;
         }
 
-        if (round((float) $balance->balance, 3) !== $availableDays || !$balance->year) {
+        if (round((float) $balance->balance, 3) !== $availableDays || ! $balance->year) {
             $balance->balance = $availableDays;
-            if (!$balance->year) {
+            if (! $balance->year) {
                 $balance->year = (int) now()->year;
             }
             $balance->save();
@@ -447,7 +454,7 @@ class CocLedgerService
     private function formatHistoryEntry(array $entry): ?array
     {
         $effectiveAt = $entry['effectiveAt'] ?? null;
-        if (!$effectiveAt instanceof CarbonImmutable) {
+        if (! $effectiveAt instanceof CarbonImmutable) {
             return null;
         }
 
@@ -497,12 +504,12 @@ class CocLedgerService
 
     private function resolveHistoryApplicationId(array $entry): ?string
     {
-        if (!empty($entry['cocApplicationId'])) {
-            return 'COC-' . (int) $entry['cocApplicationId'];
+        if (! empty($entry['cocApplicationId'])) {
+            return 'COC-'.(int) $entry['cocApplicationId'];
         }
 
-        if (!empty($entry['leaveApplicationId'])) {
-            return 'LEAVE-' . (int) $entry['leaveApplicationId'];
+        if (! empty($entry['leaveApplicationId'])) {
+            return 'LEAVE-'.(int) $entry['leaveApplicationId'];
         }
 
         return null;
@@ -562,6 +569,7 @@ class CocLedgerService
         }
 
         $breakMinutes = max((int) ($row->break_minutes ?? 0), 0);
+
         return $this->calculateCreditableMinutes(max($minutes - $breakMinutes, 0));
     }
 
@@ -612,6 +620,7 @@ class CocLedgerService
         }
 
         $days = round((float) ($application->deductible_days ?? $application->total_days ?? 0), 3);
+
         return $days > 0 ? round($days * self::HOURS_PER_DAY, 2) : 0.0;
     }
 
@@ -695,8 +704,8 @@ class CocLedgerService
         }
 
         return collect($candidates)
-            ->map(fn(string $candidate): string => trim($candidate))
-            ->filter(fn(string $candidate): bool => $candidate !== '')
+            ->map(fn (string $candidate): string => trim($candidate))
+            ->filter(fn (string $candidate): bool => $candidate !== '')
             ->unique()
             ->values()
             ->all();
@@ -722,7 +731,7 @@ class CocLedgerService
         static $resolved = false;
         static $hasColumn = false;
 
-        if (!$resolved) {
+        if (! $resolved) {
             $hasColumn = Schema::hasColumn('tblLeaveApplications', 'cto_deducted_hours');
             $resolved = true;
         }

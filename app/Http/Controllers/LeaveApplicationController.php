@@ -2699,6 +2699,103 @@ class LeaveApplicationController extends Controller
         ]);
     }
 
+    /**
+     * Admin withdraws/cancels their pending recall request.
+     * Application reverts back to APPROVED status.
+     */
+    public function adminCancelRecall(Request $request, int $id): JsonResponse
+    {
+        $admin = $request->user();
+        if (! $admin instanceof DepartmentAdmin) {
+            return response()->json(['message' => 'Only department admins can cancel recall requests.'], 403);
+        }
+
+        $request->validate([
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $admin->loadMissing('department');
+        $app = LeaveApplication::with('leaveType')->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        if (! $this->adminCanManageApplication($admin, $app)) {
+            return response()->json(['message' => 'You can only manage applications from your department.'], 403);
+        }
+
+        if ($app->status !== LeaveApplication::STATUS_PENDING_HR) {
+            return response()->json([
+                'message' => "Cannot withdraw recall request: application status is '{$app->status}', expected 'PENDING_HR'.",
+            ], 422);
+        }
+
+        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
+        $pendingUpdateRequest = $pendingUpdateMeta['request_record'] ?? null;
+        $pendingActionType = $this->resolveUpdateRequestActionTypeFromPayload($pendingUpdateMeta['payload'] ?? null);
+
+        if ($pendingActionType !== LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL && ! ($pendingUpdateRequest instanceof LeaveApplicationUpdateRequest)) {
+            return response()->json([
+                'message' => 'This application does not have an active pending recall request to withdraw.',
+            ], 422);
+        }
+
+        $reason = trim((string) $request->input('remarks', ''));
+        $withdrawnRemarksLine = $reason !== ''
+            ? "Recall request withdrawn by department admin. Reason: {$reason}"
+            : 'Recall request withdrawn by department admin.';
+
+        DB::transaction(function () use (
+            $app,
+            $admin,
+            $pendingUpdateRequest,
+            $withdrawnRemarksLine
+        ): void {
+            $cleanedRemarks = $this->cleanRequestLinesFromRemarks($app->remarks);
+
+            $app->update([
+                'status' => LeaveApplication::STATUS_APPROVED,
+                'admin_id' => $admin->id,
+                'remarks' => $cleanedRemarks,
+            ]);
+
+            if ($pendingUpdateRequest instanceof LeaveApplicationUpdateRequest) {
+                $pendingUpdateRequest->update([
+                    'status' => LeaveApplicationUpdateRequest::STATUS_REJECTED,
+                    'reviewed_at' => now(),
+                    'review_remarks' => $withdrawnRemarksLine,
+                ]);
+            }
+
+            LeaveApplicationLog::create([
+                'leave_application_id' => $app->id,
+                'action' => LeaveApplicationLog::ACTION_ADMIN_CANCELLED,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_ADMIN,
+                'performed_by_id' => $admin->id,
+                'remarks' => $withdrawnRemarksLine,
+                'created_at' => now(),
+            ]);
+        });
+
+        $employeeName = $this->resolveEmployeeDisplayName($app);
+        $notifyMessage = "Recall request for {$employeeName} ({$app->leaveType?->name}) was withdrawn by department admin.";
+        $hrAccounts = HRAccount::all();
+        foreach ($hrAccounts as $hrAccount) {
+            Notification::send(
+                $hrAccount,
+                Notification::TYPE_LEAVE_EDIT_REQUEST,
+                'Recall Request Withdrawn',
+                $notifyMessage,
+                $app->id
+            );
+        }
+
+        return response()->json([
+            'message' => 'Recall request withdrawn successfully. Application restored to Approved.',
+            'application' => $this->formatApplication($app->fresh(['leaveType', 'applicantAdmin'])),
+        ]);
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     //  HR ACTIONS
     // ═══════════════════════════════════════════════════════════════════
@@ -10759,10 +10856,13 @@ class LeaveApplicationController extends Controller
             $pendingUpdateRequest,
             $pendingActionType
         ): void {
+            $remarksInput = $request->input('remarks');
+            $cleanedRemarks = $remarksInput ?: $this->cleanRequestLinesFromRemarks($app->remarks);
+
             $app->update([
                 'status' => $previousStatus,
                 'admin_id' => $admin->id,
-                'remarks' => $request->input('remarks'),
+                'remarks' => $cleanedRemarks,
             ]);
 
             if ($pendingUpdateRequest instanceof LeaveApplicationUpdateRequest) {
@@ -11535,7 +11635,8 @@ class LeaveApplicationController extends Controller
             );
 
         if ($isCtoDeduction) {
-            $this->syncEmployeeCtoBalance($employeeControlNo, true);
+            $excludeApplicationId = (int) ($app->id ?? 0) > 0 ? (int) $app->id : null;
+            $this->syncEmployeeCtoBalance($employeeControlNo, true, null, $excludeApplicationId);
         }
 
         $primaryBalance = $this->lockEmployeeLeaveBalance($employeeControlNo, $primaryLeaveTypeId);
@@ -11952,7 +12053,8 @@ class LeaveApplicationController extends Controller
     private function syncEmployeeCtoBalance(
         string $employeeControlNo,
         bool $lockForUpdate = false,
-        ?\Carbon\CarbonImmutable $asOfDate = null
+        ?\Carbon\CarbonImmutable $asOfDate = null,
+        ?int $excludeApplicationId = null
     ): ?float {
         $ctoLeaveTypeId = $this->resolveCtoLeaveTypeId();
         if ($ctoLeaveTypeId === null) {
@@ -11965,7 +12067,7 @@ class LeaveApplicationController extends Controller
         }
 
         $effectiveBalance = round(max(
-            $this->cocLedgerService()->getAvailableDays($employeeControlNo, $ctoLeaveTypeId, $asOfDate),
+            $this->cocLedgerService()->getAvailableDays($employeeControlNo, $ctoLeaveTypeId, $asOfDate, $excludeApplicationId),
             0.0
         ), 3);
 
@@ -12013,14 +12115,15 @@ class LeaveApplicationController extends Controller
     private function computeEmployeeCtoAvailableBalance(
         string $employeeControlNo,
         int $ctoLeaveTypeId,
-        ?\Carbon\CarbonImmutable $asOfDate = null
+        ?\Carbon\CarbonImmutable $asOfDate = null,
+        ?int $excludeApplicationId = null
     ): float {
         if ($ctoLeaveTypeId <= 0) {
             return 0.0;
         }
 
         return round(max(
-            $this->cocLedgerService()->getAvailableDays($employeeControlNo, $ctoLeaveTypeId, $asOfDate),
+            $this->cocLedgerService()->getAvailableDays($employeeControlNo, $ctoLeaveTypeId, $asOfDate, $excludeApplicationId),
             0.0
         ), 3);
     }
