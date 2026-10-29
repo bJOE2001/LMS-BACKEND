@@ -881,7 +881,8 @@ class LeaveCreditService
         bool $lockForUpdate = false,
         ?CarbonImmutable $asOfDate = null,
         ?callable $candidatesResolver = null,
-        ?callable $employeeResolver = null
+        ?callable $employeeResolver = null,
+        ?int $excludeApplicationId = null
     ): ?float {
         $ctoLeaveTypeId = $this->resolveCtoLeaveTypeId();
         if ($ctoLeaveTypeId === null) {
@@ -897,7 +898,7 @@ class LeaveCreditService
         }
 
         $effectiveBalance = round(max(
-            $this->cocLedgerService->getAvailableDays($employeeControlNo, $ctoLeaveTypeId, $asOfDate),
+            $this->cocLedgerService->getAvailableDays($employeeControlNo, $ctoLeaveTypeId, $asOfDate, $excludeApplicationId),
             0.0
         ), 3);
 
@@ -946,14 +947,15 @@ class LeaveCreditService
     public function computeEmployeeCtoAvailableBalance(
         string $employeeControlNo,
         int $ctoLeaveTypeId,
-        ?CarbonImmutable $asOfDate = null
+        ?CarbonImmutable $asOfDate = null,
+        ?int $excludeApplicationId = null
     ): float {
         if ($ctoLeaveTypeId <= 0) {
             return 0.0;
         }
 
         return round(max(
-            $this->cocLedgerService->getAvailableDays($employeeControlNo, $ctoLeaveTypeId, $asOfDate),
+            $this->cocLedgerService->getAvailableDays($employeeControlNo, $ctoLeaveTypeId, $asOfDate, $excludeApplicationId),
             0.0
         ), 3);
     }
@@ -1365,7 +1367,8 @@ class LeaveCreditService
             );
 
         if ($isCtoDeduction) {
-            $this->syncEmployeeCtoBalance($employeeControlNo, true, null, $candidatesResolver, $employeeResolver);
+            $excludeApplicationId = (int) ($app->id ?? 0) > 0 ? (int) $app->id : null;
+            $this->syncEmployeeCtoBalance($employeeControlNo, true, null, $candidatesResolver, $employeeResolver, $excludeApplicationId);
         }
 
         $primaryBalance = $this->lockEmployeeLeaveBalance($employeeControlNo, $primaryLeaveTypeId, $candidatesResolver);

@@ -464,6 +464,20 @@ class LeaveApplicationController extends Controller
         );
     }
 
+    /**
+     * Admin withdraws/cancels their pending recall request.
+     * Application reverts back to APPROVED status.
+     */
+    public function adminCancelRecall(Request $request, int $id): JsonResponse
+    {
+        return $this->leaveWorkflowService()->handleAdminCancelRecall(
+            $request,
+            $id,
+            fn (string $controlNo): ?object => $this->findEmployeeByControlNo($controlNo),
+            fn (LeaveApplication $application): array => $this->formatApplication($application)
+        );
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     //  HR ACTIONS
     // ═══════════════════════════════════════════════════════════════════

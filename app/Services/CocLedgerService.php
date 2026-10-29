@@ -26,7 +26,8 @@ class CocLedgerService
         string $employeeControlNo,
         ?int $leaveTypeId = null,
         ?CarbonImmutable $asOfDate = null,
-        bool $syncLeaveBalance = true
+        bool $syncLeaveBalance = true,
+        ?int $excludeApplicationId = null
     ): array {
         $resolvedLeaveTypeId = $leaveTypeId ?: $this->resolveCtoLeaveTypeId();
         if ($resolvedLeaveTypeId === null) {
@@ -38,13 +39,13 @@ class CocLedgerService
             return $this->emptySnapshot($resolvedLeaveTypeId);
         }
 
-        $snapshot = $this->buildLedgerSnapshot($employeeControlNo, $resolvedLeaveTypeId, $asOfDate);
+        $snapshot = $this->buildLedgerSnapshot($employeeControlNo, $resolvedLeaveTypeId, $asOfDate, $excludeApplicationId);
 
-        if ($this->hasLedgerTable()) {
+        if ($excludeApplicationId === null && $this->hasLedgerTable()) {
             $this->persistLedgerEntries($controlNoCandidates, $snapshot);
         }
 
-        if ($syncLeaveBalance) {
+        if ($syncLeaveBalance && $excludeApplicationId === null) {
             $this->syncLeaveBalanceRow($controlNoCandidates, $snapshot);
         }
 
@@ -54,17 +55,19 @@ class CocLedgerService
     public function getAvailableHours(
         string $employeeControlNo,
         ?int $leaveTypeId = null,
-        ?CarbonImmutable $asOfDate = null
+        ?CarbonImmutable $asOfDate = null,
+        ?int $excludeApplicationId = null
     ): float {
-        return (float) ($this->syncEmployeeLedger($employeeControlNo, $leaveTypeId, $asOfDate, false)['availableHours'] ?? 0.0);
+        return (float) ($this->syncEmployeeLedger($employeeControlNo, $leaveTypeId, $asOfDate, false, $excludeApplicationId)['availableHours'] ?? 0.0);
     }
 
     public function getAvailableDays(
         string $employeeControlNo,
         ?int $leaveTypeId = null,
-        ?CarbonImmutable $asOfDate = null
+        ?CarbonImmutable $asOfDate = null,
+        ?int $excludeApplicationId = null
     ): float {
-        return (float) ($this->syncEmployeeLedger($employeeControlNo, $leaveTypeId, $asOfDate, false)['availableDays'] ?? 0.0);
+        return (float) ($this->syncEmployeeLedger($employeeControlNo, $leaveTypeId, $asOfDate, false, $excludeApplicationId)['availableDays'] ?? 0.0);
     }
 
     public function getHistoryByLeaveType(
@@ -92,7 +95,8 @@ class CocLedgerService
     private function buildLedgerSnapshot(
         string $employeeControlNo,
         int $leaveTypeId,
-        ?CarbonImmutable $asOfDate = null
+        ?CarbonImmutable $asOfDate = null,
+        ?int $excludeApplicationId = null
     ): array {
         $controlNoCandidates = $this->controlNoCandidates($employeeControlNo);
         if ($controlNoCandidates === []) {
@@ -158,6 +162,7 @@ class CocLedgerService
             ->where('status', LeaveApplication::STATUS_APPROVED)
             ->whereIn('employee_control_no', $controlNoCandidates)
             ->where('leave_type_id', $leaveTypeId)
+            ->when($excludeApplicationId !== null, fn ($query) => $query->where('id', '<>', (int) $excludeApplicationId))
             ->where(function ($query): void {
                 $query->where('is_monetization', true)
                     ->orWhereRaw(

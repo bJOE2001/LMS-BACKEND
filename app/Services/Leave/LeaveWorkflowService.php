@@ -1868,10 +1868,12 @@ class LeaveWorkflowService
             $pendingUpdateRequest,
             $pendingActionType
         ): void {
+            $cleanedRemarks = $remarks ?: $this->cleanRequestLinesFromRemarks($app->remarks);
+
             $app->update([
                 'status' => $previousStatus,
                 'admin_id' => $admin->id,
-                'remarks' => $remarks,
+                'remarks' => $cleanedRemarks,
             ]);
 
             if ($pendingUpdateRequest instanceof LeaveApplicationUpdateRequest) {
@@ -8740,6 +8742,112 @@ class LeaveWorkflowService
         ]);
     }
 
+    /**
+     * @param  array<string, mixed>  $validated
+     * @param  null|callable(string): ?object  $findEmployeeByControlNo
+     * @param  null|callable(LeaveApplication): array<string, mixed>  $applicationFormatter
+     */
+    public function executeAdminCancelRecall(
+        DepartmentAdmin $admin,
+        LeaveApplication $app,
+        array $validated,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $admin->loadMissing('department');
+
+        if (! $this->adminCanManageApplication(
+            $admin,
+            $app,
+            fn (string $controlNo): ?int => $this->eligibilityService()->resolveLatestAssignedDepartmentIdForControlNo($controlNo),
+            function (LeaveApplication $application) use ($findEmployeeByControlNo): ?object {
+                $controlNo = trim((string) ($application->employee_control_no ?? ''));
+                if ($controlNo === '') {
+                    return null;
+                }
+
+                return $findEmployeeByControlNo !== null
+                    ? $findEmployeeByControlNo($controlNo)
+                    : HrisEmployee::findByControlNo($controlNo);
+            }
+        )) {
+            return response()->json(['message' => 'You can only manage applications from your department.'], 403);
+        }
+
+        if ($app->status !== LeaveApplication::STATUS_PENDING_HR) {
+            return response()->json([
+                'message' => "Cannot withdraw recall request: application status is '{$app->status}', expected 'PENDING_HR'.",
+            ], 422);
+        }
+
+        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
+        $pendingUpdateRequest = $pendingUpdateMeta['request_record'] ?? null;
+        $pendingActionType = $this->resolveUpdateRequestActionTypeFromPayload($pendingUpdateMeta['payload'] ?? null);
+
+        if ($pendingActionType !== LeaveApplicationUpdateRequest::ACTION_TYPE_RECALL && ! ($pendingUpdateRequest instanceof LeaveApplicationUpdateRequest)) {
+            return response()->json([
+                'message' => 'This application does not have an active pending recall request to withdraw.',
+            ], 422);
+        }
+
+        $reason = trim((string) ($validated['remarks'] ?? ''));
+        $withdrawnRemarksLine = $reason !== ''
+            ? "Recall request withdrawn by department admin. Reason: {$reason}"
+            : 'Recall request withdrawn by department admin.';
+
+        DB::transaction(function () use (
+            $app,
+            $admin,
+            $pendingUpdateRequest,
+            $withdrawnRemarksLine
+        ): void {
+            $cleanedRemarks = $this->cleanRequestLinesFromRemarks($app->remarks);
+
+            $app->update([
+                'status' => LeaveApplication::STATUS_APPROVED,
+                'admin_id' => $admin->id,
+                'remarks' => $cleanedRemarks,
+            ]);
+
+            if ($pendingUpdateRequest instanceof LeaveApplicationUpdateRequest) {
+                $pendingUpdateRequest->update([
+                    'status' => LeaveApplicationUpdateRequest::STATUS_REJECTED,
+                    'reviewed_at' => now(),
+                    'review_remarks' => $withdrawnRemarksLine,
+                ]);
+            }
+
+            LeaveApplicationLog::create([
+                'leave_application_id' => $app->id,
+                'action' => LeaveApplicationLog::ACTION_ADMIN_CANCELLED,
+                'performed_by_type' => LeaveApplicationLog::PERFORMER_ADMIN,
+                'performed_by_id' => $admin->id,
+                'remarks' => $withdrawnRemarksLine,
+                'created_at' => now(),
+            ]);
+        });
+
+        $employeeName = $this->resolveEmployeeDisplayName($app, $findEmployeeByControlNo);
+        $notifyMessage = "Recall request for {$employeeName} ({$app->leaveType?->name}) was withdrawn by department admin.";
+        $hrAccounts = HRAccount::all();
+        foreach ($hrAccounts as $hrAccount) {
+            Notification::send(
+                $hrAccount,
+                Notification::TYPE_LEAVE_EDIT_REQUEST,
+                'Recall Request Withdrawn',
+                $notifyMessage,
+                $app->id
+            );
+        }
+
+        return response()->json([
+            'message' => 'Recall request withdrawn successfully. Application restored to Approved.',
+            'application' => $applicationFormatter !== null
+                ? $applicationFormatter($app->fresh(['leaveType', 'applicantAdmin']))
+                : $app->fresh(['leaveType', 'applicantAdmin'])?->toArray(),
+        ]);
+    }
+
     public function executeAdminIndex(
         DepartmentAdmin $admin,
         ?callable $departmentEmployeeControlNosResolver = null,
@@ -9677,6 +9785,35 @@ class LeaveWorkflowService
         }
 
         return $this->executeAdminRequestRecall(
+            $admin,
+            $app,
+            $validated,
+            $findEmployeeByControlNo,
+            $applicationFormatter
+        );
+    }
+
+    public function handleAdminCancelRecall(
+        Request $request,
+        int $id,
+        ?callable $findEmployeeByControlNo = null,
+        ?callable $applicationFormatter = null
+    ): JsonResponse {
+        $admin = $request->user();
+        if (! $admin instanceof DepartmentAdmin) {
+            return response()->json(['message' => 'Only department admins can cancel recall requests.'], 403);
+        }
+
+        $validated = $request->validate([
+            'remarks' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $app = LeaveApplication::with('leaveType')->find($id);
+        if (! $app) {
+            return response()->json(['message' => 'Leave application not found.'], 404);
+        }
+
+        return $this->executeAdminCancelRecall(
             $admin,
             $app,
             $validated,
