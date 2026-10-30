@@ -58,10 +58,16 @@ class DtrCalculationService
     /**
      * Calculate and save DTR for a specific employee on a single date.
      */
-    public function calculateForEmployeeDate(string $controlNo, string $date, ?int $departmentId = null): DailyTimeRecord
-    {
+    public function calculateForEmployeeDate(
+        string $controlNo,
+        string $date,
+        ?int $departmentId = null,
+        ?object $cachedEmployee = null,
+        ?array $cachedSchedule = null
+    ): DailyTimeRecord {
         $controlNo = trim($controlNo);
-        $emp = HrisEmployee::findByControlNo($controlNo, true)
+        $emp = $cachedEmployee
+            ?? HrisEmployee::findByControlNo($controlNo, true)
             ?? HrisEmployee::findByControlNo($controlNo, false);
         $canonicalControlNo = $emp?->control_no ?? $controlNo;
         $variants = $this->resolveControlNoVariants($controlNo, $canonicalControlNo);
@@ -72,11 +78,11 @@ class DtrCalculationService
         $isWeekend = $dateObj->isWeekend();
 
         // 1. Resolve Department ID from employee assignment (Home Office takes strict precedence)
-        $assignedDeptId = $this->resolveDepartmentId($canonicalControlNo, $variants);
-        $departmentId = $assignedDeptId ?? $departmentId;
+        $assignedDeptId = $departmentId ?? $this->resolveDepartmentId($canonicalControlNo, $variants);
+        $departmentId = $assignedDeptId;
 
         // 2. Resolve Work Schedule (Override vs Global Default)
-        $schedule = $this->resolveSchedule($canonicalControlNo, $variants);
+        $schedule = $cachedSchedule ?? $this->resolveSchedule($canonicalControlNo, $variants);
 
         // 3. Fetch Raw Punches for this date
         $rawPunches = AttendanceRawLog::query()
@@ -267,8 +273,15 @@ class DtrCalculationService
      *
      * @return Collection<int, DailyTimeRecord>
      */
-    public function calculateForEmployeeRange(string $controlNo, string $startDate, string $endDate, ?int $departmentId = null): Collection
-    {
+    public function calculateForEmployeeRange(
+        string $controlNo,
+        string $startDate,
+        string $endDate,
+        ?int $departmentId = null,
+        ?object $cachedEmployee = null,
+        ?array $cachedSchedule = null,
+        bool $forceRecalculate = false
+    ): Collection {
         $start = CarbonImmutable::parse($startDate);
         $end = CarbonImmutable::parse($endDate);
 
@@ -276,11 +289,59 @@ class DtrCalculationService
             [$start, $end] = [$end, $start];
         }
 
+        $startDateStr = $start->format('Y-m-d');
+        $endDateStr = $end->format('Y-m-d');
+
+        $emp = $cachedEmployee
+            ?? HrisEmployee::findByControlNo($controlNo, true)
+            ?? HrisEmployee::findByControlNo($controlNo, false);
+        $canonicalControlNo = $emp?->control_no ?? $controlNo;
+        $variants = $this->resolveControlNoVariants($controlNo, $canonicalControlNo);
+        $assignedDeptId = $departmentId ?? $this->resolveDepartmentId($canonicalControlNo, $variants);
+        $schedule = $cachedSchedule ?? $this->resolveSchedule($canonicalControlNo, $variants);
+
+        // Preload existing DTRs for this range in 1 batch query
+        $existingRecords = DailyTimeRecord::query()
+            ->whereIn('employee_control_no', $variants)
+            ->whereBetween('record_date', [$startDateStr, $endDateStr])
+            ->get()
+            ->keyBy(static fn ($r): string => substr((string) $r->record_date, 0, 10));
+
+        // Preload dates that have unprocessed raw logs
+        $unprocessedDates = AttendanceRawLog::query()
+            ->unprocessed()
+            ->where(function ($q) use ($variants): void {
+                $q->whereIn('employee_control_no', $variants)
+                    ->orWhereIn('biometric_pin', $variants);
+            })
+            ->whereBetween('punch_time', [$startDateStr.' 00:00:00', $endDateStr.' 23:59:59'])
+            ->pluck('punch_time')
+            ->map(static fn ($t): string => substr((string) $t, 0, 10))
+            ->unique()
+            ->flip()
+            ->all();
+
         $records = collect();
         $curr = $start;
 
         while ($curr->isBefore($end) || $curr->isSameDay($end)) {
-            $records->push($this->calculateForEmployeeDate($controlNo, $curr->format('Y-m-d'), $departmentId));
+            $dateStr = $curr->format('Y-m-d');
+            $existing = $existingRecords->get($dateStr);
+            $hasUnprocessed = isset($unprocessedDates[$dateStr]);
+
+            if ($existing && ! $hasUnprocessed && ! $forceRecalculate) {
+                $records->push($existing);
+            } else {
+                $records->push(
+                    $this->calculateForEmployeeDate(
+                        $canonicalControlNo,
+                        $dateStr,
+                        $assignedDeptId,
+                        $emp,
+                        $schedule
+                    )
+                );
+            }
             $curr = $curr->addDay();
         }
 

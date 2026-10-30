@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Attendance;
 
 use App\Http\Controllers\Controller;
+use App\Models\AttendanceRawLog;
 use App\Models\BiometricDevice;
 use App\Models\BiometricEnrollment;
 use App\Models\DailyTimeRecord;
@@ -77,7 +78,9 @@ class DailyTimeRecordController extends Controller
         $records = $this->dtrService->calculateForEmployeeRange(
             $canonicalControlNo,
             $startDate->format('Y-m-d'),
-            $endDate->format('Y-m-d')
+            $endDate->format('Y-m-d'),
+            null,
+            $employee
         );
 
         $daysLate = $records->filter(fn ($r) => (int) ($r->late_minutes ?? 0) > 0)->count();
@@ -180,6 +183,7 @@ class DailyTimeRecordController extends Controller
                 'employment_status' => strtoupper(trim((string) ($employee->status ?? ''))),
                 'is_contractual' => strtoupper(trim((string) ($employee->status ?? ''))) === 'CONTRACTUAL',
                 'in_charge' => $defaultInCharge,
+                'schedule' => $this->dtrService->resolveSchedule($canonicalControlNo),
             ],
             'in_charge' => $defaultInCharge,
             'department_heads' => $departmentHeads,
@@ -355,6 +359,7 @@ class DailyTimeRecordController extends Controller
                     'employment_status' => strtoupper(trim((string) ($employee->status ?? ''))),
                     'is_contractual' => strtoupper(trim((string) ($employee->status ?? ''))) === 'CONTRACTUAL',
                     'in_charge' => $defaultInCharge,
+                    'schedule' => $this->dtrService->resolveSchedule($canonicalControlNo),
                 ],
                 'in_charge' => $defaultInCharge,
                 'records' => $records,
@@ -412,6 +417,9 @@ class DailyTimeRecordController extends Controller
             ]);
         }
 
+        // 1. Batch directory lookup for assigned employees in ONE cached query
+        $employeeDirectory = HrisEmployee::directoryByControlNos($assignedControlNos);
+
         // Compute DTR for today for these employees
         $dtrRows = [];
         $presentCount = 0;
@@ -419,7 +427,7 @@ class DailyTimeRecordController extends Controller
         $onLeaveCount = 0;
         $absentCount = 0;
 
-        // Build all variants for assigned control numbers for robust biometric enrollment lookup
+        // Build all variants for assigned control numbers for robust biometric enrollment and DTR lookup
         $allLookupVariants = [];
         foreach ($assignedControlNos as $cNo) {
             $cNoStr = trim((string) $cNo);
@@ -448,15 +456,85 @@ class DailyTimeRecordController extends Controller
             }
         }
 
+        // 2. Pre-load existing DTR records for target date in ONE query
+        $existingDtrs = DailyTimeRecord::query()
+            ->whereIn('employee_control_no', $allLookupVariants)
+            ->where('record_date', $targetDate)
+            ->get();
+        $dtrMap = [];
+        foreach ($existingDtrs as $row) {
+            $cNo = trim((string) $row->employee_control_no);
+            $unpadded = ltrim($cNo, '0');
+            $padded = str_pad($unpadded, 6, '0', STR_PAD_LEFT);
+            $dtrMap[$cNo] = $row;
+            if ($unpadded !== '') {
+                $dtrMap[$unpadded] = $row;
+                $dtrMap[$padded] = $row;
+            }
+        }
+
+        // 3. Check which employees have unprocessed punches for this date
+        $unprocessedControlNos = AttendanceRawLog::query()
+            ->unprocessed()
+            ->whereDate('punch_time', $targetDate)
+            ->where(function ($q) use ($allLookupVariants): void {
+                $q->whereIn('employee_control_no', $allLookupVariants)
+                    ->orWhereIn('biometric_pin', $allLookupVariants);
+            })
+            ->pluck('employee_control_no')
+            ->merge(
+                AttendanceRawLog::query()
+                    ->unprocessed()
+                    ->whereDate('punch_time', $targetDate)
+                    ->where(function ($q) use ($allLookupVariants): void {
+                        $q->whereIn('employee_control_no', $allLookupVariants)
+                            ->orWhereIn('biometric_pin', $allLookupVariants);
+                    })
+                    ->pluck('biometric_pin')
+            )
+            ->filter()
+            ->unique()
+            ->all();
+        $unprocessedSet = array_flip($unprocessedControlNos);
+
         foreach ($assignedControlNos as $controlNo) {
             $controlNoStr = (string) $controlNo;
-            $dtr = $this->dtrService->calculateForEmployeeDate($controlNoStr, $targetDate, $targetDepartmentId);
-            $emp = HrisEmployee::findByControlNo($controlNoStr, true)
-                ?? HrisEmployee::findByControlNo($controlNoStr, false);
-            $canonicalControlNo = $emp?->control_no ?? $dtr->employee_control_no ?? $controlNoStr;
+            $unpadded = ltrim($controlNoStr, '0');
+
+            $emp = $employeeDirectory[$controlNoStr]
+                ?? $employeeDirectory[$unpadded]
+                ?? null;
+
+            $canonicalControlNo = $emp?->control_no ?? $controlNoStr;
+
+            // Resolve schedule (fast in-memory)
+            $schedule = $this->dtrService->resolveSchedule($canonicalControlNo);
+
+            // Reuse existing DTR if available and no unprocessed punches exist
+            $existing = $dtrMap[$canonicalControlNo]
+                ?? $dtrMap[$controlNoStr]
+                ?? $dtrMap[$unpadded]
+                ?? null;
+
+            $hasUnprocessed = isset($unprocessedSet[$canonicalControlNo])
+                || isset($unprocessedSet[$controlNoStr])
+                || isset($unprocessedSet[$unpadded]);
+
+            if ($existing !== null && ! $hasUnprocessed) {
+                $dtr = $existing;
+            } else {
+                $dtr = $this->dtrService->calculateForEmployeeDate(
+                    $controlNoStr,
+                    $targetDate,
+                    $targetDepartmentId,
+                    $emp,
+                    $schedule
+                );
+            }
+
             $enrollment = $enrollmentsMap[$canonicalControlNo]
                 ?? $enrollmentsMap[$controlNoStr]
-                ?? $enrollmentsMap[ltrim($controlNoStr, '0')]
+                ?? $enrollmentsMap[$unpadded]
                 ?? null;
 
             $fullName = $emp ? trim(($emp->firstname ?? '').' '.($emp->middlename ? $emp->middlename[0].'. ' : '').($emp->surname ?? '')) : 'Employee '.$canonicalControlNo;
@@ -497,6 +575,7 @@ class DailyTimeRecordController extends Controller
                 'synced_devices' => $enrollment?->synced_devices ?? [],
                 'attendance_status' => $attendanceStatus,
                 'employment_status' => $emp?->status ?? null,
+                'schedule' => $schedule,
                 'dtr' => $dtr,
             ];
         }

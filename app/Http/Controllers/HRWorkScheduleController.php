@@ -146,6 +146,7 @@ class HRWorkScheduleController extends Controller
 
         $employeeControlNo = (string) ($override->employee_control_no ?? '');
         $override->delete();
+        app(WorkScheduleService::class)->clearScheduleCache();
 
         $repricingSummary = app(LeaveApplicationController::class)
             ->repriceFutureApprovedApplicationsForScheduleChange($employeeControlNo);

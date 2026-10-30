@@ -3,6 +3,7 @@
 namespace App\Services\Attendance;
 
 use App\Models\AttendanceRawLog;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Throwable;
@@ -23,8 +24,15 @@ class ZkBioPunchSyncService
      *
      * @return int Number of newly imported punches.
      */
-    public function syncPunches(?int $limit = 1000): int
+    public function syncPunches(?int $limit = 1000, bool $force = false): int
     {
+        if (! $force && Cache::has('zkbio_sync_cooldown')) {
+            return 0;
+        }
+
+        // 30s cooldown prevents rapid subsequent GET requests from hammering ZKBio
+        Cache::put('zkbio_sync_cooldown', true, 30);
+
         try {
             $query = DB::connection('zkbio')->table('iclock_transaction as t')
                 ->select([
@@ -47,6 +55,17 @@ class ZkBioPunchSyncService
                 return 0;
             }
 
+            $pins = $transactions->pluck('emp_code')->map(static fn ($p): string => trim((string) $p))->filter()->unique()->values()->all();
+            $punchTimes = $transactions->pluck('punch_time')->map(static fn ($t): string => substr(trim((string) $t), 0, 19))->filter()->unique()->values()->all();
+
+            $existingLogs = AttendanceRawLog::query()
+                ->whereIn('biometric_pin', $pins)
+                ->whereIn('punch_time', $punchTimes)
+                ->get(['biometric_pin', 'punch_time'])
+                ->map(static fn ($r): string => $r->biometric_pin.'_'.substr((string) $r->punch_time, 0, 19))
+                ->flip()
+                ->all();
+
             $importedCount = 0;
             $affectedDates = [];
 
@@ -58,34 +77,34 @@ class ZkBioPunchSyncService
                     continue;
                 }
 
-                $punchDate = substr($punchTime, 0, 10);
+                $punchTimeStandard = substr($punchTime, 0, 19);
+                $lookupKey = $pin.'_'.$punchTimeStandard;
+
+                if (isset($existingLogs[$lookupKey])) {
+                    continue;
+                }
+
+                $punchDate = substr($punchTimeStandard, 0, 10);
                 $deviceSn = trim((string) ($tx->terminal_sn ?? ''));
                 $punchState = is_numeric($tx->punch_state) ? (int) $tx->punch_state : 0;
                 $verifyType = is_numeric($tx->verify_type) ? (int) $tx->verify_type : 15;
                 $workCode = $tx->work_code ? trim((string) $tx->work_code) : null;
 
-                // Check if already in tblAttendanceLogs
-                $exists = AttendanceRawLog::query()
-                    ->where('biometric_pin', $pin)
-                    ->where('punch_time', $punchTime)
-                    ->exists();
+                AttendanceRawLog::query()->create([
+                    'device_serial_number' => $deviceSn ?: null,
+                    'biometric_pin' => $pin,
+                    'employee_control_no' => $pin,
+                    'punch_time' => $punchTimeStandard,
+                    'punch_state' => $punchState,
+                    'verify_type' => $verifyType,
+                    'work_code' => $workCode,
+                    'sync_source' => 'ZKBIO_SYNC',
+                    'raw_payload' => "ID={$tx->id};SN={$deviceSn}",
+                ]);
 
-                if (! $exists) {
-                    AttendanceRawLog::query()->create([
-                        'device_serial_number' => $deviceSn ?: null,
-                        'biometric_pin' => $pin,
-                        'employee_control_no' => $pin,
-                        'punch_time' => $punchTime,
-                        'punch_state' => $punchState,
-                        'verify_type' => $verifyType,
-                        'work_code' => $workCode,
-                        'sync_source' => 'ZKBIO_SYNC',
-                        'raw_payload' => "ID={$tx->id};SN={$deviceSn}",
-                    ]);
-
-                    $importedCount++;
-                    $affectedDates[$pin][$punchDate] = true;
-                }
+                $importedCount++;
+                $affectedDates[$pin][$punchDate] = true;
+                $existingLogs[$lookupKey] = true;
             }
 
             // Recalculate DTR for all affected employees and dates

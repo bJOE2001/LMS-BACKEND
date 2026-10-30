@@ -7,6 +7,8 @@ use App\Models\HRAccount;
 use App\Models\HrisEmployee;
 use App\Models\WorkScheduleSetting;
 use Carbon\CarbonImmutable;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
 use InvalidArgumentException;
 
 class WorkScheduleService
@@ -14,6 +16,27 @@ class WorkScheduleService
     public const STANDARD_WORKDAY_HOURS = 8.0;
 
     public const DEDUCTION_PRECISION = 3;
+
+    private static ?Collection $activeOverridesCache = null;
+
+    public function clearScheduleCache(): void
+    {
+        Cache::forget('active_employee_schedule_overrides');
+        self::$activeOverridesCache = null;
+    }
+
+    public function getActiveOverrides(): Collection
+    {
+        if (self::$activeOverridesCache !== null) {
+            return self::$activeOverridesCache;
+        }
+
+        self::$activeOverridesCache = Cache::remember('active_employee_schedule_overrides', 60, static function (): Collection {
+            return EmployeeWorkScheduleOverride::query()->active()->get();
+        });
+
+        return self::$activeOverridesCache;
+    }
 
     /**
      * @return array{
@@ -63,6 +86,8 @@ class WorkScheduleService
     {
         $computedPayload = $this->normalizeSchedulePayload($payload, $updatedBy);
 
+        $this->clearScheduleCache();
+
         $setting = $this->getDefaultSetting();
         $setting->fill($computedPayload);
         $setting->save();
@@ -100,6 +125,8 @@ class WorkScheduleService
         $override->is_active = true;
         $override->save();
 
+        $this->clearScheduleCache();
+
         return $override->fresh(['updatedByHr']) ?? $override;
     }
 
@@ -117,10 +144,12 @@ class WorkScheduleService
         $override->is_active = true;
         $override->save();
 
+        $this->clearScheduleCache();
+
         return $override->fresh(['updatedByHr']) ?? $override;
     }
 
-    public function resolveScheduleForEmployee(?string $employeeControlNo = null): array
+    public function resolveScheduleForEmployee(?string $employeeControlNo = null, ?object $cachedEmployee = null): array
     {
         $default = $this->getResolvedDefaultSchedule();
         $controlNo = trim((string) ($employeeControlNo ?? ''));
@@ -128,13 +157,19 @@ class WorkScheduleService
             return $default;
         }
 
-        $employee = HrisEmployee::findByControlNo($controlNo);
-        $lookupControlNo = trim((string) ($employee->control_no ?? $controlNo));
+        $lookupControlNo = trim((string) ($cachedEmployee->control_no ?? $controlNo));
+        $unpadded = ltrim($lookupControlNo, '0');
+        $variants = array_values(array_unique(array_filter([
+            $lookupControlNo,
+            $controlNo,
+            $unpadded,
+            $unpadded !== '' ? str_pad($unpadded, 6, '0', STR_PAD_LEFT) : null,
+        ])));
 
-        $override = EmployeeWorkScheduleOverride::query()
-            ->active()
-            ->where('employee_control_no', $lookupControlNo)
-            ->first();
+        $activeOverrides = $this->getActiveOverrides();
+        $override = $activeOverrides->first(
+            static fn (EmployeeWorkScheduleOverride $item): bool => in_array((string) $item->employee_control_no, $variants, true)
+        );
 
         if (! $override) {
             return $default;
