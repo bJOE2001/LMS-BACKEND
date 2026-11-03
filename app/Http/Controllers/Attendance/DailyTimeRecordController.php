@@ -496,6 +496,7 @@ class DailyTimeRecordController extends Controller
             ->unique()
             ->all();
         $unprocessedSet = array_flip($unprocessedControlNos);
+        $isTargetDateFuture = CarbonImmutable::parse($targetDate)->isAfter(CarbonImmutable::today());
 
         foreach ($assignedControlNos as $controlNo) {
             $controlNoStr = (string) $controlNo;
@@ -520,7 +521,11 @@ class DailyTimeRecordController extends Controller
                 || isset($unprocessedSet[$controlNoStr])
                 || isset($unprocessedSet[$unpadded]);
 
-            if ($existing !== null && ! $hasUnprocessed) {
+            $isStalePending = $existing !== null
+                && $existing->status === DailyTimeRecord::STATUS_PENDING
+                && ! $isTargetDateFuture;
+
+            if ($existing !== null && ! $hasUnprocessed && ! $isStalePending) {
                 $dtr = $existing;
             } else {
                 $dtr = $this->dtrService->calculateForEmployeeDate(
@@ -563,6 +568,7 @@ class DailyTimeRecordController extends Controller
                 DailyTimeRecord::STATUS_HALF_DAY => 'On Leave (Half Day)',
                 DailyTimeRecord::STATUS_REST_DAY => 'Rest Day',
                 DailyTimeRecord::STATUS_ABSENT => 'Absent',
+                DailyTimeRecord::STATUS_PENDING => 'Pending',
                 default => $dtr->status ?: 'Absent',
             };
 

@@ -11,6 +11,9 @@ Schedule::command('leave:accrue')->monthlyOn(1, '00:01');
 Schedule::command('leave:reset')->yearlyOn(1, 1, '00:05');
 Schedule::command('coc:expire')->yearlyOn(1, 1, '00:10');
 
+// Biometric Synchronization (City Hall LAN devices)
+Schedule::command('bio:poll-lan')->everyFiveMinutes()->withoutOverlapping();
+
 Artisan::command('inspire', function () {
     $this->comment(Inspiring::quote());
 })->purpose('Display an inspiring quote');

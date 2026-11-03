@@ -323,13 +323,18 @@ class DtrCalculationService
 
         $records = collect();
         $curr = $start;
+        $today = CarbonImmutable::today();
 
         while ($curr->isBefore($end) || $curr->isSameDay($end)) {
             $dateStr = $curr->format('Y-m-d');
             $existing = $existingRecords->get($dateStr);
             $hasUnprocessed = isset($unprocessedDates[$dateStr]);
+            $isDateFuture = $curr->isAfter($today);
+            $isStalePending = $existing !== null
+                && $existing->status === DailyTimeRecord::STATUS_PENDING
+                && ! $isDateFuture;
 
-            if ($existing && ! $hasUnprocessed && ! $forceRecalculate) {
+            if ($existing && ! $hasUnprocessed && ! $forceRecalculate && ! $isStalePending) {
                 $records->push($existing);
             } else {
                 $records->push(

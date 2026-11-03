@@ -6,6 +6,8 @@ use App\Http\Controllers\Controller;
 use App\Models\BiometricDevice;
 use App\Models\Department;
 use App\Models\HRAccount;
+use App\Services\Attendance\LanBioPunchSyncService;
+use App\Services\Attendance\ZkSocketClient;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -127,6 +129,8 @@ class BiometricDeviceController extends Controller
                 'device_name' => $dev->device_name,
                 'serial_number' => $dev->serial_number,
                 'ip_address' => $dev->ip_address ?: ($zkLive?->ip_address ?? null),
+                'port' => $dev->port ?: 4370,
+                'communication_mode' => $dev->communication_mode ?: 'ADMS',
                 'model' => $dev->model_name ?: ($zkLive?->terminal_name ?? 'MB360'),
                 'model_name' => $dev->model_name ?: ($zkLive?->terminal_name ?? 'MB360'),
                 'firmware_version' => $dev->firmware_version ?: ($zkLive?->fw_ver ?? null),
@@ -177,6 +181,8 @@ class BiometricDeviceController extends Controller
                     'device_name' => $zt->alias ?: $sn,
                     'serial_number' => $sn,
                     'ip_address' => $zt->ip_address,
+                    'port' => 4370,
+                    'communication_mode' => 'ADMS',
                     'model' => $zt->terminal_name ?: 'MB360',
                     'model_name' => $zt->terminal_name ?: 'MB360',
                     'firmware_version' => $zt->fw_ver ?? null,
@@ -269,17 +275,34 @@ class BiometricDeviceController extends Controller
             'device_name' => ['required', 'string', 'max:150'],
             'model_name' => ['nullable', 'string', 'max:100'],
             'department_id' => ['required', 'integer', 'exists:tblDepartments,id'],
-            'zkbio_area_id' => ['required', 'integer'],
+            'communication_mode' => ['nullable', 'string', 'in:ADMS,LAN_POLL,OFFLINE_USB'],
+            'zkbio_area_id' => ['nullable', 'integer'],
             'is_primary' => ['nullable', 'boolean'],
             'comm_key' => ['nullable', 'string', 'max:50'],
             'ip_address' => ['nullable', 'string', 'max:45'],
+            'port' => ['nullable', 'integer', 'min:1', 'max:65535'],
         ]);
 
-        $zkAreaId = (int) $validated['zkbio_area_id'];
-        if ($zkAreaId === 1) {
+        $mode = $validated['communication_mode'] ?? 'ADMS';
+
+        if ($mode === 'LAN_POLL' && empty($validated['ip_address'])) {
             return response()->json([
-                'message' => 'Area 1 is the default non-synchronizing area in ZKBio Time and cannot be assigned to devices. Please select an active area such as Area 2 or Area 3.',
+                'message' => 'IP Address is required for devices in LAN Direct Poll mode.',
             ], 422);
+        }
+
+        $zkAreaId = isset($validated['zkbio_area_id']) ? (int) $validated['zkbio_area_id'] : null;
+        if ($mode === 'ADMS') {
+            if (! $zkAreaId) {
+                return response()->json([
+                    'message' => 'ZKBio Area assignment is required for ADMS devices.',
+                ], 422);
+            }
+            if ($zkAreaId === 1) {
+                return response()->json([
+                    'message' => 'Area 1 is the default non-synchronizing area in ZKBio Time and cannot be assigned to devices. Please select an active area such as Area 2 or Area 3.',
+                ], 422);
+            }
         }
 
         $serialNumber = trim($validated['serial_number']);
@@ -300,10 +323,12 @@ class BiometricDeviceController extends Controller
                 'model_name' => trim($validated['model_name'] ?? '') ?: ($existing->model_name ?: 'MB360'),
                 'department_id' => $deptId,
                 'department_name' => $department->name,
+                'communication_mode' => $mode,
                 'zkbio_area_id' => $zkAreaId,
                 'is_primary' => $isPrimary,
                 'comm_key' => trim($validated['comm_key'] ?? '') ?: ($existing->comm_key ?: '0'),
                 'ip_address' => trim($validated['ip_address'] ?? '') ?: $existing->ip_address,
+                'port' => $validated['port'] ?? ($existing->port ?: 4370),
                 'is_active' => true,
                 'status' => 'ONLINE',
                 'last_heartbeat_at' => now(),
@@ -321,11 +346,12 @@ class BiometricDeviceController extends Controller
             'model_name' => trim($validated['model_name'] ?? '') ?: 'MB360',
             'department_id' => $deptId,
             'department_name' => $department->name,
+            'communication_mode' => $mode,
             'zkbio_area_id' => $zkAreaId,
             'is_primary' => $isPrimary,
             'comm_key' => trim($validated['comm_key'] ?? '') ?: '0',
             'ip_address' => trim($validated['ip_address'] ?? '') ?: null,
-            'communication_mode' => 'ADMS',
+            'port' => $validated['port'] ?? 4370,
             'is_active' => true,
             'status' => 'ONLINE',
             'last_heartbeat_at' => now(),
@@ -363,17 +389,34 @@ class BiometricDeviceController extends Controller
             'device_name' => ['required', 'string', 'max:150'],
             'model_name' => ['nullable', 'string', 'max:100'],
             'department_id' => ['required', 'integer', 'exists:tblDepartments,id'],
-            'zkbio_area_id' => ['required', 'integer'],
+            'communication_mode' => ['nullable', 'string', 'in:ADMS,LAN_POLL,OFFLINE_USB'],
+            'zkbio_area_id' => ['nullable', 'integer'],
             'is_primary' => ['nullable', 'boolean'],
             'comm_key' => ['nullable', 'string', 'max:50'],
             'ip_address' => ['nullable', 'string', 'max:45'],
+            'port' => ['nullable', 'integer', 'min:1', 'max:65535'],
         ]);
 
-        $zkAreaId = (int) $validated['zkbio_area_id'];
-        if ($zkAreaId === 1) {
+        $mode = $validated['communication_mode'] ?? ($device->communication_mode ?: 'ADMS');
+
+        if ($mode === 'LAN_POLL' && empty($validated['ip_address'])) {
             return response()->json([
-                'message' => 'Area 1 is the default non-synchronizing area in ZKBio Time and cannot be assigned to devices. Please select an active area such as Area 2 or Area 3.',
+                'message' => 'IP Address is required for devices in LAN Direct Poll mode.',
             ], 422);
+        }
+
+        $zkAreaId = isset($validated['zkbio_area_id']) ? (int) $validated['zkbio_area_id'] : null;
+        if ($mode === 'ADMS') {
+            if (! $zkAreaId) {
+                return response()->json([
+                    'message' => 'ZKBio Area assignment is required for ADMS devices.',
+                ], 422);
+            }
+            if ($zkAreaId === 1) {
+                return response()->json([
+                    'message' => 'Area 1 is the default non-synchronizing area in ZKBio Time and cannot be assigned to devices. Please select an active area such as Area 2 or Area 3.',
+                ], 422);
+            }
         }
 
         $deptId = (int) $validated['department_id'];
@@ -392,10 +435,12 @@ class BiometricDeviceController extends Controller
             'model_name' => trim($validated['model_name'] ?? '') ?: ($device->model_name ?: 'MB360'),
             'department_id' => $deptId,
             'department_name' => $department->name,
+            'communication_mode' => $mode,
             'zkbio_area_id' => $zkAreaId,
             'is_primary' => $isPrimary,
             'comm_key' => trim($validated['comm_key'] ?? '') ?: ($device->comm_key ?: '0'),
             'ip_address' => trim($validated['ip_address'] ?? '') ?: null,
+            'port' => $validated['port'] ?? ($device->port ?: 4370),
         ]);
 
         return response()->json([
@@ -450,5 +495,87 @@ class BiometricDeviceController extends Controller
         return response()->json([
             'message' => "Biometric terminal '{$name}' has been deleted.",
         ]);
+    }
+
+    /**
+     * Test connection to a LAN biometric terminal over TCP port 4370.
+     * Accessible only to HR accounts.
+     */
+    public function testConnection(Request $request, int $id): JsonResponse
+    {
+        if (! $request->user() instanceof HRAccount) {
+            return response()->json([
+                'message' => 'Unauthorized. Only HR administrators can test device connectivity.',
+            ], 403);
+        }
+
+        $device = BiometricDevice::query()->findOrFail($id);
+
+        if (! $device->ip_address) {
+            return response()->json([
+                'success' => false,
+                'message' => "Device '{$device->device_name}' does not have an IP address configured.",
+            ], 422);
+        }
+
+        $client = new ZkSocketClient(
+            ip: $device->ip_address,
+            port: $device->port ?: 4370,
+            timeout: 2.5
+        );
+
+        $result = $client->testConnection();
+
+        if ($result['success']) {
+            $device->update([
+                'status' => BiometricDevice::STATUS_ONLINE,
+                'last_heartbeat_at' => now(),
+            ]);
+        } else {
+            $device->update([
+                'status' => BiometricDevice::STATUS_OFFLINE,
+            ]);
+        }
+
+        return response()->json([
+            'success' => $result['success'],
+            'latency_ms' => $result['latency_ms'],
+            'message' => $result['message'],
+            'status' => $result['success'] ? BiometricDevice::STATUS_ONLINE : BiometricDevice::STATUS_OFFLINE,
+            'device' => $device->fresh(),
+        ]);
+    }
+
+    /**
+     * Trigger immediate manual sync for a City Hall LAN terminal.
+     * Accessible only to HR accounts.
+     */
+    public function syncLanDevice(Request $request, int $id, LanBioPunchSyncService $syncService): JsonResponse
+    {
+        if (! $request->user() instanceof HRAccount) {
+            return response()->json([
+                'message' => 'Unauthorized. Only HR administrators can sync biometric devices.',
+            ], 403);
+        }
+
+        $device = BiometricDevice::query()->findOrFail($id);
+
+        if ($device->communication_mode !== 'LAN_POLL') {
+            return response()->json([
+                'success' => false,
+                'message' => "Device '{$device->device_name}' is set to {$device->communication_mode} mode. Only LAN_POLL devices can be pulled directly.",
+            ], 422);
+        }
+
+        $result = $syncService->syncDevice($device);
+
+        return response()->json([
+            'success' => $result['success'],
+            'message' => $result['message'],
+            'imported' => $result['imported'],
+            'duplicates' => $result['duplicates'],
+            'total_read' => $result['total_read'],
+            'device' => $device->fresh(),
+        ], $result['success'] ? 200 : 422);
     }
 }
