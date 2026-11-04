@@ -2236,10 +2236,18 @@ class LeaveApplicationController extends Controller
             ->get();
         $applications = $this->sortLeaveApplicationsForHrQueue($applications);
 
-        $actorDirectory = $this->buildWorkflowActorDirectory($applications);
+        $controlNos = $applications->pluck('employee_control_no')
+            ->filter(fn ($no) => ! empty(trim((string) $no)))
+            ->map(fn ($no) => $this->normalizeControlNo((string) $no))
+            ->unique()
+            ->values()
+            ->all();
+
+        $employeeDirectory = HrisEmployee::directoryByControlNos($controlNos);
+        $actorDirectory = $this->buildWorkflowActorDirectory($applications, $employeeDirectory);
 
         return response()->json([
-            'applications' => $applications->map(fn ($app) => $this->formatApplication($app, $actorDirectory)),
+            'applications' => $applications->map(fn ($app) => $this->formatApplication($app, $actorDirectory, true, $employeeDirectory)),
         ]);
     }
 
@@ -9021,20 +9029,23 @@ class LeaveApplicationController extends Controller
 
     private function isDepartmentHeadRecord(?string $controlNo): bool
     {
+        static $cachedHeadControlNos = null;
+
         $normalizedControlNo = $this->normalizeControlNo($controlNo);
         if ($normalizedControlNo === '') {
             return false;
         }
 
-        $departmentHeads = DepartmentHead::query()->get(['control_no']);
-        foreach ($departmentHeads as $head) {
-            $headControlNo = $this->normalizeControlNo((string) $head->control_no);
-            if ($headControlNo !== '' && $headControlNo === $normalizedControlNo) {
-                return true;
-            }
+        if ($cachedHeadControlNos === null) {
+            $cachedHeadControlNos = DepartmentHead::query()
+                ->pluck('control_no')
+                ->map(fn ($no) => $this->normalizeControlNo((string) $no))
+                ->filter(fn ($no) => $no !== '')
+                ->flip()
+                ->all();
         }
 
-        return false;
+        return isset($cachedHeadControlNos[$normalizedControlNo]);
     }
 
     private function formatEmployeeFullName(?object $employee): string
@@ -9051,7 +9062,7 @@ class LeaveApplicationController extends Controller
         ], static fn (string $part): bool => $part !== '')));
     }
 
-    private function buildWorkflowActorDirectory(iterable $applications): array
+    private function buildWorkflowActorDirectory(iterable $applications, ?array $employeeDirectory = null): array
     {
         $adminIds = [];
         $hrIds = [];
@@ -9070,11 +9081,24 @@ class LeaveApplicationController extends Controller
                 $hrIds[] = (int) $application->hr_id;
             }
 
-            $employeeControlNo = $this->normalizeControlNo($application->employee_control_no);
+            $rawControlNo = trim((string) ($application->employee_control_no ?? ''));
+            $employeeControlNo = $this->normalizeControlNo($rawControlNo);
             if ($employeeControlNo !== '') {
-                $employeeName = $this->formatEmployeeFullName($this->resolveApplicationEmployee($application));
+                $employeeName = trim((string) ($application->employee_name ?? ''));
+                if ($employeeName === '' && $employeeDirectory !== null) {
+                    $emp = $employeeDirectory[$rawControlNo]
+                        ?? $employeeDirectory[$employeeControlNo]
+                        ?? $employeeDirectory[(int) $employeeControlNo]
+                        ?? null;
+                    if ($emp) {
+                        $employeeName = $this->formatEmployeeFullName($emp);
+                    }
+                }
                 if ($employeeName === '') {
                     $employeeName = trim((string) ($application->applicantAdmin?->full_name ?? ''));
+                }
+                if ($employeeName === '' && $employeeDirectory === null) {
+                    $employeeName = $this->formatEmployeeFullName($this->resolveApplicationEmployee($application));
                 }
                 if ($employeeName !== '') {
                     $employeeNamesByControlNo[$employeeControlNo] = $employeeName;
@@ -15624,6 +15648,7 @@ class LeaveApplicationController extends Controller
                 'selected_date_coverage',
                 'selected_date_half_day_portion',
                 'total_days',
+                'recall_selected_dates',
             ])
             ->whereIn('status', [
                 LeaveApplication::STATUS_PENDING_ADMIN,
@@ -15638,13 +15663,19 @@ class LeaveApplicationController extends Controller
 
         $duplicateDateMap = [];
         foreach ($existingApplications as $existingApplication) {
+            $effectiveRecallDates = $this->resolveEffectiveStoredRecallDateKeys($existingApplication);
+            $recalledDates = $effectiveRecallDates !== []
+                ? $effectiveRecallDates
+                : (is_array($existingApplication->recall_selected_dates) ? $existingApplication->recall_selected_dates : null);
+
             $existingDateOccupancy = LeaveApplication::resolveDateOccupancyMap(
                 $existingApplication->start_date?->toDateString(),
                 $existingApplication->end_date?->toDateString(),
                 is_array($existingApplication->selected_dates) ? $existingApplication->selected_dates : null,
                 $existingApplication->total_days,
                 is_array($existingApplication->selected_date_coverage) ? $existingApplication->selected_date_coverage : null,
-                is_array($existingApplication->selected_date_half_day_portion) ? $existingApplication->selected_date_half_day_portion : null
+                is_array($existingApplication->selected_date_half_day_portion) ? $existingApplication->selected_date_half_day_portion : null,
+                $recalledDates
             );
 
             foreach (LeaveApplication::resolveOverlappingOccupancyDates($requestedDateOccupancy, $existingDateOccupancy) as $duplicateDate) {
@@ -16287,12 +16318,37 @@ class LeaveApplicationController extends Controller
         return 0.0;
     }
 
-    private function formatApplication(LeaveApplication $app, ?array $actorDirectory = null): array
-    {
-        $documentVerification = $this->documentVerificationService->issue($app);
-        $resolvedEmployee = $this->resolveApplicationEmployee($app);
+    private function formatApplication(
+        LeaveApplication $app,
+        ?array $actorDirectory = null,
+        bool $forIndex = false,
+        ?array $employeeDirectory = null
+    ): array {
+        $documentVerification = $forIndex ? null : $this->documentVerificationService->issue($app);
+
+        $resolvedEmployee = null;
+        $rawControlNo = trim((string) ($app->employee_control_no ?? ''));
+        if ($employeeDirectory !== null && $rawControlNo !== '') {
+            $normalizedControlNo = $this->normalizeControlNo($rawControlNo);
+            $resolvedEmployee = $employeeDirectory[$rawControlNo]
+                ?? $employeeDirectory[$normalizedControlNo]
+                ?? $employeeDirectory[(int) $normalizedControlNo]
+                ?? null;
+        }
+        if ($resolvedEmployee === null && ! $forIndex) {
+            $resolvedEmployee = $this->resolveApplicationEmployee($app);
+        }
+
         $employeeName = trim((string) ($app->employee_name ?? ''));
-        if ($employeeName === '') {
+        if ($employeeName === '' && $resolvedEmployee !== null) {
+            $employeeName = $this->formatEmployeeFullName($resolvedEmployee);
+        }
+        if ($employeeName === '' && $forIndex) {
+            $normalizedControlNo = $this->normalizeControlNo($rawControlNo);
+            $employeeName = $actorDirectory['employee'][$normalizedControlNo] ?? '';
+        }
+        if ($employeeName === '' && ! $forIndex) {
+            $resolvedEmployee = $this->resolveApplicationEmployee($app);
             $employeeName = $this->formatEmployeeFullName($resolvedEmployee);
         }
         $applicantName = $employeeName !== ''
@@ -16305,23 +16361,26 @@ class LeaveApplicationController extends Controller
         $durationDays = (float) $app->total_days;
         $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
         $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
-        $leaveBalanceSnapshot = $this->getApplicationLeaveBalanceSnapshot($app);
-        $vacationLeaveBalance = $this->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Vacation Leave');
-        $sickLeaveBalance = $this->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Sick Leave');
-        $monthlyRate = $resolvedEmployee?->rate_mon !== null ? (float) $resolvedEmployee->rate_mon : null;
-        $terminalLeaveEstimatedAmount = $this->resolveTerminalLeaveEstimatedAmount(
-            $monthlyRate,
-            $vacationLeaveBalance,
-            $sickLeaveBalance
-        );
-        $monetizationComponents = (bool) $app->is_monetization
-            ? $this->resolveStoredMonetizationLeaveCreditComponents($app)
-            : [];
-        $displayLeaveTypeName = (bool) $app->is_monetization && $monetizationComponents !== []
-            ? $this->formatMonetizationComponentsLabel($monetizationComponents, false)
-            : ($app->leaveType?->name ?? 'Unknown');
-        $isForcedLeave = LeaveType::isForcedLeaveType($app->leaveType, (int) $app->leave_type_id);
-        $currentLeaveBalance = $this->findLeaveTypeBalanceInSnapshot($leaveBalanceSnapshot, (int) $app->leave_type_id);
+
+        if ($forIndex) {
+            $leaveBalanceSnapshot = [];
+            $vacationLeaveBalance = null;
+            $sickLeaveBalance = null;
+            $monthlyRate = $resolvedEmployee?->rate_mon !== null ? (float) $resolvedEmployee->rate_mon : null;
+            $terminalLeaveEstimatedAmount = null;
+            $currentLeaveBalance = null;
+        } else {
+            $leaveBalanceSnapshot = $this->getApplicationLeaveBalanceSnapshot($app);
+            $vacationLeaveBalance = $this->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Vacation Leave');
+            $sickLeaveBalance = $this->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Sick Leave');
+            $monthlyRate = $resolvedEmployee?->rate_mon !== null ? (float) $resolvedEmployee->rate_mon : null;
+            $terminalLeaveEstimatedAmount = $this->resolveTerminalLeaveEstimatedAmount(
+                $monthlyRate,
+                $vacationLeaveBalance,
+                $sickLeaveBalance
+            );
+            $currentLeaveBalance = $this->findLeaveTypeBalanceInSnapshot($leaveBalanceSnapshot, (int) $app->leave_type_id);
+        }
         $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
         $hasForcedLeaveHrLedgerOverride = $isForcedLeave
             && (
@@ -16517,7 +16576,7 @@ class LeaveApplicationController extends Controller
             'leaveBalances' => $leaveBalanceSnapshot,
             'leave_balances' => $leaveBalanceSnapshot,
             'employee_leave_balances' => $leaveBalanceSnapshot,
-            'certificationLeaveCredits' => $this->resolveCertificationLeaveCredits($app, $leaveBalanceSnapshot),
+            'certificationLeaveCredits' => $forIndex ? [] : $this->resolveCertificationLeaveCredits($app, $leaveBalanceSnapshot),
             'admin_id' => $app->admin_id,
             'hr_id' => $app->hr_id,
             'admin_approved_at' => $app->admin_approved_at?->toIso8601String(),
