@@ -396,7 +396,7 @@ class LeaveApplicationController extends Controller
         return $this->leaveWorkflowService()->executeAdminIndex(
             $admin,
             fn (?string $name, ?int $id) => $this->findDepartmentEmployeeControlNos($name, null, $id),
-            fn ($app) => $this->formatApplication($app)
+            fn ($app, $actorDirectory = null) => $this->formatApplication($app, $actorDirectory)
         );
     }
 

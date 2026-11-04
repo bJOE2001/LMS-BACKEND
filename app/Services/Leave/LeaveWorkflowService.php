@@ -8934,8 +8934,10 @@ class LeaveWorkflowService
             ->get();
         $applications = $this->sortLeaveApplicationsForHrQueue($applications);
 
+        $actorDirectory = $this->buildWorkflowActorDirectory($applications);
+
         return response()->json([
-            'applications' => $applications->map(fn ($app) => $applicationFormatter !== null ? $applicationFormatter($app) : $this->formatApplication($app)),
+            'applications' => $applications->map(fn ($app) => $applicationFormatter !== null ? $applicationFormatter($app, $actorDirectory) : $this->formatApplication($app, $actorDirectory)),
         ]);
     }
 
