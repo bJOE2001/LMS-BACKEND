@@ -2236,8 +2236,10 @@ class LeaveApplicationController extends Controller
             ->get();
         $applications = $this->sortLeaveApplicationsForHrQueue($applications);
 
+        $actorDirectory = $this->buildWorkflowActorDirectory($applications);
+
         return response()->json([
-            'applications' => $applications->map(fn ($app) => $this->formatApplication($app)),
+            'applications' => $applications->map(fn ($app) => $this->formatApplication($app, $actorDirectory)),
         ]);
     }
 
