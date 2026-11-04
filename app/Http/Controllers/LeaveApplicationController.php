@@ -396,7 +396,7 @@ class LeaveApplicationController extends Controller
         return $this->leaveWorkflowService()->executeAdminIndex(
             $admin,
             fn (?string $name, ?int $id) => $this->findDepartmentEmployeeControlNos($name, null, $id),
-            fn ($app, $actorDirectory = null) => $this->formatApplication($app, $actorDirectory)
+            fn ($app, $actorDirectory = null, $forIndex = false, $employeeDirectory = null) => $this->formatApplication($app, $actorDirectory, $forIndex, $employeeDirectory)
         );
     }
 
@@ -1099,12 +1099,18 @@ class LeaveApplicationController extends Controller
         return $this->leaveCalculationService()->resolveApplicationDeductibleDays($app);
     }
 
-    private function formatApplication(LeaveApplication $app, ?array $actorDirectory = null): array
-    {
+    private function formatApplication(
+        LeaveApplication $app,
+        ?array $actorDirectory = null,
+        bool $forIndex = false,
+        ?array $employeeDirectory = null
+    ): array {
         return $this->leaveWorkflowService()->formatApplication(
             $app,
             $actorDirectory,
-            fn (string $no): ?object => $this->findEmployeeByControlNo($no)
+            fn (string $no): ?object => $this->findEmployeeByControlNo($no),
+            $forIndex,
+            $employeeDirectory
         );
     }
 

@@ -1074,8 +1074,11 @@ class LeaveWorkflowService
                 : trim((string) ($application->employee_control_no ?? ''));
 
             if ($employeeControlNo !== '') {
-                $employee = $employeeResolver !== null ? $employeeResolver($application) : null;
-                $employeeName = self::formatEmployeeFullName($employee);
+                $employeeName = trim((string) ($application->employee_name ?? ''));
+                if ($employeeName === '') {
+                    $employee = $employeeResolver !== null ? $employeeResolver($application) : null;
+                    $employeeName = self::formatEmployeeFullName($employee);
+                }
                 if ($employeeName === '') {
                     $employeeName = trim((string) ($application->applicantAdmin?->full_name ?? ''));
                 }
@@ -8934,10 +8937,23 @@ class LeaveWorkflowService
             ->get();
         $applications = $this->sortLeaveApplicationsForHrQueue($applications);
 
-        $actorDirectory = $this->buildWorkflowActorDirectory($applications);
+        $controlNos = $applications->pluck('employee_control_no')
+            ->filter(fn ($no) => ! empty(trim((string) $no)))
+            ->map(fn ($no) => $this->normalizeControlNo((string) $no))
+            ->unique()
+            ->values()
+            ->all();
+
+        $employeeDirectory = HrisEmployee::directoryByControlNos($controlNos);
+        $actorDirectory = $this->buildWorkflowActorDirectory(
+            $applications,
+            fn ($app) => $employeeDirectory[trim((string) ($app->employee_control_no ?? ''))]
+                ?? $employeeDirectory[$this->normalizeControlNo((string) ($app->employee_control_no ?? ''))]
+                ?? null
+        );
 
         return response()->json([
-            'applications' => $applications->map(fn ($app) => $applicationFormatter !== null ? $applicationFormatter($app, $actorDirectory) : $this->formatApplication($app, $actorDirectory)),
+            'applications' => $applications->map(fn ($app) => $applicationFormatter !== null ? $applicationFormatter($app, $actorDirectory, true, $employeeDirectory) : $this->formatApplication($app, $actorDirectory, null, true, $employeeDirectory)),
         ]);
     }
 
@@ -10986,20 +11002,23 @@ class LeaveWorkflowService
 
     public function isDepartmentHeadRecord(?string $controlNo): bool
     {
+        static $cachedHeadControlNos = null;
+
         $normalizedControlNo = $this->normalizeControlNo($controlNo);
         if ($normalizedControlNo === '') {
             return false;
         }
 
-        $departmentHeads = DepartmentHead::query()->get(['control_no']);
-        foreach ($departmentHeads as $head) {
-            $headControlNo = $this->normalizeControlNo((string) $head->control_no);
-            if ($headControlNo !== '' && $headControlNo === $normalizedControlNo) {
-                return true;
-            }
+        if ($cachedHeadControlNos === null) {
+            $cachedHeadControlNos = DepartmentHead::query()
+                ->pluck('control_no')
+                ->map(fn ($no) => $this->normalizeControlNo((string) $no))
+                ->filter(fn ($no) => $no !== '')
+                ->flip()
+                ->all();
         }
 
-        return false;
+        return isset($cachedHeadControlNos[$normalizedControlNo]);
     }
 
     public function formatErmsApplication(
@@ -11336,12 +11355,35 @@ class LeaveWorkflowService
     public function formatApplication(
         LeaveApplication $app,
         ?array $actorDirectory = null,
-        ?callable $findEmployeeByControlNo = null
+        ?callable $findEmployeeByControlNo = null,
+        bool $forIndex = false,
+        ?array $employeeDirectory = null
     ): array {
-        $documentVerification = $this->documentVerificationService()->issue($app);
-        $resolvedEmployee = $this->resolveApplicationEmployee($app, $findEmployeeByControlNo);
+        $documentVerification = $forIndex ? null : $this->documentVerificationService()->issue($app);
+
+        $resolvedEmployee = null;
+        $rawControlNo = trim((string) ($app->employee_control_no ?? ''));
+        if ($employeeDirectory !== null && $rawControlNo !== '') {
+            $normalizedControlNo = $this->normalizeControlNo($rawControlNo);
+            $resolvedEmployee = $employeeDirectory[$rawControlNo]
+                ?? $employeeDirectory[$normalizedControlNo]
+                ?? $employeeDirectory[(int) $normalizedControlNo]
+                ?? null;
+        }
+        if ($resolvedEmployee === null && ! $forIndex) {
+            $resolvedEmployee = $this->resolveApplicationEmployee($app, $findEmployeeByControlNo);
+        }
+
         $employeeName = trim((string) ($app->employee_name ?? ''));
-        if ($employeeName === '') {
+        if ($employeeName === '' && $resolvedEmployee !== null) {
+            $employeeName = $this->formatEmployeeFullName($resolvedEmployee);
+        }
+        if ($employeeName === '' && $forIndex) {
+            $normalizedControlNo = $this->normalizeControlNo($rawControlNo);
+            $employeeName = $actorDirectory['employee'][$normalizedControlNo] ?? '';
+        }
+        if ($employeeName === '' && ! $forIndex) {
+            $resolvedEmployee = $this->resolveApplicationEmployee($app, $findEmployeeByControlNo);
             $employeeName = $this->formatEmployeeFullName($resolvedEmployee);
         }
         $applicantName = $employeeName !== ''
@@ -11354,23 +11396,26 @@ class LeaveWorkflowService
         $durationDays = (float) $app->total_days;
         $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
         $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
-        $leaveBalanceSnapshot = $this->creditService()->getApplicationLeaveBalanceSnapshot($app);
-        $vacationLeaveBalance = $this->certificationService()->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Vacation Leave');
-        $sickLeaveBalance = $this->certificationService()->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Sick Leave');
-        $monthlyRate = $resolvedEmployee?->rate_mon !== null ? (float) $resolvedEmployee->rate_mon : null;
-        $terminalLeaveEstimatedAmount = $this->certificationService()->resolveTerminalLeaveEstimatedAmount(
-            $monthlyRate,
-            $vacationLeaveBalance,
-            $sickLeaveBalance
-        );
-        $monetizationComponents = (bool) $app->is_monetization
-            ? $this->certificationService()->resolveStoredMonetizationLeaveCreditComponents($app)
-            : [];
-        $displayLeaveTypeName = (bool) $app->is_monetization && $monetizationComponents !== []
-            ? $this->eligibilityService()->formatMonetizationComponentsLabel($monetizationComponents, false)
-            : ($app->leaveType?->name ?? 'Unknown');
-        $isForcedLeave = LeaveType::isForcedLeaveType($app->leaveType, (int) $app->leave_type_id);
-        $currentLeaveBalance = $this->certificationService()->findLeaveTypeBalanceInSnapshot($leaveBalanceSnapshot, (int) $app->leave_type_id);
+
+        if ($forIndex) {
+            $leaveBalanceSnapshot = [];
+            $vacationLeaveBalance = null;
+            $sickLeaveBalance = null;
+            $monthlyRate = $resolvedEmployee?->rate_mon !== null ? (float) $resolvedEmployee->rate_mon : null;
+            $terminalLeaveEstimatedAmount = null;
+            $currentLeaveBalance = null;
+        } else {
+            $leaveBalanceSnapshot = $this->creditService()->getApplicationLeaveBalanceSnapshot($app);
+            $vacationLeaveBalance = $this->certificationService()->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Vacation Leave');
+            $sickLeaveBalance = $this->certificationService()->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Sick Leave');
+            $monthlyRate = $resolvedEmployee?->rate_mon !== null ? (float) $resolvedEmployee->rate_mon : null;
+            $terminalLeaveEstimatedAmount = $this->certificationService()->resolveTerminalLeaveEstimatedAmount(
+                $monthlyRate,
+                $vacationLeaveBalance,
+                $sickLeaveBalance
+            );
+            $currentLeaveBalance = $this->certificationService()->findLeaveTypeBalanceInSnapshot($leaveBalanceSnapshot, (int) $app->leave_type_id);
+        }
         $normalizedPayMode = $this->calculationService()->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
         $hasForcedLeaveHrLedgerOverride = $isForcedLeave
             && (
@@ -11542,7 +11587,7 @@ class LeaveWorkflowService
             'leaveBalances' => $leaveBalanceSnapshot,
             'leave_balances' => $leaveBalanceSnapshot,
             'employee_leave_balances' => $leaveBalanceSnapshot,
-            'certificationLeaveCredits' => $this->certificationService()->resolveCertificationLeaveCredits($app, $leaveBalanceSnapshot),
+            'certificationLeaveCredits' => $forIndex ? [] : $this->certificationService()->resolveCertificationLeaveCredits($app, $leaveBalanceSnapshot),
             'admin_id' => $app->admin_id,
             'hr_id' => $app->hr_id,
             'admin_approved_at' => $app->admin_approved_at?->toIso8601String(),
