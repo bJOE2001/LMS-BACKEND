@@ -11416,6 +11416,15 @@ class LeaveWorkflowService
             );
             $currentLeaveBalance = $this->certificationService()->findLeaveTypeBalanceInSnapshot($leaveBalanceSnapshot, (int) $app->leave_type_id);
         }
+
+        $monetizationComponents = (bool) $app->is_monetization
+            ? $this->certificationService()->resolveStoredMonetizationLeaveCreditComponents($app)
+            : [];
+        $displayLeaveTypeName = (bool) $app->is_monetization && $monetizationComponents !== []
+            ? $this->eligibilityService()->formatMonetizationComponentsLabel($monetizationComponents, false)
+            : ($app->leaveType?->name ?? 'Unknown');
+        $isForcedLeave = LeaveType::isForcedLeaveType($app->leaveType, (int) $app->leave_type_id);
+
         $normalizedPayMode = $this->calculationService()->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
         $hasForcedLeaveHrLedgerOverride = $isForcedLeave
             && (
