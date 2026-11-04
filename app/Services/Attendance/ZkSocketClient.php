@@ -43,6 +43,8 @@ class ZkSocketClient
 
     public const CMD_ACK_UNAUTH = 2005;
 
+    public const CMD_AUTH = 1102;
+
     public const TCP_HEADER_MAGIC = "\x50\x50\x82\x7D";
 
     /**
@@ -56,11 +58,19 @@ class ZkSocketClient
 
     protected bool $isConnected = false;
 
+    protected ?string $lastError = null;
+
     public function __construct(
         public readonly string $ip,
         public readonly int $port = 4370,
-        public readonly float $timeout = 3.0
+        public readonly float $timeout = 3.0,
+        public readonly int $commKey = 0
     ) {}
+
+    public function getLastError(): ?string
+    {
+        return $this->lastError;
+    }
 
     /**
      * Test basic reachability and handshake latency with the terminal.
@@ -73,10 +83,12 @@ class ZkSocketClient
 
         try {
             if (! $this->connect()) {
+                $reason = $this->lastError ?? 'Connection timed out or refused';
+
                 return [
                     'success' => false,
                     'latency_ms' => null,
-                    'message' => "Unable to connect to {$this->ip}:{$this->port} (Connection timed out or refused).",
+                    'message' => "Unable to connect to {$this->ip}:{$this->port} ({$reason}).",
                 ];
             }
 
@@ -104,6 +116,8 @@ class ZkSocketClient
      */
     public function connect(): bool
     {
+        $this->lastError = null;
+
         if ($this->isConnected && is_resource($this->socket)) {
             return true;
         }
@@ -113,6 +127,7 @@ class ZkSocketClient
 
         $socket = @fsockopen($this->ip, $this->port, $errno, $errstr, $this->timeout);
         if (! $socket) {
+            $this->lastError = $errstr !== '' ? "{$errstr} ({$errno})" : 'Connection timed out or refused';
             try {
                 Log::debug("ZkSocketClient: Failed to connect to {$this->ip}:{$this->port} - {$errstr} ({$errno})");
             } catch (\Throwable) {
@@ -131,16 +146,42 @@ class ZkSocketClient
 
         // Send CMD_CONNECT (1000)
         $resp = $this->sendCommand(self::CMD_CONNECT);
-        if (! $resp || $resp['code'] !== self::CMD_ACK_OK) {
+        if (! $resp) {
+            $this->lastError = 'Terminal did not respond to connect handshake';
             $this->disconnect();
 
             return false;
         }
 
-        $this->sessionId = $resp['session_id'];
-        $this->isConnected = true;
+        if ($resp['code'] === self::CMD_ACK_OK) {
+            $this->sessionId = $resp['session_id'];
+            $this->isConnected = true;
 
-        return true;
+            return true;
+        }
+
+        // Handle CMD_ACK_UNAUTH (2005) - Terminal requires Comm Key authentication
+        if ($resp['code'] === self::CMD_ACK_UNAUTH) {
+            $this->sessionId = $resp['session_id'];
+            $authData = self::makeCommKey($this->commKey, $this->sessionId);
+            $authResp = $this->sendCommand(self::CMD_AUTH, $authData);
+
+            if ($authResp && $authResp['code'] === self::CMD_ACK_OK) {
+                $this->isConnected = true;
+
+                return true;
+            }
+
+            $this->lastError = 'Authentication failed (Invalid Comm Key)';
+            $this->disconnect();
+
+            return false;
+        }
+
+        $this->lastError = "Terminal returned unexpected handshake code ({$resp['code']})";
+        $this->disconnect();
+
+        return false;
     }
 
     /**
@@ -228,7 +269,7 @@ class ZkSocketClient
         $buffer = '';
         $timeout = time() + 10;
 
-        while (strlen($buffer) < $expectedBytes && time() < $timeout) {
+        while (time() < $timeout) {
             $packet = $this->receivePacket();
             if (! $packet) {
                 break;
@@ -237,6 +278,19 @@ class ZkSocketClient
             if ($packet['code'] === self::CMD_DATA) {
                 $buffer .= $packet['data'];
             } elseif ($packet['code'] === self::CMD_ACK_OK) {
+                break;
+            }
+
+            // If we have received at least 4 bytes, check the internal record payload size
+            if (strlen($buffer) >= 4) {
+                $internalSize = unpack('V', substr($buffer, 0, 4))[1] ?? 0;
+                if ($internalSize > 0 && strlen($buffer) >= $internalSize + 4) {
+                    break;
+                }
+            }
+
+            // Check if buffer covers expectedBytes
+            if ($expectedBytes > 0 && (strlen($buffer) >= $expectedBytes || strlen($buffer) + 8 >= $expectedBytes)) {
                 break;
             }
         }
@@ -249,12 +303,13 @@ class ZkSocketClient
      *
      * Supports both standard 40-byte record format and 14-byte legacy record format.
      *
-     * 40-byte format:
-     * - [0-23]  User PIN (null-padded string, up to 24 chars)
-     * - [24]    Verify State (0=Check-In, 1=Check-Out, etc.)
-     * - [25]    Verify Type (1=Finger, 15=Face, 4=Card, 0=Password)
-     * - [26-29] Timestamp (Unix 32-bit or encoded format)
-     * - [30-37] WorkCode
+     * 40-byte format with UID prefix:
+     * - [0-1]   UID (2 bytes unsigned short)
+     * - [2-25]  User PIN (null-padded string, up to 24 chars)
+     * - [26]    Verify State (0=Check-In, 1=Check-Out, etc.)
+     * - [27-30] Timestamp (Unix 32-bit or encoded format)
+     * - [31]    Verify Type (1=Finger, 15=Face, 4=Card, 0=Password)
+     * - [32-39] WorkCode
      *
      * @return array<int, array{pin: string, time: string, state: int, type: int, work_code: string|null}>
      */
@@ -265,8 +320,11 @@ class ZkSocketClient
 
         // Discard first 4 bytes if payload is prefixed with internal record size
         $offset = 0;
-        if ($len >= 4 && (ord($data[0]) === 0x00 || ord($data[1]) === 0x00)) {
-            $offset = 4;
+        if ($len >= 4) {
+            $internalSize = unpack('V', substr($data, 0, 4))[1] ?? 0;
+            if ($internalSize === $len - 4 || ($len % 40 === 4) || ($len % 14 === 4) || (ord($data[0]) === 0x00 || ord($data[1]) === 0x00)) {
+                $offset = 4;
+            }
         }
 
         // Determine record length (standard 40 bytes or legacy 14 bytes)
@@ -276,22 +334,42 @@ class ZkSocketClient
             $recordSize = 14;
         }
 
+        // For 40-byte format, check whether the payload uses 2-byte UID prefix
+        $hasUidPrefix = false;
+        if ($recordSize === 40 && $remaining >= 40) {
+            $testRecord = substr($data, $offset, 40);
+            if (($testRecord[24] === "\x00" && $testRecord[25] === "\x00" && ord($testRecord[26]) <= 15)
+                || ($testRecord[1] === "\x00" && ctype_alnum($testRecord[2]) && ord($testRecord[26]) <= 15)) {
+                $hasUidPrefix = true;
+            }
+        }
+
         while ($offset + $recordSize <= $len) {
             $record = substr($data, $offset, $recordSize);
             $offset += $recordSize;
 
             if ($recordSize === 40) {
-                $pinRaw = substr($record, 0, 24);
-                $pin = trim(explode("\x00", $pinRaw)[0]);
+                if ($hasUidPrefix) {
+                    $pinRaw = substr($record, 2, 24);
+                    $state = ord($record[26] ?? "\x00");
+                    $timeRaw = unpack('V', substr($record, 27, 4))[1] ?? 0;
+                    $type = ord($record[31] ?? "\x00");
+                    $workCodeRaw = substr($record, 32, 8);
+                } else {
+                    $pinRaw = substr($record, 0, 24);
+                    $state = ord($record[24] ?? "\x00");
+                    $type = ord($record[25] ?? "\x00");
+                    $timeRaw = unpack('V', substr($record, 26, 4))[1] ?? 0;
+                    $workCodeRaw = substr($record, 30, 8);
+                }
 
-                $state = ord($record[24] ?? "\x00");
-                $type = ord($record[25] ?? "\x00");
+                $pinClean = trim(preg_replace('/[^\x20-\x7E]/', '', explode("\x00", $pinRaw)[0]));
+                $pin = mb_convert_encoding($pinClean, 'UTF-8', 'UTF-8');
 
-                $timeRaw = unpack('V', substr($record, 26, 4))[1] ?? 0;
                 $formattedTime = $this->decodeTime($timeRaw);
 
-                $workCodeRaw = trim(explode("\x00", substr($record, 30, 8))[0]);
-                $workCode = $workCodeRaw !== '' ? $workCodeRaw : null;
+                $workClean = trim(preg_replace('/[^\x20-\x7E]/', '', explode("\x00", $workCodeRaw)[0]));
+                $workCode = $workClean !== '' ? mb_convert_encoding($workClean, 'UTF-8', 'UTF-8') : null;
             } else {
                 // 14-byte legacy format
                 $pin = (string) (unpack('v', substr($record, 0, 2))[1] ?? 0);
@@ -465,5 +543,43 @@ class ZkSocketClient
         }
 
         return (~$sum) & 0xFFFF;
+    }
+
+    /**
+     * Scramble communication key and session ID for terminal authentication (CMD_AUTH).
+     * Ported from standard ZKTeco protocol MakeKey (commpro.c / pyzk).
+     */
+    public static function makeCommKey(int $key, int $sessionId, int $ticks = 50): string
+    {
+        $k = 0;
+        for ($i = 0; $i < 32; $i++) {
+            if ($key & (1 << $i)) {
+                $k = ($k << 1) | 1;
+            } else {
+                $k = $k << 1;
+            }
+        }
+        $k = ($k + $sessionId) & 0xFFFFFFFF;
+
+        $packed = pack('V', $k);
+        $bytes = array_values(unpack('C4', $packed));
+
+        $bytes[0] ^= ord('Z');
+        $bytes[1] ^= ord('K');
+        $bytes[2] ^= ord('S');
+        $bytes[3] ^= ord('O');
+
+        $packed2 = pack('C4', ...$bytes);
+        $words = array_values(unpack('v2', $packed2));
+        $swapped = pack('v2', $words[1], $words[0]);
+
+        $b = 0xFF & $ticks;
+        $finalBytes = array_values(unpack('C4', $swapped));
+        $finalBytes[0] ^= $b;
+        $finalBytes[1] ^= $b;
+        $finalBytes[2] = $b;
+        $finalBytes[3] ^= $b;
+
+        return pack('C4', ...$finalBytes);
     }
 }

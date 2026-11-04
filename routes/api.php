@@ -134,6 +134,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::post('/devices/{id}/delete', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'deleteDevice'])->middleware('hr');
         Route::post('/devices/{id}/test-connection', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'testConnection'])->middleware('hr');
         Route::post('/devices/{id}/sync-lan', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'syncLanDevice'])->middleware('hr');
+        Route::post('/sync-office-biometrics', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'syncOfficeDevices']);
         Route::post('/import-usb', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'importUsb']);
 
         // Biometric Registration & Device Syncing

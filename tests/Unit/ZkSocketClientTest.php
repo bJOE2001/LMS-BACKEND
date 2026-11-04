@@ -79,4 +79,35 @@ class ZkSocketClientTest extends TestCase
         $this->assertNull($result['latency_ms']);
         $this->assertStringContainsString('Unable to connect', $result['message']);
     }
+
+    public function test_make_comm_key_generates_scrambled_auth_token(): void
+    {
+        $token = ZkSocketClient::makeCommKey(0, 51420);
+
+        $this->assertSame(4, strlen($token));
+        $this->assertSame('617d32b1', bin2hex($token));
+    }
+
+    public function test_parse_attendance_data_with_uid_prefix(): void
+    {
+        $client = new ZkSocketClient('127.0.0.1', 4370);
+
+        // 44-byte stream: 4 bytes payload size (40) + 2 (uid) + 24 (pin) + 1 (state) + 4 (timestamp) + 1 (type) + 8 (workcode)
+        $header = pack('V', 40);
+        $uid = pack('v', 1);
+        $pin = str_pad("022936\x00", 24, "\x00");
+        $state = chr(1);
+        $timestamp = pack('V', strtotime('2026-11-03 08:30:00'));
+        $type = chr(255);
+        $workCode = str_repeat("\x00", 8);
+
+        $payload = $header.$uid.$pin.$state.$timestamp.$type.$workCode;
+
+        $parsed = $client->parseAttendanceData($payload);
+
+        $this->assertCount(1, $parsed);
+        $this->assertSame('022936', $parsed[0]['pin']);
+        $this->assertSame('2026-11-03 08:30:00', $parsed[0]['time']);
+        $this->assertSame(1, $parsed[0]['state']);
+    }
 }

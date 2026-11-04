@@ -65,7 +65,8 @@ class LanBioPunchSyncService
             $zk = $client ?? new ZkSocketClient(
                 ip: $device->ip_address,
                 port: $device->port ?: 4370,
-                timeout: 3.5
+                timeout: 3.5,
+                commKey: (int) ($device->comm_key ?? 0)
             );
 
             if (! $zk->connect()) {
@@ -110,11 +111,18 @@ class LanBioPunchSyncService
             $affectedDates = [];
 
             foreach ($rawLogs as $log) {
-                $pin = trim((string) $log['pin']);
-                $punchTime = trim((string) $log['time']);
+                $pinClean = trim(preg_replace('/[^\x20-\x7E]/', '', (string) ($log['pin'] ?? '')));
+                $pin = mb_convert_encoding($pinClean, 'UTF-8', 'UTF-8');
+                $punchTime = trim((string) ($log['time'] ?? ''));
 
                 if ($pin === '' || $punchTime === '') {
                     continue;
+                }
+
+                $workCode = null;
+                if (! empty($log['work_code'])) {
+                    $workClean = trim(preg_replace('/[^\x20-\x7E]/', '', (string) $log['work_code']));
+                    $workCode = $workClean !== '' ? mb_convert_encoding($workClean, 'UTF-8', 'UTF-8') : null;
                 }
 
                 // Match canonical employee control number if available
@@ -144,7 +152,7 @@ class LanBioPunchSyncService
                     'punch_time' => $punchTimeStandard,
                     'punch_state' => $log['state'] ?? 0,
                     'verify_type' => $log['type'] ?? 1,
-                    'work_code' => $log['work_code'] ?? null,
+                    'work_code' => $workCode,
                     'sync_source' => 'LAN_POLL',
                     'raw_payload' => "IP={$device->ip_address};SN={$device->serial_number}",
                 ]);
@@ -186,9 +194,12 @@ class LanBioPunchSyncService
                 'error' => $e->getMessage(),
             ]);
 
+            $cleanError = mb_convert_encoding($e->getMessage(), 'UTF-8', 'UTF-8');
+            $cleanError = preg_replace('/[^\x20-\x7E]/', ' ', $cleanError) ?? $cleanError;
+
             return [
                 'success' => false,
-                'message' => "Sync error on {$deviceName}: {$e->getMessage()}",
+                'message' => "Sync error on {$deviceName}: {$cleanError}",
                 'device' => $deviceName,
                 'imported' => 0,
                 'duplicates' => 0,

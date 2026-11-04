@@ -5,12 +5,15 @@ namespace App\Http\Controllers\Attendance;
 use App\Http\Controllers\Controller;
 use App\Models\BiometricDevice;
 use App\Models\Department;
+use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Services\Attendance\LanBioPunchSyncService;
+use App\Services\Attendance\ZkBioPunchSyncService;
 use App\Services\Attendance\ZkSocketClient;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Throwable;
 
 class BiometricDeviceController extends Controller
@@ -521,7 +524,8 @@ class BiometricDeviceController extends Controller
         $client = new ZkSocketClient(
             ip: $device->ip_address,
             port: $device->port ?: 4370,
-            timeout: 2.5
+            timeout: 2.5,
+            commKey: (int) ($device->comm_key ?? 0)
         );
 
         $result = $client->testConnection();
@@ -560,22 +564,188 @@ class BiometricDeviceController extends Controller
 
         $device = BiometricDevice::query()->findOrFail($id);
 
-        if ($device->communication_mode !== 'LAN_POLL') {
+        if (empty(trim((string) $device->ip_address))) {
             return response()->json([
                 'success' => false,
-                'message' => "Device '{$device->device_name}' is set to {$device->communication_mode} mode. Only LAN_POLL devices can be pulled directly.",
+                'message' => "Device '{$device->device_name}' does not have an IP address configured for direct socket communication.",
             ], 422);
         }
 
         $result = $syncService->syncDevice($device);
 
+        $cleanMessage = mb_convert_encoding($result['message'], 'UTF-8', 'UTF-8');
+
         return response()->json([
             'success' => $result['success'],
-            'message' => $result['message'],
+            'message' => $cleanMessage,
             'imported' => $result['imported'],
             'duplicates' => $result['duplicates'],
             'total_read' => $result['total_read'],
             'device' => $device->fresh(),
         ], $result['success'] ? 200 : 422);
+    }
+
+    /**
+     * Pull punches from biometric device(s) assigned to the current office/department.
+     * Supports Hybrid Fallback: Pulls direct hardware logs via LAN socket (port 4370)
+     * AND force-syncs Cloud/ADMS logs, safeguarding against Cloud outages.
+     * Accessible to Department Admin (for their own office) and HR.
+     */
+    public function syncOfficeDevices(
+        Request $request,
+        LanBioPunchSyncService $lanSyncService,
+        ZkBioPunchSyncService $zkBioSyncService
+    ): JsonResponse {
+        $account = $request->user();
+        $isHr = $account instanceof HRAccount;
+        $isAdmin = $account instanceof DepartmentAdmin;
+
+        if (! $isHr && ! $isAdmin) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized access. Only Office Administrators or HR can pull punches.',
+            ], 403);
+        }
+
+        $departmentId = $isAdmin
+            ? (int) $account->department_id
+            : (int) ($request->input('department_id') ?: 0);
+
+        if (! $departmentId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Department ID is required to identify office biometric devices.',
+            ], 422);
+        }
+
+        $department = Department::query()->find($departmentId);
+        $officeLabel = $department?->acronym ?: ($department?->name ?: "Office #{$departmentId}");
+
+        $devices = BiometricDevice::query()
+            ->where('department_id', $departmentId)
+            ->where('is_active', true)
+            ->get();
+
+        if ($devices->isEmpty()) {
+            return response()->json([
+                'success' => false,
+                'message' => "No active biometric terminal is registered for {$officeLabel}. Please contact HR to register or assign your office device.",
+                'imported' => 0,
+                'duplicates' => 0,
+                'total_read' => 0,
+                'devices_synced' => 0,
+            ], 404);
+        }
+
+        // 1. Attempt Cloud/ADMS force sync first (in case punches were uploaded to cloud)
+        $cloudImported = 0;
+        try {
+            $cloudImported = $zkBioSyncService->syncPunches(limit: 2000, force: true);
+        } catch (Throwable $e) {
+            // Cloud/ADMS down or unreachable: log warning and gracefully proceed to direct hardware pull
+            Log::warning("syncOfficeDevices: Cloud/ADMS sync failed or offline for {$officeLabel}", [
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        // 2. Filter physical devices with a configured IP address (LAN or ADMS with IP)
+        $directPollDevices = $devices->filter(fn ($dev) => ! empty(trim((string) $dev->ip_address)));
+
+        // If no devices have an IP address configured:
+        if ($directPollDevices->isEmpty()) {
+            if ($cloudImported > 0) {
+                return response()->json([
+                    'success' => true,
+                    'message' => "Synced {$cloudImported} new punch(es) from Cloud/ADMS for {$officeLabel}.",
+                    'imported' => $cloudImported,
+                    'duplicates' => 0,
+                    'total_read' => $cloudImported,
+                    'devices_synced' => $devices->count(),
+                    'device_names' => $devices->pluck('device_name')->all(),
+                ]);
+            }
+
+            return response()->json([
+                'success' => true,
+                'message' => "Cloud/ADMS synchronized for {$officeLabel} (records are up-to-date). Note: To enable direct hardware pull if Cloud fails, configure the terminal's IP address.",
+                'imported' => 0,
+                'duplicates' => 0,
+                'total_read' => 0,
+                'devices_synced' => $devices->count(),
+                'device_names' => $devices->pluck('device_name')->all(),
+            ]);
+        }
+
+        // 3. Connect directly to each physical terminal over TCP 4370 (Hardware pull)
+        $totalImported = $cloudImported;
+        $totalDuplicates = 0;
+        $totalRead = $cloudImported;
+        $successfulDevices = [];
+        $failedDevices = [];
+
+        foreach ($directPollDevices as $device) {
+            $result = $lanSyncService->syncDevice($device);
+
+            if ($result['success']) {
+                $totalImported += (int) ($result['imported'] ?? 0);
+                $totalDuplicates += (int) ($result['duplicates'] ?? 0);
+                $totalRead += (int) ($result['total_read'] ?? 0);
+                $successfulDevices[] = $device->device_name;
+            } else {
+                $cleanErrMsg = mb_convert_encoding($result['message'] ?? 'Connection error', 'UTF-8', 'UTF-8');
+                $failedDevices[] = "{$device->device_name}: {$cleanErrMsg}";
+            }
+        }
+
+        // If direct hardware socket pull failed on all devices:
+        if (empty($successfulDevices) && ! empty($failedDevices)) {
+            if ($cloudImported > 0) {
+                return response()->json([
+                    'success' => true,
+                    'message' => "Synced {$cloudImported} punch(es) from Cloud/ADMS. (Direct terminal pull failed: {$failedDevices[0]})",
+                    'imported' => $cloudImported,
+                    'duplicates' => 0,
+                    'total_read' => $cloudImported,
+                    'devices_synced' => 0,
+                    'device_names' => [],
+                ]);
+            }
+
+            return response()->json([
+                'success' => false,
+                'message' => mb_convert_encoding($failedDevices[0], 'UTF-8', 'UTF-8'),
+                'imported' => 0,
+                'duplicates' => 0,
+                'total_read' => 0,
+                'devices_synced' => 0,
+            ], 422);
+        }
+
+        $devCount = count($successfulDevices);
+        $devNames = implode(', ', $successfulDevices);
+
+        if ($totalImported > 0) {
+            $summary = "Synced {$devNames}: {$totalImported} new punch(es) imported ({$totalDuplicates} existing skipped).";
+        } elseif ($totalRead > 0) {
+            $summary = "Synced {$devNames}: All {$totalRead} punches are already up-to-date.";
+        } else {
+            $summary = "Connected to {$devNames}: No punches recorded on terminal.";
+        }
+
+        if (! empty($failedDevices)) {
+            $summary .= ' (Warning: '.implode('; ', $failedDevices).')';
+        }
+
+        $cleanSummary = mb_convert_encoding($summary, 'UTF-8', 'UTF-8');
+
+        return response()->json([
+            'success' => true,
+            'message' => $cleanSummary,
+            'imported' => $totalImported,
+            'duplicates' => $totalDuplicates,
+            'total_read' => $totalRead,
+            'devices_synced' => $devCount,
+            'device_names' => $successfulDevices,
+        ]);
     }
 }
