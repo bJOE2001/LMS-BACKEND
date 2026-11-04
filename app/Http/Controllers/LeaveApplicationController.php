@@ -16381,6 +16381,15 @@ class LeaveApplicationController extends Controller
             );
             $currentLeaveBalance = $this->findLeaveTypeBalanceInSnapshot($leaveBalanceSnapshot, (int) $app->leave_type_id);
         }
+
+        $monetizationComponents = (bool) $app->is_monetization
+            ? $this->resolveStoredMonetizationLeaveCreditComponents($app)
+            : [];
+        $displayLeaveTypeName = (bool) $app->is_monetization && $monetizationComponents !== []
+            ? $this->formatMonetizationComponentsLabel($monetizationComponents, false)
+            : ($app->leaveType?->name ?? 'Unknown');
+        $isForcedLeave = LeaveType::isForcedLeaveType($app->leaveType, (int) $app->leave_type_id);
+
         $normalizedPayMode = $this->normalizePayMode($app->pay_mode ?? null, (bool) $app->is_monetization);
         $hasForcedLeaveHrLedgerOverride = $isForcedLeave
             && (
