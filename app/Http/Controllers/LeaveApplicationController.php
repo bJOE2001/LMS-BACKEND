@@ -597,7 +597,7 @@ class LeaveApplicationController extends Controller
             fn (LeaveApplication $application): array => $this->formatApplication($application),
             fn (LeaveApplicationUpdateRequest $editRequest): array => $this->formatHrApplicationEditRequest($editRequest),
             function (LeaveApplication $application): void {
-                $this->lockApprovedApplicationCertificationSnapshot($application);
+                $this->lockCertificationLeaveCreditsSnapshot($application);
             },
             fn (int $adminId): ?string => $this->findAdminEmployeeControlNo($adminId)
         );
@@ -1176,6 +1176,11 @@ class LeaveApplicationController extends Controller
             fn (LeaveApplication $a) => $this->resolveStoredMonetizationLeaveCreditComponents($a),
             fn (LeaveApplication $a) => $this->hasPendingApprovedUpdateRequest($a)
         );
+    }
+
+    private function lockApprovedApplicationCertificationSnapshot(LeaveApplication $app): void
+    {
+        $this->lockCertificationLeaveCreditsSnapshot($app);
     }
 
     private function resolveApplicationBalanceLookupControlNo(LeaveApplication $app): ?string
