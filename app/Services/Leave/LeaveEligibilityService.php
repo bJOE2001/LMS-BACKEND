@@ -2088,6 +2088,7 @@ class LeaveEligibilityService
                 'selected_date_coverage',
                 'selected_date_half_day_portion',
                 'total_days',
+                'recall_selected_dates',
             ])
             ->whereIn('status', [
                 LeaveApplication::STATUS_PENDING_ADMIN,
@@ -2108,7 +2109,8 @@ class LeaveEligibilityService
                 is_array($existingApplication->selected_dates) ? $existingApplication->selected_dates : null,
                 $existingApplication->total_days,
                 is_array($existingApplication->selected_date_coverage) ? $existingApplication->selected_date_coverage : null,
-                is_array($existingApplication->selected_date_half_day_portion) ? $existingApplication->selected_date_half_day_portion : null
+                is_array($existingApplication->selected_date_half_day_portion) ? $existingApplication->selected_date_half_day_portion : null,
+                is_array($existingApplication->recall_selected_dates) ? $existingApplication->recall_selected_dates : null
             );
 
             foreach (LeaveApplication::resolveOverlappingOccupancyDates($requestedDateOccupancy, $existingDateOccupancy) as $duplicateDate) {

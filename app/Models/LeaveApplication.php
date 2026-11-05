@@ -455,7 +455,8 @@ class LeaveApplication extends Model
         mixed $selectedDates = null,
         mixed $totalDays = null,
         mixed $selectedDateCoverage = null,
-        mixed $selectedDateHalfDayPortion = null
+        mixed $selectedDateHalfDayPortion = null,
+        mixed $recalledDates = null
     ): array {
         $resolvedDates = self::resolveSelectedDates($startDate, $endDate, $selectedDates, $totalDays)
             ?? self::buildDateRange($startDate, $endDate);
@@ -484,6 +485,12 @@ class LeaveApplication extends Model
                 $coverage === 'half' && $halfDayPortion === 'PM' => ['AM' => false, 'PM' => true],
                 default => ['AM' => true, 'PM' => true],
             };
+        }
+
+        if ($recalledDates !== null) {
+            foreach (self::normalizeDateList($recalledDates) as $recalledDateKey) {
+                unset($occupancyMap[$recalledDateKey]);
+            }
         }
 
         ksort($occupancyMap);
