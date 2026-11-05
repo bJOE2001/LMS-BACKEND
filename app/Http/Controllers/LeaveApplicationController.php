@@ -883,6 +883,11 @@ class LeaveApplicationController extends Controller
         return HrisEmployee::findByControlNo($controlNo);
     }
 
+    private function resolveEmployeeRecordByControlNo(string $controlNo): ?object
+    {
+        return $this->findEmployeeByControlNo($controlNo);
+    }
+
     private function assertErmsEmployeeIsPulled(string $controlNo): ?JsonResponse
     {
         return $this->leaveEligibilityService()->assertErmsEmployeeIsPulled($controlNo, fn (string $no): array => $this->controlNoCandidates($no));
@@ -1146,7 +1151,7 @@ class LeaveApplicationController extends Controller
             $app,
             fn (LeaveApplication $a) => $this->resolveApplicationBalanceLookupControlNo($a),
             fn (string $controlNo) => $this->controlNoCandidates($controlNo),
-            fn (string $controlNo) => $this->resolveEmployeeRecordByControlNo($controlNo)
+            fn (string $controlNo) => $this->findEmployeeByControlNo($controlNo)
         );
     }
 
@@ -1157,7 +1162,7 @@ class LeaveApplicationController extends Controller
             $syncCtoBalance,
             fn (LeaveApplication $a) => $this->resolveApplicationBalanceLookupControlNo($a),
             fn (string $controlNo) => $this->controlNoCandidates($controlNo),
-            fn (string $controlNo) => $this->resolveEmployeeRecordByControlNo($controlNo)
+            fn (string $controlNo) => $this->findEmployeeByControlNo($controlNo)
         );
     }
 
