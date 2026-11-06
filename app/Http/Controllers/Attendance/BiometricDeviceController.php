@@ -9,6 +9,7 @@ use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Services\Attendance\LanBioPunchSyncService;
 use App\Services\Attendance\ZkBioPunchSyncService;
+use App\Services\Attendance\ZkBioTerminalProvisioningService;
 use App\Services\Attendance\ZkSocketClient;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -18,6 +19,10 @@ use Throwable;
 
 class BiometricDeviceController extends Controller
 {
+    public function __construct(
+        protected ZkBioTerminalProvisioningService $provisioningService
+    ) {}
+
     /**
      * List all registered ZKTeco biometric devices mapped to offices.
      * Enriched with live telemetry from ZKBio Time terminals.
@@ -42,7 +47,8 @@ class BiometricDeviceController extends Controller
                 ->get();
 
             foreach ($zkAreas as $za) {
-                $zkAreasById[(int) $za->id] = (string) $za->area_name;
+                $code = ! empty($za->area_code) ? $za->area_code : $za->id;
+                $zkAreasById[(int) $za->id] = "Area {$code} ({$za->area_name})";
             }
         } catch (Throwable) {
             // ZKBio DB offline fallback
@@ -85,8 +91,9 @@ class BiometricDeviceController extends Controller
                 $isOnline = ((int) $zkLive->state === 1) && $isRecent;
 
                 $updates = [];
-                if (! empty($zkLive->ip_address) && $dev->ip_address !== $zkLive->ip_address) {
-                    $updates['ip_address'] = $zkLive->ip_address;
+                $liveIp = $this->provisioningService->normalizeIp($zkLive->ip_address ?? null);
+                if ($liveIp !== null && $dev->ip_address !== $liveIp) {
+                    $updates['ip_address'] = $liveIp;
                 }
                 $liveStatus = $isOnline ? BiometricDevice::STATUS_ONLINE : BiometricDevice::STATUS_OFFLINE;
                 if ($dev->status !== $liveStatus) {
@@ -131,7 +138,8 @@ class BiometricDeviceController extends Controller
                 'id' => $dev->id,
                 'device_name' => $dev->device_name,
                 'serial_number' => $dev->serial_number,
-                'ip_address' => $dev->ip_address ?: ($zkLive?->ip_address ?? null),
+                'ip_address' => $this->provisioningService->normalizeIp($dev->ip_address)
+                    ?: $this->provisioningService->normalizeIp($zkLive?->ip_address ?? null),
                 'port' => $dev->port ?: 4370,
                 'communication_mode' => $dev->communication_mode ?: 'ADMS',
                 'model' => $dev->model_name ?: ($zkLive?->terminal_name ?? 'MB360'),
@@ -143,7 +151,7 @@ class BiometricDeviceController extends Controller
                 'office_acronym' => $dev->department?->acronym,
                 'location' => $dev->department?->acronym ? "{$dev->department->acronym} - {$dev->department->name}" : ($dev->department_name ?: 'Tagum City Hall'),
                 'zkbio_area_id' => $areaId,
-                'zkbio_area_name' => $areaName ? "Area {$areaId} ({$areaName})" : ($areaId ? "Area {$areaId}" : null),
+                'zkbio_area_name' => $areaName,
                 'is_primary' => (bool) $dev->is_primary,
                 'is_active' => (bool) $dev->is_active,
                 'is_online' => $isOnline,
@@ -183,7 +191,7 @@ class BiometricDeviceController extends Controller
                     'id' => null,
                     'device_name' => $zt->alias ?: $sn,
                     'serial_number' => $sn,
-                    'ip_address' => $zt->ip_address,
+                    'ip_address' => $this->provisioningService->normalizeIp($zt->ip_address ?? null),
                     'port' => 4370,
                     'communication_mode' => 'ADMS',
                     'model' => $zt->terminal_name ?: 'MB360',
@@ -195,7 +203,7 @@ class BiometricDeviceController extends Controller
                     'office_acronym' => null,
                     'location' => 'Unassigned',
                     'zkbio_area_id' => $areaId,
-                    'zkbio_area_name' => $areaName ? "Area {$areaId} ({$areaName})" : ($areaId ? "Area {$areaId}" : null),
+                    'zkbio_area_name' => $areaName,
                     'is_primary' => false,
                     'is_active' => false,
                     'is_online' => ((int) $zt->state === 1) && $ztRecent,
@@ -235,6 +243,7 @@ class BiometricDeviceController extends Controller
 
             $result = $areas->map(function ($area): array {
                 $isProhibited = ((int) $area->id === 1 || (int) ($area->is_default ?? 0) === 1);
+                $code = ! empty($area->area_code) ? $area->area_code : $area->id;
 
                 return [
                     'id' => (int) $area->id,
@@ -243,8 +252,8 @@ class BiometricDeviceController extends Controller
                     'is_default' => (bool) ($area->is_default ?? false),
                     'is_prohibited' => $isProhibited,
                     'label' => $isProhibited
-                        ? "Area {$area->id} ({$area->area_name}) - Prohibited (Default non-sync area)"
-                        : "Area {$area->id} ({$area->area_name})",
+                        ? "Area {$code} ({$area->area_name}) - Prohibited (Default non-sync area)"
+                        : "Area {$code} ({$area->area_name})",
                 ];
             });
 
@@ -255,7 +264,7 @@ class BiometricDeviceController extends Controller
             return response()->json([
                 'areas' => [
                     ['id' => 2, 'area_code' => '2', 'area_name' => 'CICTMO', 'is_prohibited' => false, 'label' => 'Area 2 (CICTMO)'],
-                    ['id' => 3, 'area_code' => '3', 'area_name' => 'CHRMO', 'is_prohibited' => false, 'label' => 'Area 3 (CHRMO)'],
+                    ['id' => 4, 'area_code' => '3', 'area_name' => 'CHRMO', 'is_prohibited' => false, 'label' => 'Area 3 (CHRMO)'],
                 ],
             ]);
         }
@@ -294,23 +303,36 @@ class BiometricDeviceController extends Controller
             ], 422);
         }
 
-        $zkAreaId = isset($validated['zkbio_area_id']) ? (int) $validated['zkbio_area_id'] : null;
-        if ($mode === 'ADMS') {
-            if (! $zkAreaId) {
-                return response()->json([
-                    'message' => 'ZKBio Area assignment is required for ADMS devices.',
-                ], 422);
-            }
-            if ($zkAreaId === 1) {
-                return response()->json([
-                    'message' => 'Area 1 is the default non-synchronizing area in ZKBio Time and cannot be assigned to devices. Please select an active area such as Area 2 or Area 3.',
-                ], 422);
-            }
-        }
-
         $serialNumber = trim($validated['serial_number']);
         $deptId = (int) $validated['department_id'];
         $department = Department::query()->findOrFail($deptId);
+
+        $rawAreaId = $validated['zkbio_area_id'] ?? null;
+        if ($rawAreaId !== null && (int) $rawAreaId === 1) {
+            return response()->json([
+                'message' => 'Area 1 (Default) cannot be used for office biometric synchronization.',
+            ], 422);
+        }
+
+        $requestedAreaId = ($rawAreaId !== null && (int) $rawAreaId > 1) ? (int) $rawAreaId : null;
+        $zkAreaId = $requestedAreaId;
+        $areaCreatedMessage = null;
+
+        if ($mode === 'ADMS') {
+            $areaRes = $this->provisioningService->resolveOrCreateAreaForDepartment($department, $requestedAreaId);
+            if (! $areaRes['success'] && $requestedAreaId !== null) {
+                return response()->json([
+                    'message' => $areaRes['message'],
+                ], 422);
+            }
+
+            if ($areaRes['area_id'] !== null && $areaRes['area_id'] > 1) {
+                $zkAreaId = $areaRes['area_id'];
+                if ($areaRes['created']) {
+                    $areaCreatedMessage = $areaRes['message'];
+                }
+            }
+        }
 
         $isPrimary = $request->boolean('is_primary', true);
         if ($isPrimary) {
@@ -318,6 +340,27 @@ class BiometricDeviceController extends Controller
                 ->where('department_id', $deptId)
                 ->update(['is_primary' => false]);
         }
+
+        $zkLive = null;
+        $isOnline = false;
+        $lastHeartbeat = null;
+        try {
+            $zkLive = DB::connection('zkbio')
+                ->table('iclock_terminal')
+                ->where('sn', $serialNumber)
+                ->first();
+
+            if ($zkLive && $zkLive->last_activity) {
+                $diff = \Carbon\Carbon::parse($zkLive->last_activity)->diffInSeconds(now());
+                $isOnline = ((int) $zkLive->state === 1) && ($diff <= 180);
+                $lastHeartbeat = $zkLive->last_activity;
+            }
+        } catch (Throwable) {
+            // ZKBio offline fallback
+        }
+
+        $inputIp = $this->provisioningService->normalizeIp($validated['ip_address'] ?? null);
+        $liveIp = $this->provisioningService->normalizeIp($zkLive?->ip_address ?? null);
 
         $existing = BiometricDevice::query()->where('serial_number', $serialNumber)->first();
         if ($existing) {
@@ -330,40 +373,54 @@ class BiometricDeviceController extends Controller
                 'zkbio_area_id' => $zkAreaId,
                 'is_primary' => $isPrimary,
                 'comm_key' => trim($validated['comm_key'] ?? '') ?: ($existing->comm_key ?: '0'),
-                'ip_address' => trim($validated['ip_address'] ?? '') ?: $existing->ip_address,
+                'ip_address' => $inputIp ?: ($liveIp ?: $this->provisioningService->normalizeIp($existing->ip_address)),
                 'port' => $validated['port'] ?? ($existing->port ?: 4370),
                 'is_active' => true,
-                'status' => 'ONLINE',
-                'last_heartbeat_at' => now(),
+                'status' => $isOnline ? 'ONLINE' : 'OFFLINE',
+                'last_heartbeat_at' => $lastHeartbeat ?: $existing->last_heartbeat_at,
             ]);
 
-            return response()->json([
-                'message' => "Biometric terminal '{$existing->device_name}' successfully authorized and activated for {$department->name}.",
-                'device' => $existing,
-            ], 200);
+            $device = $existing;
+            $httpStatus = 200;
+            $message = "Biometric terminal '{$device->device_name}' successfully authorized and activated for {$department->name}.";
+        } else {
+            $device = BiometricDevice::query()->create([
+                'serial_number' => $serialNumber,
+                'device_name' => trim($validated['device_name']),
+                'model_name' => trim($validated['model_name'] ?? '') ?: ($zkLive?->terminal_name ?? 'MB360'),
+                'department_id' => $deptId,
+                'department_name' => $department->name,
+                'communication_mode' => $mode,
+                'zkbio_area_id' => $zkAreaId,
+                'is_primary' => $isPrimary,
+                'comm_key' => trim($validated['comm_key'] ?? '') ?: '0',
+                'ip_address' => $inputIp ?: $liveIp,
+                'port' => $validated['port'] ?? 4370,
+                'is_active' => true,
+                'status' => $isOnline ? 'ONLINE' : 'OFFLINE',
+                'last_heartbeat_at' => $lastHeartbeat,
+            ]);
+
+            $httpStatus = 201;
+            $message = "Biometric device '{$device->device_name}' successfully authorized for {$department->name}.";
         }
 
-        $device = BiometricDevice::query()->create([
-            'serial_number' => $serialNumber,
-            'device_name' => trim($validated['device_name']),
-            'model_name' => trim($validated['model_name'] ?? '') ?: 'MB360',
-            'department_id' => $deptId,
-            'department_name' => $department->name,
-            'communication_mode' => $mode,
-            'zkbio_area_id' => $zkAreaId,
-            'is_primary' => $isPrimary,
-            'comm_key' => trim($validated['comm_key'] ?? '') ?: '0',
-            'ip_address' => trim($validated['ip_address'] ?? '') ?: null,
-            'port' => $validated['port'] ?? 4370,
-            'is_active' => true,
-            'status' => 'ONLINE',
-            'last_heartbeat_at' => now(),
-        ]);
+        $zkbioSynced = false;
+        if ($mode === 'ADMS' && $zkAreaId !== null && $zkAreaId > 1) {
+            $syncRes = $this->provisioningService->syncTerminalToZkBio($device, $zkAreaId);
+            $zkbioSynced = $syncRes['success'];
+            if ($zkbioSynced) {
+                $message .= $areaCreatedMessage
+                    ? " {$areaCreatedMessage} Auto-synced to ZKBio Time."
+                    : ' Auto-synced to ZKBio Time.';
+            }
+        }
 
         return response()->json([
-            'message' => "Biometric device '{$device->device_name}' successfully authorized for {$department->name}.",
-            'device' => $device,
-        ], 201);
+            'message' => $message,
+            'device' => $device->fresh(),
+            'zkbio_synced' => $zkbioSynced,
+        ], $httpStatus);
     }
 
     /**
@@ -408,22 +465,41 @@ class BiometricDeviceController extends Controller
             ], 422);
         }
 
-        $zkAreaId = isset($validated['zkbio_area_id']) ? (int) $validated['zkbio_area_id'] : null;
-        if ($mode === 'ADMS') {
-            if (! $zkAreaId) {
-                return response()->json([
-                    'message' => 'ZKBio Area assignment is required for ADMS devices.',
-                ], 422);
-            }
-            if ($zkAreaId === 1) {
-                return response()->json([
-                    'message' => 'Area 1 is the default non-synchronizing area in ZKBio Time and cannot be assigned to devices. Please select an active area such as Area 2 or Area 3.',
-                ], 422);
-            }
-        }
-
         $deptId = (int) $validated['department_id'];
         $department = Department::query()->findOrFail($deptId);
+
+        if ($request->exists('zkbio_area_id')) {
+            $rawAreaId = $validated['zkbio_area_id'] ?? null;
+            if ($rawAreaId !== null && (int) $rawAreaId === 1) {
+                return response()->json([
+                    'message' => 'Area 1 (Default) cannot be used for office biometric synchronization.',
+                ], 422);
+            }
+            $requestedAreaId = ($rawAreaId !== null && (int) $rawAreaId > 1) ? (int) $rawAreaId : null;
+        } else {
+            $departmentChanged = (int) $device->department_id !== $deptId;
+            $existingArea = ($device->zkbio_area_id && (int) $device->zkbio_area_id > 1) ? (int) $device->zkbio_area_id : null;
+            $requestedAreaId = $departmentChanged ? null : $existingArea;
+        }
+
+        $zkAreaId = $requestedAreaId;
+        $areaCreatedMessage = null;
+
+        if ($mode === 'ADMS') {
+            $areaRes = $this->provisioningService->resolveOrCreateAreaForDepartment($department, $requestedAreaId);
+            if (! $areaRes['success'] && $requestedAreaId !== null) {
+                return response()->json([
+                    'message' => $areaRes['message'],
+                ], 422);
+            }
+
+            if ($areaRes['area_id'] !== null && $areaRes['area_id'] > 1) {
+                $zkAreaId = $areaRes['area_id'];
+                if ($areaRes['created']) {
+                    $areaCreatedMessage = $areaRes['message'];
+                }
+            }
+        }
 
         $isPrimary = $request->boolean('is_primary', true);
         if ($isPrimary) {
@@ -442,13 +518,27 @@ class BiometricDeviceController extends Controller
             'zkbio_area_id' => $zkAreaId,
             'is_primary' => $isPrimary,
             'comm_key' => trim($validated['comm_key'] ?? '') ?: ($device->comm_key ?: '0'),
-            'ip_address' => trim($validated['ip_address'] ?? '') ?: null,
+            'ip_address' => $this->provisioningService->normalizeIp($validated['ip_address'] ?? null),
             'port' => $validated['port'] ?? ($device->port ?: 4370),
         ]);
 
+        $message = "Biometric device '{$device->device_name}' updated successfully.";
+        $zkbioSynced = false;
+
+        if ($mode === 'ADMS' && $zkAreaId !== null && $zkAreaId > 1) {
+            $syncRes = $this->provisioningService->syncTerminalToZkBio($device, $zkAreaId);
+            $zkbioSynced = $syncRes['success'];
+            if ($zkbioSynced) {
+                $message .= $areaCreatedMessage
+                    ? " {$areaCreatedMessage} Synced to ZKBio Time."
+                    : ' Synced to ZKBio Time.';
+            }
+        }
+
         return response()->json([
-            'message' => "Biometric device '{$device->device_name}' updated successfully.",
-            'device' => $device,
+            'message' => $message,
+            'device' => $device->fresh(),
+            'zkbio_synced' => $zkbioSynced,
         ]);
     }
 
@@ -491,12 +581,30 @@ class BiometricDeviceController extends Controller
             ], 403);
         }
 
+        if ($id === 0 && $request->filled('serial_number')) {
+            $serialNumber = trim((string) $request->input('serial_number'));
+            BiometricDevice::query()->where('serial_number', $serialNumber)->delete();
+            $zkDelete = $this->provisioningService->deleteTerminalFromZkBio($serialNumber);
+
+            return response()->json([
+                'message' => "Biometric terminal '{$serialNumber}' has been removed from ZKBio Time.",
+                'zkbio_deleted' => $zkDelete['deleted'],
+            ]);
+        }
+
         $device = BiometricDevice::query()->findOrFail($id);
         $name = $device->device_name;
+        $serialNumber = (string) $device->serial_number;
         $device->delete();
 
+        $zkDelete = $this->provisioningService->deleteTerminalFromZkBio($serialNumber);
+        $message = $zkDelete['deleted']
+            ? "Biometric terminal '{$name}' has been deleted from ALMS and ZKBio Time."
+            : "Biometric terminal '{$name}' has been deleted.";
+
         return response()->json([
-            'message' => "Biometric terminal '{$name}' has been deleted.",
+            'message' => $message,
+            'zkbio_deleted' => $zkDelete['deleted'],
         ]);
     }
 
@@ -725,9 +833,10 @@ class BiometricDeviceController extends Controller
         $devNames = implode(', ', $successfulDevices);
 
         if ($totalImported > 0) {
-            $summary = "Synced {$devNames}: {$totalImported} new punch(es) imported ({$totalDuplicates} existing skipped).";
+            $logWord = $totalImported === 1 ? 'log' : 'logs';
+            $summary = "Successfully synced {$totalImported} new attendance {$logWord}.";
         } elseif ($totalRead > 0) {
-            $summary = "Synced {$devNames}: All {$totalRead} punches are already up-to-date.";
+            $summary = "Attendance logs are up to date ({$totalRead} logs checked).";
         } else {
             $summary = "Connected to {$devNames}: No punches recorded on terminal.";
         }

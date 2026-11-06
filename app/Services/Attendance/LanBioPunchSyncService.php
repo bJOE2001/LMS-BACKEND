@@ -176,8 +176,13 @@ class LanBioPunchSyncService
                 }
             }
 
-            $msg = "Device '{$deviceName}': {$imported} newly imported, {$duplicates} duplicates skipped out of ".count($rawLogs).' logs.';
-            Log::info("LanBioPunchSyncService: {$msg}");
+            if ($imported > 0) {
+                $logWord = $imported === 1 ? 'log' : 'logs';
+                $msg = "Successfully synced {$imported} new attendance {$logWord}.";
+            } else {
+                $msg = 'Attendance logs are up to date ('.count($rawLogs).' logs checked).';
+            }
+            Log::info("LanBioPunchSyncService: Device '{$deviceName}' - {$msg}");
 
             return [
                 'success' => true,
