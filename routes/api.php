@@ -43,6 +43,7 @@ Route::prefix('iclock')->group(function () {
     Route::match(['get', 'post'], '/devicecmd', [\App\Http\Controllers\Attendance\NativeAdmsController::class, 'devicecmd']);
     Route::match(['get', 'post'], '/registry', [\App\Http\Controllers\Attendance\NativeAdmsController::class, 'registry']);
     Route::match(['get', 'post'], '/fdata', [\App\Http\Controllers\Attendance\NativeAdmsController::class, 'fdata']);
+    Route::match(['get', 'post'], '/querydata', [\App\Http\Controllers\Attendance\NativeAdmsController::class, 'querydata']);
 });
 
 // Authentication

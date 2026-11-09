@@ -2,8 +2,10 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\AttendanceLog;
 use App\Models\BiometricDevice;
 use App\Models\BiometricEnrollment;
+use App\Models\BiometricTemplate;
 use App\Models\COCApplication;
 use App\Models\Department;
 use App\Models\DepartmentAdmin;
@@ -3398,6 +3400,37 @@ class EmployeeController extends Controller
             ->whereIn('employee_control_no', $rowControlNos)
             ->get()
             ->keyBy('employee_control_no');
+
+        // Reconcile any pending enrollments that already have templates or punch logs
+        $pendingEnrollments = $enrollments->filter(fn ($e) => $e->status === BiometricEnrollment::STATUS_PENDING_ENROLLMENT);
+        if ($pendingEnrollments->isNotEmpty()) {
+            $pendingPins = $pendingEnrollments->pluck('employee_control_no')->all();
+
+            $withTemplates = BiometricTemplate::query()
+                ->whereIn('employee_control_no', $pendingPins)
+                ->pluck('employee_control_no')
+                ->flip();
+
+            $withLogs = AttendanceLog::query()
+                ->where(function ($q) use ($pendingPins): void {
+                    $q->whereIn('employee_control_no', $pendingPins)
+                        ->orWhereIn('biometric_pin', $pendingPins);
+                })
+                ->pluck('employee_control_no')
+                ->merge(
+                    AttendanceLog::query()->whereIn('biometric_pin', $pendingPins)->pluck('biometric_pin')
+                )
+                ->flip();
+
+            foreach ($pendingEnrollments as $pen) {
+                $pin = (string) $pen->employee_control_no;
+                if (isset($withTemplates[$pin]) || isset($withLogs[$pin])) {
+                    $pen->status = BiometricEnrollment::STATUS_REGISTERED;
+                    $pen->enrolled_at = $pen->enrolled_at ?? now();
+                    $pen->save();
+                }
+            }
+        }
 
         $deviceSns = $enrollments->pluck('enrollment_device_sn')->filter()->unique()->values()->all();
         $devices = empty($deviceSns)

@@ -24,6 +24,17 @@ class BiometricDevice extends Model
 
     public const STATUS_BLOCKED = 'BLOCKED';
 
+    public const MODE_ADMS = 'ADMS';
+
+    public const MODE_LAN_POLL = 'LAN_POLL';
+
+    /**
+     * @var array<string, mixed>
+     */
+    protected $attributes = [
+        'model_name' => '',
+    ];
+
     protected $fillable = [
         'device_name',
         'serial_number',
@@ -89,9 +100,19 @@ class BiometricDevice extends Model
         return false;
     }
 
-    public function getModelAttribute(): string
+    public function getModelAttribute(): ?string
     {
-        return $this->model_name ?: 'MB360';
+        return $this->model_name ?: null;
+    }
+
+    /**
+     * Resolve normalized template communication mode (ADMS vs LAN_POLL).
+     */
+    public function getTemplateCommunicationMode(): string
+    {
+        return $this->communication_mode === self::MODE_LAN_POLL
+            ? self::MODE_LAN_POLL
+            : self::MODE_ADMS;
     }
 
     public function getLocationAttribute(): string

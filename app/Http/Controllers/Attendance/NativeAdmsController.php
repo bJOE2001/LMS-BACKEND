@@ -20,18 +20,18 @@ class NativeAdmsController extends Controller
     {
         $sn = $this->extractSerialNumber($request);
         if ($sn === '') {
-            return response("ERROR: Missing SN\r\n", 400)->header('Content-Type', 'text/plain');
+            return $this->plainTextResponse("ERROR: Missing SN\n", 400);
         }
 
         if ($request->isMethod('POST')) {
             $result = $this->admsService->handleDataPush($request, $sn);
 
-            return response($result['response_text']."\r\n", 200)->header('Content-Type', 'text/plain');
+            return $this->plainTextResponse($result['response_text']."\n");
         }
 
         $handshake = $this->admsService->handleHandshake($request, $sn);
 
-        return response($handshake, 200)->header('Content-Type', 'text/plain');
+        return $this->plainTextResponse($handshake);
     }
 
     /**
@@ -41,12 +41,12 @@ class NativeAdmsController extends Controller
     {
         $sn = $this->extractSerialNumber($request);
         if ($sn === '') {
-            return response("ERROR: Missing SN\r\n", 400)->header('Content-Type', 'text/plain');
+            return $this->plainTextResponse("ERROR: Missing SN\n", 400);
         }
 
         $response = $this->admsService->handleGetRequest($request, $sn);
 
-        return response($response."\r\n", 200)->header('Content-Type', 'text/plain');
+        return $this->plainTextResponse($response."\n");
     }
 
     /**
@@ -56,12 +56,12 @@ class NativeAdmsController extends Controller
     {
         $sn = $this->extractSerialNumber($request);
         if ($sn === '') {
-            return response("ERROR: Missing SN\r\n", 400)->header('Content-Type', 'text/plain');
+            return $this->plainTextResponse("ERROR: Missing SN\n", 400);
         }
 
         $response = $this->admsService->handleDeviceCmd($request, $sn);
 
-        return response($response."\r\n", 200)->header('Content-Type', 'text/plain');
+        return $this->plainTextResponse($response."\n");
     }
 
     /**
@@ -71,12 +71,12 @@ class NativeAdmsController extends Controller
     {
         $sn = $this->extractSerialNumber($request);
         if ($sn === '') {
-            return response("ERROR: Missing SN\r\n", 400)->header('Content-Type', 'text/plain');
+            return $this->plainTextResponse("ERROR: Missing SN\n", 400);
         }
 
         $response = $this->admsService->handleRegistry($request, $sn);
 
-        return response($response, 200)->header('Content-Type', 'text/plain');
+        return $this->plainTextResponse($response);
     }
 
     /**
@@ -84,7 +84,36 @@ class NativeAdmsController extends Controller
      */
     public function fdata(Request $request): Response
     {
-        return response("OK\r\n", 200)->header('Content-Type', 'text/plain');
+        return $this->plainTextResponse("OK\n");
+    }
+
+    /**
+     * Query data upload endpoint (POST /iclock/querydata).
+     */
+    public function querydata(Request $request): Response
+    {
+        $sn = $this->extractSerialNumber($request);
+        if ($sn === '') {
+            return $this->plainTextResponse("ERROR: Missing SN\n", 400);
+        }
+
+        $result = $this->admsService->handleDataPush($request, $sn);
+
+        return $this->plainTextResponse($result['response_text']."\n");
+    }
+
+    /**
+     * Build a minimal ADMS HTTP response with explicit Content-Length and no session cookies.
+     * ZKTeco embedded C HTTP clients require Content-Length to read multi-packet responses (>1460 bytes).
+     */
+    private function plainTextResponse(string $body, int $status = 200): Response
+    {
+        return response($body, $status, [
+            'Content-Type' => 'text/plain',
+            'Content-Length' => (string) strlen($body),
+            'Pragma' => 'no-cache',
+            'Cache-Control' => 'no-store',
+        ]);
     }
 
     /**

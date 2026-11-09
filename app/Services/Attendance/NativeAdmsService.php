@@ -4,14 +4,21 @@ namespace App\Services\Attendance;
 
 use App\Models\AttendanceRawLog;
 use App\Models\BiometricDevice;
+use App\Models\BiometricDeviceCommand;
+use App\Models\BiometricEnrollment;
+use App\Models\BiometricTemplate;
+use App\Models\BiometricTransferLog;
 use App\Models\HrisEmployee;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
 class NativeAdmsService
 {
+    private const MAX_COMMANDS_PER_POLL = 5;
+
     public function __construct(
         private readonly DtrCalculationService $dtrService
     ) {}
@@ -22,24 +29,25 @@ class NativeAdmsService
     public function handleHandshake(Request $request, string $serialNumber): string
     {
         $this->updateDeviceTelemetry($request, $serialNumber);
+        $opStamp = (int) Cache::get("adms_opstamp_{$serialNumber}", 0);
 
-        return "GET OPTION FROM: {$serialNumber}\r\n"
-            ."Stamp=9999\r\n"
-            ."OpStamp=9999\r\n"
-            ."PhotoStamp=9999\r\n"
-            ."ErrorDelay=30\r\n"
-            ."Delay=10\r\n"
-            ."TransTimes=00:00;14:05\r\n"
-            ."TransInterval=1\r\n"
-            ."TransFlag=1111000000\r\n"
-            ."TimeZone=8\r\n"
-            ."Realtime=1\r\n"
-            ."Encrypt=0\r\n"
-            ."ServerVersion=3.0.1\r\n";
+        return "GET OPTION FROM: {$serialNumber}\n"
+            ."Stamp=9999\n"
+            ."OpStamp={$opStamp}\n"
+            ."PhotoStamp=9999\n"
+            ."ErrorDelay=30\n"
+            ."Delay=10\n"
+            ."TransTimes=00:00;14:05\n"
+            ."TransInterval=1\n"
+            ."TransFlag=1111111111\n"
+            ."TimeZone=8\n"
+            ."Realtime=1\n"
+            ."Encrypt=0\n"
+            ."ServerVersion=3.0.1\n";
     }
 
     /**
-     * Handle incoming data pushes from ZKTeco terminal (POST /iclock/cdata).
+     * Handle incoming data pushes from ZKTeco terminal (POST /iclock/cdata or /iclock/querydata).
      *
      * @return array{
      *     success: bool,
@@ -55,11 +63,19 @@ class NativeAdmsService
         $table = strtoupper(trim((string) ($request->query('table') ?: $request->input('table') ?: 'ATTLOG')));
         $rawContent = (string) $request->getContent();
 
+        $opStamp = $request->query('OpStamp') ?? $request->input('OpStamp');
+        if ($opStamp !== null && is_numeric($opStamp)) {
+            Cache::forever("adms_opstamp_{$serialNumber}", (int) $opStamp);
+        }
+
         if ($table === 'ATTLOG') {
             return $this->processAttendanceLogs($device, $serialNumber, $rawContent);
         }
 
-        // For OPERLOG, BIODATA, options or other operational pushes, acknowledge OK
+        if (in_array($table, ['OPERLOG', 'BIODATA', 'USERINFO', 'USER', 'FINGERTMP', 'FP', 'FACE'], true)) {
+            return $this->processBiometricDataPush($device, $serialNumber, $table, $rawContent);
+        }
+
         return [
             'success' => true,
             'table' => $table,
@@ -74,10 +90,45 @@ class NativeAdmsService
      */
     public function handleGetRequest(Request $request, string $serialNumber): string
     {
-        $this->updateDeviceTelemetry($request, $serialNumber);
+        $device = $this->updateDeviceTelemetry($request, $serialNumber);
+        $this->updateDeviceInfoFromQuery($request, $device);
 
-        // When no commands are pending, ZKTeco protocol standard response is "OK"
-        return 'OK';
+        try {
+            BiometricDeviceCommand::query()
+                ->where('device_serial_number', $serialNumber)
+                ->where('status', BiometricDeviceCommand::STATUS_SENT)
+                ->where('sent_at', '<', now()->subMinutes(5))
+                ->update(['status' => BiometricDeviceCommand::STATUS_PENDING]);
+
+            $commands = BiometricDeviceCommand::query()
+                ->where('device_serial_number', $serialNumber)
+                ->where('status', BiometricDeviceCommand::STATUS_PENDING)
+                ->orderBy('id')
+                ->limit(self::MAX_COMMANDS_PER_POLL)
+                ->get();
+
+            if ($commands->isEmpty()) {
+                return 'OK';
+            }
+
+            $lines = [];
+            foreach ($commands as $cmd) {
+                $cmd->update([
+                    'status' => BiometricDeviceCommand::STATUS_SENT,
+                    'sent_at' => now(),
+                ]);
+                $cleanPayload = str_replace(["\r", "\n"], '', (string) $cmd->command_payload);
+                $lines[] = "C:{$cmd->id}:{$cleanPayload}";
+            }
+
+            return implode("\n", $lines);
+        } catch (Throwable $e) {
+            Log::warning("NativeAdmsService: Command poll failed for SN {$serialNumber}", [
+                'error' => $e->getMessage(),
+            ]);
+
+            return 'OK';
+        }
     }
 
     /**
@@ -86,6 +137,91 @@ class NativeAdmsService
     public function handleDeviceCmd(Request $request, string $serialNumber): string
     {
         $this->updateDeviceTelemetry($request, $serialNumber);
+        $rawContent = trim((string) $request->getContent());
+
+        $ackItems = [];
+        if ($rawContent !== '') {
+            $lines = preg_split('/\r\n|\r|\n/', $rawContent) ?: [];
+            foreach ($lines as $line) {
+                $trimmed = trim($line);
+                if ($trimmed === '') {
+                    continue;
+                }
+                parse_str($trimmed, $parsed);
+                if (isset($parsed['ID']) || isset($parsed['id'])) {
+                    $ackItems[] = [
+                        'id' => (int) ($parsed['ID'] ?? $parsed['id']),
+                        'return' => (int) ($parsed['Return'] ?? $parsed['return'] ?? -1),
+                        'raw' => $trimmed,
+                    ];
+                }
+            }
+        }
+
+        if ($ackItems === [] && ($request->has('ID') || $request->has('id'))) {
+            $ackItems[] = [
+                'id' => (int) ($request->input('ID') ?? $request->input('id')),
+                'return' => (int) ($request->input('Return') ?? $request->input('return') ?? -1),
+                'raw' => http_build_query($request->all()),
+            ];
+        }
+
+        foreach ($ackItems as $ack) {
+            if ($ack['id'] <= 0) {
+                continue;
+            }
+
+            try {
+                $command = BiometricDeviceCommand::query()
+                    ->where('id', $ack['id'])
+                    ->where('device_serial_number', $serialNumber)
+                    ->first();
+
+                if (! $command) {
+                    continue;
+                }
+
+                $isSuccess = $ack['return'] === 0;
+                $command->update([
+                    'status' => $isSuccess ? BiometricDeviceCommand::STATUS_SUCCESS : BiometricDeviceCommand::STATUS_FAILED,
+                    'return_code' => $ack['return'],
+                    'response_payload' => substr($ack['raw'], 0, 1000),
+                    'executed_at' => now(),
+                ]);
+
+                if ($isSuccess && $command->employee_control_no && in_array($command->command_type, [
+                    BiometricDeviceCommand::CMD_DATA_USER,
+                    BiometricDeviceCommand::CMD_UPDATE_TEMPLATE,
+                ], true)) {
+                    $enrollment = BiometricEnrollment::query()
+                        ->where('employee_control_no', $command->employee_control_no)
+                        ->first();
+                    $enrollment?->markSyncedToDevice($serialNumber);
+                } elseif (! $isSuccess) {
+                    Log::error("NativeAdmsService: Terminal {$serialNumber} rejected command ID {$command->id} ({$command->command_type}) with Return={$ack['return']}", [
+                        'employee_control_no' => $command->employee_control_no,
+                        'response' => $ack['raw'],
+                    ]);
+
+                    if ($command->employee_control_no && $command->command_type === BiometricDeviceCommand::CMD_UPDATE_TEMPLATE) {
+                        $latestLog = BiometricTransferLog::query()
+                            ->where('employee_control_no', $command->employee_control_no)
+                            ->where('target_device_sn', $serialNumber)
+                            ->orderByDesc('id')
+                            ->first();
+
+                        $latestLog?->update([
+                            'status' => BiometricTransferLog::STATUS_FAILED,
+                            'remarks' => "Terminal {$serialNumber} rejected biometric template push (Return={$ack['return']}).",
+                        ]);
+                    }
+                }
+            } catch (Throwable $e) {
+                Log::warning("NativeAdmsService: Failed processing devicecmd ID {$ack['id']}", [
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
 
         return 'OK';
     }
@@ -97,7 +233,309 @@ class NativeAdmsService
     {
         $this->updateDeviceTelemetry($request, $serialNumber);
 
-        return "RegistryCode=OK\r\n";
+        return "RegistryCode=OK\n";
+    }
+
+    /**
+     * Parse and store biometric templates (USER, FP, FACE, BIODATA) pushed from MB360 / ADMS terminals.
+     *
+     * @return array{
+     *     success: bool,
+     *     table: string,
+     *     imported: int,
+     *     duplicates: int,
+     *     response_text: string
+     * }
+     */
+    private function processBiometricDataPush(
+        ?BiometricDevice $device,
+        string $serialNumber,
+        string $table,
+        string $rawContent
+    ): array {
+        $lines = preg_split('/\r\n|\r|\n/', trim($rawContent)) ?: [];
+        $communicationMode = $device?->getTemplateCommunicationMode() ?? BiometricDevice::MODE_ADMS;
+        $imported = 0;
+        $processedLines = 0;
+
+        foreach ($lines as $rawLine) {
+            $line = trim($rawLine);
+            if ($line === '') {
+                continue;
+            }
+            $processedLines++;
+
+            $recordType = $table;
+            $kvBody = $line;
+
+            if (preg_match('/^(USERINFO|USER|FINGERTMP|FP|FACE|BIODATA|OPLOG)\s+(.+)$/i', $line, $matches)) {
+                $recordType = strtoupper($matches[1]);
+                $kvBody = $matches[2];
+            }
+
+            if ($recordType === 'OPLOG') {
+                continue;
+            }
+
+            $fields = $this->parseKeyValueLine($kvBody);
+            $rawPin = trim((string) ($fields['PIN'] ?? ''));
+            if ($rawPin === '') {
+                continue;
+            }
+
+            $emp = HrisEmployee::findByControlNo($rawPin, true);
+            $canonicalControlNo = $emp?->control_no ? (string) $emp->control_no : $rawPin;
+            $fallbackName = trim((string) ($fields['NAME'] ?? ''));
+            $fullName = $emp
+                ? trim(($emp->firstname ?? '').' '.($emp->middlename ? $emp->middlename[0].'. ' : '').($emp->surname ?? ''))
+                : ($fallbackName !== '' ? $fallbackName : 'EMP '.$canonicalControlNo);
+
+            if (in_array($recordType, ['USER', 'USERINFO'], true)) {
+                $this->upsertUserEnrollmentFromPush($canonicalControlNo, $fullName, $serialNumber, false);
+
+                continue;
+            }
+
+            if (in_array($recordType, ['FP', 'FINGERTMP'], true)) {
+                $tmp = trim((string) ($fields['TMP'] ?? ''));
+                if ($tmp === '') {
+                    continue;
+                }
+
+                $fid = isset($fields['FID']) && is_numeric($fields['FID']) ? (int) $fields['FID'] : 0;
+                $size = isset($fields['SIZE']) && is_numeric($fields['SIZE']) ? (int) $fields['SIZE'] : strlen($tmp);
+                $valid = isset($fields['VALID']) && is_numeric($fields['VALID']) ? (int) $fields['VALID'] : 1;
+
+                BiometricTemplate::query()->updateOrCreate(
+                    [
+                        'employee_control_no' => $canonicalControlNo,
+                        'communication_mode' => $communicationMode,
+                        'biometric_type' => BiometricTemplate::TYPE_FINGERPRINT,
+                        'finger_id' => $fid,
+                    ],
+                    [
+                        'template_size' => $size,
+                        'valid' => $valid,
+                        'template_version' => '10',
+                        'template_data' => $tmp,
+                        'raw_payload' => $line,
+                        'source_device_sn' => $serialNumber,
+                    ]
+                );
+
+                $this->upsertUserEnrollmentFromPush($canonicalControlNo, $fullName, $serialNumber, true);
+                $imported++;
+
+                continue;
+            }
+
+            if ($recordType === 'FACE') {
+                $tmp = trim((string) ($fields['TMP'] ?? ''));
+                if ($tmp === '') {
+                    continue;
+                }
+
+                $fid = isset($fields['FID']) && is_numeric($fields['FID']) ? (int) $fields['FID'] : 0;
+                $size = isset($fields['SIZE']) && is_numeric($fields['SIZE']) ? (int) $fields['SIZE'] : strlen($tmp);
+                $valid = isset($fields['VALID']) && is_numeric($fields['VALID']) ? (int) $fields['VALID'] : 1;
+
+                BiometricTemplate::query()->updateOrCreate(
+                    [
+                        'employee_control_no' => $canonicalControlNo,
+                        'communication_mode' => $communicationMode,
+                        'biometric_type' => BiometricTemplate::TYPE_FACE,
+                        'finger_id' => $fid,
+                    ],
+                    [
+                        'template_size' => $size,
+                        'valid' => $valid,
+                        'template_version' => '7',
+                        'template_data' => $tmp,
+                        'raw_payload' => $line,
+                        'source_device_sn' => $serialNumber,
+                    ]
+                );
+
+                $this->upsertUserEnrollmentFromPush($canonicalControlNo, $fullName, $serialNumber, true);
+                $imported++;
+
+                continue;
+            }
+
+            if ($recordType === 'BIODATA') {
+                $tmp = trim((string) ($fields['TMP'] ?? ''));
+                if ($tmp === '') {
+                    continue;
+                }
+
+                $no = isset($fields['NO']) && is_numeric($fields['NO'])
+                    ? (int) $fields['NO']
+                    : (isset($fields['FID']) && is_numeric($fields['FID']) ? (int) $fields['FID'] : 0);
+                $valid = isset($fields['VALID']) && is_numeric($fields['VALID']) ? (int) $fields['VALID'] : 1;
+                $bioCode = isset($fields['TYPE']) && is_numeric($fields['TYPE']) ? (int) $fields['TYPE'] : 1;
+                $majorVer = isset($fields['MAJORVER']) && is_numeric($fields['MAJORVER']) ? (int) $fields['MAJORVER'] : 10;
+                $minorVer = isset($fields['MINORVER']) && is_numeric($fields['MINORVER']) ? (int) $fields['MINORVER'] : 0;
+
+                $bioType = match ($bioCode) {
+                    9, 2 => BiometricTemplate::TYPE_FACE,
+                    8 => BiometricTemplate::TYPE_PALM,
+                    default => BiometricTemplate::TYPE_FINGERPRINT,
+                };
+
+                BiometricTemplate::query()->updateOrCreate(
+                    [
+                        'employee_control_no' => $canonicalControlNo,
+                        'communication_mode' => $communicationMode,
+                        'biometric_type' => $bioType,
+                        'finger_id' => $no,
+                    ],
+                    [
+                        'template_size' => strlen($tmp),
+                        'valid' => $valid,
+                        'template_version' => "biodata:{$bioCode}:{$majorVer}.{$minorVer}",
+                        'template_data' => $tmp,
+                        'raw_payload' => $line,
+                        'source_device_sn' => $serialNumber,
+                    ]
+                );
+
+                $this->upsertUserEnrollmentFromPush($canonicalControlNo, $fullName, $serialNumber, true);
+                $imported++;
+            }
+        }
+
+        return [
+            'success' => true,
+            'table' => $table,
+            'imported' => $imported,
+            'duplicates' => 0,
+            'response_text' => $processedLines > 0 ? "OK: {$processedLines}" : 'OK',
+        ];
+    }
+
+    /**
+     * Parse tab-separated or space-separated Key=Value pairs from ADMS OPERLOG / BIODATA lines.
+     *
+     * @return array<string, string>
+     */
+    private function parseKeyValueLine(string $kvBody): array
+    {
+        $result = [];
+        $parts = str_contains($kvBody, "\t")
+            ? explode("\t", $kvBody)
+            : (preg_split('/\s+(?=[A-Za-z0-9_]+=)/', $kvBody) ?: []);
+
+        foreach ($parts as $part) {
+            $eqPos = strpos($part, '=');
+            if ($eqPos === false) {
+                continue;
+            }
+            $key = strtoupper(trim(substr($part, 0, $eqPos)));
+            $val = trim(substr($part, $eqPos + 1));
+            if ($key !== '') {
+                $result[$key] = $val;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Upsert employee enrollment status when terminal reports USER or biometric template upload.
+     */
+    private function upsertUserEnrollmentFromPush(
+        string $controlNo,
+        string $fullName,
+        string $serialNumber,
+        bool $hasBiometricTemplate
+    ): void {
+        try {
+            $enrollment = BiometricEnrollment::query()
+                ->where('employee_control_no', $controlNo)
+                ->first();
+
+            if (! $enrollment) {
+                $enrollment = new BiometricEnrollment([
+                    'employee_control_no' => $controlNo,
+                    'employee_name' => $fullName,
+                    'status' => $hasBiometricTemplate
+                        ? BiometricEnrollment::STATUS_REGISTERED
+                        : BiometricEnrollment::STATUS_PENDING_ENROLLMENT,
+                    'enrollment_device_sn' => $serialNumber,
+                    'enrolled_at' => $hasBiometricTemplate ? now() : null,
+                    'synced_devices' => [$serialNumber],
+                ]);
+                $enrollment->save();
+
+                return;
+            }
+
+            if ($enrollment->employee_name === '' || str_starts_with((string) $enrollment->employee_name, 'EMP ')) {
+                $enrollment->employee_name = $fullName;
+            }
+
+            if ($hasBiometricTemplate) {
+                $enrollment->status = BiometricEnrollment::STATUS_REGISTERED;
+                $enrollment->enrolled_at = $enrollment->enrolled_at ?? now();
+                $enrollment->enrollment_device_sn = $enrollment->enrollment_device_sn ?: $serialNumber;
+            }
+
+            $synced = is_array($enrollment->synced_devices) ? $enrollment->synced_devices : [];
+            if (! in_array($serialNumber, $synced, true)) {
+                $synced[] = $serialNumber;
+                $enrollment->synced_devices = $synced;
+            }
+
+            $enrollment->save();
+        } catch (Throwable $e) {
+            Log::warning("NativeAdmsService: Failed upserting enrollment for {$controlNo}", [
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
+     * Parse INFO parameter sent on GET /iclock/getrequest?SN=...&INFO=Ver,Users,FPs,Logs,IP,FPAlg,FaceAlg,FaceEnroll,Faces
+     */
+    private function updateDeviceInfoFromQuery(Request $request, ?BiometricDevice $device): void
+    {
+        if (! $device) {
+            return;
+        }
+
+        $info = trim((string) ($request->query('INFO') ?: $request->input('INFO') ?: ''));
+        if ($info === '') {
+            return;
+        }
+
+        $parts = array_map('trim', explode(',', $info));
+        $updates = [];
+
+        if (! empty($parts[0])) {
+            $updates['firmware_version'] = substr($parts[0], 0, 100);
+        }
+        if (isset($parts[1]) && is_numeric($parts[1])) {
+            $updates['device_user_count'] = (int) $parts[1];
+        }
+        if (isset($parts[2]) && is_numeric($parts[2])) {
+            $updates['device_finger_count'] = (int) $parts[2];
+        }
+        if (isset($parts[3]) && is_numeric($parts[3])) {
+            $updates['device_log_count'] = (int) $parts[3];
+        }
+        if (isset($parts[8]) && is_numeric($parts[8])) {
+            $updates['device_face_count'] = (int) $parts[8];
+        } elseif (isset($parts[7]) && is_numeric($parts[7])) {
+            $updates['device_face_count'] = (int) $parts[7];
+        }
+
+        if ($updates !== []) {
+            try {
+                $device->update($updates);
+            } catch (Throwable) {
+                // Ignore non-critical telemetry update error
+            }
+        }
     }
 
     /**
@@ -341,7 +779,7 @@ class NativeAdmsService
                 'ip_address' => ($clientIp !== '127.0.0.1' && $clientIp !== '::1') ? $clientIp : null,
                 'port' => 4370,
                 'comm_key' => '0',
-                'model_name' => 'MB360',
+                'model_name' => '',
             ]);
         } catch (Throwable $e) {
             Log::warning("NativeAdmsService: Telemetry update failed for SN {$sn}", [

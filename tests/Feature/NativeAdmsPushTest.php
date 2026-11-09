@@ -47,6 +47,8 @@ class NativeAdmsPushTest extends TestCase
 
         $response->assertStatus(200);
         $response->assertSee('OK');
+        $this->assertNotNull($response->headers->get('Content-Length'));
+        $this->assertEmpty($response->headers->getCookies());
 
         $device = BiometricDevice::query()->where('serial_number', $this->testSn)->first();
         $this->assertNotNull($device);

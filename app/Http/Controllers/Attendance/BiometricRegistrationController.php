@@ -6,16 +6,24 @@ use App\Http\Controllers\Controller;
 use App\Models\AttendanceLog;
 use App\Models\BiometricDevice;
 use App\Models\BiometricEnrollment;
+use App\Models\BiometricTemplate;
 use App\Models\BiometricTransferLog;
 use App\Models\DepartmentAdmin;
 use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
+use App\Services\Attendance\BiometricTransferService;
+use App\Services\Attendance\LanBioTemplateSyncService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
 class BiometricRegistrationController extends Controller
 {
+    public function __construct(
+        private readonly BiometricTransferService $transferService,
+        private readonly LanBioTemplateSyncService $lanTemplateService
+    ) {}
+
     public function hrIndex(Request $request): JsonResponse
     {
         $search = trim((string) $request->input('search', ''));
@@ -57,7 +65,7 @@ class BiometricRegistrationController extends Controller
                 ->whereIn('status', [BiometricEnrollment::STATUS_REGISTERED, BiometricEnrollment::STATUS_FINGERPRINT_ENROLLED]);
 
             if ($search !== '') {
-                $query->where(function ($q) use ($search) {
+                $query->where(function ($q) use ($search): void {
                     $q->where('employee_control_no', 'like', "%{$search}%")
                         ->orWhere('employee_name', 'like', "%{$search}%");
                 });
@@ -87,7 +95,7 @@ class BiometricRegistrationController extends Controller
                 ->where('status', BiometricEnrollment::STATUS_PENDING_ENROLLMENT);
 
             if ($search !== '') {
-                $query->where(function ($q) use ($search) {
+                $query->where(function ($q) use ($search): void {
                     $q->where('employee_control_no', 'like', "%{$search}%")
                         ->orWhere('employee_name', 'like', "%{$search}%");
                 });
@@ -97,7 +105,7 @@ class BiometricRegistrationController extends Controller
             $enrollments = $query->forPage($page, $perPage)->get();
 
             foreach ($enrollments as $enrollment) {
-                $this->reconciliationService->reconcileEnrollment($enrollment);
+                $this->reconcileSingleEnrollment($enrollment, false);
             }
 
             $items = $enrollments->map(function ($enrollment) use ($resolveDeviceOffices) {
@@ -124,7 +132,7 @@ class BiometricRegistrationController extends Controller
             }
 
             if ($search !== '') {
-                $hrisQuery->where(function ($q) use ($search) {
+                $hrisQuery->where(function ($q) use ($search): void {
                     $q->where('xp.ControlNo', 'like', "%{$search}%")
                         ->orWhere('xp.Firstname', 'like', "%{$search}%")
                         ->orWhere('xp.Surname', 'like', "%{$search}%");
@@ -152,7 +160,7 @@ class BiometricRegistrationController extends Controller
             // 'all'
             $enrollmentsQuery = BiometricEnrollment::query();
             if ($search !== '') {
-                $enrollmentsQuery->where(function ($q) use ($search) {
+                $enrollmentsQuery->where(function ($q) use ($search): void {
                     $q->where('employee_control_no', 'like', "%{$search}%")
                         ->orWhere('employee_name', 'like', "%{$search}%");
                 });
@@ -164,7 +172,7 @@ class BiometricRegistrationController extends Controller
                 $hrisQuery->whereNotIn('xp.ControlNo', $enrolledControlNos);
             }
             if ($search !== '') {
-                $hrisQuery->where(function ($q) use ($search) {
+                $hrisQuery->where(function ($q) use ($search): void {
                     $q->where('xp.ControlNo', 'like', "%{$search}%")
                         ->orWhere('xp.Firstname', 'like', "%{$search}%")
                         ->orWhere('xp.Surname', 'like', "%{$search}%");
@@ -282,30 +290,79 @@ class BiometricRegistrationController extends Controller
             ['employee_name' => $fullName]
         );
 
+        $templatesTransferred = 0;
+        $requiresLocalScan = true;
+
+        if ($device->communication_mode === 'LAN_POLL') {
+            $pushResult = $this->lanTemplateService->pushEmployeeToDevice($device, $controlNo, $fullName, true);
+            if (! $pushResult['success']) {
+                $transferLog = BiometricTransferLog::query()->create([
+                    'employee_control_no' => $controlNo,
+                    'employee_name' => $fullName,
+                    'action_type' => BiometricTransferLog::ACTION_REGISTRATION,
+                    'target_department_id' => $device->department_id ?: BiometricTransferService::CHRMO_DEPARTMENT_ID,
+                    'target_office_name' => $device->department_name ?: 'CHRMO',
+                    'target_device_sn' => $deviceSn,
+                    'status' => BiometricTransferLog::STATUS_FAILED,
+                    'remarks' => $pushResult['message'],
+                    'performed_by_user_id' => $request->user()->id,
+                    'performed_by_name' => $request->user()->full_name ?? $request->user()->username ?? 'HR Admin',
+                ]);
+
+                return response()->json([
+                    'message' => $pushResult['message'],
+                    'transfer_log_id' => $transferLog->id,
+                ], 422);
+            }
+
+            $templatesTransferred = (int) ($pushResult['templates_pushed'] ?? 0);
+            $requiresLocalScan = $templatesTransferred === 0;
+        } else {
+            $provision = $this->transferService->provisionEmployeeToDevice($device, $controlNo, $fullName, $request->user()->id);
+            $templatesTransferred = (int) ($provision['templates_transferred'] ?? 0);
+            $requiresLocalScan = (bool) ($provision['requires_local_scan'] ?? true);
+        }
+
+        $existingSynced = is_array($enrollment->synced_devices) ? $enrollment->synced_devices : [];
+        if (! in_array($deviceSn, $existingSynced, true)) {
+            $existingSynced[] = $deviceSn;
+        }
+
         $enrollment->update([
-            'status' => BiometricEnrollment::STATUS_PENDING_ENROLLMENT,
+            'status' => $templatesTransferred > 0 ? BiometricEnrollment::STATUS_REGISTERED : BiometricEnrollment::STATUS_PENDING_ENROLLMENT,
             'enrollment_device_sn' => $deviceSn,
-            'synced_devices' => [$deviceSn],
+            'synced_devices' => array_values(array_unique($existingSynced)),
         ]);
+
+        $commMode = $device->getTemplateCommunicationMode();
+        $remarks = $requiresLocalScan
+            ? "Registration initiated on device {$deviceSn} ({$commMode}). Awaiting scan."
+            : "Provisioned profile and synced {$templatesTransferred} {$commMode} template(s) to {$deviceSn}.";
 
         $transferLog = BiometricTransferLog::query()->create([
             'employee_control_no' => $controlNo,
             'employee_name' => $fullName,
             'action_type' => BiometricTransferLog::ACTION_REGISTRATION,
-            'target_department_id' => \App\Services\Attendance\BiometricTransferService::CHRMO_DEPARTMENT_ID,
-            'target_office_name' => 'CHRMO',
+            'target_department_id' => $device->department_id ?: BiometricTransferService::CHRMO_DEPARTMENT_ID,
+            'target_office_name' => $device->department_name ?: 'CHRMO',
             'target_device_sn' => $deviceSn,
             'status' => BiometricTransferLog::STATUS_SUCCESS,
-            'remarks' => "Registration initiated on device {$deviceSn}. Awaiting scan.",
+            'remarks' => $remarks,
             'performed_by_user_id' => $request->user()->id,
             'performed_by_name' => $request->user()->full_name ?? $request->user()->username ?? 'HR Admin',
         ]);
 
+        $message = $requiresLocalScan
+            ? "Registration initiated for {$fullName} on {$device->device_name}. Please step up to the device to scan."
+            : "Successfully pushed {$fullName} and {$templatesTransferred} {$commMode} template(s) to {$device->device_name}.";
+
         return response()->json([
-            'message' => "Registration initiated for {$fullName}. Please step up to the device to scan your fingerprint.",
+            'message' => $message,
+            'templates_transferred' => $templatesTransferred,
+            'requires_local_scan' => $requiresLocalScan,
             'transfer_log_id' => $transferLog->id,
             'command_id' => $transferLog->id,
-            'enrollment' => $enrollment,
+            'enrollment' => $enrollment->fresh(),
         ]);
     }
 
@@ -330,7 +387,7 @@ class BiometricRegistrationController extends Controller
     }
 
     /**
-     * Manually trigger biometric reconciliation against attendance logs.
+     * Manually trigger biometric reconciliation against stored templates and attendance logs.
      * Can reconcile a specific employee or all pending records.
      */
     public function reconcile(Request $request): JsonResponse
@@ -343,16 +400,7 @@ class BiometricRegistrationController extends Controller
                 return response()->json(['message' => "No enrollment found for control number [{$controlNo}]."], 404);
             }
 
-            $hasLogs = AttendanceLog::query()
-                ->where('employee_control_no', $controlNo)
-                ->orWhere('biometric_pin', $controlNo)
-                ->exists();
-
-            if ($hasLogs && $enrollment->status === BiometricEnrollment::STATUS_PENDING_ENROLLMENT) {
-                $enrollment->status = BiometricEnrollment::STATUS_REGISTERED;
-                $enrollment->enrolled_at = $enrollment->enrolled_at ?? now();
-                $enrollment->save();
-            }
+            $this->reconcileSingleEnrollment($enrollment, true);
 
             return response()->json([
                 'message' => "Biometric enrollment for [{$controlNo}] reconciled.",
@@ -373,15 +421,7 @@ class BiometricRegistrationController extends Controller
 
         $updatedCount = 0;
         foreach ($pendingEnrollments as $enrollment) {
-            $hasLogs = AttendanceLog::query()
-                ->where('employee_control_no', $enrollment->employee_control_no)
-                ->orWhere('biometric_pin', $enrollment->employee_control_no)
-                ->exists();
-
-            if ($hasLogs) {
-                $enrollment->status = BiometricEnrollment::STATUS_REGISTERED;
-                $enrollment->enrolled_at = $enrollment->enrolled_at ?? now();
-                $enrollment->save();
+            if ($this->reconcileSingleEnrollment($enrollment, true)) {
                 $updatedCount++;
             }
         }
@@ -430,11 +470,20 @@ class BiometricRegistrationController extends Controller
             ? trim(($emp->firstname ?? '').' '.($emp->middlename ? $emp->middlename[0].'. ' : '').($emp->surname ?? ''))
             : ($enrollment->employee_name ?? 'EMP '.$controlNo);
 
+        $provision = $this->transferService->provisionEmployeeToDevice(
+            $device,
+            $controlNo,
+            $fullName,
+            $account->id
+        );
+
         if (! $enrollment) {
             $enrollment = BiometricEnrollment::query()->create([
                 'employee_control_no' => $controlNo,
                 'employee_name' => $fullName,
-                'status' => BiometricEnrollment::STATUS_REGISTERED,
+                'status' => $provision['templates_transferred'] > 0
+                    ? BiometricEnrollment::STATUS_REGISTERED
+                    : BiometricEnrollment::STATUS_PENDING_ENROLLMENT,
                 'enrolled_at' => now(),
                 'synced_devices' => [$deviceSn],
             ]);
@@ -448,23 +497,29 @@ class BiometricRegistrationController extends Controller
         }
 
         $deptLabel = $account->department?->acronym ?: ($account->department?->name ?: "Office #{$account->department_id}");
+        $remarks = $provision['requires_local_scan']
+            ? "Provisioned PIN on Office Terminal ({$deviceSn}, {$provision['communication_mode']}); local biometric scan needed."
+            : "Synced {$provision['templates_transferred']} {$provision['communication_mode']} template(s) to Office Terminal ({$deviceSn}).";
+
         $transferLog = BiometricTransferLog::query()->create([
             'employee_control_no' => $controlNo,
             'employee_name' => $fullName,
             'action_type' => BiometricTransferLog::ACTION_ASSIGN,
-            'source_department_id' => \App\Services\Attendance\BiometricTransferService::CHRMO_DEPARTMENT_ID,
+            'source_department_id' => BiometricTransferService::CHRMO_DEPARTMENT_ID,
             'source_office_name' => 'CHRMO',
             'target_department_id' => $account->department_id,
             'target_office_name' => $deptLabel,
             'target_device_sn' => $deviceSn,
             'status' => BiometricTransferLog::STATUS_SUCCESS,
-            'remarks' => "Employee assigned to Office Biometric Terminal ({$deviceSn}).",
+            'remarks' => $remarks,
             'performed_by_user_id' => $account->id,
             'performed_by_name' => $account->full_name ?? $account->username ?? 'Department Admin',
         ]);
 
         return response()->json([
-            'message' => "Employee {$fullName} assigned to Office Biometric Terminal ({$deviceSn}).",
+            'message' => $remarks,
+            'templates_transferred' => $provision['templates_transferred'],
+            'requires_local_scan' => $provision['requires_local_scan'],
             'transfer_log_id' => $transferLog->id,
             'command_id' => $transferLog->id,
         ]);
@@ -481,6 +536,11 @@ class BiometricRegistrationController extends Controller
 
         if (! ($account instanceof DepartmentAdmin)) {
             return response()->json(['message' => 'Unauthorized: Only Department Admins can sync office roster.'], 403);
+        }
+
+        $device = BiometricDevice::query()->where('serial_number', $deviceSn)->first();
+        if (! $device) {
+            return response()->json(['message' => "Terminal {$deviceSn} is not registered."], 404);
         }
 
         $deptId = (int) $account->department_id;
@@ -500,7 +560,18 @@ class BiometricRegistrationController extends Controller
             ->get();
 
         $queuedCount = 0;
+        $templatesTransferred = 0;
+
         foreach ($registeredEnrollments as $enrollment) {
+            $prov = $this->transferService->provisionEmployeeToDevice(
+                $device,
+                (string) $enrollment->employee_control_no,
+                (string) ($enrollment->employee_name ?: 'EMP '.$enrollment->employee_control_no),
+                $account->id
+            );
+
+            $templatesTransferred += $prov['templates_transferred'];
+
             $synced = is_array($enrollment->synced_devices) ? $enrollment->synced_devices : [];
             if (! in_array($deviceSn, $synced, true)) {
                 $synced[] = $deviceSn;
@@ -511,8 +582,9 @@ class BiometricRegistrationController extends Controller
         }
 
         return response()->json([
-            'message' => "Successfully synced {$queuedCount} employee(s) to Office Terminal ({$deviceSn}).",
+            'message' => "Successfully synced {$queuedCount} employee(s) ({$templatesTransferred} {$device->getTemplateCommunicationMode()} template(s)) to Office Terminal ({$deviceSn}).",
             'queued_count' => $queuedCount,
+            'templates_transferred' => $templatesTransferred,
             'total_in_roster' => count($assignedControlNos),
             'skipped_unregistered' => count($assignedControlNos) - $queuedCount,
         ]);
@@ -520,7 +592,7 @@ class BiometricRegistrationController extends Controller
 
     public function syncFromLogs(): JsonResponse
     {
-        $rawLogs = \App\Models\AttendanceLog::query()
+        $rawLogs = AttendanceLog::query()
             ->select('biometric_pin', 'device_serial_number', 'punch_time')
             ->orderBy('id')
             ->get();
@@ -624,5 +696,43 @@ class BiometricRegistrationController extends Controller
             'current_page' => $logs->currentPage(),
             'last_page' => $logs->lastPage(),
         ]);
+    }
+
+    /**
+     * Reconcile a single pending enrollment against stored templates or attendance logs.
+     */
+    private function reconcileSingleEnrollment(BiometricEnrollment $enrollment, bool $allowSocketPull): bool
+    {
+        if ($enrollment->status !== BiometricEnrollment::STATUS_PENDING_ENROLLMENT) {
+            return false;
+        }
+
+        $controlNo = (string) $enrollment->employee_control_no;
+
+        if ($allowSocketPull && $enrollment->enrollment_device_sn) {
+            $dev = BiometricDevice::query()->where('serial_number', $enrollment->enrollment_device_sn)->first();
+            if ($dev && $dev->communication_mode === 'LAN_POLL' && ! empty($dev->ip_address)) {
+                $this->lanTemplateService->pullTemplatesFromDevice($dev, $controlNo);
+            }
+        }
+
+        $hasTemplate = BiometricTemplate::query()
+            ->where('employee_control_no', $controlNo)
+            ->exists();
+
+        $hasLogs = $hasTemplate || AttendanceLog::query()
+            ->where('employee_control_no', $controlNo)
+            ->orWhere('biometric_pin', $controlNo)
+            ->exists();
+
+        if (! $hasLogs) {
+            return false;
+        }
+
+        $enrollment->status = BiometricEnrollment::STATUS_REGISTERED;
+        $enrollment->enrolled_at = $enrollment->enrolled_at ?? now();
+        $enrollment->save();
+
+        return true;
     }
 }

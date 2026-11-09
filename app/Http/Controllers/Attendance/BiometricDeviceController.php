@@ -57,8 +57,8 @@ class BiometricDeviceController extends Controller
                 'ip_address' => $dev->ip_address,
                 'port' => $dev->port ?: 4370,
                 'communication_mode' => $dev->communication_mode ?: 'ADMS',
-                'model' => $dev->model_name ?: 'MB360',
-                'model_name' => $dev->model_name ?: 'MB360',
+                'model' => $dev->model_name,
+                'model_name' => $dev->model_name,
                 'firmware_version' => $dev->firmware_version,
                 'comm_key' => $dev->comm_key,
                 'department_id' => $dev->department_id,
@@ -142,7 +142,7 @@ class BiometricDeviceController extends Controller
         if ($existing) {
             $existing->update([
                 'device_name' => trim($validated['device_name']),
-                'model_name' => trim($validated['model_name'] ?? '') ?: ($existing->model_name ?: 'MB360'),
+                'model_name' => trim($validated['model_name'] ?? '') ?: $existing->model_name,
                 'department_id' => $deptId,
                 'department_name' => $department->name,
                 'communication_mode' => $mode,
@@ -162,7 +162,7 @@ class BiometricDeviceController extends Controller
         $device = BiometricDevice::query()->create([
             'serial_number' => $serialNumber,
             'device_name' => trim($validated['device_name']),
-            'model_name' => trim($validated['model_name'] ?? '') ?: 'MB360',
+            'model_name' => trim($validated['model_name'] ?? ''),
             'department_id' => $deptId,
             'department_name' => $department->name,
             'communication_mode' => $mode,
@@ -238,7 +238,7 @@ class BiometricDeviceController extends Controller
 
         $device->update([
             'device_name' => trim($validated['device_name']),
-            'model_name' => trim($validated['model_name'] ?? '') ?: ($device->model_name ?: 'MB360'),
+            'model_name' => trim($validated['model_name'] ?? '') ?: $device->model_name,
             'department_id' => $deptId,
             'department_name' => $department->name,
             'communication_mode' => $mode,

@@ -4,6 +4,7 @@ namespace App\Services\Attendance;
 
 use App\Models\AttendanceRawLog;
 use App\Models\BiometricDevice;
+use App\Models\BiometricEnrollment;
 use App\Models\HrisEmployee;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -16,7 +17,8 @@ use Throwable;
 class LanBioPunchSyncService
 {
     public function __construct(
-        private readonly DtrCalculationService $dtrService
+        private readonly DtrCalculationService $dtrService,
+        private readonly ?LanBioTemplateSyncService $templateSyncService = null
     ) {}
 
     /**
@@ -86,6 +88,17 @@ class LanBioPunchSyncService
 
             $rawLogs = $zk->getAttendanceLogs();
             $zk->disconnect();
+
+            if ($client === null && $device->communication_mode === 'LAN_POLL') {
+                try {
+                    ($this->templateSyncService ?? new LanBioTemplateSyncService)->pullTemplatesFromDevice($device);
+                } catch (Throwable $tplError) {
+                    Log::warning('LanBioPunchSyncService: Non-critical template harvest skipped', [
+                        'device' => $device->serial_number,
+                        'error' => $tplError->getMessage(),
+                    ]);
+                }
+            }
 
             // Mark device online and timestamp heartbeat & sync
             $device->update([
@@ -159,6 +172,23 @@ class LanBioPunchSyncService
 
                 $imported++;
                 $affectedDates[$canonicalControlNo][substr($punchTimeStandard, 0, 10)] = true;
+
+                // Auto-confirm registration if employee was pending biometric enrollment
+                $enrollment = BiometricEnrollment::query()
+                    ->where('employee_control_no', $canonicalControlNo)
+                    ->first();
+
+                if ($enrollment && $enrollment->status === BiometricEnrollment::STATUS_PENDING_ENROLLMENT) {
+                    $enrollment->status = BiometricEnrollment::STATUS_REGISTERED;
+                    $enrollment->enrolled_at = $enrollment->enrolled_at ?? now();
+                    $enrollment->enrollment_device_sn = $enrollment->enrollment_device_sn ?: $device->serial_number;
+                    $synced = is_array($enrollment->synced_devices) ? $enrollment->synced_devices : [];
+                    if (! in_array($device->serial_number, $synced, true)) {
+                        $synced[] = $device->serial_number;
+                        $enrollment->synced_devices = $synced;
+                    }
+                    $enrollment->save();
+                }
             }
 
             // Recalculate DTR for all affected employees and dates

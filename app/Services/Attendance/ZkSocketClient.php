@@ -6,11 +6,33 @@ use Exception;
 use Illuminate\Support\Facades\Log;
 
 /**
- * Low-level TCP socket client for ZKTeco biometric terminals.
+ * Low-level TCP socket client for ZKTeco biometric terminals (F7 / standalone LAN devices).
  * Implements the standard ZK protocol over port 4370.
  */
 class ZkSocketClient
 {
+    public const CMD_DB_RRQ = 7;
+
+    public const CMD_USER_WRQ = 8;
+
+    public const CMD_USERTEMP_RRQ = 9;
+
+    public const CMD_USERTEMP_WRQ = 10;
+
+    public const CMD_ATTLOG_RRQ = 13;
+
+    public const CMD_CLEAR_ATTLOG = 14;
+
+    public const CMD_DELETE_USER = 18;
+
+    public const CMD_DELETE_USERTEMP = 19;
+
+    public const CMD_TMP_WRITE = 87;
+
+    public const CMD_GET_USERTEMP = 88;
+
+    public const CMD_GET_TIME = 201;
+
     public const CMD_CONNECT = 1000;
 
     public const CMD_EXIT = 1001;
@@ -23,17 +45,19 @@ class ZkSocketClient
 
     public const CMD_POWEROFF = 1005;
 
-    public const CMD_ATTLOG_RRQ = 13;
+    public const CMD_REFRESHDATA = 1013;
 
-    public const CMD_CLEAR_ATTLOG = 14;
-
-    public const CMD_GET_TIME = 201;
+    public const CMD_AUTH = 1102;
 
     public const CMD_PREPARE_DATA = 1500;
 
     public const CMD_DATA = 1501;
 
     public const CMD_FREE_DATA = 1502;
+
+    public const CMD_PREPARE_BUFFER = 1503;
+
+    public const CMD_READ_BUFFER = 1504;
 
     public const CMD_ACK_OK = 2000;
 
@@ -43,7 +67,9 @@ class ZkSocketClient
 
     public const CMD_ACK_UNAUTH = 2005;
 
-    public const CMD_AUTH = 1102;
+    public const FCT_FINGERTMP = 2;
+
+    public const FCT_USER = 5;
 
     public const TCP_HEADER_MAGIC = "\x50\x50\x82\x7D";
 
@@ -60,6 +86,8 @@ class ZkSocketClient
 
     protected ?string $lastError = null;
 
+    protected int $detectedUserPacketSize = 72;
+
     public function __construct(
         public readonly string $ip,
         public readonly int $port = 4370,
@@ -70,6 +98,11 @@ class ZkSocketClient
     public function getLastError(): ?string
     {
         return $this->lastError;
+    }
+
+    public function getDetectedUserPacketSize(): int
+    {
+        return $this->detectedUserPacketSize;
     }
 
     /**
@@ -205,6 +238,468 @@ class ZkSocketClient
         $this->isConnected = false;
         $this->sessionId = 0;
         $this->replyId = 0;
+    }
+
+    /**
+     * Fetch user profiles stored on the standalone F7 / LAN terminal.
+     *
+     * @return array<int, array{uid: int, pin: string, name: string, privilege: int, password: string, card: int}>
+     */
+    public function getUsers(): array
+    {
+        if (! $this->isConnected && ! $this->connect()) {
+            return [];
+        }
+
+        try {
+            $this->sendCommand(self::CMD_DISABLEDEVICE);
+            $rawPayload = $this->readBulkDataset(self::CMD_USERTEMP_RRQ, self::FCT_USER);
+            $this->sendCommand(self::CMD_ENABLEDEVICE);
+
+            if ($rawPayload === '') {
+                return [];
+            }
+
+            return $this->parseUserRecords($rawPayload);
+        } catch (Exception $e) {
+            try {
+                Log::warning("ZkSocketClient: Error reading users from {$this->ip}", ['error' => $e->getMessage()]);
+            } catch (\Throwable) {
+            }
+            try {
+                $this->sendCommand(self::CMD_ENABLEDEVICE);
+            } catch (Exception) {
+            }
+
+            return [];
+        }
+    }
+
+    /**
+     * Fetch all fingerprint templates stored on the standalone F7 / LAN terminal.
+     *
+     * @return array<int, array{uid: int, fid: int, valid: int, size: int, template: string}>
+     */
+    public function getFingerprintTemplates(): array
+    {
+        if (! $this->isConnected && ! $this->connect()) {
+            return [];
+        }
+
+        try {
+            $this->sendCommand(self::CMD_DISABLEDEVICE);
+            $rawPayload = $this->readBulkDataset(self::CMD_DB_RRQ, self::FCT_FINGERTMP);
+            if ($rawPayload === '') {
+                $rawPayload = $this->readBulkDataset(self::CMD_USERTEMP_RRQ, self::FCT_FINGERTMP);
+            }
+            $this->sendCommand(self::CMD_ENABLEDEVICE);
+
+            if ($rawPayload === '') {
+                return [];
+            }
+
+            return $this->parseFingerprintTemplates($rawPayload);
+        } catch (Exception $e) {
+            try {
+                Log::warning("ZkSocketClient: Error reading fingerprint templates from {$this->ip}", ['error' => $e->getMessage()]);
+            } catch (\Throwable) {
+            }
+            try {
+                $this->sendCommand(self::CMD_ENABLEDEVICE);
+            } catch (Exception) {
+            }
+
+            return [];
+        }
+    }
+
+    /**
+     * Write or update a user record on an F7 / LAN terminal.
+     */
+    public function setUser(
+        int $uid,
+        string $pin,
+        string $name,
+        int $privilege = 0,
+        string $password = '',
+        int $card = 0,
+        ?int $packetSize = null
+    ): bool {
+        if (! $this->isConnected && ! $this->connect()) {
+            return false;
+        }
+
+        $targetSize = $packetSize ?? $this->detectedUserPacketSize;
+        $payload = $this->packUserRecord($uid, $pin, $name, $privilege, $password, $card, $targetSize);
+
+        try {
+            $this->sendCommand(self::CMD_DISABLEDEVICE);
+            $resp = $this->sendCommand(self::CMD_USER_WRQ, $payload);
+
+            // Fallback to 28-byte classic ZK6 structure if 72-byte rejected by older F7 firmware
+            if ((! $resp || $resp['code'] !== self::CMD_ACK_OK) && $packetSize === null && $targetSize === 72) {
+                $fallbackPayload = $this->packUserRecord($uid, $pin, $name, $privilege, $password, $card, 28);
+                $resp = $this->sendCommand(self::CMD_USER_WRQ, $fallbackPayload);
+                if ($resp && $resp['code'] === self::CMD_ACK_OK) {
+                    $this->detectedUserPacketSize = 28;
+                }
+            }
+
+            $this->sendCommand(self::CMD_REFRESHDATA);
+            $this->sendCommand(self::CMD_ENABLEDEVICE);
+
+            return (bool) ($resp && $resp['code'] === self::CMD_ACK_OK);
+        } catch (Exception) {
+            try {
+                $this->sendCommand(self::CMD_ENABLEDEVICE);
+            } catch (Exception) {
+            }
+
+            return false;
+        }
+    }
+
+    /**
+     * Upload a raw binary fingerprint template to a user's finger slot (0-9) on an F7 / LAN terminal.
+     */
+    public function setFingerprintTemplate(int $uid, int $fid, string $rawTemplateBytes, int $valid = 1): bool
+    {
+        if ($rawTemplateBytes === '' || (! $this->isConnected && ! $this->connect())) {
+            return false;
+        }
+
+        $size = strlen($rawTemplateBytes);
+
+        try {
+            $this->sendCommand(self::CMD_DISABLEDEVICE);
+
+            // Method 1: Buffered write (CMD_PREPARE_DATA -> CMD_DATA -> CMD_TMP_WRITE) for classic ZK6/ZK8 F7
+            $prep = $this->sendCommand(self::CMD_PREPARE_DATA, pack('V', $size));
+            $ok = false;
+
+            if ($prep && in_array($prep['code'], [self::CMD_ACK_OK, self::CMD_PREPARE_DATA], true)) {
+                $dataResp = $this->sendCommand(self::CMD_DATA, $rawTemplateBytes);
+                if ($dataResp && in_array($dataResp['code'], [self::CMD_ACK_OK, self::CMD_ACK_DATA], true)) {
+                    $writeMeta = pack('vCCv', $uid, $fid, $valid, $size);
+                    $writeResp = $this->sendCommand(self::CMD_TMP_WRITE, $writeMeta);
+                    $ok = (bool) ($writeResp && $writeResp['code'] === self::CMD_ACK_OK);
+                }
+            }
+
+            // Method 2: Direct CMD_USERTEMP_WRQ (10) fallback
+            if (! $ok) {
+                $directPayload = $this->packFingerprintRecord($uid, $fid, $rawTemplateBytes, $valid);
+                $directResp = $this->sendCommand(self::CMD_USERTEMP_WRQ, $directPayload);
+                $ok = (bool) ($directResp && $directResp['code'] === self::CMD_ACK_OK);
+            }
+
+            $this->sendCommand(self::CMD_REFRESHDATA);
+            $this->sendCommand(self::CMD_ENABLEDEVICE);
+
+            return $ok;
+        } catch (Exception) {
+            try {
+                $this->sendCommand(self::CMD_ENABLEDEVICE);
+            } catch (Exception) {
+            }
+
+            return false;
+        }
+    }
+
+    /**
+     * Delete a user (and associated templates) from an F7 / LAN terminal by internal 2-byte UID.
+     */
+    public function deleteUser(int $uid): bool
+    {
+        if ($uid <= 0 || (! $this->isConnected && ! $this->connect())) {
+            return false;
+        }
+
+        try {
+            $this->sendCommand(self::CMD_DISABLEDEVICE);
+            $resp = $this->sendCommand(self::CMD_DELETE_USER, pack('v', $uid));
+            $this->sendCommand(self::CMD_REFRESHDATA);
+            $this->sendCommand(self::CMD_ENABLEDEVICE);
+
+            return (bool) ($resp && $resp['code'] === self::CMD_ACK_OK);
+        } catch (Exception) {
+            try {
+                $this->sendCommand(self::CMD_ENABLEDEVICE);
+            } catch (Exception) {
+            }
+
+            return false;
+        }
+    }
+
+    /**
+     * Delete a user from an F7 / LAN terminal by matching their employee PIN / Control Number.
+     */
+    public function deleteUserByPin(string $pin): bool
+    {
+        $normalizedTarget = ltrim(trim($pin), '0');
+        $users = $this->getUsers();
+
+        foreach ($users as $user) {
+            $candidatePin = trim($user['pin']);
+            if ($candidatePin === trim($pin) || ($normalizedTarget !== '' && ltrim($candidatePin, '0') === $normalizedTarget)) {
+                return $this->deleteUser($user['uid']);
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Parse raw binary user table into structured user records (auto-detects 28-byte ZK6 vs 72-byte ZK8).
+     *
+     * @return array<int, array{uid: int, pin: string, name: string, privilege: int, password: string, card: int}>
+     */
+    public function parseUserRecords(string $data): array
+    {
+        $len = strlen($data);
+        if ($len < 28) {
+            return [];
+        }
+
+        $offset = 0;
+        $declaredSize = unpack('V', substr($data, 0, 4))[1] ?? 0;
+        if ($declaredSize === $len - 4 || (($len - 4) > 0 && ((($len - 4) % 72 === 0) || (($len - 4) % 28 === 0)))) {
+            $offset = 4;
+        }
+
+        $remaining = $len - $offset;
+        if ($remaining < 28) {
+            return [];
+        }
+
+        $packetSize = 72;
+        if ($remaining % 72 === 0 && $remaining % 28 !== 0) {
+            $packetSize = 72;
+        } elseif ($remaining % 28 === 0 && $remaining % 72 !== 0) {
+            $packetSize = 28;
+        } elseif ($remaining < 72) {
+            $packetSize = 28;
+        }
+
+        $this->detectedUserPacketSize = $packetSize;
+        $users = [];
+
+        while ($offset + $packetSize <= $len) {
+            $chunk = substr($data, $offset, $packetSize);
+            $offset += $packetSize;
+
+            if ($packetSize === 28) {
+                $uid = unpack('v', substr($chunk, 0, 2))[1] ?? 0;
+                $privilege = ord($chunk[2] ?? "\x00");
+                $password = trim(explode("\x00", substr($chunk, 3, 5))[0]);
+                $name = trim(preg_replace('/[^\x20-\x7E]/', '', explode("\x00", substr($chunk, 8, 8))[0]) ?? '');
+                $card = unpack('V', substr($chunk, 16, 4))[1] ?? 0;
+                $pinInt = unpack('V', substr($chunk, 24, 4))[1] ?? 0;
+                $pin = $pinInt > 0 ? (string) $pinInt : (string) $uid;
+            } else {
+                $uid = unpack('v', substr($chunk, 0, 2))[1] ?? 0;
+                $privilege = ord($chunk[2] ?? "\x00");
+                $password = trim(explode("\x00", substr($chunk, 3, 8))[0]);
+                $name = trim(preg_replace('/[^\x20-\x7E]/', '', explode("\x00", substr($chunk, 11, 24))[0]) ?? '');
+                $card = unpack('V', substr($chunk, 35, 4))[1] ?? 0;
+                $pinRaw = trim(preg_replace('/[^\x20-\x7E]/', '', explode("\x00", substr($chunk, 48, 24))[0]) ?? '');
+                $pin = $pinRaw !== '' ? $pinRaw : (string) $uid;
+            }
+
+            if ($uid > 0 && $pin !== '') {
+                $users[] = [
+                    'uid' => $uid,
+                    'pin' => $pin,
+                    'name' => $name,
+                    'privilege' => $privilege,
+                    'password' => $password,
+                    'card' => $card,
+                ];
+            }
+        }
+
+        return $users;
+    }
+
+    /**
+     * Pack a user record into 28-byte (classic F7 ZK6) or 72-byte (F7-C ZK8) binary layout.
+     */
+    public function packUserRecord(
+        int $uid,
+        string $pin,
+        string $name,
+        int $privilege = 0,
+        string $password = '',
+        int $card = 0,
+        int $packetSize = 72
+    ): string {
+        $cleanName = trim(preg_replace('/[^\x20-\x7E]/', '', $name) ?? '');
+
+        if ($packetSize === 28) {
+            $digitsOnly = preg_replace('/\D/', '', $pin) ?? '';
+            $numericPin = $digitsOnly !== '' ? (int) $digitsOnly : $uid;
+
+            return pack(
+                'vCa5a8VxCvV',
+                $uid,
+                $privilege,
+                substr($password, 0, 5),
+                substr($cleanName, 0, 8),
+                $card,
+                1,
+                0,
+                $numericPin
+            );
+        }
+
+        return pack(
+            'vCa8a24Va1a7xa24',
+            $uid,
+            $privilege,
+            substr($password, 0, 8),
+            substr($cleanName, 0, 24),
+            $card,
+            "\x00",
+            '1',
+            substr(trim($pin), 0, 24)
+        );
+    }
+
+    /**
+     * Parse raw binary fingerprint template stream (`<HHbb` 6-byte header + template bytes).
+     *
+     * @return array<int, array{uid: int, fid: int, valid: int, size: int, template: string}>
+     */
+    public function parseFingerprintTemplates(string $data): array
+    {
+        $len = strlen($data);
+        if ($len < 6) {
+            return [];
+        }
+
+        $offset = 0;
+        while ($offset + 4 <= $len) {
+            $declaredTotal = unpack('V', substr($data, $offset, 4))[1] ?? 0;
+            if ($declaredTotal === ($len - $offset - 4)) {
+                $offset += 4;
+            } else {
+                break;
+            }
+        }
+
+        $templates = [];
+        while ($offset + 6 <= $len) {
+            $header = unpack('vsize/vuid/Cfid/Cvalid', substr($data, $offset, 6));
+            $recordSize = (int) ($header['size'] ?? 0);
+            $uid = (int) ($header['uid'] ?? 0);
+            $fid = (int) ($header['fid'] ?? 0);
+            $valid = (int) ($header['valid'] ?? 1);
+
+            if ($recordSize <= 6 || $offset + $recordSize > $len) {
+                break;
+            }
+
+            $rawTemplate = substr($data, $offset + 6, $recordSize - 6);
+            $offset += $recordSize;
+
+            if ($uid > 0 && $fid <= 9 && $rawTemplate !== '') {
+                $templates[] = [
+                    'uid' => $uid,
+                    'fid' => $fid,
+                    'valid' => $valid,
+                    'size' => strlen($rawTemplate),
+                    'template' => $rawTemplate,
+                ];
+            }
+        }
+
+        return $templates;
+    }
+
+    /**
+     * Pack a single fingerprint template record with 6-byte ZK header (`size`, `uid`, `fid`, `valid`).
+     */
+    public function packFingerprintRecord(int $uid, int $fid, string $rawTemplate, int $valid = 1): string
+    {
+        $totalRecordSize = strlen($rawTemplate) + 6;
+
+        return pack('vvCC', $totalRecordSize, $uid, $fid, $valid).$rawTemplate;
+    }
+
+    /**
+     * Read bulk dataset (users or fingerprint templates) using buffered or direct ZK protocol.
+     */
+    protected function readBulkDataset(int $command, int $fct): string
+    {
+        // Try buffered read first (CMD_PREPARE_BUFFER = 1503) used by ZK6/ZK8 terminals
+        $bufReq = pack('CvVV', 1, $command, $fct, 0);
+        $resp = $this->sendCommand(self::CMD_PREPARE_BUFFER, $bufReq);
+
+        if ($resp && $resp['code'] === self::CMD_ACK_DATA && strlen($resp['data']) >= 5) {
+            return substr($resp['data'], 1);
+        }
+
+        if ($resp && $resp['code'] === self::CMD_DATA && strlen($resp['data']) >= 4) {
+            return $resp['data'];
+        }
+
+        if ($resp && $resp['code'] === self::CMD_ACK_OK && strlen($resp['data']) >= 5) {
+            $totalSize = unpack('V', substr($resp['data'], 1, 4))[1] ?? 0;
+            if ($totalSize > 0) {
+                $buffer = '';
+                $offset = 0;
+                $maxChunk = 16384;
+
+                while ($offset < $totalSize) {
+                    $readLen = min($maxChunk, $totalSize - $offset);
+                    $chunkReq = $this->sendCommand(self::CMD_READ_BUFFER, pack('VV', $offset, $readLen));
+                    if (! $chunkReq) {
+                        break;
+                    }
+
+                    if ($chunkReq['code'] === self::CMD_PREPARE_DATA) {
+                        $expected = unpack('V', substr($chunkReq['data'], 0, 4))[1] ?? $readLen;
+                        $chunkData = $this->readDataStream($expected);
+                    } else {
+                        $chunkData = $chunkReq['data'];
+                    }
+
+                    if ($chunkData === '') {
+                        break;
+                    }
+
+                    $buffer .= $chunkData;
+                    $offset += strlen($chunkData);
+                }
+
+                $this->sendCommand(self::CMD_FREE_DATA);
+                if ($buffer !== '') {
+                    return pack('V', strlen($buffer)).$buffer;
+                }
+            }
+        }
+
+        // Fallback to direct command read (CMD_USERTEMP_RRQ / CMD_DB_RRQ)
+        $directResp = $this->sendCommand($command, pack('C', $fct));
+        if (! $directResp) {
+            return '';
+        }
+
+        if (in_array($directResp['code'], [self::CMD_ACK_OK, self::CMD_ACK_DATA, self::CMD_DATA], true) && $directResp['data'] !== '') {
+            return $directResp['data'];
+        }
+
+        if ($directResp['code'] === self::CMD_PREPARE_DATA) {
+            $expectedBytes = unpack('V', substr($directResp['data'], 0, 4))[1] ?? 0;
+            $stream = $this->readDataStream($expectedBytes);
+            $this->sendCommand(self::CMD_FREE_DATA);
+
+            return $stream;
+        }
+
+        return '';
     }
 
     /**
@@ -409,12 +904,6 @@ class ZkSocketClient
         }
 
         // ZKTeco bit-packed timestamp format:
-        // second = $encoded % 60
-        // minute = ($encoded / 60) % 60
-        // hour   = ($encoded / 3600) % 24
-        // day    = (($encoded / 86400) % 31) + 1
-        // month  = (($encoded / (86400 * 31)) % 12) + 1
-        // year   = ($encoded / (86400 * 31 * 12)) + 2000
         $second = $encoded % 60;
         $minute = (int) floor($encoded / 60) % 60;
         $hour = (int) floor($encoded / 3600) % 24;
