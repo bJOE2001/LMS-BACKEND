@@ -16,6 +16,11 @@ return Application::configure(basePath: dirname(__DIR__))
     ->withMiddleware(function (Middleware $middleware): void {
         $middleware->throttleApi();
 
+        $middleware->validateCsrfTokens(except: [
+            'iclock/*',
+            'api/iclock/*',
+        ]);
+
         $middleware->alias([
             'hr' => \App\Http\Middleware\EnsureHR::class,
             'hr.module' => \App\Http\Middleware\EnsureHRModuleAccess::class,

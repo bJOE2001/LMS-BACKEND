@@ -213,6 +213,8 @@ class LanBiometricSyncTest extends TestCase
 
         Sanctum::actingAs($deptAdmin);
 
+        BiometricDevice::query()->where('department_id', $deptId)->delete();
+
         $sn = 'TEST_ADMS_DEV_'.uniqid();
         $device = BiometricDevice::query()->create([
             'device_name' => 'Office Terminal In ADMS Mode',

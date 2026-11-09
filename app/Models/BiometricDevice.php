@@ -33,7 +33,6 @@ class BiometricDevice extends Model
         'communication_mode',
         'department_id',
         'department_name',
-        'zkbio_area_id',
         'is_primary',
         'model_name',
         'firmware_version',
@@ -61,7 +60,6 @@ class BiometricDevice extends Model
     {
         return [
             'port' => 'integer',
-            'zkbio_area_id' => 'integer',
             'is_primary' => 'boolean',
             'device_user_count' => 'integer',
             'device_finger_count' => 'integer',

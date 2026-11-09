@@ -36,6 +36,15 @@ Route::get('/ping', function () {
     ]);
 });
 
+// Public ADMS push routes
+Route::prefix('iclock')->group(function () {
+    Route::match(['get', 'post'], '/cdata', [\App\Http\Controllers\Attendance\NativeAdmsController::class, 'cdata']);
+    Route::match(['get', 'post'], '/getrequest', [\App\Http\Controllers\Attendance\NativeAdmsController::class, 'getrequest']);
+    Route::match(['get', 'post'], '/devicecmd', [\App\Http\Controllers\Attendance\NativeAdmsController::class, 'devicecmd']);
+    Route::match(['get', 'post'], '/registry', [\App\Http\Controllers\Attendance\NativeAdmsController::class, 'registry']);
+    Route::match(['get', 'post'], '/fdata', [\App\Http\Controllers\Attendance\NativeAdmsController::class, 'fdata']);
+});
+
 // Authentication
 Route::post('/login', [AuthController::class, 'login']);
 
@@ -126,7 +135,6 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::post('/dtr/override', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'overrideTime']);
         Route::post('/dtr/recalculate', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'recalculate']);
         Route::get('/devices', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'listDevices']);
-        Route::get('/zkbio-areas', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'listZkBioAreas']);
         Route::post('/devices', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'storeDevice'])->middleware('hr');
         Route::post('/devices/{id}/update', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'updateDevice'])->middleware('hr');
         Route::post('/devices/{id}/authorize', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'authorizeDevice'])->middleware('hr');

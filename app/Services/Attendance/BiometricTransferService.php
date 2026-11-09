@@ -25,14 +25,7 @@ class BiometricTransferService
      */
     public const CHRMO_DEPARTMENT_ID = 18;
 
-    /**
-     * Central enrollment pool area in ZKBio Time (CHRMO).
-     */
-    public const CHRMO_AREA_ID = 3;
-
-    public function __construct(
-        protected ZkBioTimeReconciliationService $zkBioReconciliation
-    ) {}
+    public function __construct() {}
 
     /**
      * Transfer an employee's biometric profile and templates to the target office's
@@ -98,35 +91,7 @@ class BiometricTransferService
                 ];
             }
 
-            // Verify ZKBio Area mapping on primary target device
             $primaryTarget = $targetDevices->first();
-            $targetAreaId = (int) ($primaryTarget->zkbio_area_id ?? 0);
-
-            if ($targetAreaId <= 0 || $targetAreaId === 1) {
-                $failMsg = "The biometric device for {$departmentLabel} does not have a valid ZKBio Time Area configured (Area 1 is not supported).";
-
-                $this->recordTransferLog([
-                    'employee_control_no' => $canonicalControlNo,
-                    'employee_name' => $fullName,
-                    'action_type' => BiometricTransferLog::ACTION_TRANSFER,
-                    'source_department_id' => $sourceDepartmentId ?? self::CHRMO_DEPARTMENT_ID,
-                    'source_office_name' => $this->resolveOfficeName($sourceDepartmentId ?? self::CHRMO_DEPARTMENT_ID),
-                    'target_department_id' => $newDepartmentId,
-                    'target_office_name' => $departmentLabel,
-                    'target_device_sn' => $primaryTarget->serial_number,
-                    'target_area_id' => $targetAreaId,
-                    'status' => BiometricTransferLog::STATUS_FAILED,
-                    'remarks' => $failMsg,
-                    'performed_by_user_id' => $userId,
-                    'performed_by_name' => $performedByName,
-                ]);
-
-                return [
-                    'transferred' => false,
-                    'message' => $failMsg,
-                ];
-            }
-
             $targetSns = $targetDevices->pluck('serial_number')->filter()->values()->all();
 
             // 2. Locate employee biometric enrollment and determine source device(s)
@@ -180,22 +145,8 @@ class BiometricTransferService
             }
             $sourceOfficeName = $this->resolveOfficeName($sourceDepartmentId);
             $sourceDeviceSn = count($sourceSns) > 0 ? implode(', ', $sourceSns) : null;
-            $sourceAreaId = ($sourceDepartmentId === self::CHRMO_DEPARTMENT_ID) ? self::CHRMO_AREA_ID : null;
 
-            // 3. Assign employee exclusively to target office area in ZKBio Time
-            $syncResult = $this->zkBioReconciliation->assignEmployeeExclusivelyToArea(
-                $canonicalControlNo,
-                $targetAreaId,
-                $fullName
-            );
-
-            if (! $syncResult['success']) {
-                Log::warning("BiometricTransferService: ZKBio Time exclusive area sync warning for [{$canonicalControlNo}]", [
-                    'message' => $syncResult['message'],
-                ]);
-            }
-
-            // 4. Update BiometricEnrollment record
+            // 3. Update BiometricEnrollment record
             if (! $enrollment) {
                 $enrollment = new BiometricEnrollment([
                     'employee_control_no' => $canonicalControlNo,
@@ -217,7 +168,7 @@ class BiometricTransferService
 
             $successMsg = "Biometrics transferred to {$departmentLabel} ({$targetName}) and deleted from {$sourceNames}.";
 
-            // 5. Audit Transaction in tblBiometricTransferLogs
+            // 4. Audit Transaction in tblBiometricTransferLogs
             $log = $this->recordTransferLog([
                 'employee_control_no' => $canonicalControlNo,
                 'employee_name' => $fullName,
@@ -225,11 +176,9 @@ class BiometricTransferService
                 'source_department_id' => $sourceDepartmentId,
                 'source_office_name' => $sourceOfficeName,
                 'source_device_sn' => $sourceDeviceSn,
-                'source_area_id' => $sourceAreaId,
                 'target_department_id' => $newDepartmentId,
                 'target_office_name' => $departmentLabel,
                 'target_device_sn' => $primarySn,
-                'target_area_id' => $targetAreaId,
                 'status' => BiometricTransferLog::STATUS_SUCCESS,
                 'remarks' => $successMsg,
                 'performed_by_user_id' => $userId,
@@ -293,20 +242,6 @@ class BiometricTransferService
         $oldDevice = BiometricDevice::query()->where('department_id', $oldDepartmentId)->first();
 
         try {
-            // Reset employee area back to CHRMO central enrollment area (Area 3)
-            // This causes ZKBio Time to automatically send DATA DELETE USERINFO to the office device
-            $resetResult = $this->zkBioReconciliation->assignEmployeeExclusivelyToArea(
-                $canonicalControlNo,
-                self::CHRMO_AREA_ID,
-                $fullName
-            );
-
-            if (! $resetResult['success']) {
-                Log::warning("BiometricTransferService: De-assignment area reset warning for [{$canonicalControlNo}]", [
-                    'message' => $resetResult['message'],
-                ]);
-            }
-
             // Update synced_devices in enrollment
             $enrollment = BiometricEnrollment::query()
                 ->where('employee_control_no', $canonicalControlNo)
@@ -328,10 +263,8 @@ class BiometricTransferService
                 'source_department_id' => $oldDepartmentId,
                 'source_office_name' => $sourceOfficeName,
                 'source_device_sn' => $oldDevice?->serial_number,
-                'source_area_id' => $oldDevice?->zkbio_area_id,
                 'target_department_id' => self::CHRMO_DEPARTMENT_ID,
                 'target_office_name' => 'CHRMO',
-                'target_area_id' => self::CHRMO_AREA_ID,
                 'status' => BiometricTransferLog::STATUS_SUCCESS,
                 'remarks' => $successMsg,
                 'performed_by_user_id' => $userId,
