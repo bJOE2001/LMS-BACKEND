@@ -58,7 +58,7 @@ Route::post('/reset-password', [PasswordResetController::class, 'resetPassword']
 | ERMS Integration Routes (trusted frontend origins or API key protected)
 |--------------------------------------------------------------------------
 */
-Route::prefix('erms')->middleware('erms.auth')->group(function () {
+Route::prefix('erms')->middleware(['erms.auth', 'throttle:60,1'])->group(function () {
     Route::get('/employee-access', [LeaveApplicationController::class, 'ermsEmployeeAccess']);
     Route::get('/leave-balance/{id}', [LeaveApplicationController::class, 'ermsGetLeaveBalance']);
     Route::get('/leave-balances/{controlNo}', [LeaveApplicationController::class, 'ermsGetLeaveBalances']);

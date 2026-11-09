@@ -22,16 +22,14 @@ trait FiltersEmployeeControlNos
 
         // SQL Server rejects statements with more than 2100 bound parameters.
         return $query->where(function ($nestedQuery) use ($column, $controlNos): void {
-            foreach (array_chunk($controlNos, self::EMPLOYEE_CONTROL_NO_LITERAL_CHUNK_SIZE) as $index => $chunk) {
-                $condition = $this->rawEmployeeControlNoInCondition($column, $chunk);
-
+            foreach (array_chunk($controlNos, self::EMPLOYEE_CONTROL_NO_BINDING_LIMIT) as $index => $chunk) {
                 if ($index === 0) {
-                    $nestedQuery->whereRaw($condition);
+                    $nestedQuery->whereIn($column, $chunk);
 
                     continue;
                 }
 
-                $nestedQuery->orWhereRaw($condition);
+                $nestedQuery->orWhereIn($column, $chunk);
             }
         });
     }

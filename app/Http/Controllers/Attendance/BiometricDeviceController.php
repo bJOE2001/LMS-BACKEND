@@ -111,7 +111,7 @@ class BiometricDeviceController extends Controller
             'communication_mode' => ['nullable', 'string', 'in:ADMS,LAN_POLL,OFFLINE_USB'],
             'is_primary' => ['nullable', 'boolean'],
             'comm_key' => ['nullable', 'string', 'max:50'],
-            'ip_address' => ['nullable', 'string', 'max:45'],
+            'ip_address' => ['nullable', 'ip'],
             'port' => ['nullable', 'integer', 'min:1', 'max:65535'],
         ]);
 
@@ -209,7 +209,7 @@ class BiometricDeviceController extends Controller
             'communication_mode' => ['nullable', 'string', 'in:ADMS,LAN_POLL,OFFLINE_USB'],
             'is_primary' => ['nullable', 'boolean'],
             'comm_key' => ['nullable', 'string', 'max:50'],
-            'ip_address' => ['nullable', 'string', 'max:45'],
+            'ip_address' => ['nullable', 'ip'],
             'port' => ['nullable', 'integer', 'min:1', 'max:65535'],
         ]);
 
@@ -326,10 +326,18 @@ class BiometricDeviceController extends Controller
 
         $device = BiometricDevice::query()->findOrFail($id);
 
-        if (! $device->ip_address) {
+        $ip = trim((string) $device->ip_address);
+        if ($ip === '') {
             return response()->json([
                 'success' => false,
                 'message' => "Device '{$device->device_name}' does not have an IP address configured.",
+            ], 422);
+        }
+
+        if ($ip === '127.0.0.1' || $ip === '::1' || str_starts_with($ip, '169.254.')) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Testing connection to loopback or cloud metadata IP addresses is not permitted.',
             ], 422);
         }
 

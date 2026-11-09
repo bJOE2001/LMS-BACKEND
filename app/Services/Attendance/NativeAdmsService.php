@@ -73,6 +73,18 @@ class NativeAdmsService
         }
 
         if (in_array($table, ['OPERLOG', 'BIODATA', 'USERINFO', 'USER', 'FINGERTMP', 'FP', 'FACE'], true)) {
+            if (! $device || ! $device->is_active) {
+                Log::warning("NativeAdmsService: Rejected biometric push from unapproved or inactive terminal: {$serialNumber}");
+
+                return [
+                    'success' => false,
+                    'table' => $table,
+                    'imported' => 0,
+                    'duplicates' => 0,
+                    'response_text' => 'OK',
+                ];
+            }
+
             return $this->processBiometricDataPush($device, $serialNumber, $table, $rawContent);
         }
 
@@ -551,6 +563,18 @@ class NativeAdmsService
      */
     private function processAttendanceLogs(?BiometricDevice $device, string $serialNumber, string $rawContent): array
     {
+        if (! $device || ! $device->is_active) {
+            Log::warning("NativeAdmsService: Rejected attendance push from unapproved or inactive terminal: {$serialNumber}");
+
+            return [
+                'success' => false,
+                'table' => 'ATTLOG',
+                'imported' => 0,
+                'duplicates' => 0,
+                'response_text' => 'OK',
+            ];
+        }
+
         $lines = preg_split('/\r\n|\r|\n/', trim($rawContent));
         if (empty($lines)) {
             return [

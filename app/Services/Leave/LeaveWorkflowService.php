@@ -10890,7 +10890,17 @@ class LeaveWorkflowService
         }
 
         if (filter_var($reference, FILTER_VALIDATE_URL)) {
-            return redirect()->away($reference);
+            $parsedHost = parse_url($reference, PHP_URL_HOST);
+            $appHost = parse_url((string) config('app.url'), PHP_URL_HOST);
+            $frontendUrl = (string) (config('app.frontend_url') ?: env('FRONTEND_URL', ''));
+            $frontendHost = parse_url($frontendUrl, PHP_URL_HOST);
+            $allowedHosts = array_values(array_filter(array_map('strtolower', array_filter([$appHost, $frontendHost]))));
+
+            if ($parsedHost !== null && in_array(strtolower($parsedHost), $allowedHosts, true)) {
+                return redirect()->away($reference);
+            }
+
+            return response()->json(['message' => 'Attachment redirect URL is not permitted.'], 400);
         }
 
         $normalizedReference = ltrim(str_replace('\\', '/', $reference), '/');
@@ -10922,14 +10932,16 @@ class LeaveWorkflowService
                 }
 
                 $filename = basename($path);
-                $mimeType = $storage->mimeType($path) ?: 'application/octet-stream';
+                $mimeType = strtolower((string) ($storage->mimeType($path) ?: 'application/octet-stream'));
+                $safeInlineMimeTypes = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
+                $disposition = in_array($mimeType, $safeInlineMimeTypes, true) ? 'inline' : 'attachment';
 
                 return $storage->response(
                     $path,
                     $filename,
                     [
                         'Content-Type' => $mimeType,
-                        'Content-Disposition' => 'inline; filename="'.$filename.'"',
+                        'Content-Disposition' => "{$disposition}; filename=\"{$filename}\"",
                         'X-Content-Type-Options' => 'nosniff',
                     ]
                 );
@@ -11765,7 +11777,7 @@ class LeaveWorkflowService
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
             'allow_sl_vl_cross_deduction' => ['nullable', 'boolean'],
-            'attachment' => ['nullable', 'file', 'max:10240'],
+            'attachment' => ['nullable', 'file', 'mimes:pdf,jpg,jpeg,png', 'max:10240'],
             'attachment_submitted' => ['nullable', 'boolean'],
             'attachment_attached' => ['nullable', 'boolean'],
             'has_attachment' => ['nullable', 'boolean'],
@@ -11794,7 +11806,7 @@ class LeaveWorkflowService
             'reason' => ['nullable', 'string', 'max:2000'],
             'details_of_leave' => ['nullable', 'string', 'max:2000'],
             'salary' => ['nullable', 'numeric', 'min:0'],
-            'attachment' => ['nullable', 'file', 'max:10240'],
+            'attachment' => ['nullable', 'file', 'mimes:pdf,jpg,jpeg,png', 'max:10240'],
             'attachment_submitted' => ['nullable', 'boolean'],
             'attachment_attached' => ['nullable', 'boolean'],
             'has_attachment' => ['nullable', 'boolean'],
@@ -12176,7 +12188,7 @@ class LeaveWorkflowService
             'commutation' => ['nullable', 'string', 'in:Not Requested,Requested'],
             'pay_mode' => ['nullable', 'string', 'in:WP,WOP'],
             'allow_sl_vl_cross_deduction' => ['nullable', 'boolean'],
-            'attachment' => ['nullable', 'file', 'max:10240'],
+            'attachment' => ['nullable', 'file', 'mimes:pdf,jpg,jpeg,png', 'max:10240'],
             'attachment_submitted' => ['nullable', 'boolean'],
             'attachment_attached' => ['nullable', 'boolean'],
             'has_attachment' => ['nullable', 'boolean'],

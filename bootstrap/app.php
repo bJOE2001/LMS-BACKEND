@@ -14,6 +14,7 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware): void {
+        $middleware->append(\App\Http\Middleware\SecurityHeaders::class);
         $middleware->throttleApi();
 
         $middleware->validateCsrfTokens(except: [
@@ -30,6 +31,22 @@ return Application::configure(basePath: dirname(__DIR__))
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
+        $exceptions->render(function (\Illuminate\Database\QueryException $exception, Request $request) {
+            if (! $request->is('api/*')) {
+                return null;
+            }
+
+            \Illuminate\Support\Facades\Log::error('API Database Error: '.$exception->getMessage(), [
+                'sql' => $exception->getSql(),
+                'path' => $request->path(),
+                'ip' => $request->ip(),
+            ]);
+
+            return response()->json([
+                'message' => 'A database error occurred while processing your request.',
+            ], 500);
+        });
+
         $exceptions->render(function (AuthenticationException $exception, Request $request) {
             if (! $request->is('api/*')) {
                 return null;
