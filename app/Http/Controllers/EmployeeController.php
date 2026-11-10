@@ -6575,7 +6575,8 @@ class EmployeeController extends Controller
                 );
 
                 $particulars = $this->buildLedgerParticulars('deduction', 'other', $totalDays, false, false, 'CTO');
-                $actionTaken = sprintf('Application #%d', (int) $app->id);
+                $appDateFormatted = $appDate ? Carbon::parse($appDate)->format('F j, Y') : '';
+                $actionTaken = $appDateFormatted !== '' ? $appDateFormatted : sprintf('Application #%d', (int) $app->id);
 
                 // Original Deduction
                 $transactions[] = [
