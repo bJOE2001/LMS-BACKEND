@@ -235,8 +235,10 @@ class BiometricTransferService
             $enrollment->save();
 
             $successMsg = $requiresLocalScan
-                ? "User profile provisioned on {$departmentLabel} ({$targetName}). No {$primaryMode} templates were cached yet—employee must scan once on {$targetName}."
-                : "Biometrics ({$maxTemplatesTransferred} {$primaryMode} template(s)) transferred to {$departmentLabel} ({$targetName}) and deleted from {$sourceNames}.";
+                ? 'Profile provisioned; scan needed'
+                : ($maxTemplatesTransferred > 0
+                    ? "Transferred ({$maxTemplatesTransferred} template synced)"
+                    : 'Transferred biometrics');
 
             // 7. Audit Transaction in tblBiometricTransferLogs
             $log = $this->recordTransferLog([
@@ -345,7 +347,7 @@ class BiometricTransferService
                 $enrollment->save();
             }
 
-            $successMsg = 'Employee removed from office and biometrics cleared from office terminal.';
+            $successMsg = 'Removed from office terminal';
 
             // Audit transaction
             $log = $this->recordTransferLog([

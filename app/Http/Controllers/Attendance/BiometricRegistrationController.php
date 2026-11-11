@@ -8,6 +8,7 @@ use App\Models\BiometricDevice;
 use App\Models\BiometricEnrollment;
 use App\Models\BiometricTemplate;
 use App\Models\BiometricTransferLog;
+use App\Models\Department;
 use App\Models\DepartmentAdmin;
 use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HRAccount;
@@ -301,7 +302,7 @@ class BiometricRegistrationController extends Controller
                     'employee_name' => $fullName,
                     'action_type' => BiometricTransferLog::ACTION_REGISTRATION,
                     'target_department_id' => $device->department_id ?: BiometricTransferService::CHRMO_DEPARTMENT_ID,
-                    'target_office_name' => $device->department_name ?: 'CHRMO',
+                    'target_office_name' => $this->resolveOfficeAcronym($device->department_id, $device->department_name) ?: 'CHRMO',
                     'target_device_sn' => $deviceSn,
                     'status' => BiometricTransferLog::STATUS_FAILED,
                     'remarks' => $pushResult['message'],
@@ -334,17 +335,18 @@ class BiometricRegistrationController extends Controller
             'synced_devices' => array_values(array_unique($existingSynced)),
         ]);
 
-        $commMode = $device->getTemplateCommunicationMode();
         $remarks = $requiresLocalScan
-            ? "Registration initiated on device {$deviceSn} ({$commMode}). Awaiting scan."
-            : "Provisioned profile and synced {$templatesTransferred} {$commMode} template(s) to {$deviceSn}.";
+            ? 'Registration initiated; awaiting scan'
+            : ($templatesTransferred > 0
+                ? "Registered ({$templatesTransferred} template synced)"
+                : 'Registration completed');
 
         $transferLog = BiometricTransferLog::query()->create([
             'employee_control_no' => $controlNo,
             'employee_name' => $fullName,
             'action_type' => BiometricTransferLog::ACTION_REGISTRATION,
             'target_department_id' => $device->department_id ?: BiometricTransferService::CHRMO_DEPARTMENT_ID,
-            'target_office_name' => $device->department_name ?: 'CHRMO',
+            'target_office_name' => $this->resolveOfficeAcronym($device->department_id, $device->department_name) ?: 'CHRMO',
             'target_device_sn' => $deviceSn,
             'status' => BiometricTransferLog::STATUS_SUCCESS,
             'remarks' => $remarks,
@@ -487,6 +489,19 @@ class BiometricRegistrationController extends Controller
                 'enrolled_at' => now(),
                 'synced_devices' => [$deviceSn],
             ]);
+
+            $this->logRegistration(
+                $controlNo,
+                $fullName,
+                BiometricTransferLog::STATUS_SUCCESS,
+                $provision['templates_transferred'] > 0
+                    ? "New biometric enrollment created; synced {$provision['templates_transferred']} template(s) to {$deviceSn}."
+                    : "New biometric enrollment created (pending scan) via office pull to {$deviceSn}.",
+                $deviceSn,
+                (int) $account->department_id,
+                $this->resolveOfficeAcronym($device->department_id, $device->department_name) ?: 'CHRMO',
+                $account
+            );
         } else {
             $synced = is_array($enrollment->synced_devices) ? $enrollment->synced_devices : [];
             if (! in_array($deviceSn, $synced, true)) {
@@ -498,8 +513,10 @@ class BiometricRegistrationController extends Controller
 
         $deptLabel = $account->department?->acronym ?: ($account->department?->name ?: "Office #{$account->department_id}");
         $remarks = $provision['requires_local_scan']
-            ? "Provisioned PIN on Office Terminal ({$deviceSn}, {$provision['communication_mode']}); local biometric scan needed."
-            : "Synced {$provision['templates_transferred']} {$provision['communication_mode']} template(s) to Office Terminal ({$deviceSn}).";
+            ? 'Profile assigned; scan needed'
+            : ($provision['templates_transferred'] > 0
+                ? "Assigned ({$provision['templates_transferred']} template synced)"
+                : 'Assigned to office');
 
         $transferLog = BiometricTransferLog::query()->create([
             'employee_control_no' => $controlNo,
@@ -676,6 +693,14 @@ class BiometricRegistrationController extends Controller
             $query->where('status', $request->input('status'));
         }
 
+        if ($request->filled('start_date')) {
+            $query->whereDate('created_at', '>=', $request->input('start_date'));
+        }
+
+        if ($request->filled('end_date')) {
+            $query->whereDate('created_at', '<=', $request->input('end_date'));
+        }
+
         if ($request->filled('search')) {
             $search = trim((string) $request->input('search'));
             $query->where(function ($q) use ($search): void {
@@ -683,6 +708,9 @@ class BiometricRegistrationController extends Controller
                     ->orWhere('employee_name', 'like', "%{$search}%")
                     ->orWhere('source_office_name', 'like', "%{$search}%")
                     ->orWhere('target_office_name', 'like', "%{$search}%")
+                    ->orWhere('source_device_sn', 'like', "%{$search}%")
+                    ->orWhere('target_device_sn', 'like', "%{$search}%")
+                    ->orWhere('performed_by_name', 'like', "%{$search}%")
                     ->orWhere('remarks', 'like', "%{$search}%");
             });
         }
@@ -690,8 +718,15 @@ class BiometricRegistrationController extends Controller
         $perPage = max(1, min(100, (int) $request->input('per_page', 20)));
         $logs = $query->orderByDesc('id')->paginate($perPage);
 
+        $mappedLogs = collect($logs->items())->map(function (BiometricTransferLog $log) {
+            $log->source_office_name = $this->resolveOfficeAcronym($log->source_department_id, $log->source_office_name);
+            $log->target_office_name = $this->resolveOfficeAcronym($log->target_department_id, $log->target_office_name);
+
+            return $log;
+        });
+
         return response()->json([
-            'logs' => $logs->items(),
+            'logs' => $mappedLogs,
             'total' => $logs->total(),
             'current_page' => $logs->currentPage(),
             'last_page' => $logs->lastPage(),
@@ -733,6 +768,72 @@ class BiometricRegistrationController extends Controller
         $enrollment->enrolled_at = $enrollment->enrolled_at ?? now();
         $enrollment->save();
 
+        $this->logRegistration(
+            $controlNo,
+            (string) ($enrollment->employee_name ?: 'EMP '.$controlNo),
+            BiometricTransferLog::STATUS_SUCCESS,
+            'Enrollment confirmed via punch log',
+            $enrollment->enrollment_device_sn ? (string) $enrollment->enrollment_device_sn : null,
+            null,
+            null,
+            request()->user()
+        );
+
         return true;
+    }
+
+    /**
+     * Record a REGISTRATION audit entry in the biometric transfer log.
+     */
+    private function logRegistration(
+        string $controlNo,
+        string $employeeName,
+        string $status,
+        string $remarks,
+        ?string $deviceSn,
+        ?int $departmentId,
+        ?string $officeName,
+        mixed $performedBy
+    ): BiometricTransferLog {
+        return BiometricTransferLog::query()->create([
+            'employee_control_no' => $controlNo,
+            'employee_name' => $employeeName,
+            'action_type' => BiometricTransferLog::ACTION_REGISTRATION,
+            'target_department_id' => $departmentId,
+            'target_office_name' => $this->resolveOfficeAcronym($departmentId, $officeName),
+            'target_device_sn' => $deviceSn,
+            'status' => $status,
+            'remarks' => $remarks,
+            'performed_by_user_id' => $performedBy?->id,
+            'performed_by_name' => $performedBy?->full_name ?? $performedBy?->username ?? 'System',
+        ]);
+    }
+
+    /**
+     * Resolve the office abbreviation/acronym for a department.
+     */
+    private function resolveOfficeAcronym(?int $departmentId, ?string $fallbackName = null): ?string
+    {
+        if ($departmentId) {
+            $dept = Department::query()->find($departmentId);
+            if ($dept) {
+                return $dept->acronym ?: ($dept->name ?: "Office #{$departmentId}");
+            }
+        }
+
+        if (! empty($fallbackName)) {
+            $cleanFallback = trim($fallbackName);
+            $dept = Department::query()
+                ->where('name', $cleanFallback)
+                ->orWhere('acronym', $cleanFallback)
+                ->first();
+            if ($dept && $dept->acronym) {
+                return $dept->acronym;
+            }
+
+            return $cleanFallback;
+        }
+
+        return null;
     }
 }

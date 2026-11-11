@@ -126,6 +126,7 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
     Route::get('/special-privilege-reasons/options', [SpecialPrivilegeReasonController::class, 'options']);
     Route::get('/dtr-remarks/options', [\App\Http\Controllers\Attendance\DtrRemarkController::class, 'index']);
     Route::get('/holidays/options', [\App\Http\Controllers\Attendance\HolidayController::class, 'index']);
+    Route::get('/biometric/transfer-logs', [\App\Http\Controllers\Attendance\BiometricRegistrationController::class, 'transferLogs']);
 
     // Attendance & Daily Time Records (DTR)
     Route::prefix('attendance')->group(function () {

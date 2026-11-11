@@ -2234,6 +2234,26 @@ class EmployeeController extends Controller
                 return $leftDate < $rightDate ? 1 : -1;
             }
 
+            // CSC priority tie-breaker for rows sharing exact same date/timestamp.
+            // Backend sorts descending (newest-first); frontend reverses (.reverse()) for oldest-first view.
+            // Returning $rightPriority <=> $leftPriority ensures higher priority items (VL, SL...) end up
+            // at the top of the table after frontend reversal.
+            $leftCode = strtoupper(trim((string) ($left['leave_type_code'] ?? '')));
+            if ($leftCode === '') {
+                $leftTypeKey = strtolower(trim((string) ($left['type_key'] ?? '')));
+                $leftCode = $leftTypeKey === 'vacation' ? 'VL' : ($leftTypeKey === 'sick' ? 'SL' : '');
+            }
+            $rightCode = strtoupper(trim((string) ($right['leave_type_code'] ?? '')));
+            if ($rightCode === '') {
+                $rightTypeKey = strtolower(trim((string) ($right['type_key'] ?? '')));
+                $rightCode = $rightTypeKey === 'vacation' ? 'VL' : ($rightTypeKey === 'sick' ? 'SL' : '');
+            }
+            $leftPriority = $this->resolveLedgerLeaveCodePriority($leftCode);
+            $rightPriority = $this->resolveLedgerLeaveCodePriority($rightCode);
+            if ($leftPriority !== $rightPriority) {
+                return $rightPriority <=> $leftPriority;
+            }
+
             $leftId = (string) ($left['row_id'] ?? '');
             $rightId = (string) ($right['row_id'] ?? '');
 
@@ -4040,6 +4060,22 @@ class EmployeeController extends Controller
         };
     }
 
+    private function resolveLedgerLeaveCodePriority(?string $code): int
+    {
+        $normalized = strtoupper(trim((string) ($code ?? '')));
+
+        return match ($normalized) {
+            'VL' => 1,
+            'SL' => 2,
+            'FL' => 3,
+            'MC06', 'MCO6', 'SPL-MC06' => 4,
+            'SPL', 'SPL-SP', 'SOLO' => 5,
+            'CL', 'SEL' => 6,
+            'WL' => 7,
+            default => 99,
+        };
+    }
+
     private function resolveLedgerDisplayTypeKey(?string $typeKey, ?string $leaveTypeCode = null): ?string
     {
         if (strtoupper(trim((string) $leaveTypeCode)) === 'FL') {
@@ -4392,6 +4428,16 @@ class EmployeeController extends Controller
                 $balanceKey
             );
         }
+
+        usort($badges, function (array $left, array $right): int {
+            $leftPriority = $this->resolveLedgerLeaveCodePriority($left['code'] ?? null);
+            $rightPriority = $this->resolveLedgerLeaveCodePriority($right['code'] ?? null);
+            if ($leftPriority !== $rightPriority) {
+                return $leftPriority <=> $rightPriority;
+            }
+
+            return strcmp((string) ($left['code'] ?? ''), (string) ($right['code'] ?? ''));
+        });
 
         return $badges;
     }
@@ -6934,6 +6980,26 @@ class EmployeeController extends Controller
             $rightDate = (string) ($right['sort_date'] ?? '');
             if ($leftDate !== $rightDate) {
                 return $leftDate < $rightDate ? 1 : -1;
+            }
+
+            // CSC priority tie-breaker for rows sharing exact same date/timestamp.
+            // Backend sorts descending (newest-first); frontend reverses (.reverse()) for oldest-first view.
+            // Returning $rightPriority <=> $leftPriority ensures higher priority items (VL, SL...) end up
+            // at the top of the table after frontend reversal.
+            $leftCode = strtoupper(trim((string) ($left['leave_type_code'] ?? '')));
+            if ($leftCode === '') {
+                $leftTypeKey = strtolower(trim((string) ($left['type_key'] ?? '')));
+                $leftCode = $leftTypeKey === 'vacation' ? 'VL' : ($leftTypeKey === 'sick' ? 'SL' : '');
+            }
+            $rightCode = strtoupper(trim((string) ($right['leave_type_code'] ?? '')));
+            if ($rightCode === '') {
+                $rightTypeKey = strtolower(trim((string) ($right['type_key'] ?? '')));
+                $rightCode = $rightTypeKey === 'vacation' ? 'VL' : ($rightTypeKey === 'sick' ? 'SL' : '');
+            }
+            $leftPriority = $this->resolveLedgerLeaveCodePriority($leftCode);
+            $rightPriority = $this->resolveLedgerLeaveCodePriority($rightCode);
+            if ($leftPriority !== $rightPriority) {
+                return $rightPriority <=> $leftPriority;
             }
 
             $leftId = (string) ($left['row_id'] ?? '');
