@@ -9,6 +9,7 @@ use App\Models\LeaveBalanceAccrualHistory;
 use App\Models\LeaveType;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -18,6 +19,16 @@ use Illuminate\Support\Facades\DB;
 class HRLeaveBalanceImportController extends Controller
 {
     private const MANUAL_CREDIT_PRECISION = 3;
+
+    private const STANDARD_LEAVE_TYPE_ORDER = [
+        'vacation leave',
+        'sick leave',
+        'mandatory / forced leave',
+        'special privilege leave',
+        'solo parent leave',
+        'special emergency (calamity) leave',
+        'wellness leave',
+    ];
 
     public function availableTypes(Request $request): JsonResponse
     {
@@ -794,7 +805,15 @@ class HRLeaveBalanceImportController extends Controller
                 || $leaveType->allowsEmploymentStatus($employee->status ?? null))
             ->values();
 
-        return [$allCreditLeaveTypes, $allowedCreditLeaveTypes];
+        $sortLeaveTypes = function (Collection $types): Collection {
+            return $types->sortBy(function (LeaveType $type): int {
+                $idx = array_search(strtolower(trim($type->name)), self::STANDARD_LEAVE_TYPE_ORDER, true);
+
+                return $idx === false ? 999 : $idx;
+            })->values();
+        };
+
+        return [$sortLeaveTypes($allCreditLeaveTypes), $sortLeaveTypes($allowedCreditLeaveTypes)];
     }
 
     private function employeeHasResolvedEmploymentStatus(object $employee): bool

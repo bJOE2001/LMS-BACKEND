@@ -496,7 +496,7 @@ class DtrCalculationService
 
         $breakDurationSec = abs(Carbon::parse($breakEnd)->diffInSeconds(Carbon::parse($breakStart)));
         $midLunchThreshold = Carbon::parse($breakStart)->addSeconds((int) ($breakDurationSec / 2))->format('H:i:s');
-        $postLunchThreshold = Carbon::parse($breakEnd)->addHour()->format('H:i:s');
+        $postLunchThreshold = Carbon::parse($breakEnd)->addMinutes(90)->format('H:i:s');
 
         if ($count === 1) {
             $time = $times[0];
@@ -525,6 +525,10 @@ class DtrCalculationService
                 // Morning in, lunch out
                 $result['am_arrival'] = $t1;
                 $result['am_departure'] = $t2;
+            } elseif ($t1 < $lunchThreshold && $t2 > $midLunchThreshold && $t2 <= $postLunchThreshold) {
+                // Morning in, lunch in (employee skipped lunch-out punch and clocked in after lunch)
+                $result['am_arrival'] = $t1;
+                $result['pm_arrival'] = $t2;
             } elseif ($t1 >= $preLunchThreshold && $t2 <= $postLunchThreshold) {
                 // Both punches during lunch window (e.g. 12:35 PM out, 1:00 PM in)
                 $result['am_departure'] = $t1;
@@ -587,7 +591,7 @@ class DtrCalculationService
         $pmDepartures = $times->filter(fn ($t) => $t >= $departureThreshold)->values();
         if ($pmDepartures->isNotEmpty()) {
             $result['pm_departure'] = $pmDepartures->last();
-        } elseif ($times->last() > Carbon::parse($breakEnd)->addMinutes(30)->format('H:i:s') && $times->last() !== $result['pm_arrival'] && $times->last() !== $result['am_departure']) {
+        } elseif ($times->last() > $postLunchThreshold && $times->last() !== $result['pm_arrival'] && $times->last() !== $result['am_departure']) {
             $result['pm_departure'] = $times->last();
         }
 
