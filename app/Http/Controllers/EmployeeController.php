@@ -122,10 +122,14 @@ class EmployeeController extends Controller
                 true
             );
 
-            // Also ensure the DepartmentHead is included in the available assigned records
+            // Also ensure the DepartmentHead (or inherited parent head) is included in the available assigned records
             $headControlNo = DepartmentHead::query()
                 ->where('department_id', $resolvedDepartmentId)
                 ->value('control_no');
+
+            if (! $headControlNo && $department) {
+                $headControlNo = $department->effectiveDepartmentHead()?->control_no;
+            }
 
             if ($headControlNo && ! $employeeRows->contains(fn ($r) => trim((string) ($r['control_no'] ?? '')) === trim((string) $headControlNo))) {
                 $headRows = $this->fetchHrisEmployeeRowsByControlNos(
@@ -183,12 +187,19 @@ class EmployeeController extends Controller
             return $admin;
         }
 
-        $departmentHead = DepartmentHead::query()
-            ->where('department_id', $admin->department_id)
-            ->first();
+        $department = $admin->department;
+        $departmentHead = $department?->effectiveDepartmentHead();
+        $isInherited = $departmentHead !== null && (int) $departmentHead->department_id !== (int) $admin->department_id;
+        $serializedHead = $departmentHead ? $this->serializeDepartmentHead($departmentHead) : null;
+        if ($serializedHead && $isInherited) {
+            $serializedHead['is_inherited'] = true;
+            $mainOffice = $department?->mainDepartment;
+            $serializedHead['main_office_name'] = $mainOffice?->name ? trim((string) $mainOffice->name) : null;
+        }
 
         return response()->json([
-            'department_head' => $departmentHead ? $this->serializeDepartmentHead($departmentHead) : null,
+            'department_head' => $serializedHead,
+            'is_inherited' => $isInherited,
         ]);
     }
 
@@ -325,10 +336,8 @@ class EmployeeController extends Controller
 
         $departmentHead = null;
         if ($departmentId !== null) {
-            $departmentHead = DepartmentHead::query()
-                ->where('department_id', $departmentId)
-                ->orderByDesc('id')
-                ->first();
+            $department = Department::query()->find($departmentId);
+            $departmentHead = $department?->effectiveDepartmentHead();
         }
 
         $normalizedDepartmentName = $this->normalizeDepartmentLookupLabel($departmentName);
@@ -341,10 +350,7 @@ class EmployeeController extends Controller
                 });
 
             if ($departmentFromLibrary) {
-                $departmentHead = DepartmentHead::query()
-                    ->where('department_id', (int) $departmentFromLibrary->id)
-                    ->orderByDesc('id')
-                    ->first();
+                $departmentHead = $departmentFromLibrary->effectiveDepartmentHead();
             }
         }
 
@@ -411,7 +417,6 @@ class EmployeeController extends Controller
         $payload = array_merge($attributes, [
             'department_id' => $admin->department_id,
             'full_name' => $fullName,
-            'position' => $attributes['designation'],
         ]);
 
         if (! $isUpdating) {
@@ -2602,7 +2607,7 @@ class EmployeeController extends Controller
             'designation' => $this->trimOrBlank($departmentHead->designation),
             'rate_mon' => $departmentHead->rate_mon !== null ? (float) $departmentHead->rate_mon : null,
             'full_name' => $departmentHead->full_name,
-            'position' => $departmentHead->position,
+            'position' => $this->trimOrBlank($departmentHead->designation),
         ];
     }
 

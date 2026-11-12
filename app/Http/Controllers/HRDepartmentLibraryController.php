@@ -19,7 +19,7 @@ class HRDepartmentLibraryController extends Controller
 
         $departments = Department::query()
             ->active()
-            ->with(['admin:id,department_id', 'departmentHead:id,department_id'])
+            ->with(['admin:id,department_id', 'departmentHead:id,department_id', 'mainDepartment:id,name', 'divisions:id,main_department_id'])
             ->when($searchTerm !== '', function ($query) use ($searchTerm): void {
                 $query->where('name', 'like', "%{$searchTerm}%");
             })
@@ -57,7 +57,7 @@ class HRDepartmentLibraryController extends Controller
     public function update(Request $request, int $id): JsonResponse
     {
         $department = Department::query()->active()->find($id);
-        if (!$department) {
+        if (! $department) {
             return response()->json([
                 'message' => 'Office not found.',
             ], 404);
@@ -81,7 +81,7 @@ class HRDepartmentLibraryController extends Controller
             ->with(['admin:id,department_id', 'departmentHead:id,department_id'])
             ->find($id);
 
-        if (!$department) {
+        if (! $department) {
             return response()->json([
                 'message' => 'Office not found.',
             ], 404);
@@ -113,9 +113,17 @@ class HRDepartmentLibraryController extends Controller
 
     private function serializeDepartment(Department $department): array
     {
+        $mainDepartment = $department->mainDepartment;
+        $mainId = $department->main_department_id ? (int) $department->main_department_id : null;
+        $mainName = $mainDepartment?->name ? trim((string) $mainDepartment->name) : null;
+
         return [
             'id' => $department->id,
             'name' => trim((string) $department->name),
+            'main_department_id' => $mainId,
+            'main_department_name' => $mainName,
+            'is_division' => $department->isDivision(),
+            'divisions_count' => $department->relationLoaded('divisions') ? $department->divisions->count() : $department->divisions()->count(),
             'has_admin' => $department->admin !== null,
             'has_department_head' => $department->departmentHead !== null,
             'created_at' => $department->created_at?->toIso8601String(),

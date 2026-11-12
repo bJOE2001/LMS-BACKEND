@@ -11,6 +11,7 @@ use App\Http\Controllers\HRDepartmentLibraryController;
 use App\Http\Controllers\HRIllnessLibraryController;
 use App\Http\Controllers\HRLeaveBalanceImportController;
 use App\Http\Controllers\HRLeaveTypeController;
+use App\Http\Controllers\HROfficeDivisionController;
 use App\Http\Controllers\HRReportController;
 use App\Http\Controllers\HRUserManagementController;
 use App\Http\Controllers\HRWorkScheduleController;
@@ -227,6 +228,13 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::post('/', [HRDepartmentLibraryController::class, 'store']);
             Route::post('/{id}/update', [HRDepartmentLibraryController::class, 'update']);
             Route::post('/{id}/delete', [HRDepartmentLibraryController::class, 'destroy']);
+        });
+
+        Route::middleware('hr.module:office_library')->prefix('office-divisions')->group(function () {
+            Route::get('/', [HROfficeDivisionController::class, 'index']);
+            Route::post('/assign', [HROfficeDivisionController::class, 'assign']);
+            Route::post('/{id}/detach', [HROfficeDivisionController::class, 'detach']);
+            Route::post('/bulk-detach', [HROfficeDivisionController::class, 'bulkDetach']);
         });
 
         Route::middleware('hr.module:illness_library')->prefix('illnesses')->group(function () {
