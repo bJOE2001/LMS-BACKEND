@@ -1,7 +1,10 @@
 <?php
 
-namespace App\Models;
+namespace App\Models\Leave;
 
+use App\Models\DepartmentAdmin;
+use App\Models\HRAccount;
+use App\Models\HrisEmployee;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;

@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Controllers\Leave\LeaveApplicationController;
 use App\Models\EmployeeWorkScheduleOverride;
 use App\Models\HRAccount;
 use App\Services\WorkScheduleService;

@@ -1,9 +1,10 @@
 <?php
 
-namespace App\Http\Controllers;
+namespace App\Http\Controllers\Leave;
 
+use App\Http\Controllers\Controller;
 use App\Models\DepartmentAdmin;
-use App\Models\LeaveApplicationPrintLog;
+use App\Models\Leave\LeaveApplicationPrintLog;
 use Illuminate\Http\Request;
 
 class LeaveApplicationPrintLogController extends Controller

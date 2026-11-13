@@ -1,10 +1,11 @@
 <?php
 
-namespace App\Http\Controllers;
+namespace App\Http\Controllers\Leave;
 
+use App\Http\Controllers\Controller;
 use App\Models\HRAccount;
-use App\Models\LeaveBalance;
-use App\Models\LeaveBalanceAccrualHistory;
+use App\Models\Leave\LeaveBalance;
+use App\Models\Leave\LeaveBalanceAccrualHistory;
 use App\Services\HrAccessControlService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;

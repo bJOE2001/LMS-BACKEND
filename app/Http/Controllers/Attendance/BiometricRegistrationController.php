@@ -3,16 +3,17 @@
 namespace App\Http\Controllers\Attendance;
 
 use App\Http\Controllers\Controller;
-use App\Models\AttendanceLog;
-use App\Models\BiometricDevice;
-use App\Models\BiometricEnrollment;
-use App\Models\BiometricTemplate;
-use App\Models\BiometricTransferLog;
+use App\Models\Attendance\AttendanceLog;
+use App\Models\Attendance\BiometricDevice;
+use App\Models\Attendance\BiometricEnrollment;
+use App\Models\Attendance\BiometricTemplate;
+use App\Models\Attendance\BiometricTransferLog;
 use App\Models\Department;
 use App\Models\DepartmentAdmin;
 use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
+use App\Models\HrisOffice;
 use App\Services\Attendance\BiometricTransferService;
 use App\Services\Attendance\LanBioTemplateSyncService;
 use Illuminate\Http\JsonResponse;
@@ -302,7 +303,8 @@ class BiometricRegistrationController extends Controller
                     'employee_name' => $fullName,
                     'action_type' => BiometricTransferLog::ACTION_REGISTRATION,
                     'target_department_id' => $device->department_id ?: BiometricTransferService::CHRMO_DEPARTMENT_ID,
-                    'target_office_name' => $this->resolveOfficeAcronym($device->department_id, $device->department_name) ?: 'CHRMO',
+                    'target_office_name' => $this->resolveOfficeAcronym($device->department_id, $device->department_name)
+                        ?: ($this->resolveOfficeAcronym(BiometricTransferService::CHRMO_DEPARTMENT_ID) ?? 'CHRMO'),
                     'target_device_sn' => $deviceSn,
                     'status' => BiometricTransferLog::STATUS_FAILED,
                     'remarks' => $pushResult['message'],
@@ -346,7 +348,8 @@ class BiometricRegistrationController extends Controller
             'employee_name' => $fullName,
             'action_type' => BiometricTransferLog::ACTION_REGISTRATION,
             'target_department_id' => $device->department_id ?: BiometricTransferService::CHRMO_DEPARTMENT_ID,
-            'target_office_name' => $this->resolveOfficeAcronym($device->department_id, $device->department_name) ?: 'CHRMO',
+            'target_office_name' => $this->resolveOfficeAcronym($device->department_id, $device->department_name)
+                ?: ($this->resolveOfficeAcronym(BiometricTransferService::CHRMO_DEPARTMENT_ID) ?? 'CHRMO'),
             'target_device_sn' => $deviceSn,
             'status' => BiometricTransferLog::STATUS_SUCCESS,
             'remarks' => $remarks,
@@ -511,8 +514,8 @@ class BiometricRegistrationController extends Controller
             }
         }
 
-        $deptLabel = HrisEmployee::officeAcronymByName($account->department?->name)
-            ?: ($account->department?->name ?: "Office #{$account->department_id}");
+        $deptLabel = HrisOffice::labelForDepartment($account->department) ?: "Office #{$account->department_id}";
+        $sourceOfficeLabel = $this->resolveOfficeAcronym(BiometricTransferService::CHRMO_DEPARTMENT_ID) ?? 'CHRMO';
         $remarks = $provision['requires_local_scan']
             ? 'Profile assigned; scan needed'
             : ($provision['templates_transferred'] > 0
@@ -524,7 +527,7 @@ class BiometricRegistrationController extends Controller
             'employee_name' => $fullName,
             'action_type' => BiometricTransferLog::ACTION_ASSIGN,
             'source_department_id' => BiometricTransferService::CHRMO_DEPARTMENT_ID,
-            'source_office_name' => 'CHRMO',
+            'source_office_name' => $sourceOfficeLabel,
             'target_department_id' => $account->department_id,
             'target_office_name' => $deptLabel,
             'target_device_sn' => $deviceSn,
@@ -719,9 +722,38 @@ class BiometricRegistrationController extends Controller
         $perPage = max(1, min(100, (int) $request->input('per_page', 20)));
         $logs = $query->orderByDesc('id')->paginate($perPage);
 
-        $mappedLogs = collect($logs->items())->map(function (BiometricTransferLog $log) {
-            $log->source_office_name = $this->resolveOfficeAcronym($log->source_department_id, $log->source_office_name);
-            $log->target_office_name = $this->resolveOfficeAcronym($log->target_department_id, $log->target_office_name);
+        $departmentIds = collect($logs->items())
+            ->flatMap(static fn (BiometricTransferLog $log): array => [
+                $log->source_department_id,
+                $log->target_department_id,
+            ])
+            ->filter()
+            ->unique()
+            ->values();
+
+        $departmentsById = $departmentIds->isNotEmpty()
+            ? Department::query()->whereIn('id', $departmentIds)->get(['id', 'name'])->keyBy('id')
+            : collect();
+
+        $mappedLogs = collect($logs->items())->map(function (BiometricTransferLog $log) use ($departmentsById): BiometricTransferLog {
+            $sourceDepartment = $log->source_department_id ? $departmentsById->get((int) $log->source_department_id) : null;
+            $targetDepartment = $log->target_department_id ? $departmentsById->get((int) $log->target_department_id) : null;
+
+            $sourceAcronym = $this->resolveOfficeAcronymFromDepartment(
+                $sourceDepartment,
+                $log->source_department_id,
+                $log->source_office_name
+            );
+            $targetAcronym = $this->resolveOfficeAcronymFromDepartment(
+                $targetDepartment,
+                $log->target_department_id,
+                $log->target_office_name
+            );
+
+            $log->setAttribute('source_office_acronym', $sourceAcronym);
+            $log->setAttribute('target_office_acronym', $targetAcronym);
+            $log->source_office_name = $sourceDepartment?->name ?: $log->source_office_name;
+            $log->target_office_name = $targetDepartment?->name ?: $log->target_office_name;
 
             return $log;
         });
@@ -811,21 +843,33 @@ class BiometricRegistrationController extends Controller
     }
 
     /**
-     * Resolve the office abbreviation/acronym for a department.
+     * Resolve the office abbreviation/acronym for a department via HRIS yOffice.
      */
     private function resolveOfficeAcronym(?int $departmentId, ?string $fallbackName = null): ?string
     {
-        if ($departmentId) {
-            $dept = Department::query()->find($departmentId);
-            if ($dept) {
-                return HrisEmployee::officeAcronymByName($dept->name) ?: ($dept->name ?: "Office #{$departmentId}");
-            }
+        $department = $departmentId ? Department::query()->find($departmentId) : null;
+
+        return $this->resolveOfficeAcronymFromDepartment($department, $departmentId, $fallbackName);
+    }
+
+    private function resolveOfficeAcronymFromDepartment(
+        ?Department $department,
+        ?int $departmentId,
+        ?string $fallbackName = null
+    ): ?string {
+        if ($department !== null) {
+            return HrisOffice::labelForDepartment($department, $fallbackName)
+                ?: ($departmentId ? "Office #{$departmentId}" : null);
         }
 
         if (! empty($fallbackName)) {
             $cleanFallback = trim($fallbackName);
 
-            return HrisEmployee::officeAcronymByName($cleanFallback) ?: $cleanFallback;
+            return HrisOffice::acronymForName($cleanFallback) ?: $cleanFallback;
+        }
+
+        if ($departmentId) {
+            return "Office #{$departmentId}";
         }
 
         return null;

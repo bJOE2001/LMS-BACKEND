@@ -1,17 +1,18 @@
 <?php
 
-namespace App\Http\Controllers;
+namespace App\Http\Controllers\Leave;
 
-use App\Http\Controllers\Concerns\FiltersEmployeeControlNos;
-use App\Models\COCApplication;
+use App\Traits\FiltersEmployeeControlNos;
+use App\Http\Controllers\Controller;
+use App\Models\Leave\COCApplication;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
-use App\Models\LeaveApplication;
-use App\Models\LeaveApplicationLog;
-use App\Models\LeaveApplicationUpdateRequest;
-use App\Models\LeaveBalance;
-use App\Models\LeaveType;
+use App\Models\Leave\LeaveApplication;
+use App\Models\Leave\LeaveApplicationLog;
+use App\Models\Leave\LeaveApplicationUpdateRequest;
+use App\Models\Leave\LeaveBalance;
+use App\Models\Leave\LeaveType;
 use App\Models\Notification;
 use App\Services\WorkScheduleService;
 use Carbon\CarbonImmutable;

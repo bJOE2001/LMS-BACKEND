@@ -2,12 +2,12 @@
 
 namespace App\Services\Attendance;
 
-use App\Models\AttendanceRawLog;
-use App\Models\DailyTimeRecord;
+use App\Models\Attendance\AttendanceRawLog;
+use App\Models\Attendance\DailyTimeRecord;
+use App\Models\Attendance\Holiday;
 use App\Models\EmployeeDepartmentAssignment;
-use App\Models\Holiday;
 use App\Models\HrisEmployee;
-use App\Models\LeaveApplication;
+use App\Models\Leave\LeaveApplication;
 use App\Services\WorkScheduleService;
 use Carbon\Carbon;
 use Carbon\CarbonImmutable;

@@ -1,8 +1,9 @@
 <?php
 
-namespace App\Http\Controllers;
+namespace App\Http\Controllers\Leave;
 
-use App\Models\LeaveType;
+use App\Http\Controllers\Controller;
+use App\Models\Leave\LeaveType;
 use App\Services\RecycleBinService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;

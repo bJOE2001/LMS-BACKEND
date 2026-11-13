@@ -2,25 +2,26 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\AttendanceLog;
-use App\Models\BiometricDevice;
-use App\Models\BiometricEnrollment;
-use App\Models\BiometricTemplate;
-use App\Models\COCApplication;
+use App\Models\Attendance\AttendanceLog;
+use App\Models\Attendance\BiometricDevice;
+use App\Models\Attendance\BiometricEnrollment;
+use App\Models\Attendance\BiometricTemplate;
 use App\Models\Department;
 use App\Models\DepartmentAdmin;
 use App\Models\DepartmentHead;
 use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
-use App\Models\LateDeduction;
-use App\Models\LeaveApplication;
-use App\Models\LeaveApplicationLog;
-use App\Models\LeaveApplicationUpdateRequest;
-use App\Models\LeaveBalance;
-use App\Models\LeaveBalanceAccrualHistory;
-use App\Models\LeaveRestoration;
-use App\Models\LeaveType;
+use App\Models\HrisOffice;
+use App\Models\Leave\COCApplication;
+use App\Models\Leave\LateDeduction;
+use App\Models\Leave\LeaveApplication;
+use App\Models\Leave\LeaveApplicationLog;
+use App\Models\Leave\LeaveApplicationUpdateRequest;
+use App\Models\Leave\LeaveBalance;
+use App\Models\Leave\LeaveBalanceAccrualHistory;
+use App\Models\Leave\LeaveRestoration;
+use App\Models\Leave\LeaveType;
 use App\Services\Attendance\BiometricTransferService;
 use App\Services\HrAccessControlService;
 use App\Services\RecycleBinService;
@@ -73,7 +74,19 @@ class EmployeeController extends Controller
         $departments = Department::query()
             ->active()
             ->orderBy('name')
-            ->get(['id', 'name']);
+            ->get(['id', 'name', 'main_department_id'])
+            ->map(static function (Department $department): array {
+                $acronym = HrisOffice::acronymForDepartment($department);
+
+                return [
+                    'id' => $department->id,
+                    'name' => $department->name,
+                    'main_department_id' => $department->main_department_id,
+                    'acronym' => $acronym,
+                    'office_acronym' => $acronym,
+                ];
+            })
+            ->values();
 
         return response()->json([
             'departments' => $departments,

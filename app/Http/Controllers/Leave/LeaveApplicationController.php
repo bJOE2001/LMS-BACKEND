@@ -1,23 +1,24 @@
 <?php
 
-namespace App\Http\Controllers;
+namespace App\Http\Controllers\Leave;
 
-use App\Http\Controllers\Concerns\FiltersEmployeeControlNos;
+use App\Traits\FiltersEmployeeControlNos;
+use App\Http\Controllers\Controller;
 use App\Http\Requests\HrLeaveApplicationIndexRequest;
 use App\Http\Requests\HrVerifyLeaveApplicationDocumentRequest;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
-use App\Models\LeaveApplication;
-use App\Models\LeaveApplicationUpdateRequest;
-use App\Models\LeaveBalance;
-use App\Models\LeaveType;
+use App\Models\Leave\LeaveApplication;
+use App\Models\Leave\LeaveApplicationUpdateRequest;
+use App\Models\Leave\LeaveBalance;
+use App\Models\Leave\LeaveType;
+use App\Services\Leave\LeaveApplicationDocumentVerificationService;
 use App\Services\Leave\LeaveCalculationService;
 use App\Services\Leave\LeaveCertificationService;
 use App\Services\Leave\LeaveCreditService;
 use App\Services\Leave\LeaveEligibilityService;
 use App\Services\Leave\LeaveWorkflowService;
-use App\Services\LeaveApplicationDocumentVerificationService;
 use App\Services\SmsGatewayService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;

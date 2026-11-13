@@ -2,7 +2,7 @@
 
 namespace App\Console\Commands;
 
-use App\Models\BiometricDevice;
+use App\Models\Attendance\BiometricDevice;
 use App\Services\Attendance\LanBioPunchSyncService;
 use Illuminate\Console\Command;
 

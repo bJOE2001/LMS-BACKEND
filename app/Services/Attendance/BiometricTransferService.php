@@ -2,16 +2,17 @@
 
 namespace App\Services\Attendance;
 
-use App\Models\AttendanceLog;
-use App\Models\BiometricDevice;
-use App\Models\BiometricDeviceCommand;
-use App\Models\BiometricEnrollment;
-use App\Models\BiometricTemplate;
-use App\Models\BiometricTransferLog;
+use App\Models\Attendance\AttendanceLog;
+use App\Models\Attendance\BiometricDevice;
+use App\Models\Attendance\BiometricDeviceCommand;
+use App\Models\Attendance\BiometricEnrollment;
+use App\Models\Attendance\BiometricTemplate;
+use App\Models\Attendance\BiometricTransferLog;
 use App\Models\Department;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
+use App\Models\HrisOffice;
 use App\Models\User;
 use Illuminate\Support\Facades\Log;
 use Throwable;
@@ -72,7 +73,7 @@ class BiometricTransferService
         try {
             // 1. Identify target office and its active biometric terminal(s)
             $department = Department::query()->find($newDepartmentId);
-            $departmentLabel = HrisEmployee::officeAcronymByName($department?->name) ?: ($department?->name ?: "Office #{$newDepartmentId}");
+            $departmentLabel = HrisOffice::labelForDepartment($department) ?: "Office #{$newDepartmentId}";
 
             $targetDevices = BiometricDevice::query()
                 ->where('department_id', $newDepartmentId)
@@ -358,7 +359,7 @@ class BiometricTransferService
                 'source_office_name' => $sourceOfficeName,
                 'source_device_sn' => $oldDevice?->serial_number,
                 'target_department_id' => self::CHRMO_DEPARTMENT_ID,
-                'target_office_name' => 'CHRMO',
+                'target_office_name' => $this->resolveOfficeName(self::CHRMO_DEPARTMENT_ID) ?? 'CHRMO',
                 'status' => BiometricTransferLog::STATUS_SUCCESS,
                 'remarks' => $successMsg,
                 'performed_by_user_id' => $userId,
@@ -588,7 +589,7 @@ class BiometricTransferService
 
         $dept = Department::query()->find($departmentId);
 
-        return HrisEmployee::officeAcronymByName($dept?->name) ?: ($dept?->name ?: "Office #{$departmentId}");
+        return HrisOffice::labelForDepartment($dept) ?: "Office #{$departmentId}";
     }
 
     /**

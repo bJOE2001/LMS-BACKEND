@@ -2,19 +2,18 @@
 
 namespace App\Services\Leave;
 
-use App\Http\Controllers\Concerns\FiltersEmployeeControlNos;
 use App\Models\DepartmentAdmin;
 use App\Models\DepartmentHead;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
-use App\Models\LeaveApplication;
-use App\Models\LeaveApplicationLog;
-use App\Models\LeaveApplicationPrintLog;
-use App\Models\LeaveApplicationUpdateRequest;
-use App\Models\LeaveType;
+use App\Models\Leave\LeaveApplication;
+use App\Models\Leave\LeaveApplicationLog;
+use App\Models\Leave\LeaveApplicationPrintLog;
+use App\Models\Leave\LeaveApplicationUpdateRequest;
+use App\Models\Leave\LeaveType;
 use App\Models\Notification;
-use App\Services\LeaveApplicationDocumentVerificationService;
 use App\Services\WorkScheduleService;
+use App\Traits\FiltersEmployeeControlNos;
 use Carbon\CarbonImmutable;
 use DateTimeInterface;
 use Illuminate\Database\Eloquent\Builder;
@@ -11834,7 +11833,7 @@ class LeaveWorkflowService
         $controlNo = $this->resolveValidatedEmployeeControlNo($baseValidated);
         $employee = $findEmployeeByControlNo !== null
             ? $findEmployeeByControlNo($controlNo)
-            : $this->eligibilityService()->findEmployeeByControlNo($controlNo);
+            : HrisEmployee::findByControlNo($controlNo);
 
         if (! $employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
@@ -11904,9 +11903,10 @@ class LeaveWorkflowService
             'is_monetization' => ['nullable', 'boolean'],
         ]);
 
+        $controlNo = $this->resolveValidatedEmployeeControlNo($baseValidated);
         $employee = $findEmployeeByControlNo !== null
-            ? $findEmployeeByControlNo($this->resolveValidatedEmployeeControlNo($baseValidated))
-            : $this->eligibilityService()->findEmployeeByControlNo($this->resolveValidatedEmployeeControlNo($baseValidated));
+            ? $findEmployeeByControlNo($controlNo)
+            : HrisEmployee::findByControlNo($controlNo);
 
         if (! $employee) {
             return response()->json(['error' => 'Employee not found'], 404);
@@ -12009,7 +12009,7 @@ class LeaveWorkflowService
         $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
         $employee = $findEmployeeByControlNo !== null
             ? $findEmployeeByControlNo($controlNo)
-            : $this->eligibilityService()->findEmployeeByControlNo($controlNo);
+            : HrisEmployee::findByControlNo($controlNo);
 
         if (! $employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);

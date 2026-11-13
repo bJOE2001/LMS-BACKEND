@@ -2,9 +2,9 @@
 
 namespace App\Services\Attendance;
 
-use App\Models\BiometricDevice;
-use App\Models\BiometricEnrollment;
-use App\Models\BiometricTemplate;
+use App\Models\Attendance\BiometricDevice;
+use App\Models\Attendance\BiometricEnrollment;
+use App\Models\Attendance\BiometricTemplate;
 use App\Models\HrisEmployee;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;

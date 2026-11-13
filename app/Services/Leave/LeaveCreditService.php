@@ -2,11 +2,10 @@
 
 namespace App\Services\Leave;
 
-use App\Models\LeaveApplication;
-use App\Models\LeaveBalance;
-use App\Models\LeaveBalanceAccrualHistory;
-use App\Models\LeaveType;
-use App\Services\CocLedgerService;
+use App\Models\Leave\LeaveApplication;
+use App\Models\Leave\LeaveBalance;
+use App\Models\Leave\LeaveBalanceAccrualHistory;
+use App\Models\Leave\LeaveType;
 use App\Services\WorkScheduleService;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
@@ -2850,6 +2849,7 @@ class LeaveCreditService
         $balance = $this->findPreferredEmployeeLeaveBalanceRecord(
             (string) $employee->control_no,
             (int) $leaveType->id,
+            false,
             $candidatesResolver
         );
         if ($balance instanceof LeaveBalance) {
@@ -2916,7 +2916,7 @@ class LeaveCreditService
                 : null;
         }
 
-        $balance = $this->findPreferredEmployeeLeaveBalanceRecord((string) $employee->control_no, (int) $leaveType->id, $candidatesResolver);
+        $balance = $this->findPreferredEmployeeLeaveBalanceRecord((string) $employee->control_no, (int) $leaveType->id, false, $candidatesResolver);
         if ($balance instanceof LeaveBalance) {
             $balance->loadMissing('accrualHistories');
         }

@@ -2,8 +2,8 @@
 
 namespace App\Services\Leave;
 
-use App\Models\LeaveApplication;
-use App\Models\LeaveType;
+use App\Models\Leave\LeaveApplication;
+use App\Models\Leave\LeaveType;
 use App\Services\WorkScheduleService;
 use Carbon\CarbonImmutable;
 use DateTimeInterface;

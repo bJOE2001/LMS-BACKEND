@@ -1,7 +1,8 @@
 <?php
 
-namespace App\Models;
+namespace App\Models\Leave;
 
+use App\Models\HRAccount;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 

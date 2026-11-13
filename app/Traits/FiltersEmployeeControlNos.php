@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Http\Controllers\Concerns;
+namespace App\Traits;
 
 trait FiltersEmployeeControlNos
 {

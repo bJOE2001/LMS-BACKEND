@@ -1,8 +1,8 @@
 <?php
 
-namespace App\Services;
+namespace App\Services\Leave;
 
-use App\Models\LeaveApplication;
+use App\Models\Leave\LeaveApplication;
 use DateTimeInterface;
 use JsonException;
 use RuntimeException;

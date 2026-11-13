@@ -2,10 +2,10 @@
 
 namespace App\Console\Commands;
 
-use App\Models\COCApplication;
-use App\Models\LeaveBalance;
-use App\Models\LeaveType;
-use App\Services\CocLedgerService;
+use App\Models\Leave\COCApplication;
+use App\Models\Leave\LeaveBalance;
+use App\Models\Leave\LeaveType;
+use App\Services\Leave\CocLedgerService;
 use Carbon\CarbonImmutable;
 use Illuminate\Console\Command;
 use Illuminate\Support\Collection;

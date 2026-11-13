@@ -2,12 +2,12 @@
 
 namespace App\Services\Attendance;
 
-use App\Models\AttendanceRawLog;
-use App\Models\BiometricDevice;
-use App\Models\BiometricDeviceCommand;
-use App\Models\BiometricEnrollment;
-use App\Models\BiometricTemplate;
-use App\Models\BiometricTransferLog;
+use App\Models\Attendance\AttendanceRawLog;
+use App\Models\Attendance\BiometricDevice;
+use App\Models\Attendance\BiometricDeviceCommand;
+use App\Models\Attendance\BiometricEnrollment;
+use App\Models\Attendance\BiometricTemplate;
+use App\Models\Attendance\BiometricTransferLog;
 use App\Models\HrisEmployee;
 use Carbon\Carbon;
 use Illuminate\Http\Request;

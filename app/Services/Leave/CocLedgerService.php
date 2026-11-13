@@ -1,14 +1,14 @@
 <?php
 
-namespace App\Services;
+namespace App\Services\Leave;
 
-use App\Models\COCApplication;
-use App\Models\COCApplicationRow;
-use App\Models\CocLedgerEntry;
+use App\Models\Leave\COCApplication;
+use App\Models\Leave\COCApplicationRow;
+use App\Models\Leave\CocLedgerEntry;
 use App\Models\HrisEmployee;
-use App\Models\LeaveApplication;
-use App\Models\LeaveBalance;
-use App\Models\LeaveType;
+use App\Models\Leave\LeaveApplication;
+use App\Models\Leave\LeaveBalance;
+use App\Models\Leave\LeaveType;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\Schema;
 

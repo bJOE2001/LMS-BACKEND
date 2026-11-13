@@ -3,10 +3,10 @@
 namespace App\Http\Controllers\Attendance;
 
 use App\Http\Controllers\Controller;
-use App\Models\AttendanceRawLog;
-use App\Models\BiometricDevice;
-use App\Models\BiometricEnrollment;
-use App\Models\DailyTimeRecord;
+use App\Models\Attendance\AttendanceRawLog;
+use App\Models\Attendance\BiometricDevice;
+use App\Models\Attendance\BiometricEnrollment;
+use App\Models\Attendance\DailyTimeRecord;
 use App\Models\Department;
 use App\Models\DepartmentAdmin;
 use App\Models\DepartmentHead;

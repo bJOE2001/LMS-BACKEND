@@ -1,18 +1,19 @@
 <?php
 
-namespace App\Http\Controllers;
+namespace App\Http\Controllers\Leave;
 
-use App\Http\Controllers\Concerns\FiltersEmployeeControlNos;
-use App\Models\COCApplication;
-use App\Models\COCApplicationRow;
+use App\Traits\FiltersEmployeeControlNos;
+use App\Http\Controllers\Controller;
+use App\Models\Leave\COCApplication;
+use App\Models\Leave\COCApplicationRow;
 use App\Models\DepartmentAdmin;
 use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
-use App\Models\LeaveBalance;
-use App\Models\LeaveType;
+use App\Models\Leave\LeaveBalance;
+use App\Models\Leave\LeaveType;
 use App\Models\Notification;
-use App\Services\CocLedgerService;
+use App\Services\Leave\CocLedgerService;
 use App\Services\SmsGatewayService;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;

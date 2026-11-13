@@ -1,6 +1,6 @@
 <?php
 
-use App\Models\LeaveType;
+use App\Models\Leave\LeaveType;
 use Illuminate\Database\Migrations\Migration;
 
 return new class extends Migration

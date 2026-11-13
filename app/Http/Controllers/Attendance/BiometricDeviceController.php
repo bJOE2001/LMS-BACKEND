@@ -3,11 +3,11 @@
 namespace App\Http\Controllers\Attendance;
 
 use App\Http\Controllers\Controller;
-use App\Models\BiometricDevice;
+use App\Models\Attendance\BiometricDevice;
 use App\Models\Department;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
-use App\Models\HrisEmployee;
+use App\Models\HrisOffice;
 use App\Services\Attendance\LanBioPunchSyncService;
 use App\Services\Attendance\ZkSocketClient;
 use Carbon\Carbon;
@@ -51,7 +51,7 @@ class BiometricDeviceController extends Controller
                 $status = $isOnline ? 'ONLINE' : 'OFFLINE';
             }
 
-            $officeAcronym = HrisEmployee::officeAcronymByName($dev->department?->name);
+            $officeAcronym = HrisOffice::acronymForDepartment($dev->department, $dev->department_name);
 
             $devices[] = [
                 'id' => $dev->id,
@@ -440,7 +440,7 @@ class BiometricDeviceController extends Controller
         }
 
         $department = Department::query()->find($departmentId);
-        $officeLabel = HrisEmployee::officeAcronymByName($department?->name) ?: ($department?->name ?: "Office #{$departmentId}");
+        $officeLabel = HrisOffice::labelForDepartment($department) ?: "Office #{$departmentId}";
 
         $devices = BiometricDevice::query()
             ->where('department_id', $departmentId)

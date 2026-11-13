@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\Department;
+use App\Models\HrisOffice;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
@@ -116,10 +117,13 @@ class HRDepartmentLibraryController extends Controller
         $mainDepartment = $department->mainDepartment;
         $mainId = $department->main_department_id ? (int) $department->main_department_id : null;
         $mainName = $mainDepartment?->name ? trim((string) $mainDepartment->name) : null;
+        $acronym = HrisOffice::acronymForDepartment($department);
 
         return [
             'id' => $department->id,
             'name' => trim((string) $department->name),
+            'acronym' => $acronym,
+            'office_acronym' => $acronym,
             'main_department_id' => $mainId,
             'main_department_name' => $mainName,
             'is_division' => $department->isDivision(),

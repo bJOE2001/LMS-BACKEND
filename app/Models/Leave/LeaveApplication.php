@@ -1,7 +1,9 @@
 <?php
 
-namespace App\Models;
+namespace App\Models\Leave;
 
+use App\Models\DepartmentAdmin;
+use App\Models\HrisEmployee;
 use App\Services\WorkScheduleService;
 use Carbon\CarbonImmutable;
 use Illuminate\Database\Eloquent\Model;

@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Services;
+namespace App\Services\Leave;
 
 /**
  * Service to compute monthly earned leave credits according to the official

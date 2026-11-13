@@ -2,7 +2,7 @@
 
 namespace Database\Seeders;
 
-use App\Models\SpecialPrivilegeReason;
+use App\Models\Leave\SpecialPrivilegeReason;
 use Illuminate\Database\Seeder;
 
 class SpecialPrivilegeReasonSeeder extends Seeder

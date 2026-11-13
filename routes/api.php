@@ -1,26 +1,26 @@
 <?php
 
-use App\Http\Controllers\AdminDashboardController;
 use App\Http\Controllers\Auth\AuthController;
 use App\Http\Controllers\Auth\PasswordResetController;
-use App\Http\Controllers\COCApplicationController;
 use App\Http\Controllers\EmployeeController;
 use App\Http\Controllers\HRAccessControlController;
-use App\Http\Controllers\HRDashboardController;
 use App\Http\Controllers\HRDepartmentLibraryController;
-use App\Http\Controllers\HRIllnessLibraryController;
-use App\Http\Controllers\HRLeaveBalanceImportController;
-use App\Http\Controllers\HRLeaveTypeController;
 use App\Http\Controllers\HROfficeDivisionController;
-use App\Http\Controllers\HRReportController;
 use App\Http\Controllers\HRUserManagementController;
 use App\Http\Controllers\HRWorkScheduleController;
-use App\Http\Controllers\LeaveApplicationController;
-use App\Http\Controllers\LeaveApplicationPrintLogController;
-use App\Http\Controllers\LeaveBalanceAccrualController;
+use App\Http\Controllers\Leave\AdminDashboardController;
+use App\Http\Controllers\Leave\COCApplicationController;
+use App\Http\Controllers\Leave\HRDashboardController;
+use App\Http\Controllers\Leave\HRIllnessLibraryController;
+use App\Http\Controllers\Leave\HRLeaveBalanceImportController;
+use App\Http\Controllers\Leave\HRLeaveTypeController;
+use App\Http\Controllers\Leave\HRReportController;
+use App\Http\Controllers\Leave\LeaveApplicationController;
+use App\Http\Controllers\Leave\LeaveApplicationPrintLogController;
+use App\Http\Controllers\Leave\LeaveBalanceAccrualController;
+use App\Http\Controllers\Leave\SpecialPrivilegeReasonController;
 use App\Http\Controllers\NotificationController;
 use App\Http\Controllers\SettingsController;
-use App\Http\Controllers\SpecialPrivilegeReasonController;
 use Illuminate\Support\Facades\Route;
 
 /*

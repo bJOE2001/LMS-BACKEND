@@ -1,8 +1,9 @@
 <?php
 
-namespace App\Http\Controllers;
+namespace App\Http\Controllers\Leave;
 
-use App\Models\SpecialPrivilegeReason;
+use App\Http\Controllers\Controller;
+use App\Models\Leave\SpecialPrivilegeReason;
 use Illuminate\Http\JsonResponse;
 
 class SpecialPrivilegeReasonController extends Controller

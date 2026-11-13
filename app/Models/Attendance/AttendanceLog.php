@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Models;
+namespace App\Models\Attendance;
 
 /**
  * Model representing punch records stored in tblAttendanceLogs.

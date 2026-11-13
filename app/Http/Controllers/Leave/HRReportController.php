@@ -1,14 +1,15 @@
 <?php
 
-namespace App\Http\Controllers;
+namespace App\Http\Controllers\Leave;
 
-use App\Models\COCApplication;
+use App\Http\Controllers\Controller;
+use App\Models\Leave\COCApplication;
 use App\Models\Department;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
-use App\Models\LeaveApplication;
-use App\Models\LeaveBalance;
-use App\Models\LeaveType;
+use App\Models\Leave\LeaveApplication;
+use App\Models\Leave\LeaveBalance;
+use App\Models\Leave\LeaveType;
 use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\JsonResponse;
@@ -187,10 +188,10 @@ class HRReportController extends Controller
         $actionType = $validated['action_type'] ?? 'all';
 
         $actionMap = [
-            'received' => \App\Models\LeaveApplicationLog::ACTION_HR_RECEIVED,
-            'certified' => \App\Models\LeaveApplicationLog::ACTION_HR_APPROVED,
-            'cmo_reviewed' => \App\Models\LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED,
-            'released' => \App\Models\LeaveApplicationLog::ACTION_HR_RELEASED,
+            'received' => \App\Models\Leave\LeaveApplicationLog::ACTION_HR_RECEIVED,
+            'certified' => \App\Models\Leave\LeaveApplicationLog::ACTION_HR_APPROVED,
+            'cmo_reviewed' => \App\Models\Leave\LeaveApplicationLog::ACTION_CMO_CBMO_REVIEWED,
+            'released' => \App\Models\Leave\LeaveApplicationLog::ACTION_HR_RELEASED,
         ];
 
         $targetActions = $actionType === 'all'
@@ -852,7 +853,7 @@ class HRReportController extends Controller
         [$dateFrom, $dateTo] = $this->validateDateRange($request);
         $employeeDirectory = $this->getEmployeeDirectory();
 
-        $query = \App\Models\LeaveApplicationUpdateRequest::query()
+        $query = \App\Models\Leave\LeaveApplicationUpdateRequest::query()
             ->with(['leaveApplication.leaveType', 'leaveApplication.applicantAdmin.department'])
             ->orderBy('requested_at', 'asc')
             ->orderBy('created_at', 'asc');
