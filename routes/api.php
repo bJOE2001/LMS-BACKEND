@@ -224,6 +224,9 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             // Accrual History Management
             Route::get('/leave-accruals', [LeaveBalanceAccrualController::class, 'getByIds']);
             Route::post('/leave-accruals/bulk-update', [LeaveBalanceAccrualController::class, 'bulkUpdate']);
+
+            // Raw Biometric Attendance Logs
+            Route::get('/attendance-logs', [\App\Http\Controllers\Attendance\AttendanceLogController::class, 'index']);
         });
 
         Route::middleware('hr.module:dashboard')->group(function () {

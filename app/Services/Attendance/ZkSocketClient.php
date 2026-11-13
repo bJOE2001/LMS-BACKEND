@@ -801,9 +801,9 @@ class ZkSocketClient
      * 40-byte format with UID prefix:
      * - [0-1]   UID (2 bytes unsigned short)
      * - [2-25]  User PIN (null-padded string, up to 24 chars)
-     * - [26]    Verify State (0=Check-In, 1=Check-Out, etc.)
+     * - [26]    Verify Type (1=Finger, 15=Face, 4=Card, 0=Password)
      * - [27-30] Timestamp (Unix 32-bit or encoded format)
-     * - [31]    Verify Type (1=Finger, 15=Face, 4=Card, 0=Password)
+     * - [31]    Punch State (0=Check-In, 1=Check-Out, ..., 255=Auto)
      * - [32-39] WorkCode
      *
      * @return array<int, array{pin: string, time: string, state: int, type: int, work_code: string|null}>
@@ -846,9 +846,9 @@ class ZkSocketClient
             if ($recordSize === 40) {
                 if ($hasUidPrefix) {
                     $pinRaw = substr($record, 2, 24);
-                    $state = ord($record[26] ?? "\x00");
+                    $type = ord($record[26] ?? "\x00");
                     $timeRaw = unpack('V', substr($record, 27, 4))[1] ?? 0;
-                    $type = ord($record[31] ?? "\x00");
+                    $state = ord($record[31] ?? "\x00");
                     $workCodeRaw = substr($record, 32, 8);
                 } else {
                     $pinRaw = substr($record, 0, 24);

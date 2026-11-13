@@ -30,6 +30,8 @@ class AttendanceRawLog extends Model
 
     public const STATE_OT_OUT = 5;
 
+    public const STATE_AUTO = 255;
+
     /** Verify type constants standard in ZKTeco firmware */
     public const VERIFY_PASSWORD = 0;
 
