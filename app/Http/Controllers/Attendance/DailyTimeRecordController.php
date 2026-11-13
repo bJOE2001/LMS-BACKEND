@@ -134,7 +134,7 @@ class DailyTimeRecordController extends Controller
             }
 
             $acronym = trim((string) ($dept->acronym ?? ''));
-            $title = $acronym !== '' ? $acronym.' HEAD' : ($head->position ?: 'DEPARTMENT HEAD');
+            $title = $acronym !== '' ? $acronym.' HEAD' : ($head->designation ?: 'DEPARTMENT HEAD');
 
             $defaultInCharge = [
                 'name' => $headName ?: 'DEPARTMENT HEAD',
@@ -155,7 +155,7 @@ class DailyTimeRecordController extends Controller
                     $name = strtoupper(trim($h->full_name));
                 }
                 $acronym = trim((string) ($h->department?->acronym ?? ''));
-                $title = $acronym !== '' ? $acronym.' HEAD' : ($h->position ?: 'DEPARTMENT HEAD');
+                $title = $acronym !== '' ? $acronym.' HEAD' : ($h->designation ?: 'DEPARTMENT HEAD');
 
                 return [
                     'id' => $h->id,
@@ -243,7 +243,7 @@ class DailyTimeRecordController extends Controller
                     $name = strtoupper(trim($h->full_name));
                 }
                 $acronym = trim((string) ($h->department?->acronym ?? ''));
-                $title = $acronym !== '' ? $acronym.' HEAD' : ($h->position ?: 'DEPARTMENT HEAD');
+                $title = $acronym !== '' ? $acronym.' HEAD' : ($h->designation ?: 'DEPARTMENT HEAD');
 
                 return [
                     'id' => $h->id,
@@ -332,7 +332,7 @@ class DailyTimeRecordController extends Controller
                 }
 
                 $acronym = trim((string) ($dept->acronym ?? ''));
-                $title = $acronym !== '' ? $acronym.' HEAD' : ($head->position ?: 'DEPARTMENT HEAD');
+                $title = $acronym !== '' ? $acronym.' HEAD' : ($head->designation ?: 'DEPARTMENT HEAD');
 
                 $defaultInCharge = [
                     'name' => $headName ?: 'DEPARTMENT HEAD',
