@@ -9284,10 +9284,28 @@ class LeaveApplicationController extends Controller
         };
     }
 
+    /**
+     * Resolve the single canonical position and salary fields from an HRIS employee record.
+     *
+     * @return array{position: string, salary: ?float}
+     */
+    private function resolveEmployeePositionAndSalary(?object $employee): array
+    {
+        $position = trim((string) ($employee?->designation ?? ''));
+        $rawRateMon = $employee?->rate_mon ?? null;
+        $salary = $rawRateMon !== null ? (float) $rawRateMon : null;
+
+        return [
+            'position' => $position,
+            'salary' => $salary,
+        ];
+    }
+
     private function formatErmsApplication(LeaveApplication $app, array $actorDirectory): array
     {
         $documentVerification = $this->documentVerificationService->issue($app);
         $resolvedEmployee = $this->resolveApplicationEmployee($app);
+        $employeeInfo = $this->resolveEmployeePositionAndSalary($resolvedEmployee);
         $employeeName = trim((string) ($app->employee_name ?? ''));
         if ($employeeName === '') {
             $employeeName = $this->formatEmployeeFullName($resolvedEmployee);
@@ -9566,6 +9584,8 @@ class LeaveApplicationController extends Controller
             'rejection_reason' => $app->status === LeaveApplication::STATUS_REJECTED && ! $isCancelled ? $app->remarks : null,
             'employee_name' => $employeeName,
             'office' => $office,
+            'position' => $employeeInfo['position'],
+            'salary' => $employeeInfo['salary'],
             'officeAcronym' => $resolvedEmployee?->officeAcronym,
             'office_acronym' => $resolvedEmployee?->officeAcronym,
             'hrisOfficeAcronym' => $resolvedEmployee?->hrisOfficeAcronym,
@@ -16358,6 +16378,8 @@ class LeaveApplicationController extends Controller
             $applicantName = $this->resolveEmployeeDisplayName($app);
         }
         $office = $resolvedEmployee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
+        $employeeInfo = $this->resolveEmployeePositionAndSalary($resolvedEmployee);
+        $monthlyRate = $employeeInfo['salary'];
         $durationDays = (float) $app->total_days;
         $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
         $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
@@ -16366,14 +16388,12 @@ class LeaveApplicationController extends Controller
             $leaveBalanceSnapshot = [];
             $vacationLeaveBalance = null;
             $sickLeaveBalance = null;
-            $monthlyRate = $resolvedEmployee?->rate_mon !== null ? (float) $resolvedEmployee->rate_mon : null;
             $terminalLeaveEstimatedAmount = null;
             $currentLeaveBalance = null;
         } else {
             $leaveBalanceSnapshot = $this->getApplicationLeaveBalanceSnapshot($app);
             $vacationLeaveBalance = $this->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Vacation Leave');
             $sickLeaveBalance = $this->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Sick Leave');
-            $monthlyRate = $resolvedEmployee?->rate_mon !== null ? (float) $resolvedEmployee->rate_mon : null;
             $terminalLeaveEstimatedAmount = $this->resolveTerminalLeaveEstimatedAmount(
                 $monthlyRate,
                 $vacationLeaveBalance,
@@ -16615,6 +16635,8 @@ class LeaveApplicationController extends Controller
             'applicantName' => $applicantName,
             'applicant_name' => $applicantName,
             'office' => $office,
+            'position' => $employeeInfo['position'],
+            'salary' => $employeeInfo['salary'],
             'officeAcronym' => $resolvedEmployee?->officeAcronym,
             'office_acronym' => $resolvedEmployee?->officeAcronym,
             'hrisOfficeAcronym' => $resolvedEmployee?->hrisOfficeAcronym,
