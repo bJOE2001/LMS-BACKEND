@@ -23,8 +23,6 @@ class Department extends Model
 
     protected $fillable = [
         'name',
-        'code',
-        'acronym',
         'main_department_id',
         'is_inactive',
     ];

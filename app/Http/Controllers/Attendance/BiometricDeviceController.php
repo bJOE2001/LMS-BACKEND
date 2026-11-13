@@ -7,6 +7,7 @@ use App\Models\BiometricDevice;
 use App\Models\Department;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
+use App\Models\HrisEmployee;
 use App\Services\Attendance\LanBioPunchSyncService;
 use App\Services\Attendance\ZkSocketClient;
 use Carbon\Carbon;
@@ -22,7 +23,7 @@ class BiometricDeviceController extends Controller
     public function listDevices(): JsonResponse
     {
         $configuredDevices = BiometricDevice::query()
-            ->with(['department:id,name,acronym,code'])
+            ->with(['department:id,name'])
             ->orderBy('id')
             ->get();
 
@@ -50,6 +51,8 @@ class BiometricDeviceController extends Controller
                 $status = $isOnline ? 'ONLINE' : 'OFFLINE';
             }
 
+            $officeAcronym = HrisEmployee::officeAcronymByName($dev->department?->name);
+
             $devices[] = [
                 'id' => $dev->id,
                 'device_name' => $dev->device_name,
@@ -63,9 +66,9 @@ class BiometricDeviceController extends Controller
                 'comm_key' => $dev->comm_key,
                 'department_id' => $dev->department_id,
                 'department_name' => $dev->department?->name ?? $dev->department_name,
-                'office_acronym' => $dev->department?->acronym,
-                'location' => $dev->department?->acronym
-                    ? "{$dev->department->acronym} - {$dev->department->name}"
+                'office_acronym' => $officeAcronym,
+                'location' => $officeAcronym
+                    ? "{$officeAcronym} - {$dev->department?->name}"
                     : ($dev->department_name ?: ($dev->department_id ? 'Office Terminal' : 'Unassigned')),
                 'is_primary' => (bool) $dev->is_primary,
                 'is_active' => (bool) $dev->is_active,
@@ -437,7 +440,7 @@ class BiometricDeviceController extends Controller
         }
 
         $department = Department::query()->find($departmentId);
-        $officeLabel = $department?->acronym ?: ($department?->name ?: "Office #{$departmentId}");
+        $officeLabel = HrisEmployee::officeAcronymByName($department?->name) ?: ($department?->name ?: "Office #{$departmentId}");
 
         $devices = BiometricDevice::query()
             ->where('department_id', $departmentId)

@@ -73,7 +73,7 @@ class EmployeeController extends Controller
         $departments = Department::query()
             ->active()
             ->orderBy('name')
-            ->get(['id', 'name', 'code', 'acronym']);
+            ->get(['id', 'name']);
 
         return response()->json([
             'departments' => $departments,

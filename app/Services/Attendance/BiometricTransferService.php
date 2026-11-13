@@ -72,7 +72,7 @@ class BiometricTransferService
         try {
             // 1. Identify target office and its active biometric terminal(s)
             $department = Department::query()->find($newDepartmentId);
-            $departmentLabel = $department?->acronym ?: ($department?->name ?: "Office #{$newDepartmentId}");
+            $departmentLabel = HrisEmployee::officeAcronymByName($department?->name) ?: ($department?->name ?: "Office #{$newDepartmentId}");
 
             $targetDevices = BiometricDevice::query()
                 ->where('department_id', $newDepartmentId)
@@ -588,7 +588,7 @@ class BiometricTransferService
 
         $dept = Department::query()->find($departmentId);
 
-        return $dept?->acronym ?: ($dept?->name ?: "Office #{$departmentId}");
+        return HrisEmployee::officeAcronymByName($dept?->name) ?: ($dept?->name ?: "Office #{$departmentId}");
     }
 
     /**

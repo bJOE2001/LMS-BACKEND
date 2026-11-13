@@ -133,7 +133,7 @@ class DailyTimeRecordController extends Controller
                 $headName = strtoupper(trim($head->full_name));
             }
 
-            $acronym = trim((string) ($dept->acronym ?? ''));
+            $acronym = trim((string) (HrisEmployee::officeAcronymByName($dept?->name) ?? ''));
             $title = $acronym !== '' ? $acronym.' HEAD' : ($head->designation ?: 'DEPARTMENT HEAD');
 
             $defaultInCharge = [
@@ -145,7 +145,7 @@ class DailyTimeRecordController extends Controller
 
         // Active Department Heads list for modal dropdown
         $departmentHeads = DepartmentHead::query()
-            ->with('department:id,name,acronym')
+            ->with('department:id,name')
             ->orderBy('surname')
             ->get()
             ->map(function ($h) {
@@ -154,7 +154,7 @@ class DailyTimeRecordController extends Controller
                 if ($name === '' && ! empty($h->full_name)) {
                     $name = strtoupper(trim($h->full_name));
                 }
-                $acronym = trim((string) ($h->department?->acronym ?? ''));
+                $acronym = trim((string) (HrisEmployee::officeAcronymByName($h->department?->name) ?? ''));
                 $title = $acronym !== '' ? $acronym.' HEAD' : ($h->designation ?: 'DEPARTMENT HEAD');
 
                 return [
@@ -233,7 +233,7 @@ class DailyTimeRecordController extends Controller
         ]);
 
         $departmentHeads = DepartmentHead::query()
-            ->with('department:id,name,acronym')
+            ->with('department:id,name')
             ->orderBy('surname')
             ->get()
             ->map(function ($h) {
@@ -242,7 +242,7 @@ class DailyTimeRecordController extends Controller
                 if ($name === '' && ! empty($h->full_name)) {
                     $name = strtoupper(trim($h->full_name));
                 }
-                $acronym = trim((string) ($h->department?->acronym ?? ''));
+                $acronym = trim((string) (HrisEmployee::officeAcronymByName($h->department?->name) ?? ''));
                 $title = $acronym !== '' ? $acronym.' HEAD' : ($h->designation ?: 'DEPARTMENT HEAD');
 
                 return [
@@ -331,7 +331,7 @@ class DailyTimeRecordController extends Controller
                     $headName = strtoupper(trim($head->full_name));
                 }
 
-                $acronym = trim((string) ($dept->acronym ?? ''));
+                $acronym = trim((string) (HrisEmployee::officeAcronymByName($dept?->name) ?? ''));
                 $title = $acronym !== '' ? $acronym.' HEAD' : ($head->designation ?: 'DEPARTMENT HEAD');
 
                 $defaultInCharge = [

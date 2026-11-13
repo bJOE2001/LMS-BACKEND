@@ -511,7 +511,8 @@ class BiometricRegistrationController extends Controller
             }
         }
 
-        $deptLabel = $account->department?->acronym ?: ($account->department?->name ?: "Office #{$account->department_id}");
+        $deptLabel = HrisEmployee::officeAcronymByName($account->department?->name)
+            ?: ($account->department?->name ?: "Office #{$account->department_id}");
         $remarks = $provision['requires_local_scan']
             ? 'Profile assigned; scan needed'
             : ($provision['templates_transferred'] > 0
@@ -817,21 +818,14 @@ class BiometricRegistrationController extends Controller
         if ($departmentId) {
             $dept = Department::query()->find($departmentId);
             if ($dept) {
-                return $dept->acronym ?: ($dept->name ?: "Office #{$departmentId}");
+                return HrisEmployee::officeAcronymByName($dept->name) ?: ($dept->name ?: "Office #{$departmentId}");
             }
         }
 
         if (! empty($fallbackName)) {
             $cleanFallback = trim($fallbackName);
-            $dept = Department::query()
-                ->where('name', $cleanFallback)
-                ->orWhere('acronym', $cleanFallback)
-                ->first();
-            if ($dept && $dept->acronym) {
-                return $dept->acronym;
-            }
 
-            return $cleanFallback;
+            return HrisEmployee::officeAcronymByName($cleanFallback) ?: $cleanFallback;
         }
 
         return null;
