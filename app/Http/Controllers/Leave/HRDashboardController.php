@@ -2,17 +2,19 @@
 
 namespace App\Http\Controllers\Leave;
 
-use App\Traits\FiltersEmployeeControlNos;
 use App\Http\Controllers\Controller;
-use App\Models\Leave\COCApplication;
+use App\Models\Attendance\AttendanceRawLog;
+use App\Models\Attendance\DailyTimeRecord;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
+use App\Models\Leave\COCApplication;
 use App\Models\Leave\LeaveApplication;
 use App\Models\Leave\LeaveApplicationLog;
 use App\Models\Leave\LeaveApplicationUpdateRequest;
 use App\Models\Leave\LeaveBalance;
 use App\Models\Leave\LeaveType;
+use App\Traits\FiltersEmployeeControlNos;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -70,23 +72,7 @@ class HRDashboardController extends Controller
         $employeeStatusByControlNo = $this->buildEmployeeStatusDirectory($employeeDirectoryByControlNo);
         $leaveBalanceDirectory = $this->buildLeaveBalanceDirectory($applications);
         $activeEmployeeCount = HrisEmployee::countCached(true);
-
-        // Count employees/admins currently on approved leave today
-        $today = now()->toDateString();
-        $onLeaveToday = $applications->filter(function ($app) use ($today) {
-            if ($app->status !== LeaveApplication::STATUS_APPROVED) {
-                return false;
-            }
-
-            $startStr = $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : null;
-            $endStr = $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : null;
-
-            if (! $startStr || ! $endStr) {
-                return false;
-            }
-
-            return $startStr <= $today && $endStr >= $today;
-        })->count();
+        $manpowerToday = $this->buildDailyManpowerSnapshot($applications, $activeEmployeeCount);
 
         $formatted = $applications->map(
             fn ($app) => $this->formatApplication(
@@ -111,10 +97,140 @@ class HRDashboardController extends Controller
                 ),
             ],
             'analytics' => $analytics,
-            'on_leave_today' => $onLeaveToday,
+            'on_leave_today' => $manpowerToday['on_leave_count'],
+            'manpower_today' => $manpowerToday,
             'active_employees' => $activeEmployeeCount,
             'applications' => $formatted,
         ]);
+    }
+
+    /**
+     * Compute Present / Absent / On Leave daily manpower counts out of active employees.
+     *
+     * @param  \Illuminate\Support\Collection<int, LeaveApplication>  $applications
+     * @return array{
+     *     date: string,
+     *     total_active: int,
+     *     present_count: int,
+     *     absent_count: int,
+     *     on_leave_count: int,
+     *     present_percentage: float,
+     *     absent_percentage: float,
+     *     on_leave_percentage: float
+     * }
+     */
+    private function buildDailyManpowerSnapshot($applications, int $activeEmployeeCount): array
+    {
+        $today = now()->toDateString();
+        $totalActive = max($activeEmployeeCount, 0);
+
+        $toEmployeeKey = static function (?string $controlNo): string {
+            $raw = trim((string) ($controlNo ?? ''));
+            if ($raw === '') {
+                return '';
+            }
+
+            $unpadded = ltrim($raw, '0');
+
+            return $unpadded !== '' ? $unpadded : '0';
+        };
+
+        $onLeaveKeys = [];
+        foreach ($applications as $app) {
+            if ($app->status !== LeaveApplication::STATUS_APPROVED) {
+                continue;
+            }
+
+            $isOnLeaveToday = false;
+            $selectedDates = is_array($app->selected_dates) ? $app->selected_dates : [];
+            if ($selectedDates !== []) {
+                foreach ($selectedDates as $selectedDate) {
+                    if (substr(trim((string) $selectedDate), 0, 10) === $today) {
+                        $isOnLeaveToday = true;
+                        break;
+                    }
+                }
+            } else {
+                $startStr = $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : null;
+                $endStr = $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : null;
+                if ($startStr && $endStr && $startStr <= $today && $endStr >= $today) {
+                    $isOnLeaveToday = true;
+                }
+            }
+
+            if (! $isOnLeaveToday) {
+                continue;
+            }
+
+            $key = $toEmployeeKey($app->employee_control_no) ?: 'leave-app-'.$app->id;
+            $onLeaveKeys[$key] = true;
+        }
+
+        $presentKeys = [];
+        try {
+            $todayDtrs = DailyTimeRecord::query()
+                ->where('record_date', $today)
+                ->get(['employee_control_no', 'status', 'am_arrival', 'am_departure', 'pm_arrival', 'pm_departure']);
+
+            $leaveStatuses = [
+                DailyTimeRecord::STATUS_ON_LEAVE,
+                DailyTimeRecord::STATUS_ON_LEAVE_AM,
+                DailyTimeRecord::STATUS_ON_LEAVE_PM,
+                DailyTimeRecord::STATUS_HALF_DAY,
+            ];
+            $presentStatuses = [
+                DailyTimeRecord::STATUS_PRESENT,
+                DailyTimeRecord::STATUS_OFFICIAL_BUSINESS,
+                DailyTimeRecord::STATUS_PASS_SLIP,
+            ];
+
+            foreach ($todayDtrs as $dtr) {
+                $key = $toEmployeeKey($dtr->employee_control_no);
+                if ($key === '') {
+                    continue;
+                }
+
+                $hasPunches = $dtr->am_arrival !== null
+                    || $dtr->am_departure !== null
+                    || $dtr->pm_arrival !== null
+                    || $dtr->pm_departure !== null;
+
+                if ($hasPunches || in_array($dtr->status, $presentStatuses, true)) {
+                    $presentKeys[$key] = true;
+                } elseif (in_array($dtr->status, $leaveStatuses, true)) {
+                    $onLeaveKeys[$key] = true;
+                }
+            }
+
+            $rawTodayLogs = AttendanceRawLog::query()
+                ->whereDate('punch_time', $today)
+                ->get(['employee_control_no', 'biometric_pin']);
+
+            foreach ($rawTodayLogs as $rawLog) {
+                $key = $toEmployeeKey($rawLog->employee_control_no ?: $rawLog->biometric_pin);
+                if ($key !== '') {
+                    $presentKeys[$key] = true;
+                }
+            }
+        } catch (\Throwable) {
+            // Keep approved leave snapshot if BIO_DB is unavailable
+        }
+
+        $presentCount = min(count($presentKeys), $totalActive);
+        $onLeaveOnlyKeys = array_diff_key($onLeaveKeys, $presentKeys);
+        $onLeaveCount = min(count($onLeaveOnlyKeys), max($totalActive - $presentCount, 0));
+        $absentCount = max($totalActive - $presentCount - $onLeaveCount, 0);
+
+        return [
+            'date' => $today,
+            'total_active' => $totalActive,
+            'present_count' => $presentCount,
+            'absent_count' => $absentCount,
+            'on_leave_count' => $onLeaveCount,
+            'present_percentage' => $totalActive > 0 ? round(($presentCount / $totalActive) * 100, 2) : 0.0,
+            'absent_percentage' => $totalActive > 0 ? round(($absentCount / $totalActive) * 100, 2) : 0.0,
+            'on_leave_percentage' => $totalActive > 0 ? round(($onLeaveCount / $totalActive) * 100, 2) : 0.0,
+        ];
     }
 
     /**

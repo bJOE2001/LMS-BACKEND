@@ -7,12 +7,12 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Schedule;
 
 // ─── Scheduled Tasks ─────────────────────────────────────────────────────────
-Schedule::command('leave:accrue')->monthlyOn(1, '00:01');
-Schedule::command('leave:reset')->yearlyOn(1, 1, '00:05');
-Schedule::command('coc:expire')->yearlyOn(1, 1, '00:10');
+Schedule::command('leave:accrue')->monthlyOn(19, '00:01')->withoutOverlapping(30)->runInBackground();
+Schedule::command('leave:reset')->yearlyOn(1, 1, '00:05')->withoutOverlapping(30)->runInBackground();
+Schedule::command('coc:expire')->yearlyOn(1, 1, '00:10')->withoutOverlapping(30)->runInBackground();
 
 // Biometric Synchronization (City Hall LAN devices)
-Schedule::command('bio:poll-lan')->everyMinute()->withoutOverlapping();
+Schedule::command('bio:pull')->everyMinute()->withoutOverlapping(2);
 
 Artisan::command('inspire', function () {
     $this->comment(Inspiring::quote());

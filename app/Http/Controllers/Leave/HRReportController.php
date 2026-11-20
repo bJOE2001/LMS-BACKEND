@@ -3,10 +3,10 @@
 namespace App\Http\Controllers\Leave;
 
 use App\Http\Controllers\Controller;
-use App\Models\Leave\COCApplication;
 use App\Models\Department;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
+use App\Models\Leave\COCApplication;
 use App\Models\Leave\LeaveApplication;
 use App\Models\Leave\LeaveBalance;
 use App\Models\Leave\LeaveType;
@@ -180,10 +180,10 @@ class HRReportController extends Controller
             'action_type' => ['nullable', 'string', 'in:all,received,certified,cmo_reviewed,released'],
         ]);
 
-        $fromDate = $validated['from_date'] ?? now()->startOfMonth()->toDateString();
-        $toDate = $validated['to_date'] ?? now()->endOfMonth()->toDateString();
-        $start = $fromDate.' 00:00:00';
-        $end = $toDate.' 23:59:59';
+        $fromDate = $validated['from_date'] ?? null;
+        $toDate = $validated['to_date'] ?? null;
+        $start = $fromDate ? $fromDate.' 00:00:00' : null;
+        $end = $toDate ? $toDate.' 23:59:59' : null;
 
         $actionType = $validated['action_type'] ?? 'all';
 
@@ -197,6 +197,17 @@ class HRReportController extends Controller
         $targetActions = $actionType === 'all'
             ? array_values($actionMap)
             : [$actionMap[$actionType]];
+
+        $applyLogFilters = static function (mixed $query) use ($targetActions, $start, $end): void {
+            $query->whereIn('action', $targetActions);
+            if ($start !== null && $end !== null) {
+                $query->whereBetween('created_at', [$start, $end]);
+            } elseif ($start !== null) {
+                $query->where('created_at', '>=', $start);
+            } elseif ($end !== null) {
+                $query->where('created_at', '<=', $end);
+            }
+        };
 
         $applications = LeaveApplication::query()
             ->select([
@@ -217,23 +228,24 @@ class HRReportController extends Controller
                 'leaveType:id,name',
                 'applicantAdmin:id,department_id,employee_control_no,full_name',
                 'applicantAdmin.department:id,name',
-                'logs' => function ($q) use ($start, $end, $targetActions) {
-                    $q->whereIn('action', $targetActions)
-                        ->whereBetween('created_at', [$start, $end]);
-                },
+                'logs' => $applyLogFilters,
             ])
-            ->whereHas('logs', function (Builder $q) use ($start, $end, $targetActions) {
-                $q->whereIn('action', $targetActions)
-                    ->whereBetween('created_at', [$start, $end]);
-            })
+            ->whereHas('logs', $applyLogFilters)
             ->orderBy('id', 'desc')
             ->get();
+
+        $directory = $this->getEmployeeDirectory();
 
         // Transform applications into flat rows for the frontend report
         // If an application has multiple matching logs (e.g. received AND released in the same date range when action_type=all),
         // we map each log as a separate row in the report.
         $rows = [];
         foreach ($applications as $app) {
+            $employee = $this->resolveApplicationEmployeeProfile($app, $directory);
+            $officeAcronym = $employee['officeAcronym'] !== ''
+                ? $employee['officeAcronym']
+                : $employee['office'];
+
             foreach ($app->logs as $log) {
                 $actionLabel = array_search($log->action, $actionMap) ?: 'unknown';
                 if ($actionLabel === 'cmo_reviewed') {
@@ -247,7 +259,8 @@ class HRReportController extends Controller
                     'leave_application_id' => $app->id,
                     'employee_control_no' => $app->employee_control_no,
                     'employee_name' => $app->employee_name,
-                    'office_acronym' => $app->applicantAdmin?->department?->name ?? '',
+                    'office' => $employee['office'],
+                    'office_acronym' => $officeAcronym,
                     'leave_type_name' => $app->leaveType?->name ?? '',
                     'inclusive_dates' => $app->selected_dates,
                     'action' => $actionLabel,
@@ -380,6 +393,8 @@ class HRReportController extends Controller
                 'remarks' => $this->resolveLwopReportRemarks($application, $withoutPayDays),
                 'month' => $monthYear['month'],
                 'year' => $monthYear['year'],
+                'referenceDate' => $referenceDate?->toDateString(),
+                'dateKeys' => array_values($wopDateKeys),
                 '_sort_key' => $this->composeSortKey([
                     $employee['office'],
                     $employee['name'],
@@ -592,6 +607,7 @@ class HRReportController extends Controller
                 'remarks' => '',
                 'month' => (int) $now->month,
                 'year' => (int) $now->year,
+                'referenceDate' => $now->toDateString(),
                 '_sort_key' => $this->composeSortKey([
                     $employee['office'],
                     $employee['name'],
@@ -661,6 +677,7 @@ class HRReportController extends Controller
                 'remarks' => $remarks ?? '',
                 'month' => $monthYear['month'],
                 'year' => $monthYear['year'],
+                'referenceDate' => $referenceDate?->toDateString(),
                 '_sort_key' => $this->composeSortKey([
                     $this->formatSortableDate($referenceDate),
                     $employee['office'],
@@ -832,6 +849,7 @@ class HRReportController extends Controller
                 'remarks' => $this->trimNullableString($application->remarks) ?? '',
                 'month' => $monthYear['month'],
                 'year' => $monthYear['year'],
+                'referenceDate' => $referenceDate?->toDateString(),
                 '_sort_key' => $this->composeSortKey([
                     $this->formatSortableDate($referenceDate),
                     $employee['office'],
@@ -1246,6 +1264,7 @@ class HRReportController extends Controller
                 'remarks' => $totalBalanceHours > 0 ? 'Current available COC balance' : 'No remaining COC balance',
                 'month' => $monthYear['month'],
                 'year' => $monthYear['year'],
+                'referenceDate' => $referenceDate?->toDateString(),
                 '_sort_key' => $this->composeSortKey([
                     $employee['office'],
                     $employee['name'],
@@ -1318,13 +1337,16 @@ class HRReportController extends Controller
                     'months' => [],
                     'years' => [],
                     'periodKeys' => [],
+                    'dateKeys' => [],
                     'latest_reference_date' => $referenceDate->copy(),
                 ];
             }
 
+            $dateKey = $referenceDate->toDateString();
             $aggregates[$employeeKey]['months'][(string) $month] = $month;
             $aggregates[$employeeKey]['years'][(string) $year] = $year;
             $aggregates[$employeeKey]['periodKeys'][$periodKey] = $periodKey;
+            $aggregates[$employeeKey]['dateKeys'][$dateKey] = $dateKey;
 
             if ($referenceDate->gt($aggregates[$employeeKey]['latest_reference_date'])) {
                 $aggregates[$employeeKey]['latest_reference_date'] = $referenceDate->copy();
@@ -1394,6 +1416,8 @@ class HRReportController extends Controller
                 'months' => $months,
                 'years' => $years,
                 'periodKeys' => $periodKeys,
+                'dateKeys' => array_values($aggregate['dateKeys']),
+                'referenceDate' => $latestReferenceDate->toDateString(),
                 '_sort_key' => $this->composeSortKey([
                     $employee['office'],
                     $employee['name'],

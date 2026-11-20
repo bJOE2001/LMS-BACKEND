@@ -2,7 +2,6 @@
 
 namespace App\Http\Controllers\Leave;
 
-use App\Traits\FiltersEmployeeControlNos;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\HrLeaveApplicationIndexRequest;
 use App\Http\Requests\HrVerifyLeaveApplicationDocumentRequest;
@@ -20,6 +19,7 @@ use App\Services\Leave\LeaveCreditService;
 use App\Services\Leave\LeaveEligibilityService;
 use App\Services\Leave\LeaveWorkflowService;
 use App\Services\SmsGatewayService;
+use App\Traits\FiltersEmployeeControlNos;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
@@ -207,8 +207,8 @@ class LeaveApplicationController extends Controller
             fn (string $no) => $this->assertErmsEmployeeIsPulled($no),
             fn ($query, string $no) => $this->applyApplicationOwnershipFilter($query, $no),
             fn ($applications): array => $this->buildWorkflowActorDirectory($applications),
-            null,
-            null,
+            fn (object $employee): array => $this->leaveWorkflowService()->formatErmsEmployeeContext($employee),
+            fn (object $employee) => $this->leaveWorkflowService()->getAllowedErmsLeaveTypesForEmployee($employee),
             fn (LeaveApplication $app, array $actorDirectory = []): array => $this->formatErmsApplication($app, $actorDirectory),
             fn (string $no): array => $this->employeeControlNoResponse($no)
         );
