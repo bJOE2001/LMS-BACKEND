@@ -2,9 +2,9 @@
 
 namespace App\Console\Commands;
 
-use App\Models\LeaveBalance;
-use App\Models\LeaveBalanceAccrualHistory;
-use App\Models\LeaveType;
+use App\Models\Leave\LeaveBalance;
+use App\Models\Leave\LeaveBalanceAccrualHistory;
+use App\Models\Leave\LeaveType;
 use Illuminate\Console\Command;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;

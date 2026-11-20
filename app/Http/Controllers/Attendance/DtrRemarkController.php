@@ -3,7 +3,7 @@
 namespace App\Http\Controllers\Attendance;
 
 use App\Http\Controllers\Controller;
-use App\Models\DtrRemark;
+use App\Models\Attendance\DtrRemark;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 

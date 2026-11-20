@@ -2,19 +2,18 @@
 
 namespace App\Services\Leave;
 
-use App\Http\Controllers\Concerns\FiltersEmployeeControlNos;
 use App\Models\DepartmentAdmin;
 use App\Models\DepartmentHead;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
-use App\Models\LeaveApplication;
-use App\Models\LeaveApplicationLog;
-use App\Models\LeaveApplicationPrintLog;
-use App\Models\LeaveApplicationUpdateRequest;
-use App\Models\LeaveType;
+use App\Models\Leave\LeaveApplication;
+use App\Models\Leave\LeaveApplicationLog;
+use App\Models\Leave\LeaveApplicationPrintLog;
+use App\Models\Leave\LeaveApplicationUpdateRequest;
+use App\Models\Leave\LeaveType;
 use App\Models\Notification;
-use App\Services\LeaveApplicationDocumentVerificationService;
 use App\Services\WorkScheduleService;
+use App\Traits\FiltersEmployeeControlNos;
 use Carbon\CarbonImmutable;
 use DateTimeInterface;
 use Illuminate\Database\Eloquent\Builder;
@@ -9141,6 +9140,7 @@ class LeaveWorkflowService
                 'control_no' => $controlNo,
                 'full_name' => $fullName,
                 'firstname' => $employee->firstname ?? null,
+                'middlename' => $employee->middlename ?? null,
                 'surname' => $employee->surname ?? null,
                 'status' => $this->eligibilityService()->formatEmploymentStatusLabel($employee->status ?? null),
                 'raw_status' => $this->trimNullableString($employee->status ?? null),
@@ -11033,6 +11033,23 @@ class LeaveWorkflowService
         return isset($cachedHeadControlNos[$normalizedControlNo]);
     }
 
+    /**
+     * Resolve the single canonical position and salary fields from an HRIS employee record.
+     *
+     * @return array{position: string, salary: ?float}
+     */
+    private function resolveEmployeePositionAndSalary(?object $employee): array
+    {
+        $position = trim((string) ($employee?->designation ?? ''));
+        $rawRateMon = $employee?->rate_mon ?? null;
+        $salary = $rawRateMon !== null ? (float) $rawRateMon : null;
+
+        return [
+            'position' => $position,
+            'salary' => $salary,
+        ];
+    }
+
     public function formatErmsApplication(
         LeaveApplication $app,
         array $actorDirectory = [],
@@ -11040,6 +11057,7 @@ class LeaveWorkflowService
     ): array {
         $documentVerification = $this->documentVerificationService()->issue($app);
         $resolvedEmployee = $this->resolveApplicationEmployee($app, $findEmployeeByControlNo);
+        $employeeInfo = $this->resolveEmployeePositionAndSalary($resolvedEmployee);
         $employeeName = trim((string) ($app->employee_name ?? ''));
         if ($employeeName === '') {
             $employeeName = $this->formatEmployeeFullName($resolvedEmployee);
@@ -11292,8 +11310,13 @@ class LeaveWorkflowService
             'update_requests' => $this->formatApplicationUpdateRequests($app),
             'updateRequests' => $this->formatApplicationUpdateRequests($app),
             'rejection_reason' => $app->status === LeaveApplication::STATUS_REJECTED && ! $isCancelled ? $app->remarks : null,
+            'surname' => $resolvedEmployee?->surname,
+            'firstname' => $resolvedEmployee?->firstname,
+            'middlename' => $resolvedEmployee?->middlename,
             'employee_name' => $employeeName,
             'office' => $office,
+            'position' => $employeeInfo['position'],
+            'salary' => $employeeInfo['salary'],
             'officeAcronym' => $resolvedEmployee?->officeAcronym,
             'office_acronym' => $resolvedEmployee?->officeAcronym,
             'hrisOfficeAcronym' => $resolvedEmployee?->hrisOfficeAcronym,
@@ -11405,6 +11428,8 @@ class LeaveWorkflowService
             $applicantName = $this->resolveEmployeeDisplayName($app, $findEmployeeByControlNo);
         }
         $office = $resolvedEmployee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
+        $employeeInfo = $this->resolveEmployeePositionAndSalary($resolvedEmployee);
+        $monthlyRate = $employeeInfo['salary'];
         $durationDays = (float) $app->total_days;
         $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
         $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
@@ -11413,14 +11438,12 @@ class LeaveWorkflowService
             $leaveBalanceSnapshot = [];
             $vacationLeaveBalance = null;
             $sickLeaveBalance = null;
-            $monthlyRate = $resolvedEmployee?->rate_mon !== null ? (float) $resolvedEmployee->rate_mon : null;
             $terminalLeaveEstimatedAmount = null;
             $currentLeaveBalance = null;
         } else {
             $leaveBalanceSnapshot = $this->creditService()->getApplicationLeaveBalanceSnapshot($app);
             $vacationLeaveBalance = $this->certificationService()->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Vacation Leave');
             $sickLeaveBalance = $this->certificationService()->findLeaveTypeBalanceByNameInSnapshot($leaveBalanceSnapshot, 'Sick Leave');
-            $monthlyRate = $resolvedEmployee?->rate_mon !== null ? (float) $resolvedEmployee->rate_mon : null;
             $terminalLeaveEstimatedAmount = $this->certificationService()->resolveTerminalLeaveEstimatedAmount(
                 $monthlyRate,
                 $vacationLeaveBalance,
@@ -11633,11 +11656,16 @@ class LeaveWorkflowService
             'recall_effective_date' => $app->recall_effective_date?->toDateString(),
             'recallSelectedDates' => $effectiveRecallDateKeys !== [] ? $effectiveRecallDateKeys : null,
             'recall_selected_dates' => $effectiveRecallDateKeys !== [] ? $effectiveRecallDateKeys : null,
+            'surname' => $resolvedEmployee?->surname,
+            'firstname' => $resolvedEmployee?->firstname,
+            'middlename' => $resolvedEmployee?->middlename,
             'employeeName' => $applicantName,
             'employee_name' => $applicantName,
             'applicantName' => $applicantName,
             'applicant_name' => $applicantName,
             'office' => $office,
+            'position' => $employeeInfo['position'],
+            'salary' => $employeeInfo['salary'],
             'officeAcronym' => $resolvedEmployee?->officeAcronym,
             'office_acronym' => $resolvedEmployee?->officeAcronym,
             'hrisOfficeAcronym' => $resolvedEmployee?->hrisOfficeAcronym,
@@ -11834,7 +11862,7 @@ class LeaveWorkflowService
         $controlNo = $this->resolveValidatedEmployeeControlNo($baseValidated);
         $employee = $findEmployeeByControlNo !== null
             ? $findEmployeeByControlNo($controlNo)
-            : $this->eligibilityService()->findEmployeeByControlNo($controlNo);
+            : HrisEmployee::findByControlNo($controlNo);
 
         if (! $employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);
@@ -11904,9 +11932,10 @@ class LeaveWorkflowService
             'is_monetization' => ['nullable', 'boolean'],
         ]);
 
+        $controlNo = $this->resolveValidatedEmployeeControlNo($baseValidated);
         $employee = $findEmployeeByControlNo !== null
-            ? $findEmployeeByControlNo($this->resolveValidatedEmployeeControlNo($baseValidated))
-            : $this->eligibilityService()->findEmployeeByControlNo($this->resolveValidatedEmployeeControlNo($baseValidated));
+            ? $findEmployeeByControlNo($controlNo)
+            : HrisEmployee::findByControlNo($controlNo);
 
         if (! $employee) {
             return response()->json(['error' => 'Employee not found'], 404);
@@ -12009,7 +12038,7 @@ class LeaveWorkflowService
         $controlNo = $this->resolveValidatedEmployeeControlNo($validated);
         $employee = $findEmployeeByControlNo !== null
             ? $findEmployeeByControlNo($controlNo)
-            : $this->eligibilityService()->findEmployeeByControlNo($controlNo);
+            : HrisEmployee::findByControlNo($controlNo);
 
         if (! $employee) {
             return response()->json(['message' => 'Employee record not found.'], 404);

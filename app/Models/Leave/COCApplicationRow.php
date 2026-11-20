@@ -1,0 +1,53 @@
+<?php
+
+namespace App\Models\Leave;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+
+class COCApplicationRow extends Model
+{
+    protected $table = 'tblCOCApplicationRows';
+
+    protected $fillable = [
+        'coc_application_id',
+        'employee_control_no',
+        'employee_name',
+        'line_no',
+        'overtime_date',
+        'nature_of_overtime',
+        'time_from',
+        'time_to',
+        'is_overnight',
+        'minutes',
+        'break_minutes',
+        'cumulative_minutes',
+        'credit_category',
+        'credit_multiplier',
+        'creditable_minutes',
+        'credited_hours',
+    ];
+
+    protected function casts(): array
+    {
+        return [
+            'employee_control_no' => 'string',
+            'employee_name' => 'string',
+            'line_no' => 'integer',
+            'overtime_date' => 'date',
+            'is_overnight' => 'boolean',
+            'minutes' => 'integer',
+            'break_minutes' => 'integer',
+            'cumulative_minutes' => 'integer',
+            'credit_category' => 'string',
+            'credit_multiplier' => 'decimal:2',
+            'creditable_minutes' => 'integer',
+            'credited_hours' => 'decimal:2',
+        ];
+    }
+
+    public function application(): BelongsTo
+    {
+        return $this->belongsTo(COCApplication::class, 'coc_application_id');
+    }
+}

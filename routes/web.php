@@ -12,7 +12,7 @@ Route::get('/', function () {
 | Native ZKTeco ADMS Push Protocol Routes
 |--------------------------------------------------------------------------
 | Handles incoming hardware pings and attendance pushes directly from
-| physical biometric terminals (inside City Hall & outside offices)
+| physical biometric terminals
 | without requiring third-party ZKBio Time licenses.
 */
 Route::prefix('iclock')

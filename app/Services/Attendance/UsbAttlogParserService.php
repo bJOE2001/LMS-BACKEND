@@ -2,7 +2,7 @@
 
 namespace App\Services\Attendance;
 
-use App\Models\AttendanceRawLog;
+use App\Models\Attendance\AttendanceRawLog;
 use App\Models\HrisEmployee;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\Log;

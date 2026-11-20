@@ -2,9 +2,9 @@
 
 namespace App\Services;
 
-use App\Models\COCApplication;
 use App\Models\DepartmentAdmin;
-use App\Models\LeaveApplication;
+use App\Models\Leave\COCApplication;
+use App\Models\Leave\LeaveApplication;
 use App\Models\SmsLog;
 use Carbon\CarbonImmutable;
 use Carbon\CarbonInterface;

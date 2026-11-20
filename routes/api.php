@@ -1,25 +1,26 @@
 <?php
 
-use App\Http\Controllers\AdminDashboardController;
 use App\Http\Controllers\Auth\AuthController;
 use App\Http\Controllers\Auth\PasswordResetController;
-use App\Http\Controllers\COCApplicationController;
 use App\Http\Controllers\EmployeeController;
 use App\Http\Controllers\HRAccessControlController;
-use App\Http\Controllers\HRDashboardController;
 use App\Http\Controllers\HRDepartmentLibraryController;
-use App\Http\Controllers\HRIllnessLibraryController;
-use App\Http\Controllers\HRLeaveBalanceImportController;
-use App\Http\Controllers\HRLeaveTypeController;
-use App\Http\Controllers\HRReportController;
+use App\Http\Controllers\HROfficeDivisionController;
 use App\Http\Controllers\HRUserManagementController;
 use App\Http\Controllers\HRWorkScheduleController;
-use App\Http\Controllers\LeaveApplicationController;
-use App\Http\Controllers\LeaveApplicationPrintLogController;
-use App\Http\Controllers\LeaveBalanceAccrualController;
+use App\Http\Controllers\Leave\AdminDashboardController;
+use App\Http\Controllers\Leave\COCApplicationController;
+use App\Http\Controllers\Leave\HRDashboardController;
+use App\Http\Controllers\Leave\HRIllnessLibraryController;
+use App\Http\Controllers\Leave\HRLeaveBalanceImportController;
+use App\Http\Controllers\Leave\HRLeaveTypeController;
+use App\Http\Controllers\Leave\HRReportController;
+use App\Http\Controllers\Leave\LeaveApplicationController;
+use App\Http\Controllers\Leave\LeaveApplicationPrintLogController;
+use App\Http\Controllers\Leave\LeaveBalanceAccrualController;
+use App\Http\Controllers\Leave\SpecialPrivilegeReasonController;
 use App\Http\Controllers\NotificationController;
 use App\Http\Controllers\SettingsController;
-use App\Http\Controllers\SpecialPrivilegeReasonController;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -144,7 +145,6 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::post('/devices/{id}/delete', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'deleteDevice'])->middleware('hr');
         Route::post('/devices/{id}/test-connection', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'testConnection'])->middleware('hr');
         Route::post('/devices/{id}/sync-lan', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'syncLanDevice'])->middleware('hr');
-        Route::post('/sync-office-biometrics', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'syncOfficeDevices']);
         Route::post('/import-usb', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'importUsb']);
 
         // Biometric Registration & Device Syncing
@@ -223,6 +223,9 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             // Accrual History Management
             Route::get('/leave-accruals', [LeaveBalanceAccrualController::class, 'getByIds']);
             Route::post('/leave-accruals/bulk-update', [LeaveBalanceAccrualController::class, 'bulkUpdate']);
+
+            // Raw Biometric Attendance Logs
+            Route::get('/attendance-logs', [\App\Http\Controllers\Attendance\AttendanceLogController::class, 'index']);
         });
 
         Route::middleware('hr.module:dashboard')->group(function () {
@@ -275,6 +278,13 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
             Route::post('/', [HRDepartmentLibraryController::class, 'store']);
             Route::post('/{id}/update', [HRDepartmentLibraryController::class, 'update']);
             Route::post('/{id}/delete', [HRDepartmentLibraryController::class, 'destroy']);
+        });
+
+        Route::middleware('hr.module:office_library')->prefix('office-divisions')->group(function () {
+            Route::get('/', [HROfficeDivisionController::class, 'index']);
+            Route::post('/assign', [HROfficeDivisionController::class, 'assign']);
+            Route::post('/{id}/detach', [HROfficeDivisionController::class, 'detach']);
+            Route::post('/bulk-detach', [HROfficeDivisionController::class, 'bulkDetach']);
         });
 
         Route::middleware('hr.module:illness_library')->prefix('illnesses')->group(function () {

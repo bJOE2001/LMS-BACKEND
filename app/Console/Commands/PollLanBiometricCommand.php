@@ -2,7 +2,7 @@
 
 namespace App\Console\Commands;
 
-use App\Models\BiometricDevice;
+use App\Models\Attendance\BiometricDevice;
 use App\Services\Attendance\LanBioPunchSyncService;
 use Illuminate\Console\Command;
 
@@ -13,7 +13,7 @@ class PollLanBiometricCommand extends Command
      *
      * @var string
      */
-    protected $signature = 'bio:poll-lan
+    protected $signature = 'bio:pull
                             {--device= : Specific biometric device ID or serial number to poll}';
 
     /**
@@ -22,6 +22,8 @@ class PollLanBiometricCommand extends Command
      * @var list<string>
      */
     protected $aliases = [
+        'bio:poll',
+        'bio:poll-lan',
         'bio:sync-lan',
         'attendance:poll-lan',
     ];

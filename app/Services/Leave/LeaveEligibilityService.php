@@ -2,13 +2,13 @@
 
 namespace App\Services\Leave;
 
-use App\Http\Controllers\Concerns\FiltersEmployeeControlNos;
 use App\Models\DepartmentAdmin;
 use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HrisEmployee;
-use App\Models\LeaveApplication;
-use App\Models\LeaveBalance;
-use App\Models\LeaveType;
+use App\Models\Leave\LeaveApplication;
+use App\Models\Leave\LeaveBalance;
+use App\Models\Leave\LeaveType;
+use App\Traits\FiltersEmployeeControlNos;
 use Carbon\CarbonImmutable;
 use DateTimeInterface;
 use Illuminate\Http\JsonResponse;

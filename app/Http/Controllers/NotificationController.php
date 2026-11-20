@@ -2,9 +2,9 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\COCApplication;
 use App\Models\HrisEmployee;
-use App\Models\LeaveApplication;
+use App\Models\Leave\COCApplication;
+use App\Models\Leave\LeaveApplication;
 use App\Models\Notification;
 use App\Services\RecycleBinService;
 use Illuminate\Http\JsonResponse;

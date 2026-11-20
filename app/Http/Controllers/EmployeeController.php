@@ -2,25 +2,26 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\AttendanceLog;
-use App\Models\BiometricDevice;
-use App\Models\BiometricEnrollment;
-use App\Models\BiometricTemplate;
-use App\Models\COCApplication;
+use App\Models\Attendance\AttendanceLog;
+use App\Models\Attendance\BiometricDevice;
+use App\Models\Attendance\BiometricEnrollment;
+use App\Models\Attendance\BiometricTemplate;
 use App\Models\Department;
 use App\Models\DepartmentAdmin;
 use App\Models\DepartmentHead;
 use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
-use App\Models\LateDeduction;
-use App\Models\LeaveApplication;
-use App\Models\LeaveApplicationLog;
-use App\Models\LeaveApplicationUpdateRequest;
-use App\Models\LeaveBalance;
-use App\Models\LeaveBalanceAccrualHistory;
-use App\Models\LeaveRestoration;
-use App\Models\LeaveType;
+use App\Models\HrisOffice;
+use App\Models\Leave\COCApplication;
+use App\Models\Leave\LateDeduction;
+use App\Models\Leave\LeaveApplication;
+use App\Models\Leave\LeaveApplicationLog;
+use App\Models\Leave\LeaveApplicationUpdateRequest;
+use App\Models\Leave\LeaveBalance;
+use App\Models\Leave\LeaveBalanceAccrualHistory;
+use App\Models\Leave\LeaveRestoration;
+use App\Models\Leave\LeaveType;
 use App\Services\Attendance\BiometricTransferService;
 use App\Services\HrAccessControlService;
 use App\Services\RecycleBinService;
@@ -73,7 +74,19 @@ class EmployeeController extends Controller
         $departments = Department::query()
             ->active()
             ->orderBy('name')
-            ->get(['id', 'name', 'code', 'acronym']);
+            ->get(['id', 'name', 'main_department_id'])
+            ->map(static function (Department $department): array {
+                $acronym = HrisOffice::acronymForDepartment($department);
+
+                return [
+                    'id' => $department->id,
+                    'name' => $department->name,
+                    'main_department_id' => $department->main_department_id,
+                    'acronym' => $acronym,
+                    'office_acronym' => $acronym,
+                ];
+            })
+            ->values();
 
         return response()->json([
             'departments' => $departments,
@@ -127,10 +140,14 @@ class EmployeeController extends Controller
                 true
             );
 
-            // Also ensure the DepartmentHead is included in the available assigned records
+            // Also ensure the DepartmentHead (or inherited parent head) is included in the available assigned records
             $headControlNo = DepartmentHead::query()
                 ->where('department_id', $resolvedDepartmentId)
                 ->value('control_no');
+
+            if (! $headControlNo && $department) {
+                $headControlNo = $department->effectiveDepartmentHead()?->control_no;
+            }
 
             if ($headControlNo && ! $employeeRows->contains(fn ($r) => trim((string) ($r['control_no'] ?? '')) === trim((string) $headControlNo))) {
                 $headRows = $this->fetchHrisEmployeeRowsByControlNos(
@@ -188,12 +205,19 @@ class EmployeeController extends Controller
             return $admin;
         }
 
-        $departmentHead = DepartmentHead::query()
-            ->where('department_id', $admin->department_id)
-            ->first();
+        $department = $admin->department;
+        $departmentHead = $department?->effectiveDepartmentHead();
+        $isInherited = $departmentHead !== null && (int) $departmentHead->department_id !== (int) $admin->department_id;
+        $serializedHead = $departmentHead ? $this->serializeDepartmentHead($departmentHead) : null;
+        if ($serializedHead && $isInherited) {
+            $serializedHead['is_inherited'] = true;
+            $mainOffice = $department?->mainDepartment;
+            $serializedHead['main_office_name'] = $mainOffice?->name ? trim((string) $mainOffice->name) : null;
+        }
 
         return response()->json([
-            'department_head' => $departmentHead ? $this->serializeDepartmentHead($departmentHead) : null,
+            'department_head' => $serializedHead,
+            'is_inherited' => $isInherited,
         ]);
     }
 
@@ -330,10 +354,8 @@ class EmployeeController extends Controller
 
         $departmentHead = null;
         if ($departmentId !== null) {
-            $departmentHead = DepartmentHead::query()
-                ->where('department_id', $departmentId)
-                ->orderByDesc('id')
-                ->first();
+            $department = Department::query()->find($departmentId);
+            $departmentHead = $department?->effectiveDepartmentHead();
         }
 
         $normalizedDepartmentName = $this->normalizeDepartmentLookupLabel($departmentName);
@@ -346,10 +368,7 @@ class EmployeeController extends Controller
                 });
 
             if ($departmentFromLibrary) {
-                $departmentHead = DepartmentHead::query()
-                    ->where('department_id', (int) $departmentFromLibrary->id)
-                    ->orderByDesc('id')
-                    ->first();
+                $departmentHead = $departmentFromLibrary->effectiveDepartmentHead();
             }
         }
 
@@ -416,7 +435,6 @@ class EmployeeController extends Controller
         $payload = array_merge($attributes, [
             'department_id' => $admin->department_id,
             'full_name' => $fullName,
-            'position' => $attributes['designation'],
         ]);
 
         if (! $isUpdating) {
@@ -2639,7 +2657,7 @@ class EmployeeController extends Controller
             'designation' => $this->trimOrBlank($departmentHead->designation),
             'rate_mon' => $departmentHead->rate_mon !== null ? (float) $departmentHead->rate_mon : null,
             'full_name' => $departmentHead->full_name,
-            'position' => $departmentHead->position,
+            'position' => $this->trimOrBlank($departmentHead->designation),
         ];
     }
 

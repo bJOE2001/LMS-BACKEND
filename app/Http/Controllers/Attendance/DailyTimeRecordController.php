@@ -3,18 +3,20 @@
 namespace App\Http\Controllers\Attendance;
 
 use App\Http\Controllers\Controller;
-use App\Models\AttendanceRawLog;
-use App\Models\BiometricDevice;
-use App\Models\BiometricEnrollment;
-use App\Models\DailyTimeRecord;
+use App\Models\Attendance\AttendanceRawLog;
+use App\Models\Attendance\BiometricDevice;
+use App\Models\Attendance\BiometricEnrollment;
+use App\Models\Attendance\DailyTimeRecord;
 use App\Models\Department;
 use App\Models\DepartmentAdmin;
 use App\Models\DepartmentHead;
 use App\Models\EmployeeDepartmentAssignment;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
+use App\Models\HrisOffice;
 use App\Services\Attendance\DtrCalculationService;
 use App\Services\Attendance\UsbAttlogParserService;
+use App\Services\HrAccessControlService;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -36,6 +38,10 @@ class DailyTimeRecordController extends Controller
      */
     public function employeeMonthlyDtr(Request $request, string $controlNo): JsonResponse
     {
+        if ($denied = $this->authorizeDtrReadAccess($request)) {
+            return $denied;
+        }
+
         $validated = $request->validate([
             'year' => ['nullable', 'integer', 'min:2020', 'max:2099'],
             'month' => ['nullable', 'integer', 'min:1', 'max:12'],
@@ -133,8 +139,8 @@ class DailyTimeRecordController extends Controller
                 $headName = strtoupper(trim($head->full_name));
             }
 
-            $acronym = trim((string) ($dept->acronym ?? ''));
-            $title = $acronym !== '' ? $acronym.' HEAD' : ($head->position ?: 'DEPARTMENT HEAD');
+            $acronym = trim((string) (HrisEmployee::officeAcronymByName($dept?->name) ?? ''));
+            $title = $acronym !== '' ? $acronym.' HEAD' : ($head->designation ?: 'DEPARTMENT HEAD');
 
             $defaultInCharge = [
                 'name' => $headName ?: 'DEPARTMENT HEAD',
@@ -145,7 +151,7 @@ class DailyTimeRecordController extends Controller
 
         // Active Department Heads list for modal dropdown
         $departmentHeads = DepartmentHead::query()
-            ->with('department:id,name,acronym')
+            ->with('department:id,name')
             ->orderBy('surname')
             ->get()
             ->map(function ($h) {
@@ -154,8 +160,8 @@ class DailyTimeRecordController extends Controller
                 if ($name === '' && ! empty($h->full_name)) {
                     $name = strtoupper(trim($h->full_name));
                 }
-                $acronym = trim((string) ($h->department?->acronym ?? ''));
-                $title = $acronym !== '' ? $acronym.' HEAD' : ($h->position ?: 'DEPARTMENT HEAD');
+                $acronym = trim((string) (HrisEmployee::officeAcronymByName($h->department?->name) ?? ''));
+                $title = $acronym !== '' ? $acronym.' HEAD' : ($h->designation ?: 'DEPARTMENT HEAD');
 
                 return [
                     'id' => $h->id,
@@ -201,6 +207,10 @@ class DailyTimeRecordController extends Controller
      */
     public function bulkDtr(Request $request): JsonResponse
     {
+        if ($denied = $this->authorizeDtrReadAccess($request)) {
+            return $denied;
+        }
+
         $validated = $request->validate([
             'control_nos' => ['required', 'array', 'min:1'],
             'control_nos.*' => ['required', 'string'],
@@ -233,7 +243,7 @@ class DailyTimeRecordController extends Controller
         ]);
 
         $departmentHeads = DepartmentHead::query()
-            ->with('department:id,name,acronym')
+            ->with('department:id,name')
             ->orderBy('surname')
             ->get()
             ->map(function ($h) {
@@ -242,8 +252,8 @@ class DailyTimeRecordController extends Controller
                 if ($name === '' && ! empty($h->full_name)) {
                     $name = strtoupper(trim($h->full_name));
                 }
-                $acronym = trim((string) ($h->department?->acronym ?? ''));
-                $title = $acronym !== '' ? $acronym.' HEAD' : ($h->position ?: 'DEPARTMENT HEAD');
+                $acronym = trim((string) (HrisEmployee::officeAcronymByName($h->department?->name) ?? ''));
+                $title = $acronym !== '' ? $acronym.' HEAD' : ($h->designation ?: 'DEPARTMENT HEAD');
 
                 return [
                     'id' => $h->id,
@@ -331,8 +341,8 @@ class DailyTimeRecordController extends Controller
                     $headName = strtoupper(trim($head->full_name));
                 }
 
-                $acronym = trim((string) ($dept->acronym ?? ''));
-                $title = $acronym !== '' ? $acronym.' HEAD' : ($head->position ?: 'DEPARTMENT HEAD');
+                $acronym = trim((string) (HrisEmployee::officeAcronymByName($dept?->name) ?? ''));
+                $title = $acronym !== '' ? $acronym.' HEAD' : ($head->designation ?: 'DEPARTMENT HEAD');
 
                 $defaultInCharge = [
                     'name' => $headName ?: 'DEPARTMENT HEAD',
@@ -372,6 +382,10 @@ class DailyTimeRecordController extends Controller
      */
     public function departmentOverview(Request $request): JsonResponse
     {
+        if ($denied = $this->authorizeDtrReadAccess($request)) {
+            return $denied;
+        }
+
         $validated = $request->validate([
             'department_id' => ['nullable', 'integer'],
             'date' => ['nullable', 'date_format:Y-m-d'],
@@ -380,29 +394,53 @@ class DailyTimeRecordController extends Controller
         ]);
 
         $account = $request->user();
-        $isHr = $account instanceof HRAccount;
         $isAdmin = $account instanceof DepartmentAdmin;
-
-        if (! $isHr && ! $isAdmin) {
-            return response()->json(['message' => 'Unauthorized access.'], 403);
-        }
 
         $targetDepartmentId = $isAdmin ? (int) $account->department_id : (isset($validated['department_id']) ? (int) $validated['department_id'] : null);
         $targetDate = $validated['date'] ?? now()->format('Y-m-d');
 
-        // Resolve assigned employee control numbers
-        $query = EmployeeDepartmentAssignment::query();
+        // Resolve assigned employee control numbers with office metadata
+        $assignmentsQuery = EmployeeDepartmentAssignment::query()
+            ->with('department:id,name');
         if ($targetDepartmentId !== null) {
-            $query->where('department_id', $targetDepartmentId);
+            $assignmentsQuery->where('department_id', $targetDepartmentId);
         }
-        $assignedControlNos = $query->pluck('employee_control_no')->filter()->values()->all();
+        $assignments = $assignmentsQuery->get();
+
+        $assignedControlNos = [];
+        $assignmentsByControlNo = [];
+        foreach ($assignments as $assignment) {
+            $rawControlNo = trim((string) ($assignment->employee_control_no ?? ''));
+            if ($rawControlNo === '') {
+                continue;
+            }
+            $unpaddedKey = ltrim($rawControlNo, '0');
+            $dedupeKey = $unpaddedKey !== '' ? $unpaddedKey : $rawControlNo;
+            if (isset($assignmentsByControlNo[$dedupeKey])) {
+                continue;
+            }
+
+            $deptName = $assignment->department?->name ? trim((string) $assignment->department->name) : null;
+            $officeAcronym = HrisOffice::acronymForDepartment($assignment->department);
+
+            $assignmentMeta = [
+                'department_id' => $assignment->department_id !== null ? (int) $assignment->department_id : null,
+                'office_name' => $deptName,
+                'office_acronym' => $officeAcronym,
+            ];
+
+            $assignmentsByControlNo[$dedupeKey] = $assignmentMeta;
+            $assignmentsByControlNo[$rawControlNo] = $assignmentMeta;
+            $assignedControlNos[] = $rawControlNo;
+        }
 
         if ($assignedControlNos === []) {
             return response()->json([
                 'date' => $targetDate,
                 'department_id' => $targetDepartmentId,
                 'employees' => [],
-                'stats' => ['present' => 0, 'on_leave' => 0, 'absent' => 0, 'total' => 0],
+                'stats' => ['present' => 0, 'late' => 0, 'on_leave' => 0, 'absent' => 0, 'total' => 0],
+                'devices' => [],
             ]);
         }
 
@@ -514,13 +552,23 @@ class DailyTimeRecordController extends Controller
                 && $existing->status === DailyTimeRecord::STATUS_PENDING
                 && ! $isTargetDateFuture;
 
+            $assignmentMeta = $assignmentsByControlNo[$canonicalControlNo]
+                ?? $assignmentsByControlNo[$controlNoStr]
+                ?? $assignmentsByControlNo[$unpadded]
+                ?? null;
+
+            $rowDepartmentId = $assignmentMeta['department_id'] ?? $targetDepartmentId;
+            $rowOfficeName = $assignmentMeta['office_name'] ?? ($emp?->office ? trim((string) $emp->office) : null);
+            $rowOfficeAcronym = $assignmentMeta['office_acronym']
+                ?? ($rowOfficeName !== null ? HrisOffice::acronymForName($rowOfficeName) : null);
+
             if ($existing !== null && ! $hasUnprocessed && ! $isStalePending) {
                 $dtr = $existing;
             } else {
                 $dtr = $this->dtrService->calculateForEmployeeDate(
                     $controlNoStr,
                     $targetDate,
-                    $targetDepartmentId,
+                    $rowDepartmentId,
                     $emp,
                     $schedule
                 );
@@ -565,6 +613,9 @@ class DailyTimeRecordController extends Controller
                 'control_no' => $canonicalControlNo,
                 'employee_name' => $fullName,
                 'designation' => $emp->designation ?? 'Employee',
+                'department_id' => $rowDepartmentId,
+                'office_name' => $rowOfficeName,
+                'office_acronym' => $rowOfficeAcronym,
                 'biometric_status' => $enrollment?->status ?? 'NOT_REGISTERED',
                 'is_biometric_registered' => $enrollment?->isRegistered() ?? false,
                 'synced_devices' => $enrollment?->synced_devices ?? [],
@@ -591,7 +642,9 @@ class DailyTimeRecordController extends Controller
             $dtrRows = array_values(array_filter($dtrRows, function ($row) use ($searchTerm): bool {
                 return stripos($row['employee_name'], $searchTerm) !== false
                     || stripos($row['control_no'], $searchTerm) !== false
-                    || stripos((string) ($row['designation'] ?? ''), $searchTerm) !== false;
+                    || stripos((string) ($row['designation'] ?? ''), $searchTerm) !== false
+                    || stripos((string) ($row['office_name'] ?? ''), $searchTerm) !== false
+                    || stripos((string) ($row['office_acronym'] ?? ''), $searchTerm) !== false;
             }));
         }
 
@@ -621,6 +674,10 @@ class DailyTimeRecordController extends Controller
      */
     public function adjust(Request $request, int $id): JsonResponse
     {
+        if ($denied = $this->authorizeDtrWriteAccess($request)) {
+            return $denied;
+        }
+
         $validated = $request->validate([
             'adjustment_reason' => [
                 'nullable',
@@ -735,6 +792,10 @@ class DailyTimeRecordController extends Controller
      */
     public function overrideTime(Request $request): JsonResponse
     {
+        if ($denied = $this->authorizeDtrWriteAccess($request)) {
+            return $denied;
+        }
+
         $validated = $request->validate([
             'employee_control_no' => ['required', 'string'],
             'date' => ['required', 'date_format:Y-m-d'],
@@ -947,6 +1008,10 @@ class DailyTimeRecordController extends Controller
      */
     public function recalculate(Request $request): JsonResponse
     {
+        if ($denied = $this->authorizeDtrReadAccess($request)) {
+            return $denied;
+        }
+
         $validated = $request->validate([
             'employee_control_no' => ['required', 'string'],
             'start_date' => ['required', 'date_format:Y-m-d'],
@@ -988,5 +1053,41 @@ class DailyTimeRecordController extends Controller
             'message' => 'USB attendance logs imported successfully.',
             'result' => $result,
         ]);
+    }
+
+    private function authorizeDtrReadAccess(Request $request): ?JsonResponse
+    {
+        $account = $request->user();
+        if ($account instanceof DepartmentAdmin) {
+            return null;
+        }
+
+        if ($account instanceof HRAccount) {
+            if (! app(HrAccessControlService::class)->hasModuleAccess($account, HrAccessControlService::MODULE_EMPLOYEE_MANAGEMENT)) {
+                return response()->json([
+                    'message' => 'You do not have access to this module.',
+                ], 403);
+            }
+
+            return null;
+        }
+
+        return response()->json(['message' => 'Unauthorized access.'], 403);
+    }
+
+    private function authorizeDtrWriteAccess(Request $request): ?JsonResponse
+    {
+        $account = $request->user();
+        if ($account instanceof DepartmentAdmin) {
+            return null;
+        }
+
+        if ($account instanceof HRAccount) {
+            return response()->json([
+                'message' => 'HR DTR monitoring is read-only.',
+            ], 403);
+        }
+
+        return response()->json(['message' => 'Unauthorized access.'], 403);
     }
 }

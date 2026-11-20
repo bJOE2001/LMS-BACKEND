@@ -1,0 +1,1231 @@
+<?php
+
+namespace App\Http\Controllers\Leave;
+
+use App\Http\Controllers\Controller;
+use App\Models\Attendance\AttendanceRawLog;
+use App\Models\Attendance\DailyTimeRecord;
+use App\Models\DepartmentAdmin;
+use App\Models\HRAccount;
+use App\Models\HrisEmployee;
+use App\Models\Leave\COCApplication;
+use App\Models\Leave\LeaveApplication;
+use App\Models\Leave\LeaveApplicationLog;
+use App\Models\Leave\LeaveApplicationUpdateRequest;
+use App\Models\Leave\LeaveBalance;
+use App\Models\Leave\LeaveType;
+use App\Traits\FiltersEmployeeControlNos;
+use Carbon\CarbonImmutable;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+
+/**
+ * HR Dashboard — organisation-wide leave application statistics.
+ * LOCAL LMS_DB only.
+ */
+class HRDashboardController extends Controller
+{
+    use FiltersEmployeeControlNos;
+
+    /**
+     * Dashboard data: leave-focused charts plus summary counts for leave + COC applications.
+     */
+    public function index(Request $request): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $applications = LeaveApplication::with(['leaveType', 'applicantAdmin.department', 'updateRequests', 'logs'])
+            ->where('status', '!=', LeaveApplication::STATUS_PENDING_ADMIN)
+            ->orderByDesc('created_at')
+            ->get();
+        $applications = $applications
+            ->reject(fn (LeaveApplication $application): bool => $this->isCancelledLeaveApplication($application))
+            ->values();
+
+        $cocApplications = COCApplication::query()
+            ->select(['id', 'status', 'admin_reviewed_at'])
+            ->where(function ($query): void {
+                $query
+                    ->where('status', '!=', COCApplication::STATUS_PENDING)
+                    ->orWhereNotNull('admin_reviewed_at');
+            })
+            ->orderByDesc('created_at')
+            ->get();
+
+        $pendingHR = $applications->where('status', LeaveApplication::STATUS_PENDING_HR)->count()
+            + $cocApplications->filter(fn (COCApplication $app): bool => $this->deriveCocRawStatus($app) === 'PENDING_HR')->count();
+        $totalApproved = $applications->where('status', LeaveApplication::STATUS_APPROVED)->count()
+            + $cocApplications->where('status', COCApplication::STATUS_APPROVED)->count();
+        $totalRejected = $applications->where('status', LeaveApplication::STATUS_REJECTED)->count()
+            + $cocApplications->where('status', COCApplication::STATUS_REJECTED)->count();
+        $totalRecalled = $applications->where('status', LeaveApplication::STATUS_RECALLED)->count();
+        $totalApplications = $applications->count() + $cocApplications->count();
+        $employeeDirectoryByControlNo = $this->buildEmployeeDirectory(
+            $applications
+                ->pluck('employee_control_no')
+                ->concat($cocApplications->pluck('employee_control_no'))
+                ->all()
+        );
+        $employeeStatusByControlNo = $this->buildEmployeeStatusDirectory($employeeDirectoryByControlNo);
+        $leaveBalanceDirectory = $this->buildLeaveBalanceDirectory($applications);
+        $activeEmployeeCount = HrisEmployee::countCached(true);
+        $manpowerToday = $this->buildDailyManpowerSnapshot($applications, $activeEmployeeCount);
+
+        $formatted = $applications->map(
+            fn ($app) => $this->formatApplication(
+                $app,
+                $employeeDirectoryByControlNo,
+                $employeeStatusByControlNo,
+                $leaveBalanceDirectory
+            )
+        );
+        $analytics = $this->buildDashboardTrendAnalytics($applications);
+
+        return response()->json([
+            'total_count' => $totalApplications,
+            'pending_count' => $pendingHR,
+            'approved_count' => $totalApproved,
+            'rejected_count' => $totalRejected,
+            'recalled_count' => $totalRecalled,
+            'kpi_breakdown' => [
+                'total' => $this->buildEmploymentStatusBreakdown(
+                    $applications->concat($cocApplications),
+                    $employeeStatusByControlNo
+                ),
+            ],
+            'analytics' => $analytics,
+            'on_leave_today' => $manpowerToday['on_leave_count'],
+            'manpower_today' => $manpowerToday,
+            'active_employees' => $activeEmployeeCount,
+            'applications' => $formatted,
+        ]);
+    }
+
+    /**
+     * Compute Present / Absent / On Leave daily manpower counts out of active employees.
+     *
+     * @param  \Illuminate\Support\Collection<int, LeaveApplication>  $applications
+     * @return array{
+     *     date: string,
+     *     total_active: int,
+     *     present_count: int,
+     *     absent_count: int,
+     *     on_leave_count: int,
+     *     present_percentage: float,
+     *     absent_percentage: float,
+     *     on_leave_percentage: float
+     * }
+     */
+    private function buildDailyManpowerSnapshot($applications, int $activeEmployeeCount): array
+    {
+        $today = now()->toDateString();
+        $totalActive = max($activeEmployeeCount, 0);
+
+        $toEmployeeKey = static function (?string $controlNo): string {
+            $raw = trim((string) ($controlNo ?? ''));
+            if ($raw === '') {
+                return '';
+            }
+
+            $unpadded = ltrim($raw, '0');
+
+            return $unpadded !== '' ? $unpadded : '0';
+        };
+
+        $onLeaveKeys = [];
+        foreach ($applications as $app) {
+            if ($app->status !== LeaveApplication::STATUS_APPROVED) {
+                continue;
+            }
+
+            $isOnLeaveToday = false;
+            $selectedDates = is_array($app->selected_dates) ? $app->selected_dates : [];
+            if ($selectedDates !== []) {
+                foreach ($selectedDates as $selectedDate) {
+                    if (substr(trim((string) $selectedDate), 0, 10) === $today) {
+                        $isOnLeaveToday = true;
+                        break;
+                    }
+                }
+            } else {
+                $startStr = $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : null;
+                $endStr = $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : null;
+                if ($startStr && $endStr && $startStr <= $today && $endStr >= $today) {
+                    $isOnLeaveToday = true;
+                }
+            }
+
+            if (! $isOnLeaveToday) {
+                continue;
+            }
+
+            $key = $toEmployeeKey($app->employee_control_no) ?: 'leave-app-'.$app->id;
+            $onLeaveKeys[$key] = true;
+        }
+
+        $presentKeys = [];
+        try {
+            $todayDtrs = DailyTimeRecord::query()
+                ->where('record_date', $today)
+                ->get(['employee_control_no', 'status', 'am_arrival', 'am_departure', 'pm_arrival', 'pm_departure']);
+
+            $leaveStatuses = [
+                DailyTimeRecord::STATUS_ON_LEAVE,
+                DailyTimeRecord::STATUS_ON_LEAVE_AM,
+                DailyTimeRecord::STATUS_ON_LEAVE_PM,
+                DailyTimeRecord::STATUS_HALF_DAY,
+            ];
+            $presentStatuses = [
+                DailyTimeRecord::STATUS_PRESENT,
+                DailyTimeRecord::STATUS_OFFICIAL_BUSINESS,
+                DailyTimeRecord::STATUS_PASS_SLIP,
+            ];
+
+            foreach ($todayDtrs as $dtr) {
+                $key = $toEmployeeKey($dtr->employee_control_no);
+                if ($key === '') {
+                    continue;
+                }
+
+                $hasPunches = $dtr->am_arrival !== null
+                    || $dtr->am_departure !== null
+                    || $dtr->pm_arrival !== null
+                    || $dtr->pm_departure !== null;
+
+                if ($hasPunches || in_array($dtr->status, $presentStatuses, true)) {
+                    $presentKeys[$key] = true;
+                } elseif (in_array($dtr->status, $leaveStatuses, true)) {
+                    $onLeaveKeys[$key] = true;
+                }
+            }
+
+            $rawTodayLogs = AttendanceRawLog::query()
+                ->whereDate('punch_time', $today)
+                ->get(['employee_control_no', 'biometric_pin']);
+
+            foreach ($rawTodayLogs as $rawLog) {
+                $key = $toEmployeeKey($rawLog->employee_control_no ?: $rawLog->biometric_pin);
+                if ($key !== '') {
+                    $presentKeys[$key] = true;
+                }
+            }
+        } catch (\Throwable) {
+            // Keep approved leave snapshot if BIO_DB is unavailable
+        }
+
+        $presentCount = min(count($presentKeys), $totalActive);
+        $onLeaveOnlyKeys = array_diff_key($onLeaveKeys, $presentKeys);
+        $onLeaveCount = min(count($onLeaveOnlyKeys), max($totalActive - $presentCount, 0));
+        $absentCount = max($totalActive - $presentCount - $onLeaveCount, 0);
+
+        return [
+            'date' => $today,
+            'total_active' => $totalActive,
+            'present_count' => $presentCount,
+            'absent_count' => $absentCount,
+            'on_leave_count' => $onLeaveCount,
+            'present_percentage' => $totalActive > 0 ? round(($presentCount / $totalActive) * 100, 2) : 0.0,
+            'absent_percentage' => $totalActive > 0 ? round(($absentCount / $totalActive) * 100, 2) : 0.0,
+            'on_leave_percentage' => $totalActive > 0 ? round(($onLeaveCount / $totalActive) * 100, 2) : 0.0,
+        ];
+    }
+
+    /**
+     * Department Leave Statistics table for the HR dashboard.
+     * Returns leave-application counts grouped by aggregation bucket,
+     * office, and leave type based on approved leave applications only.
+     */
+    public function departmentStatistics(Request $request): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $groupBy = $this->normalizeDepartmentStatisticsGroupBy(
+            (string) $request->query('group_by', 'daily')
+        );
+        [$rangeStart, $rangeEnd] = $this->resolveDepartmentStatisticsDateRange($request, $groupBy);
+
+        $rowsByGroupAndDepartment = [];
+
+        $applications = LeaveApplication::query()
+            ->with([
+                'leaveType:id,name',
+                'applicantAdmin.department:id,name',
+            ])
+            ->where('status', LeaveApplication::STATUS_APPROVED)
+            ->whereBetween('created_at', [$rangeStart, $rangeEnd])
+            ->orderBy('created_at')
+            ->get([
+                'id',
+                'employee_control_no',
+                'leave_type_id',
+                'applicant_admin_id',
+                'status',
+                'is_monetization',
+                'created_at',
+            ]);
+
+        $officeByControlNo = $this->buildDepartmentStatisticsOfficeDirectory(
+            $applications->pluck('employee_control_no')->all()
+        );
+
+        foreach ($applications as $application) {
+            if ((bool) $application->is_monetization) {
+                continue;
+            }
+
+            $createdAt = $this->resolveDepartmentStatisticsCreatedAt($application);
+            if (! $createdAt) {
+                continue;
+            }
+
+            $departmentName = $this->resolveDepartmentStatisticsDepartment($application, $officeByControlNo);
+            if ($departmentName === null) {
+                continue;
+            }
+
+            $leaveTypeColumn = $this->mapDepartmentStatisticsLeaveType($application->leaveType?->name);
+            if ($leaveTypeColumn === null) {
+                continue;
+            }
+
+            $groupMeta = $this->resolveDepartmentStatisticsGroupMeta($createdAt, $groupBy);
+            $rowKey = $groupMeta['groupKey'].'|'.$departmentName;
+
+            if (! array_key_exists($rowKey, $rowsByGroupAndDepartment)) {
+                $rowsByGroupAndDepartment[$rowKey] = $this->emptyDepartmentStatisticsRow(
+                    groupBy: $groupBy,
+                    groupKey: $groupMeta['groupKey'],
+                    groupLabel: $groupMeta['groupLabel'],
+                    groupSortValue: $groupMeta['groupSortValue'],
+                    departmentName: $departmentName,
+                );
+            }
+
+            $rowsByGroupAndDepartment[$rowKey][$leaveTypeColumn]++;
+        }
+
+        $rows = collect($rowsByGroupAndDepartment)
+            ->filter(function (array $row): bool {
+                $countKeys = [
+                    'vacationLeave',
+                    'sickLeave',
+                    'mandatoryForcedLeave',
+                    'wellnessLeave',
+                    'maternityLeave',
+                    'paternityLeave',
+                    'specialPrivilegeLeave',
+                    'soloParentLeave',
+                ];
+
+                $total = 0;
+                foreach ($countKeys as $countKey) {
+                    $total += (int) ($row[$countKey] ?? 0);
+                }
+
+                return $total > 0;
+            })
+            ->sort(function (array $left, array $right): int {
+                $leftSort = (string) ($left['groupSortValue'] ?? '');
+                $rightSort = (string) ($right['groupSortValue'] ?? '');
+                if ($leftSort !== $rightSort) {
+                    return strcmp($leftSort, $rightSort);
+                }
+
+                return strcasecmp((string) ($left['department'] ?? ''), (string) ($right['department'] ?? ''));
+            })
+            ->map(function (array $row): array {
+                unset($row['groupSortValue']);
+
+                return $row;
+            })
+            ->values()
+            ->all();
+
+        return response()->json($rows);
+    }
+
+    private function deriveCocRawStatus(COCApplication $app): string
+    {
+        if ($app->status !== COCApplication::STATUS_PENDING) {
+            return (string) $app->status;
+        }
+
+        return $app->admin_reviewed_at ? 'PENDING_HR' : 'PENDING_ADMIN';
+    }
+
+    private function isCancelledLeaveApplication(LeaveApplication $application): bool
+    {
+        if ($application->status === LeaveApplication::STATUS_CANCELLED) {
+            return true;
+        }
+
+        if ((bool) preg_match('/^cancelled\b/i', trim((string) ($application->remarks ?? '')))) {
+            return true;
+        }
+
+        if ($application->relationLoaded('logs')) {
+            return $application->logs
+                ->filter(fn ($log) => $log instanceof LeaveApplicationLog)
+                ->contains(
+                    fn (LeaveApplicationLog $log): bool => (bool) preg_match(
+                        '/^cancelled\b/i',
+                        trim((string) ($log->remarks ?? ''))
+                    )
+                );
+        }
+
+        return false;
+    }
+
+    private function normalizeDepartmentStatisticsGroupBy(string $groupBy): string
+    {
+        $normalized = strtolower(trim($groupBy));
+
+        return match ($normalized) {
+            'weekly' => 'weekly',
+            'monthly' => 'monthly',
+            'yearly' => 'yearly',
+            default => 'daily',
+        };
+    }
+
+    private function resolveDepartmentStatisticsDateRange(Request $request, string $groupBy): array
+    {
+        $now = CarbonImmutable::now();
+
+        if ($groupBy === 'weekly') {
+            $selectedDate = $this->resolveDepartmentStatisticsFilterDate($request) ?? $now;
+
+            return [$selectedDate->startOfWeek(), $selectedDate->endOfWeek()];
+        }
+
+        if ($groupBy === 'monthly') {
+            $selectedMonth = $this->resolveDepartmentStatisticsFilterMonth($request) ?? (int) $now->month;
+            $selectedYear = $this->resolveDepartmentStatisticsFilterYear($request) ?? (int) $now->year;
+            $selectedMonthStart = CarbonImmutable::create(
+                $selectedYear,
+                $selectedMonth,
+                1,
+                0,
+                0,
+                0,
+                $now->timezone
+            );
+
+            return [$selectedMonthStart->startOfMonth(), $selectedMonthStart->endOfMonth()];
+        }
+
+        if ($groupBy === 'yearly') {
+            $selectedYear = $this->resolveDepartmentStatisticsFilterYear($request) ?? (int) $now->year;
+            $selectedYearStart = CarbonImmutable::create(
+                $selectedYear,
+                1,
+                1,
+                0,
+                0,
+                0,
+                $now->timezone
+            );
+
+            return [$selectedYearStart->startOfYear(), $selectedYearStart->endOfYear()];
+        }
+
+        $selectedDate = $this->resolveDepartmentStatisticsFilterDate($request) ?? $now;
+
+        return [$selectedDate->startOfDay(), $selectedDate->endOfDay()];
+    }
+
+    private function resolveDepartmentStatisticsFilterDate(Request $request): ?CarbonImmutable
+    {
+        $rawFilterDate = trim((string) $request->query('filter_date', ''));
+        if ($rawFilterDate === '') {
+            return null;
+        }
+
+        try {
+            return CarbonImmutable::createFromFormat('Y-m-d', $rawFilterDate)->startOfDay();
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function resolveDepartmentStatisticsFilterMonth(Request $request): ?int
+    {
+        $rawFilterMonth = $request->query('filter_month');
+        if ($rawFilterMonth === null || $rawFilterMonth === '') {
+            return null;
+        }
+
+        $month = (int) $rawFilterMonth;
+
+        return $month >= 1 && $month <= 12 ? $month : null;
+    }
+
+    private function resolveDepartmentStatisticsFilterYear(Request $request): ?int
+    {
+        $rawFilterYear = $request->query('filter_year');
+        if ($rawFilterYear === null || $rawFilterYear === '') {
+            return null;
+        }
+
+        $year = (int) $rawFilterYear;
+
+        return $year >= 1900 && $year <= 3000 ? $year : null;
+    }
+
+    private function resolveDepartmentStatisticsGroupMeta(CarbonImmutable $createdAt, string $groupBy): array
+    {
+        return match ($groupBy) {
+            'weekly' => $this->resolveDepartmentStatisticsWeeklyMeta($createdAt),
+            'monthly' => [
+                'groupKey' => $createdAt->format('Y-m'),
+                'groupLabel' => $createdAt->format('F Y'),
+                'groupSortValue' => $createdAt->startOfMonth()->format('Y-m-d'),
+            ],
+            'yearly' => [
+                'groupKey' => $createdAt->format('Y'),
+                'groupLabel' => $createdAt->format('Y'),
+                'groupSortValue' => $createdAt->startOfYear()->format('Y-m-d'),
+            ],
+            default => [
+                'groupKey' => $createdAt->toDateString(),
+                'groupLabel' => $createdAt->toDateString(),
+                'groupSortValue' => $createdAt->startOfDay()->format('Y-m-d'),
+            ],
+        };
+    }
+
+    private function resolveDepartmentStatisticsWeeklyMeta(CarbonImmutable $createdAt): array
+    {
+        $startOfWeek = $createdAt->startOfWeek();
+        $endOfWeek = $createdAt->endOfWeek();
+
+        return [
+            'groupKey' => $startOfWeek->format('o-\WW'),
+            'groupLabel' => sprintf(
+                'Week %d (%s - %s)',
+                (int) $startOfWeek->isoWeek(),
+                $startOfWeek->format('M j'),
+                $endOfWeek->format('M j, Y')
+            ),
+            'groupSortValue' => $startOfWeek->format('Y-m-d'),
+        ];
+    }
+
+    private function emptyDepartmentStatisticsRow(
+        string $groupBy,
+        string $groupKey,
+        string $groupLabel,
+        string $groupSortValue,
+        string $departmentName
+    ): array {
+        return [
+            'groupBy' => $groupBy,
+            'groupKey' => $groupKey,
+            'groupLabel' => $groupLabel,
+            'groupSortValue' => $groupSortValue,
+            'department' => $departmentName,
+            'vacationLeave' => 0,
+            'sickLeave' => 0,
+            'mandatoryForcedLeave' => 0,
+            'wellnessLeave' => 0,
+            'maternityLeave' => 0,
+            'paternityLeave' => 0,
+            'specialPrivilegeLeave' => 0,
+            'soloParentLeave' => 0,
+        ];
+    }
+
+    private function resolveDepartmentStatisticsCreatedAt(LeaveApplication $application): ?CarbonImmutable
+    {
+        $createdAt = $application->getAttribute('created_at');
+        if ($createdAt instanceof \DateTimeInterface) {
+            return CarbonImmutable::instance($createdAt);
+        }
+
+        if ($createdAt === null || $createdAt === '') {
+            return null;
+        }
+
+        try {
+            return CarbonImmutable::parse((string) $createdAt);
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function buildDepartmentStatisticsOfficeDirectory(array $controlNos): array
+    {
+        $directory = [];
+
+        foreach ($this->buildEmployeeDirectory($controlNos) as $controlNo => $employee) {
+            $normalizedControlNo = $this->normalizeControlNo($controlNo);
+            $office = trim((string) ($employee->office ?? ''));
+
+            if ($normalizedControlNo === '' || $office === '') {
+                continue;
+            }
+
+            $directory[$normalizedControlNo] = $office;
+        }
+
+        return $directory;
+    }
+
+    private function resolveDepartmentStatisticsDepartment(LeaveApplication $application, array $officeByControlNo): ?string
+    {
+        $normalizedControlNo = $this->normalizeControlNo($application->employee_control_no ?? null);
+        $office = $officeByControlNo[$normalizedControlNo] ?? null;
+
+        if (is_string($office) && trim($office) !== '') {
+            return trim($office);
+        }
+
+        $fallbackDepartment = trim((string) ($application->applicantAdmin?->department?->name ?? ''));
+
+        return $fallbackDepartment !== '' ? $fallbackDepartment : null;
+    }
+
+    private function mapDepartmentStatisticsLeaveType(?string $leaveTypeName): ?string
+    {
+        $normalized = strtoupper(trim((string) $leaveTypeName));
+        $normalized = preg_replace('/[^A-Z0-9]+/', ' ', $normalized ?? '');
+        $normalized = trim((string) $normalized);
+
+        return match ($normalized) {
+            'VACATION LEAVE' => 'vacationLeave',
+            'SICK LEAVE' => 'sickLeave',
+            'MANDATORY FORCED LEAVE', 'MANDATORY LEAVE', 'FORCED LEAVE' => 'mandatoryForcedLeave',
+            'MCO6 LEAVE', 'MC06 LEAVE', 'MO6 LEAVE', 'SPECIAL PRIVILEGE LEAVE' => 'specialPrivilegeLeave',
+            'WELLNESS LEAVE' => 'wellnessLeave',
+            'MATERNITY LEAVE' => 'maternityLeave',
+            'PATERNITY LEAVE' => 'paternityLeave',
+            'SOLO PARENT LEAVE' => 'soloParentLeave',
+            default => null,
+        };
+    }
+
+    private function buildDashboardTrendAnalytics(iterable $applications): array
+    {
+        $trendYear = (int) now()->year;
+        $monthlyTrend = array_fill(0, 12, 0);
+        $leaveTypeMonthlyTrend = [];
+
+        foreach ($applications as $application) {
+            if (! $application instanceof LeaveApplication) {
+                continue;
+            }
+
+            if ($application->status !== LeaveApplication::STATUS_APPROVED) {
+                continue;
+            }
+
+            $trendDate = $this->resolveDashboardTrendDate($application);
+            if (! $trendDate || (int) $trendDate->year !== $trendYear) {
+                continue;
+            }
+
+            $monthIndex = max(0, min(11, (int) $trendDate->month - 1));
+            $monthlyTrend[$monthIndex]++;
+
+            $leaveTypeName = $this->resolveDashboardTrendLeaveTypeName($application);
+            if (! array_key_exists($leaveTypeName, $leaveTypeMonthlyTrend)) {
+                $leaveTypeMonthlyTrend[$leaveTypeName] = array_fill(0, 12, 0);
+            }
+
+            $leaveTypeMonthlyTrend[$leaveTypeName][$monthIndex]++;
+        }
+
+        if ($leaveTypeMonthlyTrend !== []) {
+            ksort($leaveTypeMonthlyTrend, SORT_NATURAL | SORT_FLAG_CASE);
+        }
+
+        return [
+            'trend_year' => $trendYear,
+            'monthly_leave_trend' => $monthlyTrend,
+            'leave_type_monthly_trend' => $leaveTypeMonthlyTrend,
+        ];
+    }
+
+    private function resolveDashboardTrendDate(LeaveApplication $application): ?CarbonImmutable
+    {
+        $candidates = [
+            $application->getAttribute('date_filed'),
+            $application->getAttribute('created_at'),
+            $application->getAttribute('start_date'),
+        ];
+
+        foreach ($candidates as $candidate) {
+            if ($candidate === null || $candidate === '') {
+                continue;
+            }
+
+            try {
+                if ($candidate instanceof \DateTimeInterface) {
+                    return CarbonImmutable::instance($candidate)->startOfDay();
+                }
+
+                return CarbonImmutable::parse((string) $candidate)->startOfDay();
+            } catch (\Throwable) {
+                continue;
+            }
+        }
+
+        return null;
+    }
+
+    private function resolveDashboardTrendLeaveTypeName(LeaveApplication $application): string
+    {
+        $name = trim((string) ($application->leaveType?->name ?? ''));
+
+        return $name !== '' ? $name : 'Unknown';
+    }
+
+    private function formatApplication(
+        LeaveApplication $app,
+        array $employeeDirectoryByControlNo = [],
+        array $employeeStatusByControlNo = [],
+        array $leaveBalanceDirectory = []
+    ): array {
+        $statusMap = [
+            LeaveApplication::STATUS_PENDING_ADMIN => 'Pending Admin',
+            LeaveApplication::STATUS_PENDING_HR => 'Pending HR',
+            LeaveApplication::STATUS_APPROVED => 'Approved',
+            LeaveApplication::STATUS_REJECTED => 'Rejected',
+            LeaveApplication::STATUS_RECALLED => 'Recalled',
+            LeaveApplication::STATUS_CANCELLED => 'Cancelled',
+        ];
+
+        // Determine applicant name & office
+        $resolvedEmployee = $this->resolveApplicationEmployee($app, $employeeDirectoryByControlNo);
+        $employeeName = trim((string) ($app->employee_name ?? ''));
+        if ($employeeName === '') {
+            $employeeName = $resolvedEmployee
+                ? trim(($resolvedEmployee->firstname ?? '').' '.($resolvedEmployee->surname ?? ''))
+                : null;
+        }
+        $employmentStatus = $employeeStatusByControlNo[$this->normalizeControlNo($app->employee_control_no)] ?? ($resolvedEmployee?->status ?? null);
+        $applicantName = $employeeName ?: ($app->applicantAdmin ? $app->applicantAdmin->full_name : 'Unknown');
+        $office = $resolvedEmployee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
+        $durationDays = (float) $app->total_days;
+        $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
+        $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
+        $isForcedLeave = LeaveType::isForcedLeaveType($app->leaveType, (int) $app->leave_type_id);
+        $selectedDatePayStatus = $isForcedLeave
+            ? null
+            : (is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : null);
+        $selectedDateCoverage = is_array($app->selected_date_coverage) ? $app->selected_date_coverage : null;
+        $normalizedPayMode = strtoupper(trim((string) ($app->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY)));
+        if (! in_array($normalizedPayMode, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
+            $normalizedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+        if ($isForcedLeave) {
+            $normalizedPayMode = LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+        if ($isForcedLeave) {
+            $deductibleDays = round(max($durationDays, 0.0), 3);
+        } else {
+            $deductibleDays = $app->deductible_days !== null
+                ? round((float) $app->deductible_days, 3)
+                : ($normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 0.0 : $durationDays);
+        }
+        $withoutPayDays = $isForcedLeave
+            ? 0.0
+            : ($app->without_pay_days !== null
+                ? round(max((float) $app->without_pay_days, 0.0), 3)
+                : round(max($durationDays - $deductibleDays, 0.0), 3));
+
+        return [
+            'id' => $app->id,
+            'employee_control_no' => $app->employee_control_no,
+            'employeeName' => $applicantName,
+            'office' => $office,
+            'employment_status' => $employmentStatus,
+            'employmentStatus' => $employmentStatus,
+            'employee_status' => $employmentStatus,
+            'employeeStatus' => $employmentStatus,
+            'appointment_status' => $employmentStatus,
+            'appointmentStatus' => $employmentStatus,
+            'leaveType' => $app->leaveType?->name ?? 'Unknown',
+            'startDate' => $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : null,
+            'endDate' => $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : null,
+            'days' => $durationDays,
+            'duration_value' => $durationDays,
+            'duration_unit' => 'day',
+            'duration_label' => $durationDays == (int) $durationDays
+                ? ((int) $durationDays).' '.((int) $durationDays === 1 ? 'day' : 'days')
+                : $durationDays.' days',
+            'reason' => $app->reason,
+            'details_of_leave' => $app->details_of_leave,
+            'detailsOfLeave' => $app->details_of_leave,
+            'status' => $statusMap[$app->status] ?? $app->status,
+            'rawStatus' => $app->status,
+            'remarks' => $app->remarks,
+            'pending_update' => $pendingUpdateMeta['payload'],
+            'pending_update_reason' => $pendingUpdateMeta['reason'],
+            'pending_update_previous_status' => $pendingUpdateMeta['previous_status'],
+            'pending_update_requested_by' => $pendingUpdateMeta['requested_by'],
+            'pending_update_requested_at' => $pendingUpdateMeta['requested_at']?->toIso8601String(),
+            'has_pending_update_request' => ($pendingUpdateMeta['payload'] ?? null) !== null,
+            'latest_update_request_status' => $latestUpdateMeta['status'],
+            'latest_update_request_payload' => $latestUpdateMeta['payload'],
+            'latest_update_request_reason' => $latestUpdateMeta['reason'],
+            'latest_update_request_previous_status' => $latestUpdateMeta['previous_status'],
+            'latest_update_requested_by' => $latestUpdateMeta['requested_by'],
+            'latest_update_requested_at' => $latestUpdateMeta['requested_at']?->toIso8601String(),
+            'latest_update_reviewed_at' => $latestUpdateMeta['reviewed_at']?->toIso8601String(),
+            'latest_update_review_remarks' => $latestUpdateMeta['review_remarks'],
+            'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
+            'selected_dates' => $app->resolvedSelectedDates(),
+            'selected_date_pay_status' => $selectedDatePayStatus,
+            'selected_date_coverage' => $selectedDateCoverage,
+            'selected_date_half_day_portion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'selectedDateHalfDayPortion' => is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : null,
+            'recallEffectiveDate' => $app->recall_effective_date?->toDateString(),
+            'recall_effective_date' => $app->recall_effective_date?->toDateString(),
+            'recallSelectedDates' => is_array($app->recall_selected_dates) ? array_values($app->recall_selected_dates) : null,
+            'recall_selected_dates' => is_array($app->recall_selected_dates) ? array_values($app->recall_selected_dates) : null,
+            'pay_mode' => $normalizedPayMode,
+            'pay_status' => $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY ? 'Without Pay' : 'With Pay',
+            'without_pay' => $normalizedPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY,
+            'with_pay' => $normalizedPayMode !== LeaveApplication::PAY_MODE_WITHOUT_PAY,
+            'deductible_days' => $deductibleDays,
+            'without_pay_days' => $withoutPayDays,
+            'is_monetization' => (bool) $app->is_monetization,
+            'equivalent_amount' => $app->equivalent_amount ? (float) $app->equivalent_amount : null,
+            'leaveBalance' => $this->getBalanceForApp($app, $leaveBalanceDirectory),
+        ];
+    }
+
+    private function buildEmployeeDirectory(array $controlNos): array
+    {
+        return HrisEmployee::directoryByControlNos($controlNos);
+    }
+
+    private function buildEmployeeStatusDirectory(array $employeeDirectoryByControlNo): array
+    {
+        return collect($employeeDirectoryByControlNo)
+            ->mapWithKeys(fn (object $employee, string $controlNo): array => [
+                $controlNo => trim((string) ($employee->status ?? '')) ?: null,
+            ])
+            ->all();
+    }
+
+    private function buildEmploymentStatusBreakdown(iterable $applications, array $employeeStatusByControlNo): array
+    {
+        $breakdown = $this->emptyEmploymentBreakdown();
+
+        foreach ($applications as $application) {
+            if (! is_object($application)) {
+                continue;
+            }
+
+            $bucket = $this->employmentStatusToBucket($application->employee_control_no ?? null, $employeeStatusByControlNo);
+            if ($bucket !== null) {
+                $breakdown[$bucket]++;
+            }
+        }
+
+        return $breakdown;
+    }
+
+    private function employmentStatusToBucket(mixed $controlNo, array $employeeStatusByControlNo): ?string
+    {
+        $employeeStatus = $employeeStatusByControlNo[$this->normalizeControlNo($controlNo)] ?? null;
+        $rawStatus = strtoupper(trim((string) ($employeeStatus ?? '')));
+        if ($rawStatus === '') {
+            return null;
+        }
+
+        return match ($rawStatus) {
+            'ELECTIVE' => 'elective',
+            'CO-TERMINOUS', 'CO TERMINOUS', 'COTERMINOUS' => 'co_terminous',
+            'REGULAR' => 'regular',
+            'CASUAL' => 'casual',
+            default => null,
+        };
+    }
+
+    private function emptyEmploymentBreakdown(): array
+    {
+        return [
+            'elective' => 0,
+            'co_terminous' => 0,
+            'regular' => 0,
+            'casual' => 0,
+        ];
+    }
+
+    private function normalizeControlNo(mixed $controlNo): string
+    {
+        $normalized = ltrim(trim((string) ($controlNo ?? '')), '0');
+        if ($normalized === '') {
+            $normalized = '0';
+        }
+
+        return preg_match('/^\d+$/', $normalized) ? $normalized : '';
+    }
+
+    private function getPendingApprovedUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
+    {
+        if (! $app->id) {
+            return null;
+        }
+
+        if ($app->relationLoaded('updateRequests')) {
+            $record = $app->updateRequests
+                ->filter(fn ($item) => $item instanceof LeaveApplicationUpdateRequest)
+                ->sortByDesc(fn (LeaveApplicationUpdateRequest $item) => (int) $item->id)
+                ->first(function (LeaveApplicationUpdateRequest $item): bool {
+                    return strtoupper(trim((string) $item->status)) === LeaveApplicationUpdateRequest::STATUS_PENDING
+                        && ! $item->isHrApplicationEditRequest();
+                });
+
+            return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
+        }
+
+        $record = LeaveApplicationUpdateRequest::query()
+            ->where('leave_application_id', (int) $app->id)
+            ->where('status', LeaveApplicationUpdateRequest::STATUS_PENDING)
+            ->latest('id')
+            ->get()
+            ->first(fn (LeaveApplicationUpdateRequest $item): bool => ! $item->isHrApplicationEditRequest());
+
+        return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
+    }
+
+    private function resolvePendingUpdateMeta(LeaveApplication $app): array
+    {
+        $pendingRequest = $this->getPendingApprovedUpdateRequestRecord($app);
+        if ($pendingRequest instanceof LeaveApplicationUpdateRequest) {
+            return [
+                'payload' => is_array($pendingRequest->requested_payload) ? $pendingRequest->requested_payload : null,
+                'reason' => $this->trimNullableString($pendingRequest->requested_reason),
+                'previous_status' => strtoupper(trim((string) ($pendingRequest->previous_status ?? ''))),
+                'requested_by' => $this->trimNullableString($pendingRequest->requested_by_control_no),
+                'requested_at' => $pendingRequest->requested_at,
+            ];
+        }
+
+        return [
+            'payload' => null,
+            'reason' => null,
+            'previous_status' => null,
+            'requested_by' => null,
+            'requested_at' => null,
+        ];
+    }
+
+    private function getLatestApprovedUpdateRequestRecord(LeaveApplication $app): ?LeaveApplicationUpdateRequest
+    {
+        if (! $app->id) {
+            return null;
+        }
+
+        if ($app->relationLoaded('updateRequests')) {
+            $record = $app->updateRequests
+                ->filter(fn ($item) => $item instanceof LeaveApplicationUpdateRequest)
+                ->sortByDesc(fn (LeaveApplicationUpdateRequest $item) => (int) $item->id)
+                ->first(function (LeaveApplicationUpdateRequest $item): bool {
+                    return strtoupper(trim((string) ($item->previous_status ?? ''))) === LeaveApplication::STATUS_APPROVED
+                        && ! $item->isHrApplicationEditRequest();
+                });
+
+            return $record instanceof LeaveApplicationUpdateRequest ? $record : null;
+        }
+
+        $record = LeaveApplicationUpdateRequest::query()
+            ->where('leave_application_id', (int) $app->id)
+            ->latest('id')
+            ->get()
+            ->first(fn (LeaveApplicationUpdateRequest $item): bool => ! $item->isHrApplicationEditRequest());
+
+        if (! $record) {
+            return null;
+        }
+
+        $previousStatus = strtoupper(trim((string) ($record->previous_status ?? '')));
+
+        return $previousStatus === LeaveApplication::STATUS_APPROVED ? $record : null;
+    }
+
+    private function resolveLatestUpdateMeta(LeaveApplication $app): array
+    {
+        $latestRequest = $this->getLatestApprovedUpdateRequestRecord($app);
+        if ($latestRequest instanceof LeaveApplicationUpdateRequest) {
+            return [
+                'status' => strtoupper(trim((string) ($latestRequest->status ?? ''))),
+                'payload' => is_array($latestRequest->requested_payload) ? $latestRequest->requested_payload : null,
+                'reason' => $this->trimNullableString($latestRequest->requested_reason),
+                'previous_status' => strtoupper(trim((string) ($latestRequest->previous_status ?? ''))),
+                'requested_by' => $this->trimNullableString($latestRequest->requested_by_control_no),
+                'requested_at' => $latestRequest->requested_at,
+                'reviewed_at' => $latestRequest->reviewed_at,
+                'review_remarks' => $this->trimNullableString($latestRequest->review_remarks),
+            ];
+        }
+
+        return [
+            'status' => null,
+            'payload' => null,
+            'reason' => null,
+            'previous_status' => null,
+            'requested_by' => null,
+            'requested_at' => null,
+            'reviewed_at' => null,
+            'review_remarks' => null,
+        ];
+    }
+
+    private function trimNullableString(mixed $value): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+
+        $trimmed = trim((string) $value);
+
+        return $trimmed === '' ? null : $trimmed;
+    }
+
+    private function buildLeaveBalanceDirectory(iterable $applications): array
+    {
+        $leaveTypeIds = [];
+        $candidateControlNos = [];
+
+        foreach ($applications as $application) {
+            if (! $application instanceof LeaveApplication) {
+                continue;
+            }
+
+            $leaveTypeId = (int) ($application->leave_type_id ?? 0);
+            if ($leaveTypeId <= 0) {
+                continue;
+            }
+
+            $controlNoCandidates = $this->resolveApplicationBalanceControlCandidates($application);
+            if ($controlNoCandidates === []) {
+                continue;
+            }
+
+            $leaveTypeIds[$leaveTypeId] = true;
+
+            foreach ($controlNoCandidates as $controlNoCandidate) {
+                $candidateControlNos[$controlNoCandidate] = true;
+            }
+        }
+
+        if ($leaveTypeIds === [] || $candidateControlNos === []) {
+            return [];
+        }
+
+        $directory = [];
+
+        foreach (
+            LeaveBalance::query()
+                ->whereIn('leave_type_id', array_keys($leaveTypeIds))
+                ->tap(fn ($query) => $this->whereInEmployeeControlNos($query, array_keys($candidateControlNos)))
+                ->get(['leave_type_id', 'employee_control_no', 'balance']) as $balance
+        ) {
+            $leaveTypeId = (int) ($balance->leave_type_id ?? 0);
+            $rawControlNo = trim((string) ($balance->employee_control_no ?? ''));
+
+            if ($leaveTypeId <= 0 || $rawControlNo === '') {
+                continue;
+            }
+
+            $resolvedBalance = (float) ($balance->balance ?? 0);
+            $directory[$leaveTypeId][$rawControlNo] = $resolvedBalance;
+
+            $normalizedControlNo = $this->normalizeControlNo($rawControlNo);
+            if ($normalizedControlNo !== '') {
+                $directory[$leaveTypeId][$normalizedControlNo] = $resolvedBalance;
+            }
+        }
+
+        return $directory;
+    }
+
+    private function getBalanceForApp(LeaveApplication $app, array $leaveBalanceDirectory = []): ?float
+    {
+        $leaveTypeId = (int) ($app->leave_type_id ?? 0);
+        if ($leaveTypeId <= 0) {
+            return null;
+        }
+
+        foreach ($this->resolveApplicationBalanceControlCandidates($app) as $controlNoCandidate) {
+            if (array_key_exists($controlNoCandidate, $leaveBalanceDirectory[$leaveTypeId] ?? [])) {
+                return (float) $leaveBalanceDirectory[$leaveTypeId][$controlNoCandidate];
+            }
+        }
+
+        return null;
+    }
+
+    private function resolveApplicationBalanceControlCandidates(LeaveApplication $app): array
+    {
+        $employeeControlNo = trim((string) ($app->employee_control_no ?? ''));
+        if ($employeeControlNo !== '') {
+            return $this->controlNoCandidates($employeeControlNo);
+        }
+
+        $adminControlNo = trim((string) ($app->applicantAdmin?->employee_control_no ?? ''));
+        if ($adminControlNo !== '') {
+            return $this->controlNoCandidates($adminControlNo);
+        }
+
+        if (! $app->applicant_admin_id) {
+            return [];
+        }
+
+        $fallbackAdminControlNo = trim((string) (
+            DepartmentAdmin::query()->whereKey((int) $app->applicant_admin_id)->value('employee_control_no') ?? ''
+        ));
+
+        return $fallbackAdminControlNo !== ''
+            ? $this->controlNoCandidates($fallbackAdminControlNo)
+            : [];
+    }
+
+    private function resolveAdminEmployeeControlNo(int $adminId): ?string
+    {
+        if ($adminId <= 0) {
+            return null;
+        }
+
+        $admin = DepartmentAdmin::query()->find($adminId);
+        if (! $admin) {
+            return null;
+        }
+
+        $rawControlNo = trim((string) $admin->employee_control_no);
+        if ($rawControlNo === '') {
+            return null;
+        }
+
+        $employee = HrisEmployee::findByControlNo($rawControlNo);
+
+        return trim((string) ($employee?->control_no ?? $rawControlNo));
+    }
+
+    private function resolveApplicationEmployee(LeaveApplication $application, array $employeeDirectoryByControlNo = []): ?object
+    {
+        $controlNo = trim((string) ($application->employee_control_no ?? ''));
+        if ($controlNo === '') {
+            return null;
+        }
+
+        $normalizedControlNo = $this->normalizeControlNo($controlNo);
+        if ($normalizedControlNo !== '' && array_key_exists($normalizedControlNo, $employeeDirectoryByControlNo)) {
+            return $employeeDirectoryByControlNo[$normalizedControlNo];
+        }
+
+        return HrisEmployee::findByControlNo($controlNo);
+    }
+
+    private function controlNoCandidates(string $controlNo): array
+    {
+        $rawControlNo = trim($controlNo);
+        if ($rawControlNo === '') {
+            return [];
+        }
+
+        $normalizedControlNo = ltrim($rawControlNo, '0');
+        if ($normalizedControlNo === '') {
+            $normalizedControlNo = '0';
+        }
+
+        return array_values(array_unique(array_filter(
+            [$rawControlNo, $normalizedControlNo],
+            fn (string $value): bool => $value !== ''
+        )));
+    }
+
+    /**
+     * Calendar endpoint: return approved leaves overlapping a given month.
+     * Query params: year (int), month (1-12), department (optional string)
+     */
+    public function calendarLeaves(Request $request): JsonResponse
+    {
+        $hr = $request->user();
+        if (! $hr instanceof HRAccount) {
+            return response()->json(['message' => 'Only HR accounts can access this endpoint.'], 403);
+        }
+
+        $year = (int) $request->query('year', now()->year);
+        $month = (int) $request->query('month', now()->month);
+        $dept = $request->query('department');
+
+        $monthStart = sprintf('%04d-%02d-01', $year, $month);
+        $monthEnd = date('Y-m-t', strtotime($monthStart));
+
+        $query = LeaveApplication::with(['leaveType', 'applicantAdmin.department'])
+            ->where('status', LeaveApplication::STATUS_APPROVED)
+            ->where('start_date', '<=', $monthEnd)
+            ->where('end_date', '>=', $monthStart);
+
+        if ($dept) {
+            $departmentControlNos = HrisEmployee::controlNosByOffice((string) $dept);
+            $departmentControlNoCandidates = collect($departmentControlNos)
+                ->flatMap(fn (string $controlNo): array => $this->controlNoCandidates($controlNo))
+                ->filter(fn (string $controlNo): bool => $controlNo !== '')
+                ->unique()
+                ->values()
+                ->all();
+
+            $query->where(function ($q) use ($dept, $departmentControlNoCandidates) {
+                $q->when(
+                    $departmentControlNoCandidates !== [],
+                    fn ($nestedQuery) => $this->whereInEmployeeControlNos($nestedQuery, $departmentControlNoCandidates),
+                    fn ($nestedQuery) => $nestedQuery->whereRaw('1 = 0')
+                )
+                    ->orWhereHas('applicantAdmin.department', fn ($sq) => $sq->where('name', $dept));
+            });
+        }
+
+        $applications = $query->orderBy('start_date')->get();
+
+        $employeeDirectoryByControlNo = $this->buildEmployeeDirectory(
+            $applications->pluck('employee_control_no')->all()
+        );
+
+        $formatted = $applications->map(function ($app) use ($employeeDirectoryByControlNo): array {
+            $employee = $this->resolveApplicationEmployee($app, $employeeDirectoryByControlNo);
+            $resolvedEmployeeName = trim((string) ($app->employee_name ?? ''));
+            if ($resolvedEmployeeName === '') {
+                $resolvedEmployeeName = $employee
+                    ? trim(($employee->firstname ?? '').' '.($employee->surname ?? ''))
+                    : '';
+            }
+
+            return [
+                'id' => $app->id,
+                'employeeName' => $resolvedEmployeeName !== ''
+                    ? $resolvedEmployeeName
+                    : ($app->applicantAdmin ? $app->applicantAdmin->full_name : 'Unknown'),
+                'employee_control_no' => $app->employee_control_no,
+                'office' => $employee?->office ?? ($app->applicantAdmin?->department?->name ?? ''),
+                'leaveType' => $app->leaveType?->name ?? 'Unknown',
+                'startDate' => $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : '',
+                'endDate' => $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : '',
+                'selected_dates' => $app->resolvedSelectedDates(),
+                'days' => (float) $app->total_days,
+                'duration_value' => (float) $app->total_days,
+                'duration_unit' => 'day',
+                'duration_label' => ((float) $app->total_days == (int) $app->total_days)
+                    ? ((int) $app->total_days).' '.((int) $app->total_days === 1 ? 'day' : 'days')
+                    : ((float) $app->total_days).' days',
+                'dateFiled' => $app->created_at ? $app->created_at->toDateString() : '',
+                'status' => 'Approved',
+            ];
+        });
+
+        return response()->json(['leaves' => $formatted]);
+    }
+}

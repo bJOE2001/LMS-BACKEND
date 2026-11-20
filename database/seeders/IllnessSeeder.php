@@ -2,7 +2,7 @@
 
 namespace Database\Seeders;
 
-use App\Models\Illness;
+use App\Models\Leave\Illness;
 use Illuminate\Database\Seeder;
 
 class IllnessSeeder extends Seeder

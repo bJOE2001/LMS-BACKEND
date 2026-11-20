@@ -2,7 +2,7 @@
 
 namespace Database\Seeders;
 
-use App\Models\LeaveType;
+use App\Models\Leave\LeaveType;
 use Illuminate\Database\Seeder;
 
 /**

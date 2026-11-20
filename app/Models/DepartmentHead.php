@@ -23,7 +23,6 @@ class DepartmentHead extends Model
         'designation',
         'rate_mon',
         'full_name',
-        'position',
     ];
 
     protected function casts(): array
