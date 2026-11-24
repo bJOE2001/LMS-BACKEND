@@ -2,7 +2,6 @@
 
 namespace App\Services\Attendance;
 
-use App\Models\Attendance\AttendanceRawLog;
 use App\Models\Attendance\BiometricDevice;
 use App\Models\Attendance\BiometricDeviceCommand;
 use App\Models\Attendance\BiometricEnrollment;
@@ -20,8 +19,14 @@ class NativeAdmsService
     private const MAX_COMMANDS_PER_POLL = 5;
 
     public function __construct(
-        private readonly DtrCalculationService $dtrService
+        private readonly DtrCalculationService $dtrService,
+        private readonly ?AttendanceBatchIngestService $batchIngestService = null
     ) {}
+
+    private function batchIngest(): AttendanceBatchIngestService
+    {
+        return $this->batchIngestService ?? app(AttendanceBatchIngestService::class);
+    }
 
     /**
      * Handle initial handshake from ZKTeco terminal (GET /iclock/cdata).
@@ -586,10 +591,7 @@ class NativeAdmsService
             ];
         }
 
-        $imported = 0;
-        $duplicates = 0;
-        $totalValid = 0;
-        $affectedDates = [];
+        $candidates = [];
 
         foreach ($lines as $rawLine) {
             $line = trim($rawLine);
@@ -602,45 +604,20 @@ class NativeAdmsService
                 continue;
             }
 
-            $totalValid++;
-            $pin = $punch['pin'];
-            $punchTime = $punch['time'];
-            $punchState = $punch['state'];
-            $verifyType = $punch['verify_type'];
-            $workCode = $punch['work_code'];
-
-            $emp = HrisEmployee::findByControlNo($pin, true);
-            $canonicalControlNo = $emp?->control_no ? (string) $emp->control_no : $pin;
-
-            $exists = AttendanceRawLog::query()
-                ->where(function ($q) use ($pin, $canonicalControlNo): void {
-                    $q->where('biometric_pin', $pin)
-                        ->orWhere('employee_control_no', $canonicalControlNo);
-                })
-                ->where('punch_time', $punchTime)
-                ->exists();
-
-            if ($exists) {
-                $duplicates++;
-
-                continue;
-            }
-
-            AttendanceRawLog::query()->create([
-                'device_serial_number' => $serialNumber,
-                'biometric_pin' => $pin,
-                'employee_control_no' => $canonicalControlNo,
-                'punch_time' => $punchTime,
-                'punch_state' => $punchState,
-                'verify_type' => $verifyType,
-                'work_code' => $workCode,
-                'sync_source' => 'ADMS',
+            $candidates[] = [
+                'pin' => $punch['pin'],
+                'punch_time' => $punch['time'],
+                'punch_state' => $punch['state'],
+                'verify_type' => $punch['verify_type'],
+                'work_code' => $punch['work_code'],
                 'raw_payload' => $line,
-            ]);
-
-            $imported++;
-            $affectedDates[$canonicalControlNo][substr($punchTime, 0, 10)] = true;
+            ];
         }
+
+        $totalValid = count($candidates);
+        $ingestResult = $this->batchIngest()->ingestBatch($candidates, $serialNumber, 'ADMS');
+        $imported = $ingestResult['imported'];
+        $duplicates = $ingestResult['duplicates'];
 
         if ($device && $imported > 0) {
             try {
@@ -651,18 +628,11 @@ class NativeAdmsService
             }
         }
 
-        // Recalculate DTR for all affected employees and dates
-        foreach ($affectedDates as $controlNo => $dates) {
-            foreach (array_keys($dates) as $dateStr) {
-                try {
-                    $this->dtrService->calculateForEmployeeDate($controlNo, $dateStr);
-                } catch (Throwable $e) {
-                    Log::warning("NativeAdmsService: DTR recalculate error for {$controlNo} on {$dateStr}", [
-                        'error' => $e->getMessage(),
-                    ]);
-                }
-            }
-        }
+        // Recalculate DTR in batch for all affected employees and dates
+        $this->dtrService->calculateBatchForDates(
+            $ingestResult['affected_dates'],
+            $ingestResult['employees']
+        );
 
         // ZKTeco protocol response: 'OK: <count>' tells the device all records were accepted
         return [

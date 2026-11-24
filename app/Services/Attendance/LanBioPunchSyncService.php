@@ -2,10 +2,8 @@
 
 namespace App\Services\Attendance;
 
-use App\Models\Attendance\AttendanceRawLog;
 use App\Models\Attendance\BiometricDevice;
 use App\Models\Attendance\BiometricEnrollment;
-use App\Models\HrisEmployee;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Throwable;
@@ -18,8 +16,14 @@ class LanBioPunchSyncService
 {
     public function __construct(
         private readonly DtrCalculationService $dtrService,
-        private readonly ?LanBioTemplateSyncService $templateSyncService = null
+        private readonly ?LanBioTemplateSyncService $templateSyncService = null,
+        private readonly ?AttendanceBatchIngestService $batchIngestService = null
     ) {}
+
+    private function batchIngest(): AttendanceBatchIngestService
+    {
+        return $this->batchIngestService ?? app(AttendanceBatchIngestService::class);
+    }
 
     /**
      * Poll a specific biometric device by ID or model instance.
@@ -33,7 +37,7 @@ class LanBioPunchSyncService
      *     total_read: int
      * }
      */
-    public function syncDevice(BiometricDevice $device, ?ZkSocketClient $client = null): array
+    public function syncDevice(BiometricDevice $device, ?ZkSocketClient $client = null, bool $syncTemplates = false): array
     {
         $deviceName = $device->device_name ?: "Terminal {$device->serial_number}";
 
@@ -86,18 +90,23 @@ class LanBioPunchSyncService
                 ];
             }
 
-            $rawLogs = $zk->getAttendanceLogs();
-            $zk->disconnect();
+            try {
+                $rawLogs = $zk->getAttendanceLogs();
 
-            if ($client === null && $device->communication_mode === 'LAN_POLL') {
-                try {
-                    ($this->templateSyncService ?? new LanBioTemplateSyncService)->pullTemplatesFromDevice($device);
-                } catch (Throwable $tplError) {
-                    Log::warning('LanBioPunchSyncService: Non-critical template harvest skipped', [
-                        'device' => $device->serial_number,
-                        'error' => $tplError->getMessage(),
-                    ]);
+                // Harvest missing fingerprint/face templates only when explicitly requested (manual UI sync),
+                // reusing the open terminal socket instead of connecting a second time every minute.
+                if ($client === null && $syncTemplates && $device->communication_mode === 'LAN_POLL') {
+                    try {
+                        ($this->templateSyncService ?? new LanBioTemplateSyncService)->pullTemplatesFromDevice($device, null, $zk);
+                    } catch (Throwable $tplError) {
+                        Log::warning('LanBioPunchSyncService: Non-critical template harvest skipped', [
+                            'device' => $device->serial_number,
+                            'error' => $tplError->getMessage(),
+                        ]);
+                    }
                 }
+            } finally {
+                $zk->disconnect();
             }
 
             // Mark device online and timestamp heartbeat & sync
@@ -119,9 +128,7 @@ class LanBioPunchSyncService
                 ];
             }
 
-            $imported = 0;
-            $duplicates = 0;
-            $affectedDates = [];
+            $candidates = [];
 
             foreach ($rawLogs as $log) {
                 $pinClean = trim(preg_replace('/[^\x20-\x7E]/', '', (string) ($log['pin'] ?? '')));
@@ -138,73 +145,28 @@ class LanBioPunchSyncService
                     $workCode = $workClean !== '' ? mb_convert_encoding($workClean, 'UTF-8', 'UTF-8') : null;
                 }
 
-                // Match canonical employee control number if available
-                $emp = HrisEmployee::findByControlNo($pin, true);
-                $canonicalControlNo = $emp?->control_no ? (string) $emp->control_no : $pin;
-
-                $punchTimeStandard = substr($punchTime, 0, 19);
-
-                $exists = AttendanceRawLog::query()
-                    ->where(function ($q) use ($pin, $canonicalControlNo): void {
-                        $q->where('biometric_pin', $pin)
-                            ->orWhere('employee_control_no', $canonicalControlNo);
-                    })
-                    ->where('punch_time', $punchTimeStandard)
-                    ->exists();
-
-                if ($exists) {
-                    $duplicates++;
-
-                    continue;
-                }
-
-                AttendanceRawLog::query()->create([
-                    'device_serial_number' => $device->serial_number,
-                    'biometric_pin' => $pin,
-                    'employee_control_no' => $canonicalControlNo,
-                    'punch_time' => $punchTimeStandard,
-                    'punch_state' => $log['state'] ?? 0,
-                    'verify_type' => $log['type'] ?? 1,
+                $candidates[] = [
+                    'pin' => $pin,
+                    'punch_time' => substr($punchTime, 0, 19),
+                    'punch_state' => (int) ($log['state'] ?? 0),
+                    'verify_type' => (int) ($log['type'] ?? 1),
                     'work_code' => $workCode,
-                    'sync_source' => 'LAN_POLL',
                     'raw_payload' => "IP={$device->ip_address};SN={$device->serial_number}",
-                ]);
-
-                $imported++;
-                $affectedDates[$canonicalControlNo][substr($punchTimeStandard, 0, 10)] = true;
-
-                // Auto-confirm registration if employee was pending biometric enrollment
-                $enrollment = BiometricEnrollment::query()
-                    ->where('employee_control_no', $canonicalControlNo)
-                    ->first();
-
-                if ($enrollment && $enrollment->status === BiometricEnrollment::STATUS_PENDING_ENROLLMENT) {
-                    $enrollment->status = BiometricEnrollment::STATUS_REGISTERED;
-                    $enrollment->enrolled_at = $enrollment->enrolled_at ?? now();
-                    $enrollment->enrollment_device_sn = $enrollment->enrollment_device_sn ?: $device->serial_number;
-                    $synced = is_array($enrollment->synced_devices) ? $enrollment->synced_devices : [];
-                    if (! in_array($device->serial_number, $synced, true)) {
-                        $synced[] = $device->serial_number;
-                        $enrollment->synced_devices = $synced;
-                    }
-                    $enrollment->save();
-                }
+                ];
             }
 
-            // Recalculate DTR for all affected employees and dates
-            foreach ($affectedDates as $controlNo => $dates) {
-                foreach (array_keys($dates) as $date) {
-                    try {
-                        $this->dtrService->calculateForEmployeeDate($controlNo, $date);
-                    } catch (Throwable $e) {
-                        Log::warning('LanBioPunchSyncService: Failed to recalculate DTR', [
-                            'control_no' => $controlNo,
-                            'date' => $date,
-                            'error' => $e->getMessage(),
-                        ]);
-                    }
-                }
-            }
+            $ingestResult = $this->batchIngest()->ingestBatch($candidates, $device->serial_number, 'LAN_POLL');
+            $imported = $ingestResult['imported'];
+            $duplicates = $ingestResult['duplicates'];
+
+            // Batch-confirm pending biometric enrollments for newly imported control numbers
+            $this->confirmPendingEnrollments($ingestResult['imported_control_nos'], $device->serial_number);
+
+            // Recalculate DTR in batch for all affected employees and dates
+            $this->dtrService->calculateBatchForDates(
+                $ingestResult['affected_dates'],
+                $ingestResult['employees']
+            );
 
             if ($imported > 0) {
                 $logWord = $imported === 1 ? 'log' : 'logs';
@@ -294,5 +256,38 @@ class LanBioPunchSyncService
             'total_imported' => $totalImported,
             'results' => $results,
         ];
+    }
+
+    /**
+     * Auto-confirm pending biometric enrollments in batch for newly synced employees.
+     *
+     * @param  array<int, string>  $controlNos
+     */
+    private function confirmPendingEnrollments(array $controlNos, string $deviceSerialNumber): void
+    {
+        if ($controlNos === []) {
+            return;
+        }
+
+        $now = now();
+
+        foreach (array_chunk($controlNos, 400) as $chunk) {
+            $pendingEnrollments = BiometricEnrollment::query()
+                ->whereIn('employee_control_no', $chunk)
+                ->where('status', BiometricEnrollment::STATUS_PENDING_ENROLLMENT)
+                ->get();
+
+            foreach ($pendingEnrollments as $enrollment) {
+                $enrollment->status = BiometricEnrollment::STATUS_REGISTERED;
+                $enrollment->enrolled_at = $enrollment->enrolled_at ?? $now;
+                $enrollment->enrollment_device_sn = $enrollment->enrollment_device_sn ?: $deviceSerialNumber;
+                $synced = is_array($enrollment->synced_devices) ? $enrollment->synced_devices : [];
+                if (! in_array($deviceSerialNumber, $synced, true)) {
+                    $synced[] = $deviceSerialNumber;
+                    $enrollment->synced_devices = $synced;
+                }
+                $enrollment->save();
+            }
+        }
     }
 }

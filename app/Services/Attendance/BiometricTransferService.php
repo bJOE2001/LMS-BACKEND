@@ -89,8 +89,8 @@ class BiometricTransferService
                     'employee_control_no' => $canonicalControlNo,
                     'employee_name' => $fullName,
                     'action_type' => BiometricTransferLog::ACTION_TRANSFER,
-                    'source_department_id' => $sourceDepartmentId ?? self::CHRMO_DEPARTMENT_ID,
-                    'source_office_name' => $this->resolveOfficeName($sourceDepartmentId ?? self::CHRMO_DEPARTMENT_ID),
+                    'source_department_id' => $sourceDepartmentId,
+                    'source_office_name' => $this->resolveOfficeName($sourceDepartmentId),
                     'target_department_id' => $newDepartmentId,
                     'target_office_name' => $departmentLabel,
                     'status' => BiometricTransferLog::STATUS_FAILED,
@@ -169,9 +169,6 @@ class BiometricTransferService
 
             if ($sourceDepartmentId === null && $sourceDevices->isNotEmpty()) {
                 $sourceDepartmentId = $sourceDevices->whereNotNull('department_id')->first()?->department_id;
-            }
-            if ($sourceDepartmentId === null) {
-                $sourceDepartmentId = self::CHRMO_DEPARTMENT_ID;
             }
             $sourceOfficeName = $this->resolveOfficeName($sourceDepartmentId);
             $sourceDeviceSn = count($sourceSns) > 0 ? implode(', ', $sourceSns) : null;
@@ -282,8 +279,8 @@ class BiometricTransferService
                 'employee_control_no' => $canonicalControlNo,
                 'employee_name' => $fullName,
                 'action_type' => BiometricTransferLog::ACTION_TRANSFER,
-                'source_department_id' => $sourceDepartmentId ?? self::CHRMO_DEPARTMENT_ID,
-                'source_office_name' => $this->resolveOfficeName($sourceDepartmentId ?? self::CHRMO_DEPARTMENT_ID),
+                'source_department_id' => $sourceDepartmentId,
+                'source_office_name' => $this->resolveOfficeName($sourceDepartmentId),
                 'target_department_id' => $newDepartmentId,
                 'status' => BiometricTransferLog::STATUS_FAILED,
                 'remarks' => 'Failed to execute biometric transfer: '.$e->getMessage(),
@@ -358,8 +355,6 @@ class BiometricTransferService
                 'source_department_id' => $oldDepartmentId,
                 'source_office_name' => $sourceOfficeName,
                 'source_device_sn' => $oldDevice?->serial_number,
-                'target_department_id' => self::CHRMO_DEPARTMENT_ID,
-                'target_office_name' => $this->resolveOfficeName(self::CHRMO_DEPARTMENT_ID) ?? 'CHRMO',
                 'status' => BiometricTransferLog::STATUS_SUCCESS,
                 'remarks' => $successMsg,
                 'performed_by_user_id' => $userId,

@@ -11,6 +11,7 @@ use App\Models\Leave\LeaveApplication;
 use App\Services\WorkScheduleService;
 use Carbon\Carbon;
 use Carbon\CarbonImmutable;
+use DateTimeInterface;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
 use Throwable;
@@ -28,9 +29,15 @@ class DtrCalculationService
     public const STANDARD_WORKDAY_HOURS = 8.00;
 
     public function __construct(
-        public ?WorkScheduleService $workScheduleService = null
+        public ?WorkScheduleService $workScheduleService = null,
+        private readonly ?AttendanceBatchIngestService $batchIngestService = null
     ) {
         $this->workScheduleService = $workScheduleService ?? app(WorkScheduleService::class);
+    }
+
+    private function batchIngest(): AttendanceBatchIngestService
+    {
+        return $this->batchIngestService ?? app(AttendanceBatchIngestService::class);
     }
 
     /**
@@ -84,27 +91,79 @@ class DtrCalculationService
         // 2. Resolve Work Schedule (Override vs Global Default)
         $schedule = $cachedSchedule ?? $this->resolveSchedule($canonicalControlNo, $variants);
 
-        // 3. Fetch Raw Punches for this date
+        // 3. Fetch Raw Punches for this date (range scan uses IX_tblAttendanceLogs_punch_time)
         $rawPunches = AttendanceRawLog::query()
             ->where(function ($q) use ($variants): void {
                 $q->whereIn('employee_control_no', $variants)
                     ->orWhereIn('biometric_pin', $variants);
             })
-            ->whereDate('punch_time', $dateStr)
+            ->whereBetween('punch_time', [$dateStr.' 00:00:00', $dateStr.' 23:59:59'])
             ->orderBy('punch_time')
             ->get();
 
-        // 4. De-duplicate punches within 2 minutes of each other
-        $cleanPunches = $this->filterDoubleTaps($rawPunches, $schedule);
-
-        // 5. Slot Punches into 4 Daily Slots (AM In, AM Out, PM In, PM Out)
-        $slotted = $this->slotPunches($cleanPunches, $schedule);
-
-        // 6. Check for Approved Leaves in LMS_DB
+        // 4. Check for Approved Leaves in LMS_DB
         $leaveInfo = $this->resolveApprovedLeave($canonicalControlNo, $dateStr, $variants);
 
-        // 6b. Check for Active Holidays in BIO_DB
-        $holiday = Holiday::query()
+        // 5. Check for Active Holidays in BIO_DB
+        $holiday = $this->resolveHolidayForDate($dateObj);
+
+        // 6. Check if existing DTR has a manual adjustment (preserve it)
+        $existingDtr = DailyTimeRecord::query()
+            ->whereIn('employee_control_no', $variants)
+            ->where('record_date', $dateStr)
+            ->first();
+
+        $computed = $this->computeDtrPayload(
+            $canonicalControlNo,
+            $departmentId,
+            $dateObj,
+            $rawPunches,
+            $schedule,
+            $leaveInfo,
+            $holiday,
+            $existingDtr,
+            CarbonImmutable::today()
+        );
+
+        $dtr = DailyTimeRecord::query()->updateOrCreate(
+            [
+                'employee_control_no' => $canonicalControlNo,
+                'record_date' => $dateStr,
+            ],
+            $computed['payload']
+        );
+
+        // Remove non-canonical duplicate DTR records for this date
+        $nonCanonicalVariants = array_values(array_diff($variants, [$canonicalControlNo]));
+        if (! empty($nonCanonicalVariants)) {
+            DailyTimeRecord::query()
+                ->whereIn('employee_control_no', $nonCanonicalVariants)
+                ->where('record_date', $dateStr)
+                ->delete();
+        }
+
+        // Mark raw punches as processed and heal employee_control_no to canonicalControlNo
+        $cleanPunches = $computed['clean_punches'];
+        if ($cleanPunches->isNotEmpty()) {
+            AttendanceRawLog::query()
+                ->whereIn('id', $cleanPunches->pluck('id'))
+                ->update([
+                    'employee_control_no' => $canonicalControlNo,
+                    'processed_at' => now(),
+                ]);
+        }
+
+        return $dtr;
+    }
+
+    /**
+     * Resolve an active holiday (exact or recurring) for the given calendar date.
+     */
+    private function resolveHolidayForDate(CarbonImmutable $dateObj): ?Holiday
+    {
+        $dateStr = $dateObj->format('Y-m-d');
+
+        return Holiday::query()
             ->active()
             ->where(function ($q) use ($dateStr, $dateObj): void {
                 $q->where('holiday_date', $dateStr)
@@ -115,12 +174,33 @@ class DtrCalculationService
                     });
             })
             ->first();
+    }
 
-        // 7. Check if existing DTR has a manual adjustment (preserve it)
-        $existingDtr = DailyTimeRecord::query()
-            ->whereIn('employee_control_no', $variants)
-            ->where('record_date', $dateStr)
-            ->first();
+    /**
+     * Compute DTR attributes and filtered raw punches without executing persistence queries.
+     *
+     * @param  Collection<int, AttendanceRawLog>  $rawPunches
+     * @param  array<string, mixed>  $schedule
+     * @param  array{is_on_leave: bool, portion: string, leave_type_code: string, leave_application_id: int}|null  $leaveInfo
+     * @return array{payload: array<string, mixed>, clean_punches: Collection<int, AttendanceRawLog>}
+     */
+    private function computeDtrPayload(
+        string $canonicalControlNo,
+        ?int $departmentId,
+        CarbonImmutable $dateObj,
+        Collection $rawPunches,
+        array $schedule,
+        ?array $leaveInfo,
+        ?Holiday $holiday,
+        ?DailyTimeRecord $existingDtr,
+        CarbonImmutable $today
+    ): array {
+        $dateStr = $dateObj->format('Y-m-d');
+        $dayOfWeek = $dateObj->format('l');
+        $isWeekend = $dateObj->isWeekend();
+
+        $cleanPunches = $this->filterDoubleTaps($rawPunches, $schedule);
+        $slotted = $this->slotPunches($cleanPunches, $schedule);
 
         // If this record has a manual adjustment, manual punch times take strict precedence over raw biometric logs
         if ($existingDtr && $existingDtr->is_adjusted) {
@@ -132,7 +212,6 @@ class DtrCalculationService
             $slotted['ot_departure'] = $existingDtr->ot_departure;
         }
 
-        // 8. Calculate Late and Undertime Minutes (Strict 0 Grace Period)
         $lateAndUndertime = $this->calculateLateAndUndertime(
             $slotted['am_arrival'],
             $slotted['am_departure'],
@@ -168,7 +247,6 @@ class DtrCalculationService
             $lateAndUndertime['overtime_minutes'] = (int) $existingDtr->overtime_minutes;
         }
 
-        // 9. Calculate Rendered Hours
         $renderedHours = $this->calculateRenderedHours(
             $slotted['am_arrival'],
             $slotted['am_departure'],
@@ -186,12 +264,10 @@ class DtrCalculationService
             }
         }
 
-        $today = CarbonImmutable::today();
         $isToday = $dateObj->isSameDay($today);
         $isPast = $dateObj->isBefore($today);
         $isFuture = $dateObj->isAfter($today);
 
-        // 10. Determine Final Status
         $status = $this->determineStatus(
             $slotted,
             $leaveInfo,
@@ -204,7 +280,6 @@ class DtrCalculationService
             $holiday
         );
 
-        // 11. Upsert DTR in BIO_DB under canonical control number
         $payload = [
             'employee_control_no' => $canonicalControlNo,
             'department_id' => $departmentId,
@@ -229,7 +304,6 @@ class DtrCalculationService
             $payload['adjustment_remarks'] = $holiday->name;
         }
 
-        // Preserve adjustment if one already existed
         if ($existingDtr && $existingDtr->is_adjusted) {
             $payload['is_adjusted'] = true;
             $payload['adjustment_reason'] = $existingDtr->adjustment_reason;
@@ -238,34 +312,10 @@ class DtrCalculationService
             $payload['adjusted_slots'] = $existingDtr->adjusted_slots;
         }
 
-        $dtr = DailyTimeRecord::query()->updateOrCreate(
-            [
-                'employee_control_no' => $canonicalControlNo,
-                'record_date' => $dateStr,
-            ],
-            $payload
-        );
-
-        // Remove non-canonical duplicate DTR records for this date
-        $nonCanonicalVariants = array_values(array_diff($variants, [$canonicalControlNo]));
-        if (! empty($nonCanonicalVariants)) {
-            DailyTimeRecord::query()
-                ->whereIn('employee_control_no', $nonCanonicalVariants)
-                ->where('record_date', $dateStr)
-                ->delete();
-        }
-
-        // Mark raw punches as processed and heal employee_control_no to canonicalControlNo
-        if ($cleanPunches->isNotEmpty()) {
-            AttendanceRawLog::query()
-                ->whereIn('id', $cleanPunches->pluck('id'))
-                ->update([
-                    'employee_control_no' => $canonicalControlNo,
-                    'processed_at' => now(),
-                ]);
-        }
-
-        return $dtr;
+        return [
+            'payload' => $payload,
+            'clean_punches' => $cleanPunches,
+        ];
     }
 
     /**
@@ -354,6 +404,568 @@ class DtrCalculationService
     }
 
     /**
+     * Calculate DTR records in batch across multiple employees and dates.
+     * Preloads HRIS profiles, department assignments, schedules, holidays,
+     * approved leaves, raw punches, and existing DTRs in chunked queries to avoid N+1 load.
+     *
+     * @param  array<string, array<int|string, mixed>>  $affectedDates  Map of control_no => dates (keys or values)
+     * @param  array<string, object>  $cachedEmployees  Optional preloaded directory from AttendanceBatchIngestService
+     */
+    public function calculateBatchForDates(array $affectedDates, array $cachedEmployees = []): int
+    {
+        if ($affectedDates === []) {
+            return 0;
+        }
+
+        $requestedPairs = [];
+        $rawControlNos = [];
+
+        foreach ($affectedDates as $rawControlNo => $dates) {
+            $ctrl = trim((string) $rawControlNo);
+            if ($ctrl === '' || ! is_array($dates)) {
+                continue;
+            }
+
+            $rawControlNos[$ctrl] = true;
+            foreach ($dates as $key => $val) {
+                $dateCandidate = (is_bool($val) || is_int($val)) ? (string) $key : (string) $val;
+                $dateStr = substr(trim($dateCandidate), 0, 10);
+                if ($dateStr !== '') {
+                    $requestedPairs[] = [$ctrl, $dateStr];
+                }
+            }
+        }
+
+        if ($requestedPairs === []) {
+            return 0;
+        }
+
+        // 1. Resolve HRIS employees (active first, then inactive fallback) via chunked IN queries
+        $employeesDir = $cachedEmployees;
+        $missingPins = [];
+        foreach (array_keys($rawControlNos) as $ctrl) {
+            if ($this->batchIngest()->resolveFromDirectory($employeesDir, $ctrl) === null) {
+                $missingPins[] = $ctrl;
+            }
+        }
+
+        if ($missingPins !== []) {
+            $loadedActive = $this->batchIngest()->loadEmployeeDirectory($missingPins, true);
+            $employeesDir = $employeesDir + $loadedActive;
+
+            $stillMissing = [];
+            foreach ($missingPins as $ctrl) {
+                if ($this->batchIngest()->resolveFromDirectory($employeesDir, $ctrl) === null) {
+                    $stillMissing[] = $ctrl;
+                }
+            }
+
+            if ($stillMissing !== []) {
+                $loadedInactive = $this->batchIngest()->loadEmployeeDirectory($stillMissing, false);
+                $employeesDir = $employeesDir + $loadedInactive;
+            }
+        }
+
+        // Normalize jobs keyed by canonicalControlNo|dateStr
+        $jobs = [];
+        $variantsByCanonical = [];
+        $allVariantsMap = [];
+        $uniqueDatesMap = [];
+        $dateObjs = [];
+
+        foreach ($requestedPairs as [$rawControlNo, $dateStr]) {
+            $emp = $this->batchIngest()->resolveFromDirectory($employeesDir, $rawControlNo);
+            $canonicalControlNo = $emp?->control_no ? trim((string) $emp->control_no) : $rawControlNo;
+            $variants = $this->resolveControlNoVariants($rawControlNo, $canonicalControlNo);
+
+            $jobKey = "{$canonicalControlNo}|{$dateStr}";
+            if (! isset($jobs[$jobKey])) {
+                $jobs[$jobKey] = [
+                    'canonical_control_no' => $canonicalControlNo,
+                    'date_str' => $dateStr,
+                    'variants' => [],
+                ];
+            }
+
+            foreach ($variants as $variant) {
+                $jobs[$jobKey]['variants'][$variant] = true;
+                $variantsByCanonical[$canonicalControlNo][$variant] = true;
+                $allVariantsMap[$variant] = true;
+            }
+
+            if (! isset($uniqueDatesMap[$dateStr])) {
+                $uniqueDatesMap[$dateStr] = true;
+                $dateObjs[$dateStr] = CarbonImmutable::parse($dateStr);
+            }
+        }
+
+        $allVariants = array_keys($allVariantsMap);
+        $uniqueDates = array_keys($uniqueDatesMap);
+        sort($uniqueDates);
+        $minDateStr = $uniqueDates[0];
+        $maxDateStr = $uniqueDates[count($uniqueDates) - 1];
+
+        // 2. Preload department assignments
+        $deptByVariant = $this->preloadDepartmentsByVariant($allVariants);
+
+        // 3. Resolve schedules per unique canonical employee (WorkScheduleService memoizes overrides & default)
+        $schedulesByEmp = [];
+        foreach ($variantsByCanonical as $canonicalControlNo => $variantSet) {
+            $schedulesByEmp[$canonicalControlNo] = $this->resolveSchedule(
+                (string) $canonicalControlNo,
+                array_keys($variantSet)
+            );
+        }
+
+        // 4. Preload active holidays once per distinct date
+        $holidaysByDate = [];
+        foreach ($uniqueDates as $dateStr) {
+            $holidaysByDate[$dateStr] = $this->resolveHolidayForDate($dateObjs[$dateStr]);
+        }
+
+        // 5. Preload approved leaves across all variants & affected dates
+        $leavesByVariant = $this->preloadApprovedLeavesByVariant($allVariants, $uniqueDates, $minDateStr, $maxDateStr);
+
+        // 6. Preload raw punches grouped by variant and date
+        [$punchesById, $punchIdsByVariantDate] = $this->preloadRawPunches(
+            $allVariants,
+            $uniqueDates,
+            $uniqueDatesMap,
+            $minDateStr,
+            $maxDateStr
+        );
+
+        // 7. Preload existing DTRs grouped by variant and date
+        $existingDtrsByVariantDate = $this->preloadExistingDtrs($allVariants, $uniqueDates);
+
+        // 8. Compute all DTR payloads in memory
+        $today = CarbonImmutable::today();
+        $now = now();
+        $nowStr = $now->format('Y-m-d H:i:s');
+
+        $pendingInserts = [];
+        $updatesToApply = [];
+        $nonCanonicalDtrIds = [];
+        $bulkProcessedOnlyIds = [];
+        $healAndProcessByControlNo = [];
+        $processedJobs = 0;
+
+        foreach ($jobs as $job) {
+            $canonicalControlNo = $job['canonical_control_no'];
+            $dateStr = $job['date_str'];
+            $variants = array_keys($job['variants']);
+            $schedule = $schedulesByEmp[$canonicalControlNo];
+            $departmentId = $this->matchDepartmentFromMap($canonicalControlNo, $variants, $deptByVariant);
+            $leaveInfo = $this->matchApprovedLeaveFromMap($dateStr, $variants, $leavesByVariant);
+            $holiday = $holidaysByDate[$dateStr] ?? null;
+
+            // Collect deduplicated raw punches for this employee + date across variants
+            $matchedPunches = [];
+            foreach ($variants as $variant) {
+                if (! isset($punchIdsByVariantDate[$variant][$dateStr])) {
+                    continue;
+                }
+                foreach (array_keys($punchIdsByVariantDate[$variant][$dateStr]) as $punchId) {
+                    if (isset($punchesById[$punchId])) {
+                        $matchedPunches[$punchId] = $punchesById[$punchId];
+                    }
+                }
+            }
+
+            $rawPunches = collect(array_values($matchedPunches))->sortBy(
+                static fn (AttendanceRawLog $p): string => $p->punch_time instanceof DateTimeInterface
+                    ? $p->punch_time->format('Y-m-d H:i:s')
+                    : substr((string) $p->punch_time, 0, 19)
+            )->values();
+
+            // Resolve canonical vs non-canonical existing DTR records
+            $canonicalDtr = null;
+            $fallbackVariantDtr = null;
+            foreach ($variants as $variant) {
+                if (! isset($existingDtrsByVariantDate[$variant][$dateStr])) {
+                    continue;
+                }
+                foreach ($existingDtrsByVariantDate[$variant][$dateStr] as $dtr) {
+                    if ($dtr->employee_control_no === $canonicalControlNo) {
+                        $canonicalDtr ??= $dtr;
+                    } else {
+                        $fallbackVariantDtr ??= $dtr;
+                        $nonCanonicalDtrIds[$dtr->id] = true;
+                    }
+                }
+            }
+
+            $existingDtr = $canonicalDtr ?? $fallbackVariantDtr;
+
+            $computed = $this->computeDtrPayload(
+                $canonicalControlNo,
+                $departmentId,
+                $dateObjs[$dateStr],
+                $rawPunches,
+                $schedule,
+                $leaveInfo,
+                $holiday,
+                $existingDtr,
+                $today
+            );
+
+            $payload = $computed['payload'];
+            $cleanPunches = $computed['clean_punches'];
+
+            if ($canonicalDtr !== null) {
+                $updatesToApply[] = [
+                    'model' => $canonicalDtr,
+                    'payload' => $payload,
+                ];
+            } else {
+                $adjustedSlots = $payload['adjusted_slots'] ?? null;
+                if (is_array($adjustedSlots)) {
+                    $adjustedSlots = json_encode($adjustedSlots);
+                }
+
+                $pendingInserts[] = [
+                    'canonical_control_no' => $canonicalControlNo,
+                    'date_str' => $dateStr,
+                    'payload' => $payload,
+                    'row' => [
+                        'employee_control_no' => $payload['employee_control_no'],
+                        'department_id' => $payload['department_id'],
+                        'record_date' => $payload['record_date'],
+                        'day_of_week' => $payload['day_of_week'],
+                        'am_arrival' => $payload['am_arrival'],
+                        'am_departure' => $payload['am_departure'],
+                        'pm_arrival' => $payload['pm_arrival'],
+                        'pm_departure' => $payload['pm_departure'],
+                        'ot_arrival' => $payload['ot_arrival'],
+                        'ot_departure' => $payload['ot_departure'],
+                        'late_minutes' => $payload['late_minutes'],
+                        'undertime_minutes' => $payload['undertime_minutes'],
+                        'overtime_minutes' => $payload['overtime_minutes'],
+                        'rendered_hours' => $payload['rendered_hours'],
+                        'status' => $payload['status'],
+                        'leave_type_code' => $payload['leave_type_code'],
+                        'leave_application_id' => $payload['leave_application_id'],
+                        'is_adjusted' => (bool) ($payload['is_adjusted'] ?? false),
+                        'adjustment_reason' => $payload['adjustment_reason'] ?? null,
+                        'adjustment_remarks' => $payload['adjustment_remarks'] ?? null,
+                        'adjusted_by_admin_id' => $payload['adjusted_by_admin_id'] ?? null,
+                        'adjusted_slots' => $adjustedSlots,
+                        'created_at' => $nowStr,
+                        'updated_at' => $nowStr,
+                    ],
+                ];
+            }
+
+            foreach ($cleanPunches as $punch) {
+                if (trim((string) $punch->employee_control_no) === $canonicalControlNo) {
+                    $bulkProcessedOnlyIds[(int) $punch->id] = true;
+                } else {
+                    $healAndProcessByControlNo[$canonicalControlNo][(int) $punch->id] = true;
+                }
+            }
+
+            $processedJobs++;
+        }
+
+        // 9. Persist new DTR rows in chunks of 75 (75 * 24 = 1,800 < 2,100 SQL Server params)
+        foreach (array_chunk($pendingInserts, 75) as $chunk) {
+            $rows = array_column($chunk, 'row');
+            try {
+                DailyTimeRecord::query()->insert($rows);
+            } catch (Throwable) {
+                // Concurrent push/poll may race on UQ_tblDailyTimeRecords_control_no_date
+                foreach ($chunk as $entry) {
+                    DailyTimeRecord::query()->updateOrCreate(
+                        [
+                            'employee_control_no' => $entry['canonical_control_no'],
+                            'record_date' => $entry['date_str'],
+                        ],
+                        $entry['payload']
+                    );
+                }
+            }
+        }
+
+        // 10. Persist updates to pre-existing canonical DTR records
+        foreach ($updatesToApply as $entry) {
+            $entry['model']->update($entry['payload']);
+        }
+
+        // 11. Remove non-canonical duplicate DTR rows if any existed
+        if ($nonCanonicalDtrIds !== []) {
+            foreach (array_chunk(array_keys($nonCanonicalDtrIds), 400) as $idChunk) {
+                DailyTimeRecord::query()->whereIn('id', $idChunk)->delete();
+            }
+        }
+
+        // 12. Mark raw punches as processed and heal non-canonical employee_control_no
+        if ($bulkProcessedOnlyIds !== []) {
+            foreach (array_chunk(array_keys($bulkProcessedOnlyIds), 500) as $idChunk) {
+                AttendanceRawLog::query()
+                    ->whereIn('id', $idChunk)
+                    ->update(['processed_at' => $now]);
+            }
+        }
+
+        foreach ($healAndProcessByControlNo as $canonicalControlNo => $idSet) {
+            foreach (array_chunk(array_keys($idSet), 500) as $idChunk) {
+                AttendanceRawLog::query()
+                    ->whereIn('id', $idChunk)
+                    ->update([
+                        'employee_control_no' => $canonicalControlNo,
+                        'processed_at' => $now,
+                    ]);
+            }
+        }
+
+        return $processedJobs;
+    }
+
+    /**
+     * @param  array<int, string>  $variants
+     * @return array<string, int>
+     */
+    private function preloadDepartmentsByVariant(array $variants): array
+    {
+        if ($variants === []) {
+            return [];
+        }
+
+        $map = [];
+
+        try {
+            foreach (array_chunk($variants, 400) as $chunk) {
+                $rows = EmployeeDepartmentAssignment::query()
+                    ->select(['employee_control_no', 'department_id'])
+                    ->whereIn('employee_control_no', $chunk)
+                    ->get();
+
+                foreach ($rows as $row) {
+                    $ctrl = trim((string) $row->employee_control_no);
+                    if ($ctrl !== '' && $row->department_id !== null) {
+                        $map[$ctrl] = (int) $row->department_id;
+                    }
+                }
+            }
+        } catch (Throwable) {
+            // Preserve resolveDepartmentId behavior if assignment table query fails
+        }
+
+        return $map;
+    }
+
+    /**
+     * @param  array<int, string>  $variants
+     * @param  array<string, int>  $deptByVariant
+     */
+    private function matchDepartmentFromMap(string $canonicalControlNo, array $variants, array $deptByVariant): ?int
+    {
+        if (isset($deptByVariant[$canonicalControlNo])) {
+            return $deptByVariant[$canonicalControlNo];
+        }
+
+        foreach ($variants as $variant) {
+            if (isset($deptByVariant[$variant])) {
+                return $deptByVariant[$variant];
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param  array<int, string>  $variants
+     * @param  array<int, string>  $uniqueDates
+     * @return array<string, array<int, LeaveApplication>>
+     */
+    private function preloadApprovedLeavesByVariant(
+        array $variants,
+        array $uniqueDates,
+        string $minDateStr,
+        string $maxDateStr
+    ): array {
+        if ($variants === [] || $uniqueDates === []) {
+            return [];
+        }
+
+        $map = [];
+
+        try {
+            foreach (array_chunk($variants, 200) as $chunk) {
+                $leaves = LeaveApplication::query()
+                    ->whereIn('employee_control_no', $chunk)
+                    ->where('status', 'APPROVED')
+                    ->where(function ($q) use ($minDateStr, $maxDateStr, $uniqueDates): void {
+                        $q->where(function ($sub) use ($minDateStr, $maxDateStr): void {
+                            $sub->whereDate('start_date', '<=', $maxDateStr)
+                                ->whereDate('end_date', '>=', $minDateStr);
+                        });
+                        foreach ($uniqueDates as $dateStr) {
+                            $q->orWhereJsonContains('selected_dates', $dateStr);
+                        }
+                    })
+                    ->with('leaveType:id,name')
+                    ->get();
+
+                foreach ($leaves as $leave) {
+                    $ctrl = trim((string) $leave->employee_control_no);
+                    if ($ctrl !== '') {
+                        $map[$ctrl][] = $leave;
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            Log::warning('DtrCalculationService: Error preloading approved leaves in batch', [
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        return $map;
+    }
+
+    /**
+     * @param  array<int, string>  $variants
+     * @param  array<string, array<int, LeaveApplication>>  $leavesByVariant
+     * @return array{is_on_leave: bool, portion: string, leave_type_code: string, leave_application_id: int}|null
+     */
+    private function matchApprovedLeaveFromMap(string $dateStr, array $variants, array $leavesByVariant): ?array
+    {
+        foreach ($variants as $variant) {
+            if (! isset($leavesByVariant[$variant])) {
+                continue;
+            }
+
+            foreach ($leavesByVariant[$variant] as $leave) {
+                if ($this->leaveCoversDate($leave, $dateStr)) {
+                    return $this->resolveLeaveInfoFromModel($leave, $dateStr);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private function leaveCoversDate(LeaveApplication $leave, string $dateStr): bool
+    {
+        $selectedDates = $leave->selected_dates;
+        if (is_array($selectedDates) && in_array($dateStr, $selectedDates, true)) {
+            return true;
+        }
+
+        $startRaw = $leave->start_date;
+        $endRaw = $leave->end_date;
+        if ($startRaw === null || $endRaw === null) {
+            return false;
+        }
+
+        $startDateStr = $startRaw instanceof DateTimeInterface
+            ? $startRaw->format('Y-m-d')
+            : substr(trim((string) $startRaw), 0, 10);
+        $endDateStr = $endRaw instanceof DateTimeInterface
+            ? $endRaw->format('Y-m-d')
+            : substr(trim((string) $endRaw), 0, 10);
+
+        return $startDateStr !== '' && $endDateStr !== '' && $startDateStr <= $dateStr && $endDateStr >= $dateStr;
+    }
+
+    /**
+     * @param  array<int, string>  $variants
+     * @param  array<int, string>  $uniqueDates
+     * @param  array<string, bool>  $uniqueDatesMap
+     * @return array{0: array<int, AttendanceRawLog>, 1: array<string, array<string, array<int, bool>>>}
+     */
+    private function preloadRawPunches(
+        array $variants,
+        array $uniqueDates,
+        array $uniqueDatesMap,
+        string $minDateStr,
+        string $maxDateStr
+    ): array {
+        $punchesById = [];
+        $punchIdsByVariantDate = [];
+
+        if ($variants === [] || $uniqueDates === []) {
+            return [$punchesById, $punchIdsByVariantDate];
+        }
+
+        $ranges = count($uniqueDates) <= 5
+            ? array_map(static fn (string $d): array => [$d.' 00:00:00', $d.' 23:59:59'], $uniqueDates)
+            : [[$minDateStr.' 00:00:00', $maxDateStr.' 23:59:59']];
+
+        foreach ($ranges as [$rangeStart, $rangeEnd]) {
+            foreach (array_chunk($variants, 200) as $chunk) {
+                $rows = AttendanceRawLog::query()
+                    ->where(function ($q) use ($chunk): void {
+                        $q->whereIn('employee_control_no', $chunk)
+                            ->orWhereIn('biometric_pin', $chunk);
+                    })
+                    ->whereBetween('punch_time', [$rangeStart, $rangeEnd])
+                    ->orderBy('punch_time')
+                    ->get();
+
+                foreach ($rows as $row) {
+                    $punchDate = $row->punch_time instanceof DateTimeInterface
+                        ? $row->punch_time->format('Y-m-d')
+                        : substr(trim((string) $row->punch_time), 0, 10);
+
+                    if (! isset($uniqueDatesMap[$punchDate])) {
+                        continue;
+                    }
+
+                    $id = (int) $row->id;
+                    $punchesById[$id] = $row;
+
+                    $ctrl = trim((string) ($row->employee_control_no ?? ''));
+                    if ($ctrl !== '') {
+                        $punchIdsByVariantDate[$ctrl][$punchDate][$id] = true;
+                    }
+
+                    $pin = trim((string) ($row->biometric_pin ?? ''));
+                    if ($pin !== '') {
+                        $punchIdsByVariantDate[$pin][$punchDate][$id] = true;
+                    }
+                }
+            }
+        }
+
+        return [$punchesById, $punchIdsByVariantDate];
+    }
+
+    /**
+     * @param  array<int, string>  $variants
+     * @param  array<int, string>  $uniqueDates
+     * @return array<string, array<string, array<int, DailyTimeRecord>>>
+     */
+    private function preloadExistingDtrs(array $variants, array $uniqueDates): array
+    {
+        $map = [];
+
+        if ($variants === [] || $uniqueDates === []) {
+            return $map;
+        }
+
+        foreach (array_chunk($variants, 200) as $chunk) {
+            $rows = DailyTimeRecord::query()
+                ->whereIn('employee_control_no', $chunk)
+                ->whereIn('record_date', $uniqueDates)
+                ->get();
+
+            foreach ($rows as $row) {
+                $ctrl = trim((string) $row->employee_control_no);
+                $dateStr = $row->record_date instanceof DateTimeInterface
+                    ? $row->record_date->format('Y-m-d')
+                    : substr(trim((string) $row->record_date), 0, 10);
+
+                if ($ctrl !== '' && $dateStr !== '') {
+                    $map[$ctrl][$dateStr][$row->id] = $row;
+                }
+            }
+        }
+
+        return $map;
+    }
+
+    /**
      * Process all unprocessed raw logs in BIO_DB and update corresponding DTRs.
      *
      * @return int Number of logs processed
@@ -371,33 +983,48 @@ class DtrCalculationService
             return 0;
         }
 
-        $grouped = [];
+        $rawPins = [];
+        $entries = [];
+
         foreach ($unprocessed as $log) {
             $rawControlNo = trim((string) ($log->employee_control_no ?: $log->biometric_pin));
             if ($rawControlNo === '') {
                 continue;
             }
 
-            $emp = HrisEmployee::findByControlNo($rawControlNo, true)
-                ?? HrisEmployee::findByControlNo($rawControlNo, false);
-            $canonicalControlNo = $emp?->control_no ?? $rawControlNo;
-
+            $rawPins[$rawControlNo] = true;
             $date = Carbon::parse($log->punch_time)->format('Y-m-d');
+            $entries[] = [$rawControlNo, $date];
+        }
+
+        if ($entries === []) {
+            return $unprocessed->count();
+        }
+
+        $employees = $this->batchIngest()->loadEmployeeDirectory(array_keys($rawPins), true);
+        $missingPins = [];
+        foreach (array_keys($rawPins) as $pin) {
+            if ($this->batchIngest()->resolveFromDirectory($employees, $pin) === null) {
+                $missingPins[] = $pin;
+            }
+        }
+        if ($missingPins !== []) {
+            $employees = $employees + $this->batchIngest()->loadEmployeeDirectory($missingPins, false);
+        }
+
+        $grouped = [];
+        foreach ($entries as [$rawControlNo, $date]) {
+            $emp = $this->batchIngest()->resolveFromDirectory($employees, $rawControlNo);
+            $canonicalControlNo = $emp?->control_no ? trim((string) $emp->control_no) : $rawControlNo;
             $grouped[$canonicalControlNo][$date] = true;
         }
 
-        foreach ($grouped as $controlNo => $dates) {
-            foreach (array_keys($dates) as $date) {
-                try {
-                    $this->calculateForEmployeeDate($controlNo, $date);
-                } catch (Throwable $e) {
-                    Log::error('DtrCalculationService: Error processing date', [
-                        'control_no' => $controlNo,
-                        'date' => $date,
-                        'error' => $e->getMessage(),
-                    ]);
-                }
-            }
+        try {
+            $this->calculateBatchForDates($grouped, $employees);
+        } catch (Throwable $e) {
+            Log::error('DtrCalculationService: Error in batch unprocessed logs processing', [
+                'error' => $e->getMessage(),
+            ]);
         }
 
         return $unprocessed->count();
@@ -791,39 +1418,7 @@ class DtrCalculationService
                 return null;
             }
 
-            // Determine portion: whole day vs half day
-            $portion = 'whole';
-            $selectedCoverages = $leave->selected_date_coverage;
-            $selectedPortions = $leave->selected_date_half_day_portion;
-
-            $isHalfDay = false;
-            if (is_array($selectedCoverages) && isset($selectedCoverages[$dateStr])) {
-                $isHalfDay = strtolower(trim((string) $selectedCoverages[$dateStr])) === 'half';
-            } elseif ((float) ($leave->total_days ?? 0) > 0 && (float) ($leave->total_days ?? 0) <= 0.5) {
-                $isHalfDay = true;
-            }
-
-            if ($isHalfDay) {
-                $rawPortion = is_array($selectedPortions) && isset($selectedPortions[$dateStr])
-                    ? strtolower(trim((string) $selectedPortions[$dateStr]))
-                    : 'morning';
-
-                if (in_array($rawPortion, ['pm', 'afternoon', 'p', 'afternoon (pm)'], true)) {
-                    $portion = 'afternoon';
-                } else {
-                    $portion = 'morning';
-                }
-            }
-
-            $leaveName = trim((string) ($leave->leaveType?->name ?? 'Leave'));
-            $leaveCode = $this->buildLeaveCode($leaveName);
-
-            return [
-                'is_on_leave' => true,
-                'portion' => $portion,
-                'leave_type_code' => $leaveCode,
-                'leave_application_id' => (int) $leave->id,
-            ];
+            return $this->resolveLeaveInfoFromModel($leave, $dateStr);
         } catch (Throwable $e) {
             Log::warning('DtrCalculationService: Error checking approved leave', [
                 'control_no' => $controlNo,
@@ -833,6 +1428,46 @@ class DtrCalculationService
 
             return null;
         }
+    }
+
+    /**
+     * @return array{is_on_leave: bool, portion: string, leave_type_code: string, leave_application_id: int}
+     */
+    private function resolveLeaveInfoFromModel(LeaveApplication $leave, string $dateStr): array
+    {
+        // Determine portion: whole day vs half day
+        $portion = 'whole';
+        $selectedCoverages = $leave->selected_date_coverage;
+        $selectedPortions = $leave->selected_date_half_day_portion;
+
+        $isHalfDay = false;
+        if (is_array($selectedCoverages) && isset($selectedCoverages[$dateStr])) {
+            $isHalfDay = strtolower(trim((string) $selectedCoverages[$dateStr])) === 'half';
+        } elseif ((float) ($leave->total_days ?? 0) > 0 && (float) ($leave->total_days ?? 0) <= 0.5) {
+            $isHalfDay = true;
+        }
+
+        if ($isHalfDay) {
+            $rawPortion = is_array($selectedPortions) && isset($selectedPortions[$dateStr])
+                ? strtolower(trim((string) $selectedPortions[$dateStr]))
+                : 'morning';
+
+            if (in_array($rawPortion, ['pm', 'afternoon', 'p', 'afternoon (pm)'], true)) {
+                $portion = 'afternoon';
+            } else {
+                $portion = 'morning';
+            }
+        }
+
+        $leaveName = trim((string) ($leave->leaveType?->name ?? 'Leave'));
+        $leaveCode = $this->buildLeaveCode($leaveName);
+
+        return [
+            'is_on_leave' => true,
+            'portion' => $portion,
+            'leave_type_code' => $leaveCode,
+            'leave_application_id' => (int) $leave->id,
+        ];
     }
 
     /**

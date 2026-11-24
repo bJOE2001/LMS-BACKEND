@@ -393,7 +393,7 @@ class BiometricDeviceController extends Controller
             ], 422);
         }
 
-        $result = $syncService->syncDevice($device);
+        $result = $syncService->syncDevice($device, null, true);
 
         $cleanMessage = mb_convert_encoding($result['message'], 'UTF-8', 'UTF-8');
 

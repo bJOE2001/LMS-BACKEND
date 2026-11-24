@@ -8,6 +8,7 @@ use App\Models\Attendance\DailyTimeRecord;
 use App\Models\DepartmentAdmin;
 use App\Models\HRAccount;
 use App\Models\HrisEmployee;
+use App\Models\HrisOffice;
 use App\Models\Leave\COCApplication;
 use App\Models\Leave\LeaveApplication;
 use App\Models\Leave\LeaveApplicationLog;
@@ -713,6 +714,7 @@ class HRDashboardController extends Controller
         $employmentStatus = $employeeStatusByControlNo[$this->normalizeControlNo($app->employee_control_no)] ?? ($resolvedEmployee?->status ?? null);
         $applicantName = $employeeName ?: ($app->applicantAdmin ? $app->applicantAdmin->full_name : 'Unknown');
         $office = $resolvedEmployee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
+        $officeAcronym = $this->resolveApplicationOfficeAcronym($app, $resolvedEmployee, $office);
         $durationDays = (float) $app->total_days;
         $pendingUpdateMeta = $this->resolvePendingUpdateMeta($app);
         $latestUpdateMeta = $this->resolveLatestUpdateMeta($app);
@@ -746,6 +748,8 @@ class HRDashboardController extends Controller
             'employee_control_no' => $app->employee_control_no,
             'employeeName' => $applicantName,
             'office' => $office,
+            'office_acronym' => $officeAcronym,
+            'officeAcronym' => $officeAcronym,
             'employment_status' => $employmentStatus,
             'employmentStatus' => $employmentStatus,
             'employee_status' => $employmentStatus,
@@ -1129,6 +1133,17 @@ class HRDashboardController extends Controller
         return HrisEmployee::findByControlNo($controlNo);
     }
 
+    private function resolveApplicationOfficeAcronym(LeaveApplication $application, ?object $resolvedEmployee, string $office): string
+    {
+        $employeeAcronym = HrisOffice::normalizeAcronym($resolvedEmployee?->officeAcronym ?? null, $office)
+            ?? trim((string) ($resolvedEmployee?->officeAcronym ?? ''));
+        if ($employeeAcronym !== '') {
+            return $employeeAcronym;
+        }
+
+        return HrisOffice::acronymForDepartment($application->applicantAdmin?->department, $office) ?? '';
+    }
+
     private function controlNoCandidates(string $controlNo): array
     {
         $rawControlNo = trim($controlNo);
@@ -1204,13 +1219,18 @@ class HRDashboardController extends Controller
                     : '';
             }
 
+            $office = $employee?->office ?? ($app->applicantAdmin?->department?->name ?? '');
+            $officeAcronym = $this->resolveApplicationOfficeAcronym($app, $employee, $office);
+
             return [
                 'id' => $app->id,
                 'employeeName' => $resolvedEmployeeName !== ''
                     ? $resolvedEmployeeName
                     : ($app->applicantAdmin ? $app->applicantAdmin->full_name : 'Unknown'),
                 'employee_control_no' => $app->employee_control_no,
-                'office' => $employee?->office ?? ($app->applicantAdmin?->department?->name ?? ''),
+                'office' => $office,
+                'office_acronym' => $officeAcronym,
+                'officeAcronym' => $officeAcronym,
                 'leaveType' => $app->leaveType?->name ?? 'Unknown',
                 'startDate' => $app->start_date ? \Carbon\Carbon::parse($app->start_date)->toDateString() : '',
                 'endDate' => $app->end_date ? \Carbon\Carbon::parse($app->end_date)->toDateString() : '',
