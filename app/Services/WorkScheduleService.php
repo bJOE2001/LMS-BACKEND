@@ -19,10 +19,14 @@ class WorkScheduleService
 
     private static ?Collection $activeOverridesCache = null;
 
+    /** @var array<string, mixed>|null */
+    private static ?array $resolvedDefaultScheduleCache = null;
+
     public function clearScheduleCache(): void
     {
         Cache::forget('active_employee_schedule_overrides');
         self::$activeOverridesCache = null;
+        self::$resolvedDefaultScheduleCache = null;
     }
 
     public function getActiveOverrides(): Collection
@@ -76,10 +80,16 @@ class WorkScheduleService
 
     public function getResolvedDefaultSchedule(): array
     {
-        return $this->formatResolvedSchedule(
+        if (self::$resolvedDefaultScheduleCache !== null) {
+            return self::$resolvedDefaultScheduleCache;
+        }
+
+        self::$resolvedDefaultScheduleCache = $this->formatResolvedSchedule(
             $this->getDefaultSetting()->loadMissing('updatedByHr')->toArray(),
             'default'
         );
+
+        return self::$resolvedDefaultScheduleCache;
     }
 
     public function saveDefaultSetting(array $payload, ?HRAccount $updatedBy = null): WorkScheduleSetting
