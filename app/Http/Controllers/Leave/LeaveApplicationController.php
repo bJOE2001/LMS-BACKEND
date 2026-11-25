@@ -584,7 +584,7 @@ class LeaveApplicationController extends Controller
     {
         return $this->leaveWorkflowService()->handleHrApplicationEditRequests(
             $request,
-            fn (LeaveApplicationUpdateRequest $editRequest): array => $this->formatHrApplicationEditRequest($editRequest)
+            fn (LeaveApplicationUpdateRequest $editRequest, ?array $hrAccountsById = null): array => $this->formatHrApplicationEditRequest($editRequest, $hrAccountsById)
         );
     }
 
@@ -978,11 +978,17 @@ class LeaveApplicationController extends Controller
         return trim((string) ($employee?->control_no ?? $rawControlNo));
     }
 
-    private function formatHrApplicationEditRequest(LeaveApplicationUpdateRequest $editRequest): array
-    {
+    /**
+     * @param  null|array<int, \App\Models\HRAccount>  $hrAccountsById
+     */
+    private function formatHrApplicationEditRequest(
+        LeaveApplicationUpdateRequest $editRequest,
+        ?array $hrAccountsById = null
+    ): array {
         return $this->leaveWorkflowService()->formatHrApplicationEditRequest(
             $editRequest,
-            fn (LeaveApplication $application): array => $this->formatApplication($application)
+            fn (LeaveApplication $application): array => $this->formatApplication($application),
+            $hrAccountsById
         );
     }
 

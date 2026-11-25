@@ -775,7 +775,7 @@ class EmployeeController extends Controller
 
         $searchTerm = trim((string) ($validated['search'] ?? ''));
         $limit = max(1, min(25, (int) ($validated['limit'] ?? 20)));
-        $pulledEmployeeLookup = $this->loadPulledEmployeeControlNoLookup();
+        $pulledEmployeeLookup = $this->loadPulledEmployeeControlNoLookup((int) $admin->department_id);
 
         $rows = HrisEmployee::allCached(true)
             ->filter(function (object $employee) use ($searchTerm, $pulledEmployeeLookup): bool {
@@ -3068,10 +3068,16 @@ class EmployeeController extends Controller
         return $this->buildControlNoLookup($controlNos);
     }
 
-    private function loadPulledEmployeeControlNoLookup(): array
+    private function loadPulledEmployeeControlNoLookup(?int $departmentId = null): array
     {
-        $controlNos = EmployeeDepartmentAssignment::query()
-            ->whereHas('department', fn ($query) => $query->where('is_inactive', false))
+        $query = EmployeeDepartmentAssignment::query()
+            ->whereHas('assignedDepartment', fn ($q) => $q->where('is_inactive', false));
+
+        if ($departmentId !== null) {
+            $query->where('department_id', $departmentId);
+        }
+
+        $controlNos = $query
             ->pluck('employee_control_no')
             ->map(fn (mixed $value): string => trim((string) $value))
             ->filter(fn (string $value): bool => $value !== '')
@@ -3285,27 +3291,24 @@ class EmployeeController extends Controller
         }
 
         $storedControlNo = trim((string) ($employee->control_no ?? ''));
-        $assignmentIdentityFields = $this->buildAssignmentIdentityFields($employee);
+        $assignedDepartmentName = $this->trimNullable(
+            $admin->department?->name
+                ?? Department::query()->whereKey($admin->department_id)->value('name')
+        );
+        $assignmentIdentityFields = $this->buildAssignmentIdentityFields($employee, $assignedDepartmentName);
         $existingAssignment = EmployeeDepartmentAssignment::query()
-            ->with('department:id,name,is_inactive')
+            ->with('assignedDepartment:id,name,is_inactive')
             ->where('employee_control_no', $storedControlNo)
             ->first();
 
-        if ($existingAssignment && ! ($existingAssignment->department?->is_inactive ?? false)) {
-            if ((int) $existingAssignment->department_id === (int) $admin->department_id) {
-                $existingAssignment->fill($assignmentIdentityFields);
-                $existingAssignment->save();
-
-                return response()->json([
-                    'message' => 'Employee is already pulled into your office.',
-                    'employee' => $this->serializeEmployee($employee),
-                ]);
-            }
+        if ($existingAssignment && (int) $existingAssignment->department_id === (int) $admin->department_id) {
+            $existingAssignment->fill($assignmentIdentityFields);
+            $existingAssignment->save();
 
             return response()->json([
-                'message' => 'Employee is already pulled by another office in LMS.',
-                'assigned_department_name' => trim((string) ($existingAssignment->department?->name ?? '')) ?: null,
-            ], 422);
+                'message' => 'Employee is already pulled into your office.',
+                'employee' => $this->serializeEmployee($employee),
+            ]);
         }
 
         $updatedEmployee = HrisEmployee::findByControlNo($storedControlNo, true) ?? $employee;
@@ -3355,15 +3358,16 @@ class EmployeeController extends Controller
         ], 201);
     }
 
-    private function buildAssignmentIdentityFields(object $employee): array
+    private function buildAssignmentIdentityFields(object $employee, ?string $assignedDepartmentName = null): array
     {
         return [
             'surname' => $this->trimNullable($employee->surname ?? null),
             'firstname' => $this->trimNullable($employee->firstname ?? null),
             'middlename' => $this->trimNullable($employee->middlename ?? null),
-            'department_acronym' => $this->trimNullable(
-                $employee->officeAcronym
-                    ?? $employee->hrisOfficeAcronym
+            'department' => $this->trimNullable(
+                $assignedDepartmentName
+                    ?? $employee->office
+                    ?? $employee->hris_office
                     ?? null
             ),
         ];

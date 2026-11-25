@@ -4010,6 +4010,66 @@ class LeaveWorkflowService
         return $payload;
     }
 
+    /**
+     * @return array<string, mixed>
+     */
+    private function buildHrEditPreviousSnapshot(LeaveApplication $app): array
+    {
+        $selectedDates = $app->resolvedSelectedDates();
+        if (! is_array($selectedDates)) {
+            $selectedDates = is_array($app->selected_dates) ? array_values($app->selected_dates) : [];
+        }
+        $selectedDates = $this->normalizeHrEditSelectedDates($selectedDates);
+
+        $deductibleDays = round(max((float) ($app->deductible_days ?? $app->total_days ?? 0.0), 0.0), 3);
+        $withoutPayDays = round(max((float) ($app->without_pay_days ?? 0.0), 0.0), 3);
+        $payMode = strtoupper(trim((string) ($app->pay_mode ?? LeaveApplication::PAY_MODE_WITH_PAY)));
+        if (! in_array($payMode, [LeaveApplication::PAY_MODE_WITH_PAY, LeaveApplication::PAY_MODE_WITHOUT_PAY], true)) {
+            $payMode = LeaveApplication::PAY_MODE_WITH_PAY;
+        }
+
+        $payStatusMap = is_array($app->selected_date_pay_status) ? $app->selected_date_pay_status : [];
+        $coverageMap = is_array($app->selected_date_coverage) ? $app->selected_date_coverage : [];
+        $halfDayPortionMap = is_array($app->selected_date_half_day_portion) ? $app->selected_date_half_day_portion : [];
+        $deductionMap = is_array($app->selected_date_deduction) ? $app->selected_date_deduction : [];
+        $withoutPayMap = is_array($app->selected_date_without_pay) ? $app->selected_date_without_pay : [];
+
+        $dateCount = count($selectedDates);
+        if ($dateCount > 0) {
+            $defaultWp = round($deductibleDays / $dateCount, 3);
+            $defaultWop = round($withoutPayDays / $dateCount, 3);
+            foreach ($selectedDates as $dateKey) {
+                if (! array_key_exists($dateKey, $payStatusMap)) {
+                    $payStatusMap[$dateKey] = $payMode === LeaveApplication::PAY_MODE_WITHOUT_PAY && $deductibleDays <= 0.0
+                        ? LeaveApplication::PAY_MODE_WITHOUT_PAY
+                        : LeaveApplication::PAY_MODE_WITH_PAY;
+                }
+                if (! array_key_exists($dateKey, $coverageMap)) {
+                    $coverageMap[$dateKey] = 'whole';
+                }
+                if (! array_key_exists($dateKey, $deductionMap) && ! array_key_exists($dateKey, $withoutPayMap)) {
+                    $deductionMap[$dateKey] = $defaultWp;
+                    $withoutPayMap[$dateKey] = $defaultWop;
+                }
+            }
+        }
+
+        return [
+            'start_date' => $app->start_date?->toDateString(),
+            'end_date' => $app->end_date?->toDateString(),
+            'total_days' => round(max((float) ($app->total_days ?? 0.0), 0.0), 3),
+            'deductible_days' => $deductibleDays,
+            'without_pay_days' => $withoutPayDays,
+            'pay_mode' => $payMode,
+            'selected_dates' => $selectedDates,
+            'selected_date_pay_status' => $payStatusMap,
+            'selected_date_coverage' => $coverageMap,
+            'selected_date_half_day_portion' => $halfDayPortionMap,
+            'selected_date_deduction' => $deductionMap,
+            'selected_date_without_pay' => $withoutPayMap,
+        ];
+    }
+
     public function isHrApplicationEditWorkflowLog(LeaveApplicationLog $log): bool
     {
         return in_array($log->action, [
@@ -4057,6 +4117,9 @@ class LeaveWorkflowService
     ): LeaveApplicationUpdateRequest {
         return DB::transaction(function () use ($app, $hr, $normalizedPayload, $reason, $employeeDisplayName): LeaveApplicationUpdateRequest {
             $payload = $this->withHrApplicationEditRequestMeta($normalizedPayload);
+            if (! is_array($payload['previous_snapshot'] ?? null)) {
+                $payload['previous_snapshot'] = $this->buildHrEditPreviousSnapshot($app);
+            }
 
             $editRequest = LeaveApplicationUpdateRequest::create([
                 'leave_application_id' => $app->id,
@@ -5377,6 +5440,7 @@ class LeaveWorkflowService
         );
         $targetIsCtoDeduction = $this->creditService->isCtoLeaveType($leaveType, (int) $app->leave_type_id);
         $balanceConflictError = 'HR_APPLICATION_EDIT_BALANCE_CONFLICT';
+        $preApplyPreviousSnapshot = $this->buildHrEditPreviousSnapshot($app);
 
         if ($app->employee_control_no) {
             $this->creditService->syncEmployeeCtoBalance(
@@ -5449,7 +5513,8 @@ class LeaveWorkflowService
                 $balanceConflictError,
                 $candidatesResolver,
                 $adminControlNoResolver,
-                $employeeResolver
+                $employeeResolver,
+                $preApplyPreviousSnapshot
             ): void {
                 if ($sourceDeductsBalance && $sourceDeductibleDays > 0.0) {
                     $this->creditService->refundApplicationTrackedDeductions(
@@ -5600,18 +5665,22 @@ class LeaveWorkflowService
                         fn (...$args) => $this->eligibilityService()->applyRegularLeavePolicy(...$args)
                     ) ?? [];
                     $isWithoutPay = $targetWithoutPayDays > 0.0 || $targetPayMode === LeaveApplication::PAY_MODE_WITHOUT_PAY;
+                    $preservedPreviousSnapshot = is_array($existingPayload['previous_snapshot'] ?? null)
+                        ? $existingPayload['previous_snapshot']
+                        : $preApplyPreviousSnapshot;
 
                     $prevPayMode = $existingPayload['previous_pay_mode']
-                        ?? $existingPayload['pay_mode']
+                        ?? $preservedPreviousSnapshot['pay_mode']
                         ?? $app->pay_mode;
                     $prevWopDays = $existingPayload['previous_without_pay_days']
-                        ?? $existingPayload['without_pay_days']
+                        ?? $preservedPreviousSnapshot['without_pay_days']
                         ?? $app->without_pay_days;
                     $prevDatePayStatus = $existingPayload['previous_selected_date_pay_status']
-                        ?? $existingPayload['selected_date_pay_status']
+                        ?? $preservedPreviousSnapshot['selected_date_pay_status']
                         ?? $app->selected_date_pay_status;
 
                     $updatedPayload = array_merge($existingPayload, [
+                        'previous_snapshot' => $preservedPreviousSnapshot,
                         'previous_pay_mode' => $prevPayMode,
                         'previous_without_pay_days' => $prevWopDays,
                         'previous_selected_date_pay_status' => $prevDatePayStatus,
@@ -7366,28 +7435,45 @@ class LeaveWorkflowService
         return app(\App\Services\HrAccessControlService::class)->isAccessControlOwner($hr);
     }
 
+    /**
+     * @param  null|array<int, HRAccount>  $hrAccountsById
+     */
     public function formatHrApplicationEditRequest(
         LeaveApplicationUpdateRequest $editRequest,
-        ?callable $applicationFormatter = null
+        ?callable $applicationFormatter = null,
+        ?array $hrAccountsById = null
     ): array {
         $application = $editRequest->leaveApplication;
         $payload = is_array($editRequest->requested_payload) ? $editRequest->requested_payload : [];
+        $status = strtoupper(trim((string) $editRequest->status));
+        $requestedBy = $this->trimNullableString($editRequest->requested_by_control_no);
+        $requesterInfo = $this->resolveHrEditRequesterInfo($requestedBy, $hrAccountsById);
+
+        $previousSnapshot = is_array($payload['previous_snapshot'] ?? null)
+            ? $payload['previous_snapshot']
+            : null;
+        if ($previousSnapshot === null && $application instanceof LeaveApplication && $status !== LeaveApplicationUpdateRequest::STATUS_APPROVED) {
+            $previousSnapshot = $this->buildHrEditPreviousSnapshot($application);
+        }
 
         return [
             'id' => $editRequest->id,
             'leave_application_id' => $editRequest->leave_application_id,
-            'status' => strtoupper(trim((string) $editRequest->status)),
+            'status' => $status,
             'previous_status' => strtoupper(trim((string) ($editRequest->previous_status ?? ''))),
             'employee_control_no' => $editRequest->employee_control_no,
             'employee_name' => $editRequest->employee_name,
             'leave_type_name' => $payload['leave_type_name'] ?? $application?->leaveType?->name,
-            'requested_by' => $this->trimNullableString($editRequest->requested_by_control_no),
+            'requested_by' => $requestedBy,
+            'requested_by_name' => $requesterInfo['name'],
+            'requested_by_username' => $requesterInfo['username'],
             'requested_at' => $editRequest->requested_at?->toIso8601String(),
             'requested_reason' => $this->trimNullableString($editRequest->requested_reason),
             'reviewed_by_hr_id' => $editRequest->reviewed_by_hr_id,
             'reviewed_by' => $editRequest->reviewedByHr?->full_name,
             'reviewed_at' => $editRequest->reviewed_at?->toIso8601String(),
             'review_remarks' => $this->trimNullableString($editRequest->review_remarks),
+            'previous' => $previousSnapshot,
             'payload' => $payload,
             'application' => $application instanceof LeaveApplication
                 ? ($applicationFormatter !== null
@@ -7395,6 +7481,36 @@ class LeaveWorkflowService
                     : $application->loadMissing(['leaveType', 'applicantAdmin.department', 'logs', 'updateRequests'])->toArray())
                 : null,
         ];
+    }
+
+    /**
+     * @param  null|array<int, HRAccount>  $hrAccountsById
+     * @return array{name: ?string, username: ?string}
+     */
+    private function resolveHrEditRequesterInfo(?string $requestedBy, ?array $hrAccountsById = null): array
+    {
+        $raw = trim((string) ($requestedBy ?? ''));
+        if ($raw === '') {
+            return ['name' => null, 'username' => null];
+        }
+
+        if (preg_match('/^HR:(\d+)(?::(.+))?$/i', $raw, $matches) === 1) {
+            $hrId = (int) $matches[1];
+            $fallbackUsername = $this->trimNullableString($matches[2] ?? null);
+            $account = $hrAccountsById !== null
+                ? ($hrAccountsById[$hrId] ?? null)
+                : HRAccount::query()->select(['id', 'full_name', 'username'])->find($hrId);
+
+            $fullName = $this->trimNullableString($account?->full_name ?? null);
+            $username = $this->trimNullableString($account?->username ?? null) ?? $fallbackUsername;
+
+            return [
+                'name' => $fullName ?? $username,
+                'username' => $username,
+            ];
+        }
+
+        return ['name' => $raw, 'username' => null];
     }
 
     public function executeRegularLeaveSubmission(
@@ -9501,9 +9617,26 @@ class LeaveWorkflowService
             ->filter(fn (LeaveApplicationUpdateRequest $editRequest): bool => $this->isHrApplicationEditRequestRecord($editRequest))
             ->values();
 
+        $hrAccountIds = $requests
+            ->map(function (LeaveApplicationUpdateRequest $editRequest): ?int {
+                $raw = trim((string) ($editRequest->requested_by_control_no ?? ''));
+
+                return preg_match('/^HR:(\d+)/i', $raw, $matches) === 1 ? (int) $matches[1] : null;
+            })
+            ->filter()
+            ->unique()
+            ->values()
+            ->all();
+
+        $hrAccountsById = $hrAccountIds !== []
+            ? HRAccount::query()->whereIn('id', $hrAccountIds)->get(['id', 'full_name', 'username'])->keyBy('id')->all()
+            : [];
+
         return response()->json([
             'requests' => $requests
-                ->map(fn (LeaveApplicationUpdateRequest $editRequest): array => $editRequestFormatter !== null ? $editRequestFormatter($editRequest) : $this->formatHrApplicationEditRequest($editRequest))
+                ->map(fn (LeaveApplicationUpdateRequest $editRequest): array => $editRequestFormatter !== null
+                    ? $editRequestFormatter($editRequest, $hrAccountsById)
+                    : $this->formatHrApplicationEditRequest($editRequest, null, $hrAccountsById))
                 ->all(),
             'count' => $requests->count(),
         ]);

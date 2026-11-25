@@ -756,11 +756,11 @@ class HrisEmployee
         }
 
         return self::$assignedDepartmentNamesMemo = EmployeeDepartmentAssignment::query()
-            ->with(['department:id,name,is_inactive'])
+            ->with(['assignedDepartment:id,name,is_inactive'])
             ->get()
             ->reduce(static function (array $carry, EmployeeDepartmentAssignment $assignment): array {
-                $departmentName = trim((string) ($assignment->department?->name ?? ''));
-                if ($departmentName === '' || ($assignment->department?->is_inactive ?? false)) {
+                $departmentName = trim((string) ($assignment->assignedDepartment?->name ?? ''));
+                if ($departmentName === '' || ($assignment->assignedDepartment?->is_inactive ?? false)) {
                     return $carry;
                 }
 

@@ -800,16 +800,7 @@ class LeaveCreditService
 
     public function formatEmployeeNameForBalance(?object $employee): ?string
     {
-        if (! $employee) {
-            return null;
-        }
-
-        $surname = trim((string) ($employee->surname ?? ''));
-        $firstname = trim((string) ($employee->firstname ?? ''));
-        $middlename = trim((string) ($employee->middlename ?? ''));
-        $fullName = trim(implode(', ', array_filter([$surname, trim($firstname.' '.$middlename)])));
-
-        return $fullName !== '' ? $fullName : null;
+        return LeaveBalance::formatEmployeeName($employee);
     }
 
     public function resolveApplicationBalanceOwnerControlNo(
@@ -901,46 +892,20 @@ class LeaveCreditService
             0.0
         ), 3);
 
-        $query = LeaveBalance::query()
-            ->whereIn('employee_control_no', $candidates)
-            ->where('leave_type_id', $ctoLeaveTypeId);
-
-        if ($lockForUpdate) {
-            $query->lockForUpdate();
-        }
-
-        $balance = $query->first();
-
-        if (! $balance && $effectiveBalance <= 0) {
-            return 0.0;
-        }
+        $balance = $this->cocLedgerService->syncLeaveBalanceRecord(
+            $employeeControlNo,
+            $candidates,
+            $ctoLeaveTypeId,
+            $effectiveBalance,
+            $lockForUpdate,
+            $employeeResolver
+        );
 
         if (! $balance) {
-            $resolvedEmployee = $employeeResolver !== null ? $employeeResolver($employeeControlNo) : null;
-            $canonicalControlNo = trim((string) ($resolvedEmployee?->control_no ?? $employeeControlNo));
-            if ($canonicalControlNo === '') {
-                return $effectiveBalance;
-            }
-
-            $balance = LeaveBalance::query()->create([
-                'employee_control_no' => $canonicalControlNo,
-                'leave_type_id' => $ctoLeaveTypeId,
-                'balance' => $effectiveBalance,
-                'year' => (int) now()->year,
-            ]);
-
-            return (float) $balance->balance;
+            return $effectiveBalance <= 0 ? 0.0 : $effectiveBalance;
         }
 
-        if (round((float) $balance->balance, 3) !== $effectiveBalance) {
-            $balance->balance = $effectiveBalance;
-            if (! $balance->year) {
-                $balance->year = (int) now()->year;
-            }
-            $balance->save();
-        }
-
-        return $effectiveBalance;
+        return (float) $balance->balance;
     }
 
     public function computeEmployeeCtoAvailableBalance(

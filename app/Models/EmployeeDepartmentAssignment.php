@@ -17,7 +17,7 @@ class EmployeeDepartmentAssignment extends Model
         'surname',
         'firstname',
         'middlename',
-        'department_acronym',
+        'department',
     ];
 
     protected function casts(): array
@@ -38,7 +38,7 @@ class EmployeeDepartmentAssignment extends Model
         });
     }
 
-    public function department(): BelongsTo
+    public function assignedDepartment(): BelongsTo
     {
         return $this->belongsTo(Department::class, 'department_id');
     }

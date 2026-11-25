@@ -1085,6 +1085,13 @@ class HRUserManagementController extends Controller
             ->where('employee_control_no', $controlNo)
             ->first();
 
+        $departmentName = Department::query()->whereKey($departmentId)->value('name');
+        $resolvedDepartmentName = trim((string) ($departmentName ?? ''));
+        if ($resolvedDepartmentName === '') {
+            $fallbackOffice = $employee->office ?? $employee->hris_office ?? null;
+            $resolvedDepartmentName = $fallbackOffice !== null ? trim((string) $fallbackOffice) : '';
+        }
+
         $assignmentFields = [
             'department_id' => $departmentId,
             'assigned_by_department_admin_id' => $assignedByAdminId,
@@ -1092,7 +1099,7 @@ class HRUserManagementController extends Controller
             'surname' => isset($employee->surname) ? trim((string) $employee->surname) : null,
             'firstname' => isset($employee->firstname) ? trim((string) $employee->firstname) : null,
             'middlename' => isset($employee->middlename) ? trim((string) $employee->middlename) : null,
-            'department_acronym' => isset($employee->officeAcronym) ? trim((string) $employee->officeAcronym) : (isset($employee->hrisOfficeAcronym) ? trim((string) $employee->hrisOfficeAcronym) : null),
+            'department' => $resolvedDepartmentName !== '' ? $resolvedDepartmentName : null,
         ];
 
         if ($existingAssignment) {

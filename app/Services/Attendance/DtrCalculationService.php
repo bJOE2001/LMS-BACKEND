@@ -93,6 +93,7 @@ class DtrCalculationService
 
         // 3. Fetch Raw Punches for this date (range scan uses IX_tblAttendanceLogs_punch_time)
         $rawPunches = AttendanceRawLog::query()
+            ->active()
             ->where(function ($q) use ($variants): void {
                 $q->whereIn('employee_control_no', $variants)
                     ->orWhereIn('biometric_pin', $variants);
@@ -895,6 +896,7 @@ class DtrCalculationService
         foreach ($ranges as [$rangeStart, $rangeEnd]) {
             foreach (array_chunk($variants, 200) as $chunk) {
                 $rows = AttendanceRawLog::query()
+                    ->active()
                     ->where(function ($q) use ($chunk): void {
                         $q->whereIn('employee_control_no', $chunk)
                             ->orWhereIn('biometric_pin', $chunk);

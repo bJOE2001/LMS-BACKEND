@@ -4,9 +4,9 @@ namespace App\Traits;
 
 trait FiltersEmployeeControlNos
 {
-    private const EMPLOYEE_CONTROL_NO_BINDING_LIMIT = 1000;
+    private const EMPLOYEE_CONTROL_NO_BINDING_LIMIT = 500;
 
-    private const EMPLOYEE_CONTROL_NO_LITERAL_CHUNK_SIZE = 1000;
+    private const EMPLOYEE_CONTROL_NO_SQLSRV_JSON_CHUNK_SIZE = 5000;
 
     private function whereInEmployeeControlNos($query, array $controlNos, string $column = 'employee_control_no')
     {
@@ -20,7 +20,36 @@ trait FiltersEmployeeControlNos
             return $query->whereIn($column, $controlNos);
         }
 
-        // SQL Server rejects statements with more than 2100 bound parameters.
+        $connection = method_exists($query, 'toBase')
+            ? $query->toBase()->getConnection()
+            : $query->getConnection();
+
+        if ($connection->getDriverName() === 'sqlsrv') {
+            $wrappedColumn = $connection->getQueryGrammar()->wrap($column);
+            $chunks = array_chunk($controlNos, self::EMPLOYEE_CONTROL_NO_SQLSRV_JSON_CHUNK_SIZE);
+
+            if (count($chunks) === 1) {
+                return $query->whereRaw(
+                    "{$wrappedColumn} IN (SELECT [value] FROM OPENJSON(?))",
+                    [json_encode($chunks[0], JSON_THROW_ON_ERROR)]
+                );
+            }
+
+            return $query->where(function ($nestedQuery) use ($wrappedColumn, $chunks): void {
+                foreach ($chunks as $index => $chunk) {
+                    $binding = json_encode($chunk, JSON_THROW_ON_ERROR);
+                    if ($index === 0) {
+                        $nestedQuery->whereRaw("{$wrappedColumn} IN (SELECT [value] FROM OPENJSON(?))", [$binding]);
+
+                        continue;
+                    }
+
+                    $nestedQuery->orWhereRaw("{$wrappedColumn} IN (SELECT [value] FROM OPENJSON(?))", [$binding]);
+                }
+            });
+        }
+
+        // Fallback chunking for non-sqlsrv drivers (e.g. SQLite in tests).
         return $query->where(function ($nestedQuery) use ($column, $controlNos): void {
             foreach (array_chunk($controlNos, self::EMPLOYEE_CONTROL_NO_BINDING_LIMIT) as $index => $chunk) {
                 if ($index === 0) {
@@ -52,23 +81,5 @@ trait FiltersEmployeeControlNos
         }
 
         return array_values($values);
-    }
-
-    /**
-     * @param  array<int, string>  $controlNos
-     */
-    private function rawEmployeeControlNoInCondition(string $column, array $controlNos): string
-    {
-        $quotedValues = implode(', ', array_map(
-            fn (string $value): string => $this->quoteSqlStringLiteral($value),
-            $controlNos
-        ));
-
-        return "{$column} IN ({$quotedValues})";
-    }
-
-    private function quoteSqlStringLiteral(string $value): string
-    {
-        return "'".str_replace("'", "''", $value)."'";
     }
 }

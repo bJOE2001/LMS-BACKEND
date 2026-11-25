@@ -5,8 +5,11 @@ namespace App\Http\Controllers\Attendance;
 use App\Http\Controllers\Controller;
 use App\Models\Attendance\AttendanceRawLog;
 use App\Models\Attendance\BiometricDevice;
+use App\Models\Attendance\DailyTimeRecord;
+use App\Models\HRAccount;
 use App\Models\HrisEmployee;
 use App\Models\HrisOffice;
+use App\Services\Attendance\DtrCalculationService;
 use App\Traits\FiltersEmployeeControlNos;
 use Carbon\CarbonImmutable;
 use Illuminate\Database\Eloquent\Builder;
@@ -37,6 +40,7 @@ class AttendanceLogController extends Controller
         'punch_state',
         'verify_type',
         'processed_at',
+        'voided_at',
     ];
 
     /**
@@ -52,6 +56,7 @@ class AttendanceLogController extends Controller
             'punch_state' => ['nullable', 'integer', 'min:0', 'max:255'],
             'verify_type' => ['nullable', 'integer', 'min:0', 'max:50'],
             'processed' => ['nullable', 'in:all,processed,unprocessed'],
+            'status' => ['nullable', 'in:active,voided,all'],
             'start_date' => ['nullable', 'date'],
             'end_date' => ['nullable', 'date'],
             'sort_by' => ['nullable', 'in:'.implode(',', self::ALLOWED_SORT_COLUMNS)],
@@ -82,12 +87,14 @@ class AttendanceLogController extends Controller
 
         $pageLogs = collect($logs->items());
         $employeeDirectory = $this->loadEmployeeDirectoryForLogs($pageLogs);
+        $voidedByNames = $this->loadVoidedByNames($pageLogs);
 
         $mappedLogs = $pageLogs->map(
             fn (AttendanceRawLog $log): array => $this->formatAttendanceLog(
                 $log,
                 $deviceDirectory['by_serial'],
-                $employeeDirectory
+                $employeeDirectory,
+                $voidedByNames
             )
         )->values();
 
@@ -101,6 +108,113 @@ class AttendanceLogController extends Controller
                 'devices' => $deviceDirectory['device_options'],
                 'offices' => $deviceDirectory['office_options'],
             ],
+        ]);
+    }
+
+    /**
+     * Soft-void an erroneous raw biometric punch and recalculate that employee's DTR.
+     */
+    public function voidLog(
+        Request $request,
+        int $id,
+        DtrCalculationService $dtrCalculationService
+    ): JsonResponse {
+        $user = $request->user();
+        if (! ($user instanceof HRAccount)) {
+            abort(403, 'Unauthorized.');
+        }
+
+        $validated = $request->validate([
+            'void_reason' => ['required', 'string', 'min:3', 'max:255'],
+        ]);
+
+        $reason = trim((string) $validated['void_reason']);
+        if (mb_strlen($reason) < 3) {
+            return response()->json([
+                'message' => 'Void reason must be at least 3 characters.',
+                'errors' => [
+                    'void_reason' => ['Void reason must be at least 3 characters.'],
+                ],
+            ], 422);
+        }
+
+        $log = AttendanceRawLog::query()->find($id);
+        if (! $log) {
+            return response()->json(['message' => 'Punch log not found.'], 404);
+        }
+
+        if ($log->isVoided()) {
+            return response()->json(['message' => 'Punch log is already voided.'], 422);
+        }
+
+        $log->update([
+            'voided_at' => now(),
+            'voided_by_hr_account_id' => $user->id,
+            'void_reason' => $reason,
+        ]);
+
+        $log->refresh();
+        $dtr = $this->recalculateDtrForLog($log, $dtrCalculationService);
+        $isAdjusted = (bool) ($dtr?->is_adjusted ?? false);
+
+        $message = $isAdjusted
+            ? 'Punch log voided. Note: this date has a manual DTR adjustment that was preserved.'
+            : ($dtr !== null
+                ? 'Punch log voided and DTR recalculated.'
+                : 'Punch log voided.');
+
+        return response()->json([
+            'message' => $message,
+            'log' => $this->formatSingleLog($log),
+            'dtr_recalculated' => $dtr !== null,
+            'dtr_is_adjusted' => $isAdjusted,
+        ]);
+    }
+
+    /**
+     * Restore a previously voided raw biometric punch and recalculate that employee's DTR.
+     */
+    public function restoreLog(
+        Request $request,
+        int $id,
+        DtrCalculationService $dtrCalculationService
+    ): JsonResponse {
+        $user = $request->user();
+        if (! ($user instanceof HRAccount)) {
+            abort(403, 'Unauthorized.');
+        }
+
+        $log = AttendanceRawLog::query()->find($id);
+        if (! $log) {
+            return response()->json(['message' => 'Punch log not found.'], 404);
+        }
+
+        if (! $log->isVoided()) {
+            return response()->json(['message' => 'Punch log is not voided.'], 422);
+        }
+
+        $log->update([
+            'voided_at' => null,
+            'voided_by_hr_account_id' => null,
+            'void_reason' => null,
+        ]);
+
+        $log->refresh();
+        $dtr = $this->recalculateDtrForLog($log, $dtrCalculationService);
+        $log->refresh();
+        $isAdjusted = (bool) ($dtr?->is_adjusted ?? false);
+
+        $message = $isAdjusted
+            ? 'Punch log restored. Note: this date has a manual DTR adjustment that was preserved.'
+            : ($dtr !== null
+                ? 'Punch log restored and DTR recalculated.'
+                : 'Punch log restored.');
+
+        return response()->json([
+            'message' => $message,
+            'log' => $this->formatSingleLog($log),
+            'dtr_recalculated' => $dtr !== null,
+            'dtr_is_adjusted' => $isAdjusted,
         ]);
     }
 
@@ -210,6 +324,13 @@ class AttendanceLogController extends Controller
             $query->whereNotNull('processed_at');
         } elseif ($processed === 'unprocessed') {
             $query->whereNull('processed_at');
+        }
+
+        $status = (string) ($validated['status'] ?? 'all');
+        if ($status === 'active') {
+            $query->active();
+        } elseif ($status === 'voided') {
+            $query->voided();
         }
 
         if (! empty($validated['start_date'])) {
@@ -349,14 +470,111 @@ class AttendanceLogController extends Controller
     }
 
     /**
+     * Format a single raw log with device, HRIS employee, and void actor metadata.
+     *
+     * @return array<string, mixed>
+     */
+    private function formatSingleLog(AttendanceRawLog $log): array
+    {
+        $devices = $log->device_serial_number
+            ? BiometricDevice::query()
+                ->with(['department:id,name'])
+                ->where('serial_number', $log->device_serial_number)
+                ->get()
+            : collect();
+
+        $deviceDirectory = $this->buildDeviceDirectory($devices);
+        $singleCollection = collect([$log]);
+        $employeeDirectory = $this->loadEmployeeDirectoryForLogs($singleCollection);
+        $voidedByNames = $this->loadVoidedByNames($singleCollection);
+
+        return $this->formatAttendanceLog(
+            $log,
+            $deviceDirectory['by_serial'],
+            $employeeDirectory,
+            $voidedByNames
+        );
+    }
+
+    /**
+     * Recalculate the DTR for the date of a voided or restored punch when a valid employee or DTR exists.
+     */
+    private function recalculateDtrForLog(
+        AttendanceRawLog $log,
+        DtrCalculationService $dtrCalculationService
+    ): ?DailyTimeRecord {
+        if ($log->punch_time === null) {
+            return null;
+        }
+
+        $candidate = trim((string) ($log->employee_control_no ?: $log->biometric_pin ?: ''));
+        if ($candidate === '') {
+            return null;
+        }
+
+        $punchDate = $log->punch_time->format('Y-m-d');
+        $employee = HrisEmployee::findByControlNo($candidate, true)
+            ?? HrisEmployee::findByControlNo($candidate, false);
+        $canonicalControlNo = $employee?->control_no ?? trim((string) ($log->employee_control_no ?? ''));
+
+        if ($canonicalControlNo === '') {
+            $variants = $dtrCalculationService->resolveControlNoVariants($candidate);
+            $hasExistingDtr = DailyTimeRecord::query()
+                ->whereIn('employee_control_no', $variants)
+                ->where('record_date', $punchDate)
+                ->exists();
+
+            if (! $hasExistingDtr) {
+                return null;
+            }
+
+            $canonicalControlNo = $candidate;
+        }
+
+        return $dtrCalculationService->calculateForEmployeeDate(
+            $canonicalControlNo,
+            $punchDate,
+            cachedEmployee: $employee
+        );
+    }
+
+    /**
+     * Batch-load HR account full names for voided attendance logs.
+     *
+     * @param  Collection<int, AttendanceRawLog>  $logs
+     * @return array<int, string>
+     */
+    private function loadVoidedByNames(Collection $logs): array
+    {
+        $voidedByIds = $logs
+            ->pluck('voided_by_hr_account_id')
+            ->filter(static fn (mixed $id): bool => is_numeric($id) && (int) $id > 0)
+            ->map(static fn (mixed $id): int => (int) $id)
+            ->unique()
+            ->values()
+            ->all();
+
+        if ($voidedByIds === []) {
+            return [];
+        }
+
+        return HRAccount::query()
+            ->whereIn('id', $voidedByIds)
+            ->pluck('full_name', 'id')
+            ->all();
+    }
+
+    /**
      * @param  array<string, array{serial_number: string, device_name: string, department_id: ?int, office_name: ?string, office_acronym: ?string}>  $devicesBySerial
      * @param  array<string, object>  $employeeDirectory
+     * @param  array<int, string>  $voidedByNames
      * @return array<string, mixed>
      */
     private function formatAttendanceLog(
         AttendanceRawLog $log,
         array $devicesBySerial,
-        array $employeeDirectory
+        array $employeeDirectory,
+        array $voidedByNames = []
     ): array {
         $serialKey = strtoupper(trim((string) ($log->device_serial_number ?? '')));
         $device = $serialKey !== '' ? ($devicesBySerial[$serialKey] ?? null) : null;
@@ -388,9 +606,15 @@ class AttendanceLogController extends Controller
             'punch_state' => $log->punch_state !== null ? (int) $log->punch_state : null,
             'verify_type' => $verifyType,
             'verify_type_label' => $verifyType !== null ? (self::VERIFY_TYPE_LABELS[$verifyType] ?? "Mode {$verifyType}") : null,
-            'work_code' => $log->work_code,
             'sync_source' => $log->sync_source,
             'processed_at' => $log->processed_at?->toIso8601String(),
+            'is_voided' => $log->isVoided(),
+            'voided_at' => $log->voided_at?->toIso8601String(),
+            'voided_by_hr_account_id' => $log->voided_by_hr_account_id,
+            'voided_by_name' => $log->voided_by_hr_account_id !== null
+                ? ($voidedByNames[(int) $log->voided_by_hr_account_id] ?? null)
+                : null,
+            'void_reason' => $log->void_reason,
         ];
     }
 

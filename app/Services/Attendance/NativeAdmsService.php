@@ -223,7 +223,7 @@ class NativeAdmsService
                     if ($command->employee_control_no && $command->command_type === BiometricDeviceCommand::CMD_UPDATE_TEMPLATE) {
                         $latestLog = BiometricTransferLog::query()
                             ->where('employee_control_no', $command->employee_control_no)
-                            ->where('target_device_sn', $serialNumber)
+                            ->where('to_device_sn', $serialNumber)
                             ->orderByDesc('id')
                             ->first();
 
@@ -609,7 +609,6 @@ class NativeAdmsService
                 'punch_time' => $punch['time'],
                 'punch_state' => $punch['state'],
                 'verify_type' => $punch['verify_type'],
-                'work_code' => $punch['work_code'],
                 'raw_payload' => $line,
             ];
         }
@@ -652,8 +651,7 @@ class NativeAdmsService
      *     pin: string,
      *     time: string,
      *     state: int,
-     *     verify_type: int,
-     *     work_code: ?string
+     *     verify_type: int
      * }|null
      */
     public function parseAttlogLine(string $line): ?array
@@ -710,16 +708,12 @@ class NativeAdmsService
 
         $state = isset($tokens[$nextIdx]) && is_numeric($tokens[$nextIdx]) ? (int) $tokens[$nextIdx] : 0;
         $verifyType = isset($tokens[$nextIdx + 1]) && is_numeric($tokens[$nextIdx + 1]) ? (int) $tokens[$nextIdx + 1] : 1;
-        $workCode = isset($tokens[$nextIdx + 2]) && trim((string) $tokens[$nextIdx + 2]) !== ''
-            ? trim((string) $tokens[$nextIdx + 2])
-            : null;
 
         return [
             'pin' => $pin,
             'time' => $normalizedTime,
             'state' => $state,
             'verify_type' => $verifyType,
-            'work_code' => $workCode,
         ];
     }
 

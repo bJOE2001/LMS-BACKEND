@@ -112,7 +112,6 @@ class AttendanceBatchIngestService
      *     punch_time:string,
      *     punch_state?:int,
      *     verify_type?:int,
-     *     work_code?:?string,
      *     raw_payload?:?string
      * }>  $candidates
      * @return array{
@@ -152,9 +151,6 @@ class AttendanceBatchIngestService
                 'punch_time' => $punchTime,
                 'punch_state' => (int) ($candidate['punch_state'] ?? 0),
                 'verify_type' => (int) ($candidate['verify_type'] ?? 1),
-                'work_code' => isset($candidate['work_code']) && $candidate['work_code'] !== ''
-                    ? (string) $candidate['work_code']
-                    : null,
                 'raw_payload' => $candidate['raw_payload'] ?? null,
             ];
         }
@@ -235,7 +231,6 @@ class AttendanceBatchIngestService
                     'punch_time' => $punchTime,
                     'punch_state' => $item['punch_state'],
                     'verify_type' => $item['verify_type'],
-                    'work_code' => $item['work_code'],
                     'sync_source' => $syncSource,
                     'raw_payload' => $item['raw_payload'],
                     'created_at' => $now,

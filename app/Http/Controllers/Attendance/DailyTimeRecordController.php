@@ -120,11 +120,11 @@ class DailyTimeRecordController extends Controller
             'control_no' => null,
         ];
 
-        $assignment = EmployeeDepartmentAssignment::with('department.departmentHead')
+        $assignment = EmployeeDepartmentAssignment::with('assignedDepartment.departmentHead')
             ->where('employee_control_no', $canonicalControlNo)
             ->first();
 
-        $dept = $assignment?->department;
+        $dept = $assignment?->assignedDepartment;
         if (! $dept && ! empty($employee->office)) {
             $dept = Department::with('departmentHead')
                 ->where('name', $employee->office)
@@ -322,11 +322,11 @@ class DailyTimeRecordController extends Controller
                 'control_no' => null,
             ];
 
-            $assignment = EmployeeDepartmentAssignment::with('department.departmentHead')
+            $assignment = EmployeeDepartmentAssignment::with('assignedDepartment.departmentHead')
                 ->where('employee_control_no', $canonicalControlNo)
                 ->first();
 
-            $dept = $assignment?->department;
+            $dept = $assignment?->assignedDepartment;
             if (! $dept && ! empty($employee->office)) {
                 $dept = Department::with('departmentHead')
                     ->where('name', $employee->office)
@@ -401,7 +401,7 @@ class DailyTimeRecordController extends Controller
 
         // Resolve assigned employee control numbers with office metadata
         $assignmentsQuery = EmployeeDepartmentAssignment::query()
-            ->with('department:id,name');
+            ->with('assignedDepartment:id,name');
         if ($targetDepartmentId !== null) {
             $assignmentsQuery->where('department_id', $targetDepartmentId);
         }
@@ -420,8 +420,8 @@ class DailyTimeRecordController extends Controller
                 continue;
             }
 
-            $deptName = $assignment->department?->name ? trim((string) $assignment->department->name) : null;
-            $officeAcronym = HrisOffice::acronymForDepartment($assignment->department);
+            $deptName = $assignment->assignedDepartment?->name ? trim((string) $assignment->assignedDepartment->name) : null;
+            $officeAcronym = HrisOffice::acronymForDepartment($assignment->assignedDepartment);
 
             $assignmentMeta = [
                 'department_id' => $assignment->department_id !== null ? (int) $assignment->department_id : null,

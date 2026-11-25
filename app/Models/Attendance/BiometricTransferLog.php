@@ -11,14 +11,12 @@ use Illuminate\Database\Eloquent\Model;
  * @property string $employee_control_no
  * @property string|null $employee_name
  * @property string $action_type
- * @property int|null $source_department_id
- * @property string|null $source_office_name
- * @property string|null $source_device_sn
- * @property int|null $source_area_id
- * @property int|null $target_department_id
- * @property string|null $target_office_name
- * @property string|null $target_device_sn
- * @property int|null $target_area_id
+ * @property int|null $from_department_id
+ * @property string|null $from_office_name
+ * @property string|null $from_device_sn
+ * @property int|null $to_department_id
+ * @property string|null $to_office_name
+ * @property string|null $to_device_sn
  * @property string $status
  * @property string|null $remarks
  * @property int|null $performed_by_user_id
@@ -29,8 +27,6 @@ use Illuminate\Database\Eloquent\Model;
 class BiometricTransferLog extends Model
 {
     public const ACTION_TRANSFER = 'TRANSFER';
-
-    public const ACTION_ASSIGN = 'ASSIGN';
 
     public const ACTION_REMOVE = 'REMOVE';
 
@@ -65,14 +61,12 @@ class BiometricTransferLog extends Model
         'employee_control_no',
         'employee_name',
         'action_type',
-        'source_department_id',
-        'source_office_name',
-        'source_device_sn',
-        'source_area_id',
-        'target_department_id',
-        'target_office_name',
-        'target_device_sn',
-        'target_area_id',
+        'from_department_id',
+        'from_office_name',
+        'from_device_sn',
+        'to_department_id',
+        'to_office_name',
+        'to_device_sn',
         'status',
         'remarks',
         'performed_by_user_id',
@@ -87,10 +81,8 @@ class BiometricTransferLog extends Model
     protected function casts(): array
     {
         return [
-            'source_department_id' => 'integer',
-            'source_area_id' => 'integer',
-            'target_department_id' => 'integer',
-            'target_area_id' => 'integer',
+            'from_department_id' => 'integer',
+            'to_department_id' => 'integer',
             'performed_by_user_id' => 'integer',
         ];
     }

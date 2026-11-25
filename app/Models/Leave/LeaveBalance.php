@@ -33,6 +33,29 @@ class LeaveBalance extends Model
         ];
     }
 
+    /**
+     * Format an HRIS or employee record into the canonical "SURNAME, FIRSTNAME MIDDLENAME" string.
+     */
+    public static function formatEmployeeName(?object $employee): ?string
+    {
+        if (! $employee) {
+            return null;
+        }
+
+        $surname = trim((string) ($employee->surname ?? ''));
+        $firstname = trim((string) ($employee->firstname ?? ''));
+        $middlename = trim((string) ($employee->middlename ?? ''));
+        $fullName = trim(implode(', ', array_filter([$surname, trim($firstname.' '.$middlename)])));
+
+        if ($fullName !== '') {
+            return $fullName;
+        }
+
+        $fallback = trim((string) ($employee->full_name ?? $employee->name ?? ''));
+
+        return $fallback !== '' ? $fallback : null;
+    }
+
     // ─── Relationships ───────────────────────────────────────────────
 
     public function leaveType(): BelongsTo

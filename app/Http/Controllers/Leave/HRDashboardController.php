@@ -204,6 +204,7 @@ class HRDashboardController extends Controller
             }
 
             $rawTodayLogs = AttendanceRawLog::query()
+                ->active()
                 ->whereDate('punch_time', $today)
                 ->get(['employee_control_no', 'biometric_pin']);
 

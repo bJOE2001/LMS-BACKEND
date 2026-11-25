@@ -2,10 +2,10 @@
 
 namespace App\Services\Leave;
 
+use App\Models\HrisEmployee;
 use App\Models\Leave\COCApplication;
 use App\Models\Leave\COCApplicationRow;
 use App\Models\Leave\CocLedgerEntry;
-use App\Models\HrisEmployee;
 use App\Models\Leave\LeaveApplication;
 use App\Models\Leave\LeaveBalance;
 use App\Models\Leave\LeaveType;
@@ -412,43 +412,114 @@ class CocLedgerService
     private function syncLeaveBalanceRow(array $controlNoCandidates, array $snapshot): void
     {
         $leaveTypeId = (int) ($snapshot['leaveTypeId'] ?? 0);
-        if ($leaveTypeId <= 0 || $controlNoCandidates === []) {
-            return;
-        }
-
         $availableDays = round((float) ($snapshot['availableDays'] ?? 0), 3);
         $canonicalControlNo = (string) ($snapshot['canonicalControlNo'] ?? '');
-        if ($canonicalControlNo === '') {
-            return;
+
+        $this->syncLeaveBalanceRecord(
+            $canonicalControlNo,
+            $controlNoCandidates,
+            $leaveTypeId,
+            $availableDays
+        );
+    }
+
+    /**
+     * Create or update the employee's CTO LeaveBalance row and backfill missing display metadata.
+     *
+     * @param  array<int, string>  $controlNoCandidates
+     */
+    public function syncLeaveBalanceRecord(
+        string $employeeControlNo,
+        array $controlNoCandidates,
+        int $leaveTypeId,
+        float $availableDays,
+        bool $lockForUpdate = false,
+        ?callable $employeeResolver = null
+    ): ?LeaveBalance {
+        $trimmedControlNo = trim($employeeControlNo);
+        $normalizedDays = round(max($availableDays, 0.0), 3);
+
+        if ($leaveTypeId <= 0 || $controlNoCandidates === [] || $trimmedControlNo === '') {
+            return null;
         }
 
-        $balance = LeaveBalance::query()
+        $query = LeaveBalance::query()
             ->whereIn('employee_control_no', $controlNoCandidates)
-            ->where('leave_type_id', $leaveTypeId)
-            ->first();
+            ->where('leave_type_id', $leaveTypeId);
 
-        if (! $balance && $availableDays <= 0) {
-            return;
+        if ($lockForUpdate) {
+            $query->lockForUpdate();
         }
+
+        $balance = $query->first();
+
+        if (! $balance && $normalizedDays <= 0.0) {
+            return null;
+        }
+
+        $needsEmployeeName = ! $balance || trim((string) ($balance->employee_name ?? '')) === '';
+        $needsLeaveTypeName = ! $balance || trim((string) ($balance->leave_type_name ?? '')) === '';
+
+        $resolvedEmployee = null;
+        $employeeName = null;
+        if ($needsEmployeeName) {
+            $resolvedEmployee = $employeeResolver !== null
+                ? $employeeResolver($trimmedControlNo)
+                : HrisEmployee::findByControlNo($trimmedControlNo);
+            $employeeName = LeaveBalance::formatEmployeeName($resolvedEmployee);
+        }
+
+        $leaveTypeName = $needsLeaveTypeName ? $this->resolveLeaveTypeName($leaveTypeId) : null;
 
         if (! $balance) {
-            LeaveBalance::query()->create([
+            $canonicalControlNo = trim((string) ($resolvedEmployee?->control_no ?? $trimmedControlNo));
+            if ($canonicalControlNo === '') {
+                return null;
+            }
+
+            return LeaveBalance::query()->create([
                 'employee_control_no' => $canonicalControlNo,
+                'employee_name' => $employeeName,
                 'leave_type_id' => $leaveTypeId,
-                'balance' => $availableDays,
+                'leave_type_name' => $leaveTypeName,
+                'balance' => $normalizedDays,
                 'year' => (int) now()->year,
             ]);
-
-            return;
         }
 
-        if (round((float) $balance->balance, 3) !== $availableDays || ! $balance->year) {
-            $balance->balance = $availableDays;
-            if (! $balance->year) {
-                $balance->year = (int) now()->year;
-            }
+        $dirty = false;
+        if ($employeeName !== null && trim((string) ($balance->employee_name ?? '')) === '') {
+            $balance->employee_name = $employeeName;
+            $dirty = true;
+        }
+        if ($leaveTypeName !== null && trim((string) ($balance->leave_type_name ?? '')) === '') {
+            $balance->leave_type_name = $leaveTypeName;
+            $dirty = true;
+        }
+        if (round((float) $balance->balance, 3) !== $normalizedDays) {
+            $balance->balance = $normalizedDays;
+            $dirty = true;
+        }
+        if (! $balance->year) {
+            $balance->year = (int) now()->year;
+            $dirty = true;
+        }
+        if ($dirty) {
             $balance->save();
         }
+
+        return $balance;
+    }
+
+    private function resolveLeaveTypeName(int $leaveTypeId): ?string
+    {
+        $name = LeaveType::query()
+            ->where('id', $leaveTypeId)
+            ->value('name');
+
+        $trimmed = $name !== null ? trim((string) $name) : '';
+
+        return $trimmed !== '' ? $trimmed : null;
     }
 
     private function formatHistoryEntry(array $entry): ?array

@@ -37,6 +37,7 @@ class BiometricEnrollment extends Model
     {
         return [
             'enrolled_at' => 'datetime',
+            'enrolled_by_user_id' => 'integer',
             'synced_devices' => 'array',
         ];
     }

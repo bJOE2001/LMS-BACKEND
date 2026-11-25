@@ -226,6 +226,8 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
 
             // Raw Biometric Attendance Logs
             Route::get('/attendance-logs', [\App\Http\Controllers\Attendance\AttendanceLogController::class, 'index']);
+            Route::post('/attendance-logs/{id}/void', [\App\Http\Controllers\Attendance\AttendanceLogController::class, 'voidLog'])->whereNumber('id');
+            Route::post('/attendance-logs/{id}/restore', [\App\Http\Controllers\Attendance\AttendanceLogController::class, 'restoreLog'])->whereNumber('id');
         });
 
         Route::middleware('hr.module:dashboard')->group(function () {

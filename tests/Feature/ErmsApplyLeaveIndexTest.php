@@ -145,7 +145,7 @@ class ErmsApplyLeaveIndexTest extends TestCase
             $table->string('surname', 100)->nullable();
             $table->string('firstname', 100)->nullable();
             $table->string('middlename', 100)->nullable();
-            $table->string('department_acronym', 50)->nullable();
+            $table->string('department', 50)->nullable();
             $table->timestamps();
         });
 
