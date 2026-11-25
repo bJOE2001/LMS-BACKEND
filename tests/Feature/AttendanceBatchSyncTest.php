@@ -119,8 +119,8 @@ class AttendanceBatchSyncTest extends TestCase
         $zkMock = Mockery::mock(ZkSocketClient::class);
         $zkMock->shouldReceive('connect')->once()->andReturn(true);
         $zkMock->shouldReceive('getAttendanceLogs')->once()->andReturn([
-            ['pin' => '123', 'time' => '2026-10-15 08:10:00', 'state' => 0, 'type' => 1, 'work_code' => null],
-            ['pin' => '123', 'time' => '2026-10-15 17:05:00', 'state' => 1, 'type' => 1, 'work_code' => null],
+            ['pin' => '123', 'time' => '2026-10-15 08:10:00', 'state' => 0, 'type' => 1],
+            ['pin' => '123', 'time' => '2026-10-15 17:05:00', 'state' => 1, 'type' => 1],
         ]);
         $zkMock->shouldReceive('disconnect')->once()->andReturn(true);
 
@@ -406,7 +406,7 @@ class AttendanceBatchSyncTest extends TestCase
             $table->string('surname', 100)->nullable();
             $table->string('firstname', 100)->nullable();
             $table->string('middlename', 100)->nullable();
-            $table->string('department_acronym', 50)->nullable();
+            $table->string('department', 50)->nullable();
             $table->timestamps();
         });
 
@@ -514,10 +514,12 @@ class AttendanceBatchSyncTest extends TestCase
             $table->dateTime('punch_time');
             $table->smallInteger('punch_state')->default(0);
             $table->smallInteger('verify_type')->default(15);
-            $table->string('work_code', 20)->nullable();
             $table->string('sync_source', 20)->default('ADMS');
             $table->string('raw_payload', 255)->nullable();
             $table->timestamp('processed_at')->nullable();
+            $table->timestamp('voided_at')->nullable();
+            $table->unsignedBigInteger('voided_by_hr_account_id')->nullable();
+            $table->string('void_reason', 255)->nullable();
             $table->timestamps();
 
             $table->unique(['biometric_pin', 'punch_time'], 'UQ_tblAttendanceLogs_pin_punch_time');

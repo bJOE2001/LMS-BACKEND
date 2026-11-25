@@ -77,7 +77,6 @@ class UsbAttlogParserService
                     'punch_time' => $parsed['punch_time'],
                     'punch_state' => $parsed['punch_state'],
                     'verify_type' => $parsed['verify_type'],
-                    'work_code' => $parsed['work_code'],
                     'sync_source' => 'USB_IMPORT',
                     'raw_payload' => mb_substr($line, 0, 255),
                 ]);
@@ -125,7 +124,7 @@ class UsbAttlogParserService
      * PIN \t Timestamp \t DeviceID \t State \t VerifyType \t WorkCode
      * e.g. "1002\t2026-09-21 08:01:23\t1\t0\t15\t0"
      *
-     * @return array{biometric_pin: string, punch_time: string, punch_state: int, verify_type: int, work_code: ?string}|null
+     * @return array{biometric_pin: string, punch_time: string, punch_state: int, verify_type: int}|null
      */
     public function parseLine(string $line): ?array
     {
@@ -138,7 +137,6 @@ class UsbAttlogParserService
                     'punch_time' => trim($matches[2]),
                     'punch_state' => isset($matches[3]) ? (int) $matches[3] : 0,
                     'verify_type' => isset($matches[4]) ? (int) $matches[4] : 15,
-                    'work_code' => null,
                 ];
             }
 
@@ -161,13 +159,11 @@ class UsbAttlogParserService
         // Column 2 may be DeviceID or PunchState depending on export options
         $punchState = 0;
         $verifyType = 15;
-        $workCode = null;
 
         if (count($parts) >= 5) {
             // Format: PIN, Time, DeviceID, State, VerifyType
             $punchState = is_numeric(trim($parts[3])) ? (int) trim($parts[3]) : 0;
             $verifyType = is_numeric(trim($parts[4])) ? (int) trim($parts[4]) : 15;
-            $workCode = isset($parts[5]) ? trim($parts[5]) : null;
         } elseif (count($parts) >= 3) {
             // Format: PIN, Time, State, VerifyType
             $punchState = is_numeric(trim($parts[2])) ? (int) trim($parts[2]) : 0;
@@ -179,7 +175,6 @@ class UsbAttlogParserService
             'punch_time' => $punchTime,
             'punch_state' => $punchState,
             'verify_type' => $verifyType,
-            'work_code' => $workCode !== '' ? $workCode : null,
         ];
     }
 }

@@ -139,18 +139,11 @@ class LanBioPunchSyncService
                     continue;
                 }
 
-                $workCode = null;
-                if (! empty($log['work_code'])) {
-                    $workClean = trim(preg_replace('/[^\x20-\x7E]/', '', (string) $log['work_code']));
-                    $workCode = $workClean !== '' ? mb_convert_encoding($workClean, 'UTF-8', 'UTF-8') : null;
-                }
-
                 $candidates[] = [
                     'pin' => $pin,
                     'punch_time' => substr($punchTime, 0, 19),
                     'punch_state' => (int) ($log['state'] ?? 0),
                     'verify_type' => (int) ($log['type'] ?? 1),
-                    'work_code' => $workCode,
                     'raw_payload' => "IP={$device->ip_address};SN={$device->serial_number}",
                 ];
             }

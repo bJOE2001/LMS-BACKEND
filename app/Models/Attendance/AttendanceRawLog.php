@@ -48,10 +48,12 @@ class AttendanceRawLog extends Model
         'punch_time',
         'punch_state',
         'verify_type',
-        'work_code',
         'sync_source',
         'raw_payload',
         'processed_at',
+        'voided_at',
+        'voided_by_hr_account_id',
+        'void_reason',
     ];
 
     /**
@@ -64,12 +66,29 @@ class AttendanceRawLog extends Model
             'punch_state' => 'integer',
             'verify_type' => 'integer',
             'processed_at' => 'datetime',
+            'voided_at' => 'datetime',
+            'voided_by_hr_account_id' => 'integer',
         ];
+    }
+
+    public function scopeActive(Builder $query): Builder
+    {
+        return $query->whereNull('voided_at');
+    }
+
+    public function scopeVoided(Builder $query): Builder
+    {
+        return $query->whereNotNull('voided_at');
     }
 
     public function scopeUnprocessed(Builder $query): Builder
     {
-        return $query->whereNull('processed_at');
+        return $query->whereNull('processed_at')->whereNull('voided_at');
+    }
+
+    public function isVoided(): bool
+    {
+        return $this->voided_at !== null;
     }
 
     public function scopeForEmployee(Builder $query, string $controlNo): Builder

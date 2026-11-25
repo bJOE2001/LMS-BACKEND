@@ -74,12 +74,12 @@ class HrisOfficeTest extends TestCase
             $table->string('employee_control_no', 50);
             $table->string('employee_name', 150)->nullable();
             $table->string('action_type', 30);
-            $table->unsignedInteger('source_department_id')->nullable();
-            $table->string('source_office_name', 150)->nullable();
-            $table->string('source_device_sn', 100)->nullable();
-            $table->unsignedInteger('target_department_id')->nullable();
-            $table->string('target_office_name', 150)->nullable();
-            $table->string('target_device_sn', 100)->nullable();
+            $table->unsignedInteger('from_department_id')->nullable();
+            $table->string('from_office_name', 150)->nullable();
+            $table->string('from_device_sn', 100)->nullable();
+            $table->unsignedInteger('to_department_id')->nullable();
+            $table->string('to_office_name', 150)->nullable();
+            $table->string('to_device_sn', 100)->nullable();
             $table->string('status', 30);
             $table->text('remarks')->nullable();
             $table->unsignedInteger('performed_by_user_id')->nullable();
@@ -213,10 +213,10 @@ class HrisOfficeTest extends TestCase
             'employee_control_no' => '00123',
             'employee_name' => 'JANE DOE',
             'action_type' => BiometricTransferLog::ACTION_TRANSFER,
-            'source_department_id' => $chrmo->id,
-            'source_office_name' => 'CHRMO',
-            'target_department_id' => $cacco->id,
-            'target_office_name' => $cacco->name,
+            'from_department_id' => $chrmo->id,
+            'from_office_name' => 'CHRMO',
+            'to_department_id' => $cacco->id,
+            'to_office_name' => $cacco->name,
             'status' => BiometricTransferLog::STATUS_SUCCESS,
             'remarks' => 'Transferred',
         ]);
@@ -230,10 +230,10 @@ class HrisOfficeTest extends TestCase
         $payload = $response->getData(true);
 
         $this->assertCount(1, $payload['logs']);
-        $this->assertSame('CHRMO', $payload['logs'][0]['source_office_acronym']);
-        $this->assertSame('OFFICE OF THE CITY HUMAN RESOURCE MANAGEMENT OFFICER', $payload['logs'][0]['source_office_name']);
-        $this->assertSame('CACCO', $payload['logs'][0]['target_office_acronym']);
-        $this->assertSame('OFFICE OF THE CITY ACCOUNTANT', $payload['logs'][0]['target_office_name']);
+        $this->assertSame('CHRMO', $payload['logs'][0]['from_office_acronym']);
+        $this->assertSame('OFFICE OF THE CITY HUMAN RESOURCE MANAGEMENT OFFICER', $payload['logs'][0]['from_office_name']);
+        $this->assertSame('CACCO', $payload['logs'][0]['to_office_acronym']);
+        $this->assertSame('OFFICE OF THE CITY ACCOUNTANT', $payload['logs'][0]['to_office_name']);
     }
 
     public function test_it_falls_back_gracefully_when_hris_connection_fails(): void

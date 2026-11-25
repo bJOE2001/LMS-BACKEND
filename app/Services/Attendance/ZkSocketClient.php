@@ -705,7 +705,7 @@ class ZkSocketClient
     /**
      * Fetch attendance records stored on the terminal.
      *
-     * @return array<int, array{pin: string, time: string, state: int, type: int, work_code: string|null}>
+     * @return array<int, array{pin: string, time: string, state: int, type: int}>
      */
     public function getAttendanceLogs(): array
     {
@@ -804,9 +804,9 @@ class ZkSocketClient
      * - [26]    Verify Type (1=Finger, 15=Face, 4=Card, 0=Password)
      * - [27-30] Timestamp (Unix 32-bit or encoded format)
      * - [31]    Punch State (0=Check-In, 1=Check-Out, ..., 255=Auto)
-     * - [32-39] WorkCode
+     * - [32-39] WorkCode (ignored)
      *
-     * @return array<int, array{pin: string, time: string, state: int, type: int, work_code: string|null}>
+     * @return array<int, array{pin: string, time: string, state: int, type: int}>
      */
     public function parseAttendanceData(string $data): array
     {
@@ -849,22 +849,17 @@ class ZkSocketClient
                     $type = ord($record[26] ?? "\x00");
                     $timeRaw = unpack('V', substr($record, 27, 4))[1] ?? 0;
                     $state = ord($record[31] ?? "\x00");
-                    $workCodeRaw = substr($record, 32, 8);
                 } else {
                     $pinRaw = substr($record, 0, 24);
                     $state = ord($record[24] ?? "\x00");
                     $type = ord($record[25] ?? "\x00");
                     $timeRaw = unpack('V', substr($record, 26, 4))[1] ?? 0;
-                    $workCodeRaw = substr($record, 30, 8);
                 }
 
                 $pinClean = trim(preg_replace('/[^\x20-\x7E]/', '', explode("\x00", $pinRaw)[0]));
                 $pin = mb_convert_encoding($pinClean, 'UTF-8', 'UTF-8');
 
                 $formattedTime = $this->decodeTime($timeRaw);
-
-                $workClean = trim(preg_replace('/[^\x20-\x7E]/', '', explode("\x00", $workCodeRaw)[0]));
-                $workCode = $workClean !== '' ? mb_convert_encoding($workClean, 'UTF-8', 'UTF-8') : null;
             } else {
                 // 14-byte legacy format
                 $pin = (string) (unpack('v', substr($record, 0, 2))[1] ?? 0);
@@ -872,7 +867,6 @@ class ZkSocketClient
                 $formattedTime = $this->decodeTime($timeRaw);
                 $state = ord($record[8] ?? "\x00");
                 $type = ord($record[9] ?? "\x00");
-                $workCode = null;
             }
 
             if ($pin !== '' && $formattedTime !== null) {
@@ -881,7 +875,6 @@ class ZkSocketClient
                     'time' => $formattedTime,
                     'state' => $state,
                     'type' => $type,
-                    'work_code' => $workCode,
                 ];
             }
         }

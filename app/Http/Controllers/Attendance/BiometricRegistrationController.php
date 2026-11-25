@@ -302,10 +302,10 @@ class BiometricRegistrationController extends Controller
                     'employee_control_no' => $controlNo,
                     'employee_name' => $fullName,
                     'action_type' => BiometricTransferLog::ACTION_REGISTRATION,
-                    'target_department_id' => $device->department_id ?: BiometricTransferService::CHRMO_DEPARTMENT_ID,
-                    'target_office_name' => $this->resolveOfficeAcronym($device->department_id, $device->department_name)
+                    'to_department_id' => $device->department_id ?: BiometricTransferService::CHRMO_DEPARTMENT_ID,
+                    'to_office_name' => $this->resolveOfficeAcronym($device->department_id, $device->department_name)
                         ?: ($this->resolveOfficeAcronym(BiometricTransferService::CHRMO_DEPARTMENT_ID) ?? 'CHRMO'),
-                    'target_device_sn' => $deviceSn,
+                    'to_device_sn' => $deviceSn,
                     'status' => BiometricTransferLog::STATUS_FAILED,
                     'remarks' => $pushResult['message'],
                     'performed_by_user_id' => $request->user()->id,
@@ -334,6 +334,8 @@ class BiometricRegistrationController extends Controller
         $enrollment->update([
             'status' => $templatesTransferred > 0 ? BiometricEnrollment::STATUS_REGISTERED : BiometricEnrollment::STATUS_PENDING_ENROLLMENT,
             'enrollment_device_sn' => $deviceSn,
+            'enrolled_at' => $enrollment->enrolled_at ?? now(),
+            'enrolled_by_user_id' => $enrollment->enrolled_by_user_id ?? $request->user()?->id,
             'synced_devices' => array_values(array_unique($existingSynced)),
         ]);
 
@@ -347,10 +349,10 @@ class BiometricRegistrationController extends Controller
             'employee_control_no' => $controlNo,
             'employee_name' => $fullName,
             'action_type' => BiometricTransferLog::ACTION_REGISTRATION,
-            'target_department_id' => $device->department_id ?: BiometricTransferService::CHRMO_DEPARTMENT_ID,
-            'target_office_name' => $this->resolveOfficeAcronym($device->department_id, $device->department_name)
+            'to_department_id' => $device->department_id ?: BiometricTransferService::CHRMO_DEPARTMENT_ID,
+            'to_office_name' => $this->resolveOfficeAcronym($device->department_id, $device->department_name)
                 ?: ($this->resolveOfficeAcronym(BiometricTransferService::CHRMO_DEPARTMENT_ID) ?? 'CHRMO'),
-            'target_device_sn' => $deviceSn,
+            'to_device_sn' => $deviceSn,
             'status' => BiometricTransferLog::STATUS_SUCCESS,
             'remarks' => $remarks,
             'performed_by_user_id' => $request->user()->id,
@@ -490,6 +492,7 @@ class BiometricRegistrationController extends Controller
                     ? BiometricEnrollment::STATUS_REGISTERED
                     : BiometricEnrollment::STATUS_PENDING_ENROLLMENT,
                 'enrolled_at' => now(),
+                'enrolled_by_user_id' => $account->id,
                 'synced_devices' => [$deviceSn],
             ]);
 
@@ -507,30 +510,47 @@ class BiometricRegistrationController extends Controller
             );
         } else {
             $synced = is_array($enrollment->synced_devices) ? $enrollment->synced_devices : [];
+            $needsSave = false;
             if (! in_array($deviceSn, $synced, true)) {
                 $synced[] = $deviceSn;
                 $enrollment->synced_devices = $synced;
+                $needsSave = true;
+            }
+            if ($enrollment->enrolled_by_user_id === null) {
+                $enrollment->enrolled_by_user_id = $account->id;
+                $needsSave = true;
+            }
+            if ($needsSave) {
                 $enrollment->save();
             }
         }
 
         $deptLabel = HrisOffice::labelForDepartment($account->department) ?: "Office #{$account->department_id}";
-        $sourceOfficeLabel = $this->resolveOfficeAcronym(BiometricTransferService::CHRMO_DEPARTMENT_ID) ?? 'CHRMO';
+        $sourceDevice = ($enrollment && $enrollment->enrollment_device_sn && $enrollment->enrollment_device_sn !== $deviceSn)
+            ? BiometricDevice::query()->where('serial_number', $enrollment->enrollment_device_sn)->first()
+            : null;
+        $sourceDeptId = ($sourceDevice && (int) $sourceDevice->department_id !== (int) $account->department_id)
+            ? (int) $sourceDevice->department_id
+            : null;
+        $sourceOfficeLabel = $sourceDeptId !== null
+            ? ($this->resolveOfficeAcronym($sourceDeptId) ?? 'CHRMO')
+            : null;
         $remarks = $provision['requires_local_scan']
-            ? 'Profile assigned; scan needed'
+            ? 'Profile provisioned; scan needed'
             : ($provision['templates_transferred'] > 0
-                ? "Assigned ({$provision['templates_transferred']} template synced)"
-                : 'Assigned to office');
+                ? "Transferred ({$provision['templates_transferred']} template synced)"
+                : 'Transferred to office');
 
         $transferLog = BiometricTransferLog::query()->create([
             'employee_control_no' => $controlNo,
             'employee_name' => $fullName,
-            'action_type' => BiometricTransferLog::ACTION_ASSIGN,
-            'source_department_id' => BiometricTransferService::CHRMO_DEPARTMENT_ID,
-            'source_office_name' => $sourceOfficeLabel,
-            'target_department_id' => $account->department_id,
-            'target_office_name' => $deptLabel,
-            'target_device_sn' => $deviceSn,
+            'action_type' => BiometricTransferLog::ACTION_TRANSFER,
+            'from_department_id' => $sourceDeptId,
+            'from_office_name' => $sourceOfficeLabel,
+            'from_device_sn' => $sourceDevice?->serial_number,
+            'to_department_id' => $account->department_id,
+            'to_office_name' => $deptLabel,
+            'to_device_sn' => $deviceSn,
             'status' => BiometricTransferLog::STATUS_SUCCESS,
             'remarks' => $remarks,
             'performed_by_user_id' => $account->id,
@@ -710,10 +730,10 @@ class BiometricRegistrationController extends Controller
             $query->where(function ($q) use ($search): void {
                 $q->where('employee_control_no', 'like', "%{$search}%")
                     ->orWhere('employee_name', 'like', "%{$search}%")
-                    ->orWhere('source_office_name', 'like', "%{$search}%")
-                    ->orWhere('target_office_name', 'like', "%{$search}%")
-                    ->orWhere('source_device_sn', 'like', "%{$search}%")
-                    ->orWhere('target_device_sn', 'like', "%{$search}%")
+                    ->orWhere('from_office_name', 'like', "%{$search}%")
+                    ->orWhere('to_office_name', 'like', "%{$search}%")
+                    ->orWhere('from_device_sn', 'like', "%{$search}%")
+                    ->orWhere('to_device_sn', 'like', "%{$search}%")
                     ->orWhere('performed_by_name', 'like', "%{$search}%")
                     ->orWhere('remarks', 'like', "%{$search}%");
             });
@@ -724,8 +744,8 @@ class BiometricRegistrationController extends Controller
 
         $departmentIds = collect($logs->items())
             ->flatMap(static fn (BiometricTransferLog $log): array => [
-                $log->source_department_id,
-                $log->target_department_id,
+                $log->from_department_id,
+                $log->to_department_id,
             ])
             ->filter()
             ->unique()
@@ -736,24 +756,24 @@ class BiometricRegistrationController extends Controller
             : collect();
 
         $mappedLogs = collect($logs->items())->map(function (BiometricTransferLog $log) use ($departmentsById): BiometricTransferLog {
-            $sourceDepartment = $log->source_department_id ? $departmentsById->get((int) $log->source_department_id) : null;
-            $targetDepartment = $log->target_department_id ? $departmentsById->get((int) $log->target_department_id) : null;
+            $fromDepartment = $log->from_department_id ? $departmentsById->get((int) $log->from_department_id) : null;
+            $toDepartment = $log->to_department_id ? $departmentsById->get((int) $log->to_department_id) : null;
 
-            $sourceAcronym = $this->resolveOfficeAcronymFromDepartment(
-                $sourceDepartment,
-                $log->source_department_id,
-                $log->source_office_name
+            $fromAcronym = $this->resolveOfficeAcronymFromDepartment(
+                $fromDepartment,
+                $log->from_department_id,
+                $log->from_office_name
             );
-            $targetAcronym = $this->resolveOfficeAcronymFromDepartment(
-                $targetDepartment,
-                $log->target_department_id,
-                $log->target_office_name
+            $toAcronym = $this->resolveOfficeAcronymFromDepartment(
+                $toDepartment,
+                $log->to_department_id,
+                $log->to_office_name
             );
 
-            $log->setAttribute('source_office_acronym', $sourceAcronym);
-            $log->setAttribute('target_office_acronym', $targetAcronym);
-            $log->source_office_name = $sourceDepartment?->name ?: $log->source_office_name;
-            $log->target_office_name = $targetDepartment?->name ?: $log->target_office_name;
+            $log->setAttribute('from_office_acronym', $fromAcronym);
+            $log->setAttribute('to_office_acronym', $toAcronym);
+            $log->from_office_name = $fromDepartment?->name ?: $log->from_office_name;
+            $log->to_office_name = $toDepartment?->name ?: $log->to_office_name;
 
             return $log;
         });
@@ -832,9 +852,9 @@ class BiometricRegistrationController extends Controller
             'employee_control_no' => $controlNo,
             'employee_name' => $employeeName,
             'action_type' => BiometricTransferLog::ACTION_REGISTRATION,
-            'target_department_id' => $departmentId,
-            'target_office_name' => $this->resolveOfficeAcronym($departmentId, $officeName),
-            'target_device_sn' => $deviceSn,
+            'to_department_id' => $departmentId,
+            'to_office_name' => $this->resolveOfficeAcronym($departmentId, $officeName),
+            'to_device_sn' => $deviceSn,
             'status' => $status,
             'remarks' => $remarks,
             'performed_by_user_id' => $performedBy?->id,

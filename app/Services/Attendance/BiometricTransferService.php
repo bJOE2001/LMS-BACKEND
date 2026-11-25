@@ -89,10 +89,10 @@ class BiometricTransferService
                     'employee_control_no' => $canonicalControlNo,
                     'employee_name' => $fullName,
                     'action_type' => BiometricTransferLog::ACTION_TRANSFER,
-                    'source_department_id' => $sourceDepartmentId,
-                    'source_office_name' => $this->resolveOfficeName($sourceDepartmentId),
-                    'target_department_id' => $newDepartmentId,
-                    'target_office_name' => $departmentLabel,
+                    'from_department_id' => $sourceDepartmentId,
+                    'from_office_name' => $this->resolveOfficeName($sourceDepartmentId),
+                    'to_department_id' => $newDepartmentId,
+                    'to_office_name' => $departmentLabel,
                     'status' => BiometricTransferLog::STATUS_FAILED,
                     'remarks' => $failMsg,
                     'performed_by_user_id' => $userId,
@@ -170,6 +170,55 @@ class BiometricTransferService
             if ($sourceDepartmentId === null && $sourceDevices->isNotEmpty()) {
                 $sourceDepartmentId = $sourceDevices->whereNotNull('department_id')->first()?->department_id;
             }
+
+            if ($sourceDepartmentId === null && $enrollment?->enrollment_device_sn) {
+                $enrollmentDevice = BiometricDevice::query()
+                    ->where('serial_number', $enrollment->enrollment_device_sn)
+                    ->first();
+
+                if ($enrollmentDevice && (int) $enrollmentDevice->department_id !== $newDepartmentId) {
+                    $sourceDepartmentId = $enrollmentDevice->department_id ? (int) $enrollmentDevice->department_id : null;
+                    if (! in_array($enrollmentDevice->serial_number, $sourceSns, true)
+                        && ! in_array($enrollmentDevice->serial_number, $targetSns, true)) {
+                        $sourceSns[] = $enrollmentDevice->serial_number;
+                    }
+                }
+            }
+
+            if ($sourceDepartmentId === null) {
+                $priorLog = BiometricTransferLog::query()
+                    ->where('employee_control_no', $canonicalControlNo)
+                    ->where('status', BiometricTransferLog::STATUS_SUCCESS)
+                    ->whereIn('action_type', [
+                        BiometricTransferLog::ACTION_TRANSFER,
+                        BiometricTransferLog::ACTION_REMOVE,
+                        BiometricTransferLog::ACTION_REGISTRATION,
+                    ])
+                    ->orderByDesc('id')
+                    ->first();
+
+                if ($priorLog) {
+                    $priorDeptId = $priorLog->action_type === BiometricTransferLog::ACTION_REMOVE
+                        ? $priorLog->from_department_id
+                        : $priorLog->to_department_id;
+                    $priorDeviceSn = $priorLog->action_type === BiometricTransferLog::ACTION_REMOVE
+                        ? $priorLog->from_device_sn
+                        : $priorLog->to_device_sn;
+
+                    if ($priorDeptId !== null && (int) $priorDeptId !== $newDepartmentId) {
+                        $sourceDepartmentId = (int) $priorDeptId;
+                    }
+
+                    if ($sourceSns === [] && $priorDeviceSn && ! in_array($priorDeviceSn, $targetSns, true)) {
+                        $sourceSns[] = $priorDeviceSn;
+                    }
+                }
+            }
+
+            if ((int) $sourceDepartmentId === $newDepartmentId) {
+                $sourceDepartmentId = null;
+            }
+
             $sourceOfficeName = $this->resolveOfficeName($sourceDepartmentId);
             $sourceDeviceSn = count($sourceSns) > 0 ? implode(', ', $sourceSns) : null;
 
@@ -226,6 +275,7 @@ class BiometricTransferService
                 ? BiometricEnrollment::STATUS_REGISTERED
                 : BiometricEnrollment::STATUS_PENDING_ENROLLMENT;
             $enrollment->enrolled_at = $enrollment->enrolled_at ?? now();
+            $enrollment->enrolled_by_user_id = $enrollment->enrolled_by_user_id ?? $userId;
             $enrollment->synced_devices = $targetSns;
             $enrollment->notes = $requiresLocalScan
                 ? "Provisioned PIN on {$departmentLabel} ({$targetName}, {$primaryMode}); local {$primaryMode} biometric scan required."
@@ -243,12 +293,12 @@ class BiometricTransferService
                 'employee_control_no' => $canonicalControlNo,
                 'employee_name' => $fullName,
                 'action_type' => BiometricTransferLog::ACTION_TRANSFER,
-                'source_department_id' => $sourceDepartmentId,
-                'source_office_name' => $sourceOfficeName,
-                'source_device_sn' => $sourceDeviceSn,
-                'target_department_id' => $newDepartmentId,
-                'target_office_name' => $departmentLabel,
-                'target_device_sn' => $primarySn,
+                'from_department_id' => $sourceDepartmentId,
+                'from_office_name' => $sourceOfficeName,
+                'from_device_sn' => $sourceDeviceSn,
+                'to_department_id' => $newDepartmentId,
+                'to_office_name' => $departmentLabel,
+                'to_device_sn' => $primarySn,
                 'status' => BiometricTransferLog::STATUS_SUCCESS,
                 'remarks' => $successMsg,
                 'performed_by_user_id' => $userId,
@@ -279,9 +329,9 @@ class BiometricTransferService
                 'employee_control_no' => $canonicalControlNo,
                 'employee_name' => $fullName,
                 'action_type' => BiometricTransferLog::ACTION_TRANSFER,
-                'source_department_id' => $sourceDepartmentId,
-                'source_office_name' => $this->resolveOfficeName($sourceDepartmentId),
-                'target_department_id' => $newDepartmentId,
+                'from_department_id' => $sourceDepartmentId,
+                'from_office_name' => $this->resolveOfficeName($sourceDepartmentId),
+                'to_department_id' => $newDepartmentId,
                 'status' => BiometricTransferLog::STATUS_FAILED,
                 'remarks' => 'Failed to execute biometric transfer: '.$e->getMessage(),
                 'performed_by_user_id' => $userId,
@@ -315,6 +365,25 @@ class BiometricTransferService
             ->where('department_id', $oldDepartmentId)
             ->where('is_active', true)
             ->get();
+
+        // Update synced_devices in enrollment even if no active terminal exists
+        $enrollment = BiometricEnrollment::query()
+            ->where('employee_control_no', $canonicalControlNo)
+            ->first();
+
+        if ($oldDevices->isEmpty()) {
+            if ($enrollment && ! empty($enrollment->synced_devices)) {
+                $enrollment->synced_devices = [];
+                $enrollment->notes = 'Removed from office roster (no active office terminal configured)';
+                $enrollment->save();
+            }
+
+            return [
+                'removed' => false,
+                'message' => 'No active biometric terminal configured for this office.',
+            ];
+        }
+
         $oldDevice = $oldDevices->first();
 
         try {
@@ -334,11 +403,6 @@ class BiometricTransferService
                 $this->removeEmployeeFromDevice($dev, $canonicalControlNo, $fullName, $userId);
             }
 
-            // Update synced_devices in enrollment
-            $enrollment = BiometricEnrollment::query()
-                ->where('employee_control_no', $canonicalControlNo)
-                ->first();
-
             if ($enrollment) {
                 $enrollment->synced_devices = [];
                 $enrollment->notes = 'Removed from office roster, reset to central enrollment pool';
@@ -352,9 +416,9 @@ class BiometricTransferService
                 'employee_control_no' => $canonicalControlNo,
                 'employee_name' => $fullName,
                 'action_type' => BiometricTransferLog::ACTION_REMOVE,
-                'source_department_id' => $oldDepartmentId,
-                'source_office_name' => $sourceOfficeName,
-                'source_device_sn' => $oldDevice?->serial_number,
+                'from_department_id' => $oldDepartmentId,
+                'from_office_name' => $sourceOfficeName,
+                'from_device_sn' => $oldDevice?->serial_number,
                 'status' => BiometricTransferLog::STATUS_SUCCESS,
                 'remarks' => $successMsg,
                 'performed_by_user_id' => $userId,
@@ -375,9 +439,9 @@ class BiometricTransferService
                 'employee_control_no' => $canonicalControlNo,
                 'employee_name' => $fullName,
                 'action_type' => BiometricTransferLog::ACTION_REMOVE,
-                'source_department_id' => $oldDepartmentId,
-                'source_office_name' => $sourceOfficeName,
-                'source_device_sn' => $oldDevice?->serial_number,
+                'from_department_id' => $oldDepartmentId,
+                'from_office_name' => $sourceOfficeName,
+                'from_device_sn' => $oldDevice?->serial_number,
                 'status' => BiometricTransferLog::STATUS_FAILED,
                 'remarks' => 'Failed to delete biometrics from old office terminal: '.$e->getMessage(),
                 'performed_by_user_id' => $userId,
