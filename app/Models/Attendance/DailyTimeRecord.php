@@ -62,6 +62,8 @@ class DailyTimeRecord extends Model
         'adjustment_remarks',
         'adjusted_by_admin_id',
         'adjusted_slots',
+        'workload_undertaken',
+        'workload_quantity',
     ];
 
     /**

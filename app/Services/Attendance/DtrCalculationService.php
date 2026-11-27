@@ -278,7 +278,8 @@ class DtrCalculationService
             $isFuture,
             $existingDtr?->is_adjusted ?? false,
             $existingDtr?->adjustment_reason,
-            $holiday
+            $holiday,
+            $existingDtr?->adjusted_slots
         );
 
         $payload = [
@@ -311,6 +312,14 @@ class DtrCalculationService
             $payload['adjustment_remarks'] = $existingDtr->adjustment_remarks;
             $payload['adjusted_by_admin_id'] = $existingDtr->adjusted_by_admin_id;
             $payload['adjusted_slots'] = $existingDtr->adjusted_slots;
+        }
+
+        if ($existingDtr !== null && $existingDtr->workload_undertaken !== null) {
+            $payload['workload_undertaken'] = $existingDtr->workload_undertaken;
+        }
+
+        if ($existingDtr !== null && $existingDtr->workload_quantity !== null) {
+            $payload['workload_quantity'] = $existingDtr->workload_quantity;
         }
 
         return [
@@ -624,36 +633,46 @@ class DtrCalculationService
                     $adjustedSlots = json_encode($adjustedSlots);
                 }
 
+                $insertRow = [
+                    'employee_control_no' => $payload['employee_control_no'],
+                    'department_id' => $payload['department_id'],
+                    'record_date' => $payload['record_date'],
+                    'day_of_week' => $payload['day_of_week'],
+                    'am_arrival' => $payload['am_arrival'],
+                    'am_departure' => $payload['am_departure'],
+                    'pm_arrival' => $payload['pm_arrival'],
+                    'pm_departure' => $payload['pm_departure'],
+                    'ot_arrival' => $payload['ot_arrival'],
+                    'ot_departure' => $payload['ot_departure'],
+                    'late_minutes' => $payload['late_minutes'],
+                    'undertime_minutes' => $payload['undertime_minutes'],
+                    'overtime_minutes' => $payload['overtime_minutes'],
+                    'rendered_hours' => $payload['rendered_hours'],
+                    'status' => $payload['status'],
+                    'leave_type_code' => $payload['leave_type_code'],
+                    'leave_application_id' => $payload['leave_application_id'],
+                    'is_adjusted' => (bool) ($payload['is_adjusted'] ?? false),
+                    'adjustment_reason' => $payload['adjustment_reason'] ?? null,
+                    'adjustment_remarks' => $payload['adjustment_remarks'] ?? null,
+                    'adjusted_by_admin_id' => $payload['adjusted_by_admin_id'] ?? null,
+                    'adjusted_slots' => $adjustedSlots,
+                    'created_at' => $nowStr,
+                    'updated_at' => $nowStr,
+                ];
+
+                if (array_key_exists('workload_undertaken', $payload)) {
+                    $insertRow['workload_undertaken'] = $payload['workload_undertaken'];
+                }
+
+                if (array_key_exists('workload_quantity', $payload)) {
+                    $insertRow['workload_quantity'] = $payload['workload_quantity'];
+                }
+
                 $pendingInserts[] = [
                     'canonical_control_no' => $canonicalControlNo,
                     'date_str' => $dateStr,
                     'payload' => $payload,
-                    'row' => [
-                        'employee_control_no' => $payload['employee_control_no'],
-                        'department_id' => $payload['department_id'],
-                        'record_date' => $payload['record_date'],
-                        'day_of_week' => $payload['day_of_week'],
-                        'am_arrival' => $payload['am_arrival'],
-                        'am_departure' => $payload['am_departure'],
-                        'pm_arrival' => $payload['pm_arrival'],
-                        'pm_departure' => $payload['pm_departure'],
-                        'ot_arrival' => $payload['ot_arrival'],
-                        'ot_departure' => $payload['ot_departure'],
-                        'late_minutes' => $payload['late_minutes'],
-                        'undertime_minutes' => $payload['undertime_minutes'],
-                        'overtime_minutes' => $payload['overtime_minutes'],
-                        'rendered_hours' => $payload['rendered_hours'],
-                        'status' => $payload['status'],
-                        'leave_type_code' => $payload['leave_type_code'],
-                        'leave_application_id' => $payload['leave_application_id'],
-                        'is_adjusted' => (bool) ($payload['is_adjusted'] ?? false),
-                        'adjustment_reason' => $payload['adjustment_reason'] ?? null,
-                        'adjustment_remarks' => $payload['adjustment_remarks'] ?? null,
-                        'adjusted_by_admin_id' => $payload['adjusted_by_admin_id'] ?? null,
-                        'adjusted_slots' => $adjustedSlots,
-                        'created_at' => $nowStr,
-                        'updated_at' => $nowStr,
-                    ],
+                    'row' => $insertRow,
                 ];
             }
 
@@ -668,9 +687,30 @@ class DtrCalculationService
             $processedJobs++;
         }
 
-        // 9. Persist new DTR rows in chunks of 75 (75 * 24 = 1,800 < 2,100 SQL Server params)
+        // 9. Persist new DTR rows in chunks of 75 (75 * 26 = 1,950 < 2,100 SQL Server params)
         foreach (array_chunk($pendingInserts, 75) as $chunk) {
             $rows = array_column($chunk, 'row');
+            $hasWorkload = false;
+            $hasQuantity = false;
+            foreach ($rows as $rowItem) {
+                if (array_key_exists('workload_undertaken', $rowItem)) {
+                    $hasWorkload = true;
+                }
+                if (array_key_exists('workload_quantity', $rowItem)) {
+                    $hasQuantity = true;
+                }
+            }
+            if ($hasWorkload || $hasQuantity) {
+                foreach ($rows as $idx => $rowItem) {
+                    if ($hasWorkload && ! array_key_exists('workload_undertaken', $rowItem)) {
+                        $rows[$idx]['workload_undertaken'] = null;
+                    }
+                    if ($hasQuantity && ! array_key_exists('workload_quantity', $rowItem)) {
+                        $rows[$idx]['workload_quantity'] = null;
+                    }
+                }
+            }
+
             try {
                 DailyTimeRecord::query()->insert($rows);
             } catch (Throwable) {
@@ -1474,6 +1514,8 @@ class DtrCalculationService
 
     /**
      * Determine final DTR status string.
+     *
+     * @param  array<string|int, mixed>|null  $adjustedSlots
      */
     private function determineStatus(
         array $slotted,
@@ -1484,14 +1526,16 @@ class DtrCalculationService
         bool $isFuture,
         bool $isAdjusted,
         ?string $adjustmentReason,
-        ?Holiday $holiday = null
+        ?Holiday $holiday = null,
+        ?array $adjustedSlots = null
     ): string {
         if ($isAdjusted) {
             if ($adjustmentReason === 'MANUAL_OVERRIDE') {
                 $hasPunches = $slotted['am_arrival'] !== null
                     || $slotted['am_departure'] !== null
                     || $slotted['pm_arrival'] !== null
-                    || $slotted['pm_departure'] !== null;
+                    || $slotted['pm_departure'] !== null
+                    || $this->hasNonTimeAdjustedSlot($adjustedSlots);
 
                 return $hasPunches ? DailyTimeRecord::STATUS_PRESENT : DailyTimeRecord::STATUS_ABSENT;
             }
@@ -1536,6 +1580,30 @@ class DtrCalculationService
         }
 
         return DailyTimeRecord::STATUS_ABSENT;
+    }
+
+    /**
+     * Check whether an adjusted_slots map contains a non-time slot remark (e.g. O.F., O.B., W.S).
+     *
+     * @param  array<string|int, mixed>|null  $adjustedSlots
+     */
+    private function hasNonTimeAdjustedSlot(?array $adjustedSlots): bool
+    {
+        if (! is_array($adjustedSlots) || $adjustedSlots === []) {
+            return false;
+        }
+
+        foreach ($adjustedSlots as $key => $val) {
+            if (is_int($key)) {
+                continue;
+            }
+            $normalized = strtoupper(trim((string) ($val ?? '')));
+            if ($normalized !== '' && $normalized !== 'TIME' && $normalized !== 'ABSENT') {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**

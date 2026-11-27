@@ -7,6 +7,7 @@ use App\Models\Attendance\AttendanceRawLog;
 use App\Models\Attendance\BiometricDevice;
 use App\Models\Attendance\BiometricEnrollment;
 use App\Models\Attendance\DailyTimeRecord;
+use App\Models\Attendance\DtrDeleteRequest;
 use App\Models\Department;
 use App\Models\DepartmentAdmin;
 use App\Models\DepartmentHead;
@@ -20,6 +21,8 @@ use App\Services\HrAccessControlService;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\Rule;
 
 /**
@@ -113,66 +116,16 @@ class DailyTimeRecordController extends Controller
             $endDate->format('Y-m-d')
         );
 
-        // Resolve default In-Charge signatory (Department Head)
-        $defaultInCharge = [
-            'name' => 'JOSEPH NELSON N. BRIONES',
-            'title' => 'CICTMO HEAD',
-            'control_no' => null,
-        ];
-
-        $assignment = EmployeeDepartmentAssignment::with('assignedDepartment.departmentHead')
-            ->where('employee_control_no', $canonicalControlNo)
-            ->first();
-
-        $dept = $assignment?->assignedDepartment;
-        if (! $dept && ! empty($employee->office)) {
-            $dept = Department::with('departmentHead')
-                ->where('name', $employee->office)
-                ->first();
-        }
-
-        $head = $dept?->departmentHead;
-        if ($head) {
-            $middleInitial = $head->middlename ? ' '.strtoupper(trim($head->middlename)[0]).'.' : '';
-            $headName = strtoupper(trim(($head->firstname ?? '').$middleInitial.' '.($head->surname ?? '')));
-            if ($headName === '' && ! empty($head->full_name)) {
-                $headName = strtoupper(trim($head->full_name));
-            }
-
-            $acronym = trim((string) (HrisEmployee::officeAcronymByName($dept?->name) ?? ''));
-            $title = $acronym !== '' ? $acronym.' HEAD' : ($head->designation ?: 'DEPARTMENT HEAD');
-
-            $defaultInCharge = [
-                'name' => $headName ?: 'DEPARTMENT HEAD',
-                'title' => $title,
-                'control_no' => $head->control_no,
-            ];
-        }
-
-        // Active Department Heads list for modal dropdown
-        $departmentHeads = DepartmentHead::query()
-            ->with('department:id,name')
-            ->orderBy('surname')
-            ->get()
-            ->map(function ($h) {
-                $mi = $h->middlename ? ' '.strtoupper(trim($h->middlename)[0]).'.' : '';
-                $name = strtoupper(trim(($h->firstname ?? '').$mi.' '.($h->surname ?? '')));
-                if ($name === '' && ! empty($h->full_name)) {
-                    $name = strtoupper(trim($h->full_name));
-                }
-                $acronym = trim((string) (HrisEmployee::officeAcronymByName($h->department?->name) ?? ''));
-                $title = $acronym !== '' ? $acronym.' HEAD' : ($h->designation ?: 'DEPARTMENT HEAD');
-
-                return [
-                    'id' => $h->id,
-                    'control_no' => $h->control_no,
-                    'name' => $name,
-                    'title' => $title,
-                    'department' => $h->department?->name ?? $h->office ?? '',
-                    'acronym' => $acronym,
-                ];
-            })
-            ->values();
+        $defaultInCharge = $this->resolveDefaultInCharge($canonicalControlNo, $employee);
+        $departmentHeads = $this->getFormattedDepartmentHeads();
+        $pendingDeleteRequests = Schema::connection('bio')->hasTable('tblDtrDeleteRequests')
+            ? DtrDeleteRequest::query()
+                ->where('employee_control_no', $canonicalControlNo)
+                ->whereBetween('record_date', [$startDate->format('Y-m-d'), $endDate->format('Y-m-d')])
+                ->where('status', DtrDeleteRequest::STATUS_PENDING)
+                ->orderByDesc('id')
+                ->get()
+            : collect();
 
         return response()->json([
             'employee' => [
@@ -182,7 +135,7 @@ class DailyTimeRecordController extends Controller
                 'designation' => $employee->designation ?? 'Employee',
                 'charges' => $charges ?? '',
                 'employment_status' => strtoupper(trim((string) ($employee->status ?? ''))),
-                'is_contractual' => strtoupper(trim((string) ($employee->status ?? ''))) === 'CONTRACTUAL',
+                'is_contractual' => in_array(strtoupper(trim((string) ($employee->status ?? ''))), ['CONTRACTUAL', 'HONORARIUM'], true),
                 'in_charge' => $defaultInCharge,
                 'schedule' => $this->dtrService->resolveSchedule($canonicalControlNo),
             ],
@@ -197,6 +150,7 @@ class DailyTimeRecordController extends Controller
                 'days_in_month' => $startDate->daysInMonth,
             ],
             'records' => $records,
+            'pending_delete_requests' => $pendingDeleteRequests,
             'summary' => $summary,
             'devices' => $devices,
         ]);
@@ -242,29 +196,7 @@ class DailyTimeRecordController extends Controller
             'location' => $d->location ?: 'Office',
         ]);
 
-        $departmentHeads = DepartmentHead::query()
-            ->with('department:id,name')
-            ->orderBy('surname')
-            ->get()
-            ->map(function ($h) {
-                $mi = $h->middlename ? ' '.strtoupper(trim($h->middlename)[0]).'.' : '';
-                $name = strtoupper(trim(($h->firstname ?? '').$mi.' '.($h->surname ?? '')));
-                if ($name === '' && ! empty($h->full_name)) {
-                    $name = strtoupper(trim($h->full_name));
-                }
-                $acronym = trim((string) (HrisEmployee::officeAcronymByName($h->department?->name) ?? ''));
-                $title = $acronym !== '' ? $acronym.' HEAD' : ($h->designation ?: 'DEPARTMENT HEAD');
-
-                return [
-                    'id' => $h->id,
-                    'control_no' => $h->control_no,
-                    'name' => $name,
-                    'title' => $title,
-                    'department' => $h->department?->name ?? $h->office ?? '',
-                    'acronym' => $acronym,
-                ];
-            })
-            ->values();
+        $departmentHeads = $this->getFormattedDepartmentHeads();
 
         $period = [
             'year' => $year,
@@ -315,41 +247,7 @@ class DailyTimeRecordController extends Controller
                 $endDate->format('Y-m-d')
             );
 
-            // Default signatory
-            $defaultInCharge = [
-                'name' => 'JOSEPH NELSON N. BRIONES',
-                'title' => 'CICTMO HEAD',
-                'control_no' => null,
-            ];
-
-            $assignment = EmployeeDepartmentAssignment::with('assignedDepartment.departmentHead')
-                ->where('employee_control_no', $canonicalControlNo)
-                ->first();
-
-            $dept = $assignment?->assignedDepartment;
-            if (! $dept && ! empty($employee->office)) {
-                $dept = Department::with('departmentHead')
-                    ->where('name', $employee->office)
-                    ->first();
-            }
-
-            $head = $dept?->departmentHead;
-            if ($head) {
-                $middleInitial = $head->middlename ? ' '.strtoupper(trim($head->middlename)[0]).'.' : '';
-                $headName = strtoupper(trim(($head->firstname ?? '').$middleInitial.' '.($head->surname ?? '')));
-                if ($headName === '' && ! empty($head->full_name)) {
-                    $headName = strtoupper(trim($head->full_name));
-                }
-
-                $acronym = trim((string) (HrisEmployee::officeAcronymByName($dept?->name) ?? ''));
-                $title = $acronym !== '' ? $acronym.' HEAD' : ($head->designation ?: 'DEPARTMENT HEAD');
-
-                $defaultInCharge = [
-                    'name' => $headName ?: 'DEPARTMENT HEAD',
-                    'title' => $title,
-                    'control_no' => $head->control_no,
-                ];
-            }
+            $defaultInCharge = $this->resolveDefaultInCharge($canonicalControlNo, $employee);
 
             $results[] = [
                 'employee' => [
@@ -359,7 +257,7 @@ class DailyTimeRecordController extends Controller
                     'designation' => $employee->designation ?? 'Employee',
                     'charges' => $charges ?? '',
                     'employment_status' => strtoupper(trim((string) ($employee->status ?? ''))),
-                    'is_contractual' => strtoupper(trim((string) ($employee->status ?? ''))) === 'CONTRACTUAL',
+                    'is_contractual' => in_array(strtoupper(trim((string) ($employee->status ?? ''))), ['CONTRACTUAL', 'HONORARIUM'], true),
                     'in_charge' => $defaultInCharge,
                     'schedule' => $this->dtrService->resolveSchedule($canonicalControlNo),
                 ],
@@ -826,6 +724,39 @@ class DailyTimeRecordController extends Controller
         $otArrival = $this->normalizeTimeInput($validated['ot_arrival'] ?? null);
         $otDeparture = $this->normalizeTimeInput($validated['ot_departure'] ?? null);
 
+        $rawAdjustedSlots = $request->input('adjusted_slots');
+        $incomingTimes = [
+            'am_arrival' => $amArrival,
+            'am_departure' => $amDeparture,
+            'pm_arrival' => $pmArrival,
+            'pm_departure' => $pmDeparture,
+        ];
+        $protectedSlotLabels = [
+            'am_arrival' => 'AM In',
+            'am_departure' => 'AM Out',
+            'pm_arrival' => 'PM In',
+            'pm_departure' => 'PM Out',
+        ];
+
+        foreach ($protectedSlotLabels as $slotKey => $slotLabel) {
+            if (! $this->isOriginalBiometricSlot($dtr, $slotKey)) {
+                continue;
+            }
+
+            $existingNormalized = $this->normalizeTimeInput($dtr->{$slotKey});
+            $incomingTime = $incomingTimes[$slotKey];
+            $incomingSlotRemark = '';
+            if (is_array($rawAdjustedSlots) && array_key_exists($slotKey, $rawAdjustedSlots)) {
+                $incomingSlotRemark = trim((string) ($rawAdjustedSlots[$slotKey] ?? ''));
+            }
+
+            if ($incomingTime !== $existingNormalized || $incomingSlotRemark !== '') {
+                return response()->json([
+                    'message' => "Existing biometric punch for {$slotLabel} cannot be overwritten or cleared without HR approval. Please submit a DTR Delete Request instead.",
+                ], 422);
+            }
+        }
+
         $account = $request->user();
         $adminId = $account?->id ?? null;
 
@@ -845,7 +776,6 @@ class DailyTimeRecordController extends Controller
         $dtr->ot_arrival = $otArrival;
         $dtr->ot_departure = $otDeparture;
 
-        $rawAdjustedSlots = $request->input('adjusted_slots');
         if (is_array($rawAdjustedSlots)) {
             $isAssoc = array_keys($rawAdjustedSlots) !== range(0, count($rawAdjustedSlots) - 1);
             if ($isAssoc) {
@@ -909,11 +839,8 @@ class DailyTimeRecordController extends Controller
             ? $dtr->adjusted_slots
             : [];
 
-        $amIsSpecial = in_array(strtoupper((string) ($slotMap['am_arrival'] ?? '')), ['O.F.', 'O.B.', 'OFFICIAL BUSINESS', 'ON FIELD'], true)
-            || in_array(strtoupper((string) ($slotMap['am_departure'] ?? '')), ['O.F.', 'O.B.', 'OFFICIAL BUSINESS', 'ON FIELD'], true);
-
-        $pmIsSpecial = in_array(strtoupper((string) ($slotMap['pm_arrival'] ?? '')), ['O.F.', 'O.B.', 'OFFICIAL BUSINESS', 'ON FIELD'], true)
-            || in_array(strtoupper((string) ($slotMap['pm_departure'] ?? '')), ['O.F.', 'O.B.', 'OFFICIAL BUSINESS', 'ON FIELD'], true);
+        $amIsSpecial = $this->hasSpecialSlotRemark($slotMap, ['am_arrival', 'am_departure']);
+        $pmIsSpecial = $this->hasSpecialSlotRemark($slotMap, ['pm_arrival', 'pm_departure']);
 
         if ($amIsSpecial) {
             $dtr->late_minutes = 0;
@@ -931,7 +858,13 @@ class DailyTimeRecordController extends Controller
 
         if ($hasSlotMap) {
             if ($amIsSpecial && $pmIsSpecial) {
-                $dtr->status = ($slotMap['am_arrival'] ?? '') === ($slotMap['pm_arrival'] ?? '') ? ($slotMap['am_arrival'] ?? DailyTimeRecord::STATUS_OFFICIAL_BUSINESS) : 'O.F. / O.B.';
+                $amLabel = trim((string) ($slotMap['am_arrival'] ?? $slotMap['am_departure'] ?? ''));
+                $pmLabel = trim((string) ($slotMap['pm_arrival'] ?? $slotMap['pm_departure'] ?? ''));
+                if ($amLabel !== '' && $pmLabel !== '') {
+                    $dtr->status = strcasecmp($amLabel, $pmLabel) === 0 ? $amLabel : "{$amLabel} / {$pmLabel}";
+                } else {
+                    $dtr->status = $amLabel !== '' ? $amLabel : ($pmLabel !== '' ? $pmLabel : DailyTimeRecord::STATUS_OFFICIAL_BUSINESS);
+                }
                 $dtr->adjustment_remarks = $dtr->status;
                 $dtr->rendered_hours = 8.00;
             } elseif ($hasAnyPunches) {
@@ -986,6 +919,90 @@ class DailyTimeRecordController extends Controller
         return response()->json([
             'message' => 'Attendance time overridden successfully.',
             'dtr' => $dtr,
+        ]);
+    }
+
+    /**
+     * Save or clear CSC Form 48 accomplishment workload/quantity for one or more dates.
+     */
+    public function saveAccomplishment(Request $request): JsonResponse
+    {
+        if ($denied = $this->authorizeDtrWriteAccess($request)) {
+            return $denied;
+        }
+
+        $validated = $request->validate([
+            'employee_control_no' => ['required', 'string', 'max:64'],
+            'field' => ['required', 'string', Rule::in(['workload', 'quantity'])],
+            'value' => ['nullable', 'string', 'max:500'],
+            'dates' => ['required', 'array', 'min:1', 'max:366'],
+            'dates.*' => ['required', 'date_format:Y-m-d'],
+        ]);
+
+        $field = $validated['field'];
+        $rawValue = trim((string) ($validated['value'] ?? ''));
+        $normalizedValue = $rawValue !== '' ? $rawValue : null;
+
+        if ($field === 'quantity' && $normalizedValue !== null && mb_strlen($normalizedValue) > 100) {
+            return response()->json([
+                'message' => 'Quantity must not exceed 100 characters.',
+            ], 422);
+        }
+
+        $controlNo = trim((string) $validated['employee_control_no']);
+        $employee = HrisEmployee::findByControlNo($controlNo, true)
+            ?? HrisEmployee::findByControlNo($controlNo, false);
+        if (! $employee) {
+            return response()->json([
+                'message' => 'Employee not found in active HRIS records.',
+            ], 404);
+        }
+
+        $canonicalControlNo = (string) ($employee->control_no ?? $controlNo);
+        $variants = $this->dtrService->resolveControlNoVariants($controlNo, $canonicalControlNo);
+        $column = $field === 'quantity' ? 'workload_quantity' : 'workload_undertaken';
+        $dates = array_values(array_unique($validated['dates']));
+
+        $updatedRecords = DB::connection('bio')->transaction(function () use (
+            $canonicalControlNo,
+            $variants,
+            $dates,
+            $column,
+            $normalizedValue
+        ): array {
+            $saved = [];
+
+            foreach ($dates as $dateStr) {
+                $dtr = DailyTimeRecord::query()
+                    ->whereIn('employee_control_no', $variants)
+                    ->where('record_date', $dateStr)
+                    ->first();
+
+                if ($dtr === null) {
+                    if ($normalizedValue === null) {
+                        continue;
+                    }
+
+                    $dtr = $this->dtrService->calculateForEmployeeDate($canonicalControlNo, $dateStr);
+                } elseif ($dtr->employee_control_no !== $canonicalControlNo) {
+                    $dtr = $this->dtrService->calculateForEmployeeDate($canonicalControlNo, $dateStr);
+                }
+
+                $dtr->{$column} = $normalizedValue;
+                $dtr->save();
+                $saved[] = $dtr->fresh();
+            }
+
+            return $saved;
+        });
+
+        return response()->json([
+            'message' => $field === 'quantity'
+                ? 'Quantity updated successfully.'
+                : 'Workload updated successfully.',
+            'field' => $field,
+            'value' => $normalizedValue,
+            'records' => $updatedRecords,
         ]);
     }
 
@@ -1089,5 +1106,143 @@ class DailyTimeRecordController extends Controller
         }
 
         return response()->json(['message' => 'Unauthorized access.'], 403);
+    }
+
+    /**
+     * Resolve the default In-Charge signatory for an employee using the department head's actual designation.
+     *
+     * @return array{name: string, title: string, control_no: ?string}
+     */
+    private function resolveDefaultInCharge(string $canonicalControlNo, ?object $employee): array
+    {
+        $defaultInCharge = [
+            'name' => 'JOSEPH NELSON N. BRIONES',
+            'title' => 'DEPARTMENT HEAD',
+            'control_no' => null,
+        ];
+
+        $assignment = EmployeeDepartmentAssignment::with('assignedDepartment.departmentHead')
+            ->where('employee_control_no', $canonicalControlNo)
+            ->first();
+
+        $dept = $assignment?->assignedDepartment;
+        if (! $dept && ! empty($employee?->office)) {
+            $dept = Department::with('departmentHead')
+                ->where('name', $employee->office)
+                ->first();
+        }
+
+        $head = $dept?->effectiveDepartmentHead();
+        if (! $head) {
+            return $defaultInCharge;
+        }
+
+        $middleInitial = $head->middlename ? ' '.strtoupper(trim($head->middlename)[0]).'.' : '';
+        $headName = strtoupper(trim(($head->firstname ?? '').$middleInitial.' '.($head->surname ?? '')));
+        if ($headName === '' && ! empty($head->full_name)) {
+            $headName = strtoupper(trim($head->full_name));
+        }
+
+        return [
+            'name' => $headName ?: 'DEPARTMENT HEAD',
+            'title' => $this->resolveDepartmentHeadTitle($head, $dept?->name ?? $head->office),
+            'control_no' => $head->control_no,
+        ];
+    }
+
+    /**
+     * Format all configured department heads using each head's actual designation.
+     *
+     * @return \Illuminate\Support\Collection<int, array<string, mixed>>
+     */
+    private function getFormattedDepartmentHeads(): \Illuminate\Support\Collection
+    {
+        return DepartmentHead::query()
+            ->with('department:id,name')
+            ->orderBy('surname')
+            ->get()
+            ->map(function (DepartmentHead $head): array {
+                $mi = $head->middlename ? ' '.strtoupper(trim($head->middlename)[0]).'.' : '';
+                $name = strtoupper(trim(($head->firstname ?? '').$mi.' '.($head->surname ?? '')));
+                if ($name === '' && ! empty($head->full_name)) {
+                    $name = strtoupper(trim($head->full_name));
+                }
+
+                $deptName = $head->department?->name ?? $head->office ?? '';
+                $acronym = trim((string) (HrisEmployee::officeAcronymByName($deptName) ?? ''));
+
+                return [
+                    'id' => $head->id,
+                    'control_no' => $head->control_no,
+                    'name' => $name,
+                    'title' => $this->resolveDepartmentHeadTitle($head, $deptName),
+                    'department' => $deptName,
+                    'acronym' => $acronym,
+                ];
+            })
+            ->values();
+    }
+
+    /**
+     * Resolve a department head's actual designation, falling back to HRIS or office acronym head title.
+     */
+    private function resolveDepartmentHeadTitle(DepartmentHead $head, ?string $deptName): string
+    {
+        $designation = trim((string) ($head->designation ?? ''));
+
+        if ($designation === '' && ! empty($head->control_no)) {
+            $hrisHead = HrisEmployee::findByControlNo((string) $head->control_no, true)
+                ?? HrisEmployee::findByControlNo((string) $head->control_no, false);
+            $designation = trim((string) ($hrisHead->designation ?? ''));
+        }
+
+        if ($designation !== '') {
+            return strtoupper($designation);
+        }
+
+        $acronym = trim((string) (HrisEmployee::officeAcronymByName($deptName) ?? ''));
+
+        return $acronym !== '' ? strtoupper($acronym).' HEAD' : 'DEPARTMENT HEAD';
+    }
+
+    /**
+     * Determine whether any slot in the provided keys holds a non-time remark (e.g. O.F., O.B., W.S).
+     *
+     * @param  array<string, mixed>  $slotMap
+     * @param  array<int, string>  $keys
+     */
+    private function hasSpecialSlotRemark(array $slotMap, array $keys): bool
+    {
+        foreach ($keys as $key) {
+            $value = strtoupper(trim((string) ($slotMap[$key] ?? '')));
+            if ($value !== '' && $value !== 'TIME' && $value !== 'ABSENT') {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Determine whether a slot currently holds an unmodified biometric punch.
+     */
+    private function isOriginalBiometricSlot(DailyTimeRecord $dtr, string $slotKey): bool
+    {
+        $rawTime = trim((string) ($dtr->{$slotKey} ?? ''));
+        if ($rawTime === '') {
+            return false;
+        }
+
+        $adjusted = $dtr->adjusted_slots;
+        if (! is_array($adjusted) || $adjusted === []) {
+            return true;
+        }
+
+        $isAssoc = array_keys($adjusted) !== range(0, count($adjusted) - 1);
+        if ($isAssoc) {
+            return trim((string) ($adjusted[$slotKey] ?? '')) === '';
+        }
+
+        return ! in_array($slotKey, $adjusted, true);
     }
 }

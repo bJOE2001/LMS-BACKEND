@@ -136,6 +136,12 @@ Route::middleware(['auth:sanctum', 'password.changed'])->group(function () {
         Route::post('/dtr/bulk-print', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'bulkDtr']);
         Route::post('/dtr/{id}/adjust', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'adjust']);
         Route::post('/dtr/override', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'overrideTime']);
+        Route::get('/dtr/delete-requests', [\App\Http\Controllers\Attendance\DtrDeleteRequestController::class, 'index']);
+        Route::post('/dtr/delete-requests', [\App\Http\Controllers\Attendance\DtrDeleteRequestController::class, 'store']);
+        Route::post('/dtr/delete-requests/{id}/cancel', [\App\Http\Controllers\Attendance\DtrDeleteRequestController::class, 'cancel']);
+        Route::post('/dtr/delete-requests/{id}/approve', [\App\Http\Controllers\Attendance\DtrDeleteRequestController::class, 'approve']);
+        Route::post('/dtr/delete-requests/{id}/reject', [\App\Http\Controllers\Attendance\DtrDeleteRequestController::class, 'reject']);
+        Route::post('/dtr/accomplishment', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'saveAccomplishment']);
         Route::post('/dtr/recalculate', [\App\Http\Controllers\Attendance\DailyTimeRecordController::class, 'recalculate']);
         Route::get('/devices', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'listDevices']);
         Route::post('/devices', [\App\Http\Controllers\Attendance\BiometricDeviceController::class, 'storeDevice'])->middleware('hr');
